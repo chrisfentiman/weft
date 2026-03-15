@@ -26,3 +26,11 @@ Thumbs.db
 *.o
 *.so
 *.dylib
+
+# Model files (large binaries, downloaded not committed)
+models/*.onnx
+models/*.json
+!models/.gitkeep
+
+# Local config (contains secrets / overrides)
+config/weft.toml
