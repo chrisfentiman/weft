@@ -12,3 +12,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+mockito = { version = "1" }
+tokio = { workspace = true }
+serde_json = { workspace = true }

@@ -1,13 +1,18 @@
 //! `weft_llm` — LLM provider trait and implementations.
 //!
-//! Phase 1 stub. Full implementation in Phase 2.
-//!
 //! Contains:
 //! - `LlmProvider` trait for sending conversations to an LLM backend
 //! - `LlmError` error type
 //! - `CompletionOptions` for per-request options
 //! - `CompletionResponse` and `LlmUsage` for provider responses
-//! - Anthropic and OpenAI provider implementations (Phase 2)
+//! - `AnthropicProvider`: Anthropic Messages API implementation
+//! - `OpenAIProvider`: OpenAI Chat Completions API implementation
+
+pub mod anthropic;
+pub mod openai;
+
+pub use anthropic::AnthropicProvider;
+pub use openai::OpenAIProvider;
 
 use async_trait::async_trait;
 use weft_core::Message;

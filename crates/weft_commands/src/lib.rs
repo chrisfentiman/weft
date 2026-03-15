@@ -1,14 +1,20 @@
 //! `weft_commands` — Command registry trait, parser, gRPC client, and adapter.
 //!
-//! Phase 1 stub. Full implementation in Phase 2.
-//!
 //! Contains:
 //! - `CommandRegistry` trait for managing available commands
 //! - `ToolRegistryClient` trait for communicating with a remote gRPC ToolRegistry
 //! - `CommandError` and `ToolRegistryError` error types
-//! - Command parser (Phase 2)
-//! - gRPC client wrapper (Phase 2)
-//! - `ToolRegistryCommandAdapter` bridging the two traits (Phase 2)
+//! - `parser`: slash command parser for LLM output
+//! - `grpc_client`: tonic client implementing `ToolRegistryClient`
+//! - `adapter`: `ToolRegistryCommandAdapter` bridging `ToolRegistryClient` to `CommandRegistry`
+
+pub mod adapter;
+pub mod grpc_client;
+pub mod parser;
+
+pub use adapter::ToolRegistryCommandAdapter;
+pub use grpc_client::GrpcToolRegistryClient;
+pub use parser::{ParsedResponse, parse_response};
 
 use async_trait::async_trait;
 use weft_core::{CommandDescription, CommandInvocation, CommandResult, CommandStub};
