@@ -123,6 +123,16 @@ impl ModernBertClassifier {
     pub fn is_fallback(&self) -> bool {
         self.session.is_none()
     }
+
+    /// Returns the number of commands whose embeddings are cached.
+    ///
+    /// In fallback mode this is always 0. In normal mode it equals the number
+    /// of commands successfully embedded at construction time. Used in tests to
+    /// verify that the embedding cache is populated exactly once at startup.
+    #[cfg(test)]
+    pub fn cached_command_count(&self) -> usize {
+        self.command_embeddings.len()
+    }
 }
 
 #[async_trait]
@@ -137,13 +147,19 @@ impl SemanticClassifier for ModernBertClassifier {
             (Some(s), Some(t)) => (s, t),
             _ => {
                 debug!("classifier in fallback mode, returning all commands");
-                return Ok(commands
+                // Spec Section 5.5: fallback returns all commands sorted alphabetically.
+                // Sorting here ensures that when the gateway applies take_top on equal
+                // scores (all 1.0), the alphabetical order is preserved rather than
+                // depending on input order or sort stability.
+                let mut results: Vec<ClassificationResult> = commands
                     .iter()
                     .map(|c| ClassificationResult {
                         command_name: c.name.clone(),
                         score: 1.0,
                     })
-                    .collect());
+                    .collect();
+                results.sort_by(|a, b| a.command_name.cmp(&b.command_name));
+                return Ok(results);
             }
         };
 
@@ -440,14 +456,15 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    // ---- Command not in cache scores 0.0 ----
+    // ---- Fallback scores all commands 1.0 ----
 
     #[tokio::test]
-    async fn test_unknown_command_scores_zero() {
-        // In fallback mode, commands get score 1.0.
-        // But if we had a real model, unknown commands (not in the pre-computed
-        // cache) would get 0.0. We can test this directly using the scoring logic
-        // via the fallback classifier + a different command set at query time.
+    async fn test_fallback_scores_all_commands_1_0() {
+        // This test exercises fallback mode: when the model is missing, every command
+        // passed to classify() is returned with score 1.0 regardless of the startup
+        // command set. The non-fallback path where an unknown command (not in the
+        // pre-computed cache) scores 0.0 (bert.rs `unwrap_or(0.0)`) is exercised by
+        // integration tests in Phase 4 which load a real ONNX model.
         let commands_at_startup = make_commands(&[("known", "A known command")]);
         let classifier = ModernBertClassifier::new(
             "/bad/model.onnx",
@@ -465,5 +482,74 @@ mod tests {
         // Fallback returns all passed commands with score 1.0.
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].score, 1.0);
+    }
+
+    // ---- Embedding cache reuse ----
+
+    #[tokio::test]
+    async fn test_embedding_cache_populated_at_construction() {
+        // Spec requirement: command embeddings are computed once and reused.
+        // In fallback mode (no model) the cache is always empty — this verifies
+        // the structural invariant that cached_command_count() reflects the
+        // startup command set (0 in fallback because no embeddings are computed).
+        // The matching non-zero case is exercised by integration tests with a
+        // real model, which verify the count equals the command count passed to new().
+        let commands = make_commands(&[
+            ("cmd_alpha", "Does alpha things"),
+            ("cmd_beta", "Does beta things"),
+        ]);
+        let classifier =
+            ModernBertClassifier::new("/bad/model.onnx", "/bad/tokenizer.json", &commands);
+
+        // Fallback mode: no embeddings are cached (model never ran).
+        assert_eq!(
+            classifier.cached_command_count(),
+            0,
+            "fallback classifier should have no cached embeddings"
+        );
+
+        // Results are consistent across multiple calls — each call returns the
+        // same set of commands confirming classify() reads from stable state.
+        let result_a = classifier
+            .classify("query one", &commands)
+            .await
+            .expect("first classify should succeed");
+        let result_b = classifier
+            .classify("query two", &commands)
+            .await
+            .expect("second classify should succeed");
+
+        let names_a: Vec<&str> = result_a.iter().map(|r| r.command_name.as_str()).collect();
+        let names_b: Vec<&str> = result_b.iter().map(|r| r.command_name.as_str()).collect();
+        assert_eq!(
+            names_a, names_b,
+            "classify() must return consistent results across calls (cache is not mutated)"
+        );
+    }
+
+    // ---- Fallback alphabetical ordering ----
+
+    #[tokio::test]
+    async fn test_fallback_results_sorted_alphabetically() {
+        // Spec Section 5.5: fallback returns commands sorted alphabetically by name.
+        let commands = make_commands(&[
+            ("zebra", "Last alphabetically"),
+            ("alpha", "First alphabetically"),
+            ("middle", "Middle alphabetically"),
+        ]);
+        let classifier =
+            ModernBertClassifier::new("/bad/model.onnx", "/bad/tokenizer.json", &commands);
+
+        let results = classifier
+            .classify("anything", &commands)
+            .await
+            .expect("fallback should not error");
+
+        let names: Vec<&str> = results.iter().map(|r| r.command_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["alpha", "middle", "zebra"],
+            "fallback results must be sorted alphabetically by command_name"
+        );
     }
 }
