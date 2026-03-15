@@ -3,6 +3,12 @@
 # Conventional Commits enforcement
 # Allows: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert
 # Format: type(scope): description  OR  type: description
+#
+# Rules:
+# - Subject line must be <= 72 characters
+# - Subject line must follow conventional commits format
+# - Body lines must be <= 80 characters (excluding URLs)
+# - Body must be concise (max 20 lines)
 
 commit_msg_file="$1"
 commit_msg=$(cat "$commit_msg_file")
@@ -12,10 +18,13 @@ if echo "$commit_msg" | grep -qE "^Merge "; then
   exit 0
 fi
 
+# Get subject line
+subject=$(head -1 "$commit_msg_file")
+
 # Conventional commit pattern
 pattern="^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-zA-Z0-9_-]+\))?(!)?: .+"
 
-if ! echo "$commit_msg" | head -1 | grep -qE "$pattern"; then
+if ! echo "$subject" | grep -qE "$pattern"; then
   echo "ERROR: Commit message does not follow Conventional Commits format."
   echo ""
   echo "Expected: type(scope): description"
@@ -26,6 +35,49 @@ if ! echo "$commit_msg" | head -1 | grep -qE "$pattern"; then
   echo "  fix(routing): handle empty tool registries"
   echo "  chore: initial project setup"
   echo ""
-  echo "Got: $(head -1 "$commit_msg_file")"
+  echo "Got: $subject"
+  exit 1
+fi
+
+# Subject line length check (72 chars max)
+subject_len=${#subject}
+if [ "$subject_len" -gt 72 ]; then
+  echo "ERROR: Subject line is $subject_len characters (max 72)."
+  echo "Got: $subject"
+  exit 1
+fi
+
+# Body length check (max 20 lines, excluding blank lines)
+body_lines=$(tail -n +3 "$commit_msg_file" | grep -cv '^$' 2>/dev/null || echo "0")
+if [ "$body_lines" -gt 20 ]; then
+  echo "ERROR: Commit body is $body_lines lines (max 20). Keep it concise."
+  exit 1
+fi
+
+# Body line width check (80 chars max, skip URLs)
+line_num=0
+while IFS= read -r line; do
+  line_num=$((line_num + 1))
+  # Skip subject and blank separator
+  if [ "$line_num" -le 2 ]; then
+    continue
+  fi
+  # Skip lines that are URLs
+  if echo "$line" | grep -qE '^\s*https?://'; then
+    continue
+  fi
+  line_len=${#line}
+  if [ "$line_len" -gt 80 ]; then
+    echo "ERROR: Line $line_num is $line_len characters (max 80)."
+    echo "Got: $line"
+    exit 1
+  fi
+done < "$commit_msg_file"
+
+# Block internal pipeline references
+if echo "$commit_msg" | grep -qiE 'phase [0-9]|revision [0-9]|attempt [0-9]|review #[0-9]|remediation|per spec|from review|from the spec|spec section|reviewer feedback|architect revision'; then
+  echo "ERROR: Commit message contains internal pipeline references."
+  echo "Commits should be external-facing — describe WHAT and WHY,"
+  echo "not which phase/review/iteration produced this change."
   exit 1
 fi
