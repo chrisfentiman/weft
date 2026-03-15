@@ -1,0 +1,73 @@
+//! Top-level gateway error type.
+
+/// Top-level gateway error type.
+///
+/// This aggregates domain errors via `String` payloads to avoid circular
+/// crate dependencies. Domain crates define their own error enums
+/// (`LlmError`, `ClassifierError`, `CommandError`, `ToolRegistryError`).
+/// The binary crate converts domain errors to `WeftError` at the boundary.
+#[derive(Debug, thiserror::Error)]
+pub enum WeftError {
+    #[error("configuration error: {0}")]
+    Config(String),
+    #[error("llm provider error: {0}")]
+    Llm(String),
+    #[error("classifier error: {0}")]
+    Classifier(String),
+    #[error("command error: {0}")]
+    Command(String),
+    #[error("tool registry error: {0}")]
+    ToolRegistry(String),
+    #[error("max command loop iterations ({max}) exceeded")]
+    CommandLoopExceeded { max: u32 },
+    #[error("request timed out after {timeout_secs}s")]
+    RequestTimeout { timeout_secs: u64 },
+    #[error("streaming not supported in v1")]
+    StreamingNotSupported,
+    /// Rate-limited by the LLM provider.
+    #[error("rate limited by provider, retry after {retry_after_ms}ms")]
+    RateLimited { retry_after_ms: u64 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_all_variants_constructible() {
+        let _ = WeftError::Config("bad config".to_string());
+        let _ = WeftError::Llm("provider failed".to_string());
+        let _ = WeftError::Classifier("inference failed".to_string());
+        let _ = WeftError::Command("command failed".to_string());
+        let _ = WeftError::ToolRegistry("registry down".to_string());
+        let _ = WeftError::CommandLoopExceeded { max: 10 };
+        let _ = WeftError::RequestTimeout { timeout_secs: 300 };
+        let _ = WeftError::StreamingNotSupported;
+        let _ = WeftError::RateLimited {
+            retry_after_ms: 1000,
+        };
+    }
+
+    #[test]
+    fn test_error_messages() {
+        let err = WeftError::Config("missing field".to_string());
+        assert_eq!(err.to_string(), "configuration error: missing field");
+
+        let err = WeftError::CommandLoopExceeded { max: 5 };
+        assert_eq!(err.to_string(), "max command loop iterations (5) exceeded");
+
+        let err = WeftError::RequestTimeout { timeout_secs: 120 };
+        assert_eq!(err.to_string(), "request timed out after 120s");
+
+        let err = WeftError::StreamingNotSupported;
+        assert_eq!(err.to_string(), "streaming not supported in v1");
+
+        let err = WeftError::RateLimited {
+            retry_after_ms: 2000,
+        };
+        assert_eq!(
+            err.to_string(),
+            "rate limited by provider, retry after 2000ms"
+        );
+    }
+}

@@ -1,0 +1,31 @@
+# config/weft.example.toml
+
+[server]
+bind_address = "0.0.0.0:8080"
+
+[llm]
+provider = "anthropic"
+api_key = "env:ANTHROPIC_API_KEY"
+model = "claude-sonnet-4-20250514"
+max_tokens = 4096
+# base_url = "https://api.anthropic.com"  # optional override
+
+[classifier]
+model_path = "models/modernbert-classifier.onnx"
+tokenizer_path = "models/tokenizer.json"
+threshold = 0.3
+max_commands = 20
+
+[tool_registry]
+endpoint = "http://localhost:50051"
+connect_timeout_ms = 5000
+request_timeout_ms = 30000
+
+[gateway]
+system_prompt = """
+You are a helpful assistant with access to tools.
+Use the available commands when they would help answer the user's question.
+Be concise and accurate.
+"""
+max_command_iterations = 10
+request_timeout_secs = 300
