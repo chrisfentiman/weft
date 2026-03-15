@@ -11,3 +11,5 @@ ort = { workspace = true }
 tokenizers = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true }
+ndarray = "0.17"
