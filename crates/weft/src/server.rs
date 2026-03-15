@@ -4,8 +4,6 @@
 //! - `POST /v1/chat/completions` — OpenAI-compatible chat completions
 //! - `GET /health`               — Health check for load balancers
 
-use std::time::Duration;
-
 use axum::{
     Json, Router,
     extract::State,
@@ -19,9 +17,6 @@ use weft_core::{ChatCompletionRequest, ChatCompletionResponse, WeftError};
 
 use crate::engine::GatewayEngine;
 
-/// How long in-flight requests have to complete after shutdown signal.
-const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(30);
-
 /// Build the axum `Router` with all routes attached.
 pub fn build_router(engine: GatewayEngine) -> Router {
     Router::new()
@@ -32,8 +27,9 @@ pub fn build_router(engine: GatewayEngine) -> Router {
 
 /// Start the HTTP server and block until shutdown.
 ///
-/// Listens on `bind_address`, serves requests until SIGTERM/SIGINT, then
-/// gives in-flight requests up to `SHUTDOWN_GRACE_PERIOD` to complete.
+/// Listens on `bind_address`, serves requests until SIGTERM/SIGINT.
+/// Once the signal is received, axum stops accepting new connections and
+/// waits for in-flight requests to complete before returning.
 pub async fn serve(
     router: Router,
     bind_address: &str,
@@ -72,9 +68,7 @@ async fn shutdown_signal() {
             .expect("failed to install Ctrl-C handler");
         info!("received Ctrl-C, beginning graceful shutdown");
     }
-
-    // Give in-flight requests time to complete.
-    tokio::time::sleep(SHUTDOWN_GRACE_PERIOD).await;
+    // Return immediately — axum handles the grace period for in-flight requests.
 }
 
 // ── Handlers ───────────────────────────────────────────────────────────────
