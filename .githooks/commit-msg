@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 #
 # Conventional Commits enforcement
-# Allows: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert
-# Format: type(scope): description  OR  type: description
 #
 # Rules:
-# - Subject line must be <= 72 characters
-# - Subject line must follow conventional commits format
-# - Body lines must be <= 80 characters (excluding URLs)
-# - Body must be concise (max 20 lines)
+# - Subject: type(scope): description (max 72 chars)
+# - Body: max 20 lines, max 80 chars per line
+# - Type must match the files being committed
+# - Commits must be thematic (no mixing code with infra)
+# - No internal pipeline references
 
 commit_msg_file="$1"
 commit_msg=$(cat "$commit_msg_file")
@@ -18,66 +17,153 @@ if echo "$commit_msg" | grep -qE "^Merge "; then
   exit 0
 fi
 
-# Get subject line
 subject=$(head -1 "$commit_msg_file")
 
-# Conventional commit pattern
+# ─── FORMAT CHECK ────────────────────────────────────────────────
 pattern="^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-zA-Z0-9_-]+\))?(!)?: .+"
 
 if ! echo "$subject" | grep -qE "$pattern"; then
-  echo "ERROR: Commit message does not follow Conventional Commits format."
-  echo ""
+  echo "ERROR: Does not follow Conventional Commits format."
   echo "Expected: type(scope): description"
-  echo "Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert"
-  echo ""
-  echo "Examples:"
-  echo "  feat(gateway): add OpenAI-compatible endpoint"
-  echo "  fix(routing): handle empty tool registries"
-  echo "  chore: initial project setup"
-  echo ""
+  echo "Types: feat fix docs style refactor perf test build ci chore revert"
   echo "Got: $subject"
   exit 1
 fi
 
-# Subject line length check (72 chars max)
+# Extract the commit type
+commit_type=$(echo "$subject" | sed -E 's/^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert).*/\1/')
+
+# ─── LENGTH CHECKS ──────────────────────────────────────────────
 subject_len=${#subject}
 if [ "$subject_len" -gt 72 ]; then
-  echo "ERROR: Subject line is $subject_len characters (max 72)."
+  echo "ERROR: Subject is $subject_len chars (max 72)."
   echo "Got: $subject"
   exit 1
 fi
 
-# Body length check (max 20 lines, excluding blank lines)
 body_lines=$(tail -n +3 "$commit_msg_file" | grep -cv '^$' 2>/dev/null || echo "0")
 if [ "$body_lines" -gt 20 ]; then
-  echo "ERROR: Commit body is $body_lines lines (max 20). Keep it concise."
+  echo "ERROR: Body is $body_lines lines (max 20)."
   exit 1
 fi
 
-# Body line width check (80 chars max, skip URLs)
 line_num=0
 while IFS= read -r line; do
   line_num=$((line_num + 1))
-  # Skip subject and blank separator
-  if [ "$line_num" -le 2 ]; then
-    continue
-  fi
-  # Skip lines that are URLs
-  if echo "$line" | grep -qE '^\s*https?://'; then
-    continue
-  fi
+  if [ "$line_num" -le 2 ]; then continue; fi
+  if echo "$line" | grep -qE '^\s*https?://'; then continue; fi
   line_len=${#line}
   if [ "$line_len" -gt 80 ]; then
-    echo "ERROR: Line $line_num is $line_len characters (max 80)."
+    echo "ERROR: Line $line_num is $line_len chars (max 80)."
     echo "Got: $line"
     exit 1
   fi
 done < "$commit_msg_file"
 
-# Block internal pipeline references
+# ─── NO INTERNAL REFS ───────────────────────────────────────────
 if echo "$commit_msg" | grep -qiE 'phase [0-9]|revision [0-9]|attempt [0-9]|review #[0-9]|remediation|per spec|from review|from the spec|spec section|reviewer feedback|architect revision'; then
-  echo "ERROR: Commit message contains internal pipeline references."
-  echo "Commits should be external-facing — describe WHAT and WHY,"
-  echo "not which phase/review/iteration produced this change."
+  echo "ERROR: Contains internal pipeline references."
+  echo "Describe WHAT and WHY, not which iteration."
   exit 1
+fi
+
+# ─── TYPE vs FILES CHECK ────────────────────────────────────────
+# Classify staged files into categories
+staged_files=$(git diff --cached --name-only 2>/dev/null || true)
+if [ -z "$staged_files" ]; then
+  exit 0
+fi
+
+has_src=false
+has_test=false
+has_docs=false
+has_ci=false
+has_build=false
+has_infra=false
+
+for f in $staged_files; do
+  case "$f" in
+    .github/*|.gitlab-ci*|Dockerfile*|docker-compose*|*.dockerfile)
+      has_ci=true ;;
+    .githooks/*|.claude/*|.gitignore|.editorconfig)
+      has_infra=true ;;
+    Cargo.toml|Cargo.lock|build.rs|*/build.rs)
+      has_build=true ;;
+    *.md|docs/*|LICENSE*|CHANGELOG*)
+      has_docs=true ;;
+    *test*|*_test.rs|tests/*)
+      has_test=true ;;
+    crates/*/src/*|src/*)
+      has_src=true ;;
+    config/*|*.toml|*.yaml|*.yml)
+      has_build=true ;;
+    proto/*|*/proto/*)
+      has_src=true ;;
+  esac
+done
+
+# Type validation: certain types should not be used with src changes
+case "$commit_type" in
+  ci)
+    if [ "$has_src" = "true" ]; then
+      echo "ERROR: Type 'ci' but source files changed."
+      echo "CI commits should only touch CI/CD files."
+      echo "Split into separate commits."
+      exit 1
+    fi
+    ;;
+  docs)
+    if [ "$has_src" = "true" ]; then
+      echo "ERROR: Type 'docs' but source files changed."
+      echo "Docs commits should only touch documentation."
+      echo "Split into separate commits."
+      exit 1
+    fi
+    ;;
+  chore)
+    if [ "$has_src" = "true" ]; then
+      echo "ERROR: Type 'chore' but source files changed."
+      echo "Chore commits should not include source changes."
+      echo "Split into separate commits."
+      exit 1
+    fi
+    ;;
+  test)
+    if [ "$has_src" = "true" ] && [ "$has_test" = "false" ]; then
+      echo "ERROR: Type 'test' but non-test source changed."
+      echo "Test commits should only touch test files."
+      exit 1
+    fi
+    ;;
+  fix|feat)
+    if [ "$has_src" = "false" ] && [ "$has_ci" = "true" ]; then
+      echo "ERROR: Type '$commit_type' but only CI files changed."
+      echo "Use 'ci' for CI-only changes."
+      exit 1
+    fi
+    if [ "$has_src" = "false" ] && [ "$has_infra" = "true" ]; then
+      echo "ERROR: Type '$commit_type' but only infra files changed."
+      echo "Use 'chore' for infrastructure changes."
+      exit 1
+    fi
+    if [ "$has_src" = "false" ] && [ "$has_docs" = "true" ]; then
+      echo "ERROR: Type '$commit_type' but only docs changed."
+      echo "Use 'docs' for documentation changes."
+      exit 1
+    fi
+    ;;
+esac
+
+# Thematic commit check: block mixing code with infra/CI
+if [ "$has_src" = "true" ]; then
+  if [ "$has_ci" = "true" ]; then
+    echo "ERROR: Mixing source code with CI files."
+    echo "Commit these separately for clean versioning."
+    exit 1
+  fi
+  if [ "$has_infra" = "true" ]; then
+    echo "ERROR: Mixing source code with infra files."
+    echo "Commit .githooks, .claude, etc. separately."
+    exit 1
+  fi
 fi
