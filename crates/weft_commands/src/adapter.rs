@@ -15,20 +15,21 @@ use weft_core::{CommandAction, CommandDescription, CommandInvocation, CommandRes
 use crate::{CommandError, CommandRegistry, ToolRegistryClient, ToolRegistryError};
 
 /// Implements `CommandRegistry` by delegating to a `ToolRegistryClient`.
-pub struct ToolRegistryCommandAdapter<C: ToolRegistryClient> {
-    client: Arc<C>,
+///
+/// Uses `Arc<dyn ToolRegistryClient>` so the adapter is object-safe and can be wired
+/// with any runtime-selected client (gRPC, mock, etc.) without monomorphization.
+pub struct ToolRegistryCommandAdapter {
+    client: Arc<dyn ToolRegistryClient>,
 }
 
-impl<C: ToolRegistryClient> ToolRegistryCommandAdapter<C> {
-    pub fn new(client: C) -> Self {
-        Self {
-            client: Arc::new(client),
-        }
+impl ToolRegistryCommandAdapter {
+    pub fn new(client: Arc<dyn ToolRegistryClient>) -> Self {
+        Self { client }
     }
 }
 
 #[async_trait]
-impl<C: ToolRegistryClient> CommandRegistry for ToolRegistryCommandAdapter<C> {
+impl CommandRegistry for ToolRegistryCommandAdapter {
     async fn list_commands(&self) -> Result<Vec<CommandStub>, CommandError> {
         let tools = self
             .client
@@ -153,6 +154,7 @@ mod tests {
     use crate::{ToolDescription, ToolExecutionResult, ToolInfo, ToolRegistryError};
     use async_trait::async_trait;
     use serde_json::json;
+    use std::sync::Arc;
     use weft_core::CommandAction;
 
     /// Mock client for testing the adapter.
@@ -249,7 +251,7 @@ mod tests {
             make_tool_info("web_search", "Search the web"),
             make_tool_info("code_review", "Review code"),
         ]);
-        let adapter = ToolRegistryCommandAdapter::new(client);
+        let adapter = ToolRegistryCommandAdapter::new(Arc::new(client));
 
         let commands = adapter.list_commands().await.expect("should succeed");
         assert_eq!(commands.len(), 2);
@@ -263,7 +265,7 @@ mod tests {
     async fn test_list_commands_registry_unavailable_on_connection_failure() {
         let client = MockToolRegistryClient::new_with_tools(vec![])
             .with_failure(ToolRegistryError::ConnectionFailed("refused".to_string()));
-        let adapter = ToolRegistryCommandAdapter::new(client);
+        let adapter = ToolRegistryCommandAdapter::new(Arc::new(client));
 
         let result = adapter.list_commands().await;
         assert!(matches!(result, Err(CommandError::RegistryUnavailable(_))));
@@ -282,7 +284,7 @@ mod tests {
         };
         let client =
             MockToolRegistryClient::new_with_tools(vec![]).with_description(tool_desc.clone());
-        let adapter = ToolRegistryCommandAdapter::new(client);
+        let adapter = ToolRegistryCommandAdapter::new(Arc::new(client));
 
         let cmd_desc = adapter
             .describe_command("web_search")
@@ -304,7 +306,7 @@ mod tests {
     async fn test_describe_command_not_found() {
         let client = MockToolRegistryClient::new_with_tools(vec![])
             .with_failure(ToolRegistryError::ToolNotFound("no_such".to_string()));
-        let adapter = ToolRegistryCommandAdapter::new(client);
+        let adapter = ToolRegistryCommandAdapter::new(Arc::new(client));
 
         let result = adapter.describe_command("no_such").await;
         assert!(matches!(result, Err(CommandError::NotFound(_))));
@@ -319,7 +321,7 @@ mod tests {
         };
         let client =
             MockToolRegistryClient::new_with_tools(vec![]).with_execution_result(exec_result);
-        let adapter = ToolRegistryCommandAdapter::new(client);
+        let adapter = ToolRegistryCommandAdapter::new(Arc::new(client));
 
         let invocation = CommandInvocation {
             name: "web_search".to_string(),
@@ -345,7 +347,7 @@ mod tests {
             parameters_schema: None,
         };
         let client = MockToolRegistryClient::new_with_tools(vec![]).with_description(tool_desc);
-        let adapter = ToolRegistryCommandAdapter::new(client);
+        let adapter = ToolRegistryCommandAdapter::new(Arc::new(client));
 
         let invocation = CommandInvocation {
             name: "web_search".to_string(),
@@ -370,7 +372,7 @@ mod tests {
         };
         let client =
             MockToolRegistryClient::new_with_tools(vec![]).with_execution_result(exec_result);
-        let adapter = ToolRegistryCommandAdapter::new(client);
+        let adapter = ToolRegistryCommandAdapter::new(Arc::new(client));
 
         let invocation = CommandInvocation {
             name: "web_search".to_string(),
@@ -393,7 +395,7 @@ mod tests {
             description: "Does something useful".to_string(),
         };
         let client = MockToolRegistryClient::new_with_tools(vec![tool]);
-        let adapter = ToolRegistryCommandAdapter::new(client);
+        let adapter = ToolRegistryCommandAdapter::new(Arc::new(client));
 
         let stubs = adapter.list_commands().await.expect("should succeed");
         assert_eq!(stubs.len(), 1);

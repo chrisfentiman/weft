@@ -10,6 +10,7 @@ license = "AGPL-3.0"
 [workspace.dependencies]
 # Async
 tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 async-trait = { version = "0.1" }
 
 # HTTP

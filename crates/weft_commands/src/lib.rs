@@ -7,14 +7,17 @@
 //! - `parser`: slash command parser for LLM output
 //! - `grpc_client`: tonic client implementing `ToolRegistryClient`
 //! - `adapter`: `ToolRegistryCommandAdapter` bridging `ToolRegistryClient` to `CommandRegistry`
+//! - `types`: gRPC mapping types (`ToolInfo`, `ToolDescription`, `ToolExecutionResult`)
 
 pub mod adapter;
 pub mod grpc_client;
 pub mod parser;
+pub mod types;
 
 pub use adapter::ToolRegistryCommandAdapter;
 pub use grpc_client::GrpcToolRegistryClient;
 pub use parser::{ParsedResponse, parse_response};
+pub use types::{ToolDescription, ToolExecutionResult, ToolInfo};
 
 use async_trait::async_trait;
 use weft_core::{CommandDescription, CommandInvocation, CommandResult, CommandStub};
@@ -72,37 +75,4 @@ pub enum ToolRegistryError {
     ExecutionFailed(String),
     #[error("grpc error: {0}")]
     GrpcError(String),
-}
-
-/// Summary of a tool from the remote registry.
-/// Maps to the gRPC ToolInfo message.
-#[derive(Debug, Clone)]
-pub struct ToolInfo {
-    /// Unique tool name within the registry.
-    pub name: String,
-    /// One-line description.
-    pub description: String,
-}
-
-/// Full tool description from the remote registry.
-/// Maps to the gRPC DescribeToolResponse message.
-#[derive(Debug, Clone)]
-pub struct ToolDescription {
-    pub name: String,
-    pub description: String,
-    /// Detailed usage instructions.
-    pub usage: String,
-    /// JSON schema for the tool's parameters. None if no schema.
-    pub parameters_schema: Option<serde_json::Value>,
-}
-
-/// Result of executing a tool via the remote registry.
-/// Maps to the gRPC ExecuteToolResponse message.
-#[derive(Debug, Clone)]
-pub struct ToolExecutionResult {
-    pub success: bool,
-    /// Result content (text).
-    pub output: String,
-    /// Error message if success is false.
-    pub error: Option<String>,
 }

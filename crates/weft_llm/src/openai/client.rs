@@ -239,7 +239,9 @@ mod tests {
     #[tokio::test]
     async fn test_system_prompt_prepended_as_system_message() {
         let mut server = mockito::Server::new_async().await;
-        let _mock = server
+        // Verify that the system prompt appears as the first message with role "system"
+        // in the serialized request body.
+        let mock = server
             .mock("POST", "/")
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -250,6 +252,15 @@ mod tests {
                 })
                 .to_string(),
             )
+            .match_body(mockito::Matcher::PartialJsonString(
+                json!({
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": "Hello"}
+                    ]
+                })
+                .to_string(),
+            ))
             .create_async()
             .await;
 
@@ -263,7 +274,45 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
-        // The system prompt is sent as first message with role "system"
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_options_forwarded() {
+        let mut server = mockito::Server::new_async().await;
+        // Verify that max_tokens and temperature from CompletionOptions appear in the
+        // serialized request body sent to OpenAI.
+        let mock = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                    "usage": null
+                })
+                .to_string(),
+            )
+            .match_body(mockito::Matcher::PartialJsonString(
+                json!({
+                    "max_tokens": 256,
+                    "temperature": 0.5_f32
+                })
+                .to_string(),
+            ))
+            .create_async()
+            .await;
+
+        let provider = OpenAIProvider::new(&make_config(&server.url()));
+        let options = CompletionOptions {
+            max_tokens: Some(256),
+            temperature: Some(0.5),
+        };
+        let result = provider
+            .complete("system", &make_messages(), &options)
+            .await;
+        assert!(result.is_ok());
+        mock.assert_async().await;
     }
 
     #[tokio::test]

@@ -17,6 +17,9 @@ pub struct ParsedResponse {
     pub text: String,
     /// All parsed command invocations, in order of appearance.
     pub invocations: Vec<CommandInvocation>,
+    /// Commands whose TOON argument parsing failed. Each has `success: false`.
+    /// These are not included in `invocations`.
+    pub parse_errors: Vec<CommandResult>,
 }
 
 /// Parse LLM output into clean text and command invocations.
@@ -25,12 +28,9 @@ pub struct ParsedResponse {
 /// appears in this set will be matched as commands.
 ///
 /// Any command whose TOON argument parsing fails produces a `CommandResult` with
-/// `success: false` in the returned `parse_errors`, and is NOT added to `invocations`.
+/// `success: false` in `ParsedResponse::parse_errors`, and is NOT added to `invocations`.
 /// The rest of parsing continues normally.
-pub fn parse_response(
-    text: &str,
-    known_commands: &HashSet<String>,
-) -> (ParsedResponse, Vec<CommandResult>) {
+pub fn parse_response(text: &str, known_commands: &HashSet<String>) -> ParsedResponse {
     let mut invocations = Vec::new();
     let mut parse_errors: Vec<CommandResult> = Vec::new();
     let mut clean_parts: Vec<String> = Vec::new();
@@ -64,11 +64,11 @@ pub fn parse_response(
                 }
             }
 
-            // Determine the action: check for --describe / --help flag
-            let combined = arg_parts.join(", ");
-            let combined_trimmed = combined.trim();
-
-            let action = detect_flag(combined_trimmed);
+            // Determine the action: detect flags from the inline portion only.
+            // A flag like `--describe` or `--verbose` is "standalone" when the inline
+            // contains only the flag and nothing else (no TOON key-value pairs). Continuation
+            // lines are never flag-only lines, so they don't affect flag detection.
+            let action = detect_flag(inline.trim());
 
             match action {
                 FlagAction::Describe => {
@@ -79,36 +79,21 @@ pub fn parse_response(
                     });
                 }
                 FlagAction::UnknownFlag(_) => {
-                    // Unknown flags: do NOT match as command (treat as prose).
-                    // Re-add the line as clean text.
+                    // Unknown flags: do NOT match as command (treat entire invocation as prose).
+                    // Re-emit the command line and all consumed continuation lines as clean text.
                     clean_parts.push(line.to_string());
-                    // Reset index to just after this line (we already advanced i).
-                    // But we consumed continuation lines — add them back as clean text too.
-                    // Actually we need to re-emit the consumed continuation lines.
-                    // The simplest fix: back up i is not possible since we advanced.
-                    // Instead, track them and emit.
-                    // NOTE: we emitted clean_parts.push(line) above, but we also consumed
-                    // continuation lines. Those continuation lines should also be clean text.
-                    // We can't easily "un-consume" them, but we can add them to clean_parts.
-                    // The combined arg_parts minus the first element (inline) are continuation.
-                    let continuation_count = if !inline.is_empty() {
-                        arg_parts.len().saturating_sub(1)
-                    } else {
-                        arg_parts.len()
-                    };
-                    // We need to emit those continuation lines as clean text.
-                    // arg_parts contains trimmed content; reconstruct approximate lines.
-                    for _ in 0..continuation_count {
-                        // We don't have the original lines anymore, but we have trimmed content.
-                        // The spec says unknown flags treat the command as prose, so we just
-                        // emit the arg content as clean text.
+                    // arg_parts holds the trimmed content of continuation lines (and inline).
+                    // Re-emit each consumed continuation line. We use the original indented form
+                    // (two leading spaces + trimmed content) to faithfully reconstruct the line.
+                    let continuation_start = if !inline.is_empty() { 1 } else { 0 };
+                    for part in arg_parts.iter().skip(continuation_start) {
+                        clean_parts.push(format!("  {part}"));
                     }
-                    // No continuation cleanup needed in practice — the spec says unknown flags
-                    // are treated as prose for the whole invocation, so we skip it.
                 }
                 FlagAction::Execute => {
-                    // Parse TOON args from combined arg parts
-                    let toon_input = combined_trimmed;
+                    // Parse TOON args from all collected arg parts (inline + continuation).
+                    let combined = arg_parts.join(", ");
+                    let toon_input = combined.trim();
                     match parse_toon_args(toon_input) {
                         Ok(arguments) => {
                             invocations.push(CommandInvocation {
@@ -140,13 +125,11 @@ pub fn parse_response(
     // Reconstruct clean text, collapsing consecutive blank lines.
     let clean_text = clean_parts.join("\n").trim().to_string();
 
-    (
-        ParsedResponse {
-            text: clean_text,
-            invocations,
-        },
+    ParsedResponse {
+        text: clean_text,
+        invocations,
         parse_errors,
-    )
+    }
 }
 
 /// Describes what flag (if any) was detected in the argument text.
@@ -200,6 +183,8 @@ fn detect_flag(args: &str) -> FlagAction {
 /// The `/` must be at the start of the line or preceded only by whitespace.
 ///
 /// After the command name, the next character must be whitespace, `--`, or end-of-line.
+/// A single `-` does NOT terminate the name — only `--` or whitespace does. This prevents
+/// `/web_search-related topic` from falsely matching `web_search` as a command.
 fn try_match_command<'a>(
     line: &'a str,
     known_commands: &HashSet<String>,
@@ -213,17 +198,25 @@ fn try_match_command<'a>(
     // Strip the leading '/'
     let after_slash = &trimmed[1..];
 
-    // Find the boundary: the command name is the identifier up to whitespace, end of line,
-    // or `--` (flag start).
+    // The command name ends only at whitespace or end-of-string. Stopping at a single '-'
+    // would cause `/web_search-related` to falsely extract `web_search`. The `--` flag
+    // prefix is detected later by `detect_flag`, after the full name is extracted.
     let name_end = after_slash
-        .find(|c: char| c.is_whitespace() || c == '-')
+        .find(|c: char| c.is_whitespace())
         .unwrap_or(after_slash.len());
 
     let candidate_name = &after_slash[..name_end];
 
-    // The character immediately after the name must be whitespace, '-', or end-of-string.
-    // (Enforced by the find above.)
     if candidate_name.is_empty() {
+        return None;
+    }
+
+    // After the name, only whitespace or end-of-string is a valid boundary.
+    // This rejects `/web_search--flag` (no space before --) as a false positive.
+    let after_name = &after_slash[name_end..];
+    let valid_boundary =
+        after_name.is_empty() || after_name.starts_with(|c: char| c.is_whitespace());
+    if !valid_boundary {
         return None;
     }
 
@@ -231,7 +224,7 @@ fn try_match_command<'a>(
         return None;
     }
 
-    let rest = after_slash[name_end..].trim_start();
+    let rest = after_name.trim_start();
     Some((candidate_name.to_string(), rest))
 }
 
@@ -249,7 +242,7 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
-    fn parse(text: &str, cmds: &[&str]) -> (ParsedResponse, Vec<CommandResult>) {
+    fn parse(text: &str, cmds: &[&str]) -> ParsedResponse {
         parse_response(text, &commands(cmds))
     }
 
@@ -257,16 +250,16 @@ mod tests {
 
     #[test]
     fn test_no_commands_returns_clean_text() {
-        let (resp, errors) = parse("Hello, world!", &["web_search"]);
+        let resp = parse("Hello, world!", &["web_search"]);
         assert_eq!(resp.text, "Hello, world!");
         assert!(resp.invocations.is_empty());
-        assert!(errors.is_empty());
+        assert!(resp.parse_errors.is_empty());
     }
 
     #[test]
     fn test_simple_command_no_args() {
-        let (resp, errors) = parse("/web_search", &["web_search"]);
-        assert!(errors.is_empty());
+        let resp = parse("/web_search", &["web_search"]);
+        assert!(resp.parse_errors.is_empty());
         assert_eq!(resp.invocations.len(), 1);
         assert_eq!(resp.invocations[0].name, "web_search");
         assert_eq!(resp.invocations[0].action, CommandAction::Execute);
@@ -276,11 +269,11 @@ mod tests {
 
     #[test]
     fn test_command_with_toon_args() {
-        let (resp, errors) = parse(
+        let resp = parse(
             r#"/web_search query: "Rust async patterns""#,
             &["web_search"],
         );
-        assert!(errors.is_empty());
+        assert!(resp.parse_errors.is_empty());
         assert_eq!(resp.invocations.len(), 1);
         assert_eq!(
             resp.invocations[0].arguments,
@@ -290,11 +283,11 @@ mod tests {
 
     #[test]
     fn test_command_with_multiple_toon_args() {
-        let (resp, errors) = parse(
+        let resp = parse(
             r#"/web_search query: "Rust async patterns 2026", max_results: 10"#,
             &["web_search"],
         );
-        assert!(errors.is_empty());
+        assert!(resp.parse_errors.is_empty());
         assert_eq!(resp.invocations.len(), 1);
         assert_eq!(
             resp.invocations[0].arguments,
@@ -304,8 +297,8 @@ mod tests {
 
     #[test]
     fn test_describe_flag() {
-        let (resp, errors) = parse("/docs_search --describe", &["docs_search"]);
-        assert!(errors.is_empty());
+        let resp = parse("/docs_search --describe", &["docs_search"]);
+        assert!(resp.parse_errors.is_empty());
         assert_eq!(resp.invocations.len(), 1);
         assert_eq!(resp.invocations[0].name, "docs_search");
         assert_eq!(resp.invocations[0].action, CommandAction::Describe);
@@ -314,8 +307,8 @@ mod tests {
 
     #[test]
     fn test_help_flag_alias_for_describe() {
-        let (resp, errors) = parse("/docs_search --help", &["docs_search"]);
-        assert!(errors.is_empty());
+        let resp = parse("/docs_search --help", &["docs_search"]);
+        assert!(resp.parse_errors.is_empty());
         assert_eq!(resp.invocations.len(), 1);
         assert_eq!(resp.invocations[0].action, CommandAction::Describe);
     }
@@ -325,8 +318,8 @@ mod tests {
     #[test]
     fn test_multiple_commands_in_response() {
         let text = "I'll search for that.\n\n/web_search query: \"Rust\"\n\nLet me check docs.\n\n/docs_search --describe";
-        let (resp, errors) = parse(text, &["web_search", "docs_search"]);
-        assert!(errors.is_empty());
+        let resp = parse(text, &["web_search", "docs_search"]);
+        assert!(resp.parse_errors.is_empty());
         assert_eq!(resp.invocations.len(), 2);
         assert_eq!(resp.invocations[0].name, "web_search");
         assert_eq!(resp.invocations[1].name, "docs_search");
@@ -339,19 +332,19 @@ mod tests {
 
     #[test]
     fn test_unregistered_command_is_text() {
-        let (resp, errors) = parse("/unknown_cmd foo: bar", &["web_search"]);
-        assert!(errors.is_empty());
+        let resp = parse("/unknown_cmd foo: bar", &["web_search"]);
+        assert!(resp.parse_errors.is_empty());
         assert!(resp.invocations.is_empty());
         assert!(resp.text.contains("/unknown_cmd foo: bar"));
     }
 
     #[test]
     fn test_path_not_matched() {
-        let (resp, errors) = parse(
+        let resp = parse(
             "See /usr/local/bin for details",
             &["web_search", "docs_search"],
         );
-        assert!(errors.is_empty());
+        assert!(resp.parse_errors.is_empty());
         assert!(resp.invocations.is_empty());
         // usr is not a registered command
         assert!(resp.text.contains("/usr/local/bin"));
@@ -359,9 +352,21 @@ mod tests {
 
     #[test]
     fn test_api_path_not_matched() {
-        let (resp, errors) = parse("POST /v1/chat/completions", &["web_search", "docs_search"]);
-        assert!(errors.is_empty());
+        let resp = parse("POST /v1/chat/completions", &["web_search", "docs_search"]);
+        assert!(resp.parse_errors.is_empty());
         assert!(resp.invocations.is_empty());
+    }
+
+    // ── Command name boundary ─────────────────────────────────────────────
+
+    #[test]
+    fn test_hyphen_in_text_after_command_name_not_matched() {
+        // `/web_search-related topic` must NOT match `web_search` — the name runs up to
+        // the hyphen with no whitespace boundary, so it is not a registered command name.
+        let resp = parse("/web_search-related topic", &["web_search"]);
+        assert!(resp.invocations.is_empty());
+        assert!(resp.parse_errors.is_empty());
+        assert!(resp.text.contains("/web_search-related topic"));
     }
 
     // ── Multi-line arguments ──────────────────────────────────────────────
@@ -369,8 +374,8 @@ mod tests {
     #[test]
     fn test_multiline_arguments() {
         let text = "/create_document\n  title: \"Architecture Decision Record\"\n  draft: true";
-        let (resp, errors) = parse(text, &["create_document"]);
-        assert!(errors.is_empty());
+        let resp = parse(text, &["create_document"]);
+        assert!(resp.parse_errors.is_empty());
         assert_eq!(resp.invocations.len(), 1);
         assert_eq!(resp.invocations[0].name, "create_document");
         assert_eq!(resp.invocations[0].action, CommandAction::Execute);
@@ -383,8 +388,8 @@ mod tests {
     #[test]
     fn test_multiline_with_inline_and_continuation() {
         let text = "/web_search query: \"Rust\"\n  max_results: 10";
-        let (resp, errors) = parse(text, &["web_search"]);
-        assert!(errors.is_empty());
+        let resp = parse(text, &["web_search"]);
+        assert!(resp.parse_errors.is_empty());
         assert_eq!(resp.invocations.len(), 1);
         assert_eq!(
             resp.invocations[0].arguments,
@@ -395,8 +400,8 @@ mod tests {
     #[test]
     fn test_multiline_terminates_at_non_indented_line() {
         let text = "/create_document\n  title: \"Test\"\nThis is prose after.";
-        let (resp, errors) = parse(text, &["create_document"]);
-        assert!(errors.is_empty());
+        let resp = parse(text, &["create_document"]);
+        assert!(resp.parse_errors.is_empty());
         assert_eq!(resp.invocations.len(), 1);
         assert!(resp.text.contains("This is prose after."));
     }
@@ -405,11 +410,11 @@ mod tests {
 
     #[test]
     fn test_command_with_array_argument() {
-        let (resp, errors) = parse(
+        let resp = parse(
             r#"/create_note tags: [ml, ai, "deep learning"]"#,
             &["create_note"],
         );
-        assert!(errors.is_empty());
+        assert!(resp.parse_errors.is_empty());
         assert_eq!(resp.invocations.len(), 1);
         assert_eq!(
             resp.invocations[0].arguments,
@@ -421,37 +426,47 @@ mod tests {
 
     #[test]
     fn test_malformed_toon_produces_error_result() {
-        let (resp, errors) = parse("/web_search query:", &["web_search"]);
-        // Parse error should be in errors, not invocations
+        let resp = parse("/web_search query:", &["web_search"]);
+        // Parse error should be in parse_errors, not invocations
         assert_eq!(resp.invocations.len(), 0);
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].command_name, "web_search");
-        assert!(!errors[0].success);
-        assert!(errors[0].error.is_some());
+        assert_eq!(resp.parse_errors.len(), 1);
+        assert_eq!(resp.parse_errors[0].command_name, "web_search");
+        assert!(!resp.parse_errors[0].success);
+        assert!(resp.parse_errors[0].error.is_some());
     }
 
     #[test]
     fn test_malformed_toon_does_not_abort_rest() {
         let text = "/web_search query:\n/docs_search query: \"hello\"";
-        let (resp, errors) = parse(text, &["web_search", "docs_search"]);
+        let resp = parse(text, &["web_search", "docs_search"]);
         // web_search fails, but docs_search succeeds
         assert_eq!(resp.invocations.len(), 1);
         assert_eq!(resp.invocations[0].name, "docs_search");
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].command_name, "web_search");
+        assert_eq!(resp.parse_errors.len(), 1);
+        assert_eq!(resp.parse_errors[0].command_name, "web_search");
     }
 
     // ── Unknown flags treated as prose ────────────────────────────────────
 
     #[test]
     fn test_unknown_flag_treated_as_prose() {
-        // /path --verbose is not a command invocation (unknown flag, standalone)
-        let (resp, _errors) = parse("/web_search --verbose", &["web_search"]);
-        // --verbose is unknown, so the invocation should NOT match
-        // Based on spec: "Unknown flags are treated as part of the prose text"
-        // and "the command invocation is not matched"
+        // /web_search --verbose has an unknown flag — the entire invocation is prose
+        let resp = parse("/web_search --verbose", &["web_search"]);
         assert_eq!(resp.invocations.len(), 0);
         assert!(resp.text.contains("/web_search --verbose"));
+    }
+
+    #[test]
+    fn test_unknown_flag_with_continuation_lines_re_emitted() {
+        // Unknown flag: the command and its continuation lines must all appear in clean text
+        let text = "/web_search --verbose\n  query: \"rust\"\n  limit: 5";
+        let resp = parse(text, &["web_search"]);
+        assert_eq!(resp.invocations.len(), 0);
+        assert!(resp.parse_errors.is_empty());
+        // The command line and its continuation lines must all be in clean text
+        assert!(resp.text.contains("/web_search --verbose"));
+        assert!(resp.text.contains("query: \"rust\""));
+        assert!(resp.text.contains("limit: 5"));
     }
 
     // ── Clean text extraction ─────────────────────────────────────────────
@@ -459,8 +474,8 @@ mod tests {
     #[test]
     fn test_clean_text_excludes_command_lines() {
         let text = "I'll help you.\n\n/web_search query: \"test\"\n\nDone.";
-        let (resp, errors) = parse(text, &["web_search"]);
-        assert!(errors.is_empty());
+        let resp = parse(text, &["web_search"]);
+        assert!(resp.parse_errors.is_empty());
         assert_eq!(resp.invocations.len(), 1);
         assert!(resp.text.contains("I'll help you."));
         assert!(resp.text.contains("Done."));
@@ -469,8 +484,8 @@ mod tests {
 
     #[test]
     fn test_only_commands_produces_empty_text() {
-        let (resp, errors) = parse("/web_search query: \"test\"", &["web_search"]);
-        assert!(errors.is_empty());
+        let resp = parse("/web_search query: \"test\"", &["web_search"]);
+        assert!(resp.parse_errors.is_empty());
         assert!(resp.text.is_empty());
     }
 
@@ -479,8 +494,8 @@ mod tests {
     #[test]
     fn test_spec_example_from_section_4_2() {
         let text = "I'll search for that information now.\n\n/web_search query: \"Rust async patterns 2026\"\n\nLet me also check the documentation.\n\n/docs_search --describe";
-        let (resp, errors) = parse(text, &["web_search", "docs_search"]);
-        assert!(errors.is_empty());
+        let resp = parse(text, &["web_search", "docs_search"]);
+        assert!(resp.parse_errors.is_empty());
         assert_eq!(resp.invocations.len(), 2);
         assert_eq!(resp.invocations[0].name, "web_search");
         assert_eq!(
@@ -495,8 +510,8 @@ mod tests {
     #[test]
     fn test_spec_multiline_example() {
         let text = "/web_search query: \"Rust async patterns 2026\", max_results: 10\n\n/create_note\n  title: \"Research findings\"\n  content: \"Found several relevant articles on async Rust patterns.\"\n  tags: [rust, async, research]";
-        let (resp, errors) = parse(text, &["web_search", "create_note"]);
-        assert!(errors.is_empty());
+        let resp = parse(text, &["web_search", "create_note"]);
+        assert!(resp.parse_errors.is_empty());
         assert_eq!(resp.invocations.len(), 2);
         assert_eq!(resp.invocations[0].name, "web_search");
         assert_eq!(resp.invocations[1].name, "create_note");

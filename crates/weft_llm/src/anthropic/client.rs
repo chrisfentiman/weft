@@ -241,7 +241,8 @@ mod tests {
     #[tokio::test]
     async fn test_system_role_messages_concatenated() {
         let mut server = mockito::Server::new_async().await;
-        // Capture the request body to verify system prompt concatenation
+        // Verify that the `system` field in the request body contains the concatenated
+        // system prompt (base + Role::System messages joined with "\n\n").
         let mock = server
             .mock("POST", "/")
             .with_status(200)
@@ -253,6 +254,13 @@ mod tests {
                 })
                 .to_string(),
             )
+            // Partial JSON match: verify the `system` field contains both parts.
+            .match_body(mockito::Matcher::PartialJsonString(
+                json!({
+                    "system": "base system\n\nYou are a helpful assistant."
+                })
+                .to_string(),
+            ))
             .create_async()
             .await;
 
@@ -279,7 +287,9 @@ mod tests {
     #[tokio::test]
     async fn test_options_forwarded() {
         let mut server = mockito::Server::new_async().await;
-        let _mock = server
+        // Verify that max_tokens and temperature from CompletionOptions appear in the
+        // serialized request body sent to Anthropic.
+        let mock = server
             .mock("POST", "/")
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -290,6 +300,13 @@ mod tests {
                 })
                 .to_string(),
             )
+            // Verify max_tokens appears in the request body. Temperature is an f32 and its
+            // JSON representation can vary (e.g. 0.699...); we check it separately via regex.
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::PartialJsonString(json!({"max_tokens": 512}).to_string()),
+                // temperature field is present (value starts with "0.6" or "0.7")
+                mockito::Matcher::Regex(r#""temperature"\s*:"#.to_string()),
+            ]))
             .create_async()
             .await;
 
@@ -302,6 +319,7 @@ mod tests {
             .complete("system", &make_messages(), &options)
             .await;
         assert!(result.is_ok());
+        mock.assert_async().await;
     }
 
     #[tokio::test]

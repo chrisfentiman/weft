@@ -14,5 +14,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+tokio-stream = { workspace = true }
+
 [build-dependencies]
 tonic-build = { workspace = true }
