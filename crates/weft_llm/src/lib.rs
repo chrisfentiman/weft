@@ -4,9 +4,9 @@
 //! - `Provider` trait for executing requests against an AI provider backend
 //! - `ProviderError` error type
 //! - `ProviderRequest` / `ProviderResponse` enums covering all capability types
-//! - `ChatCompletionInput` / `ChatCompletionOutput` for chat completion requests
 //! - `TokenUsage` for provider-reported token counts
 //! - `Capability` newtype with well-known constants
+//! - `extract_text_messages` utility for extracting text from `WeftMessage` slices
 //! - `AnthropicProvider`: Anthropic Messages API implementation
 //! - `OpenAIProvider`: OpenAI Chat Completions API implementation
 //! - `ProviderRegistry`: Registry of named providers keyed by model routing name
@@ -20,8 +20,7 @@ pub mod rhai_provider;
 pub use anthropic::AnthropicProvider;
 pub use openai::OpenAIProvider;
 pub use provider::{
-    Capability, ChatCompletionInput, ChatCompletionOutput, ProviderError, ProviderRequest,
-    ProviderResponse, TokenUsage,
+    Capability, ProviderError, ProviderRequest, ProviderResponse, TokenUsage, extract_text_messages,
 };
 pub use registry::ProviderRegistry;
 pub use rhai_provider::RhaiProvider;
@@ -32,6 +31,11 @@ use async_trait::async_trait;
 ///
 /// Providers handle requests they support and return `ProviderError::Unsupported`
 /// for request types they cannot handle.
+///
+/// The request carries `Vec<WeftMessage>` (Weft Wire format). The system prompt,
+/// if present, is `messages[0]` with `Role::System` -- a positional convention
+/// set by the gateway during context assembly. Each provider extracts what it
+/// needs from the `WeftMessage` content parts and translates to its wire format.
 ///
 /// Send + Sync + 'static: shared across request handlers via Arc.
 #[async_trait]

@@ -3,7 +3,7 @@
 //! These types form the contract between the gateway engine and provider implementations.
 //! The `Provider` trait (defined in `lib.rs`) uses these types exclusively.
 
-use weft_core::{ContentPart, ResponseFormat, WeftMessage};
+use weft_core::{ContentPart, Role, SamplingOptions, Source, WeftMessage};
 
 /// A capability that a model supports.
 ///
@@ -62,67 +62,87 @@ impl Capability {
 #[derive(Debug, Clone)]
 pub enum ProviderRequest {
     /// Chat completion (text generation).
-    ChatCompletion(ChatCompletionInput),
-    // Future variants -- defined here so the enum shape is visible,
-    // but not wired into the engine yet:
-    // Embedding(EmbeddingInput),
-    // ImageGeneration(ImageGenerationInput),
-    // AudioSpeech(AudioSpeechInput),
-    // AudioTranscription(AudioTranscriptionInput),
-    // Moderation(ModerationInput),
-    // Rerank(RerankInput),
+    ChatCompletion {
+        /// Conversation messages in Weft Wire format.
+        ///
+        /// The system prompt, if present, is `messages[0]` with `Role::System`.
+        /// This is a positional convention set by the gateway during context assembly.
+        /// Providers check `messages[0]`: if `Role::System`, handle per wire format
+        /// (Anthropic extracts to top-level `system` field, OpenAI leaves in place,
+        /// Rhai passes through). If `messages[0]` is not `Role::System`, there is
+        /// no system prompt.
+        ///
+        /// Providers extract the content parts they support (text, image, etc.)
+        /// and translate to their wire format.
+        messages: Vec<WeftMessage>,
+        /// Model identifier to send to the provider API.
+        model: String,
+        /// Sampling and behavior options. Providers extract what they support
+        /// and ignore the rest.
+        options: SamplingOptions,
+    },
+    // Future variants (same enum shape, will carry WeftMessage content):
+    // Embedding { input: Vec<WeftMessage>, model: String },
+    // ImageGeneration { prompt: WeftMessage, model: String, options: ... },
+    // AudioTranscription { audio: WeftMessage, model: String },
 }
 
-/// Input for a chat completion request.
+/// A response from a provider.
 #[derive(Debug, Clone)]
-pub struct ChatCompletionInput {
-    /// The assembled system prompt.
-    pub system_prompt: String,
-    /// The conversation messages (domain type with source attribution).
-    pub messages: Vec<WeftMessage>,
-    /// Model identifier to send to the provider API.
-    pub model: String,
-    /// Maximum tokens in response.
-    pub max_tokens: u32,
-    /// Sampling temperature. If None, use provider default.
-    pub temperature: Option<f32>,
-    /// Nucleus sampling threshold. If None, use provider default.
-    pub top_p: Option<f32>,
-    /// Top-k sampling. If None, use provider default.
-    pub top_k: Option<u32>,
-    /// Stop sequences. Empty means none.
-    pub stop: Vec<String>,
-    /// Frequency penalty. If None, use provider default.
-    pub frequency_penalty: Option<f32>,
-    /// Presence penalty. If None, use provider default.
-    pub presence_penalty: Option<f32>,
-    /// Deterministic seed. If None, non-deterministic.
-    pub seed: Option<i64>,
-    /// Response format constraint.
-    pub response_format: Option<ResponseFormat>,
+pub enum ProviderResponse {
+    /// Chat completion response.
+    ChatCompletion {
+        /// The assistant's response as a WeftMessage.
+        ///
+        /// Contains at minimum a Text content part with the response text.
+        /// Future multimodal providers may include Image, Audio, etc.
+        /// Role is always Assistant, Source is always Provider.
+        message: WeftMessage,
+        /// Token usage, if the provider reports it.
+        usage: Option<TokenUsage>,
+    },
+    // Future variants:
+    // Embedding { vectors: Vec<Vec<f32>>, usage: Option<TokenUsage> },
+    // ImageGeneration { message: WeftMessage },
 }
 
-/// Extract text content from a slice of `WeftMessage` for text-only providers.
+/// Token usage reported by a provider.
+#[derive(Debug, Clone)]
+pub struct TokenUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+}
+
+/// Extract text content from WeftMessages for provider wire format conversion.
 ///
 /// Filters out activity messages (source: Gateway, role: System) since those
-/// are for the client, not the LLM. Tool and memory results ARE included
-/// because the LLM needs to see them for multi-turn command loops.
-/// Returns `(role, text)` pairs where `text` is all Text parts joined with `\n`.
-/// Messages whose text content is empty after extraction are omitted.
-pub fn weft_messages_to_text(messages: &[WeftMessage]) -> Vec<(weft_core::Role, String)> {
-    use weft_core::{Role, Source};
+/// are gateway-internal activity content (routing events, hook results), not
+/// conversational content for the LLM. This is a behavioral change from the
+/// pre-migration code where ALL Role::System messages were forwarded to providers.
+///
+/// Concatenates all Text content parts within each message, separated by newlines.
+/// Messages with no text content after extraction are omitted.
+///
+/// Tool results (CommandResult) are serialized as text for providers that don't
+/// natively support tool calling.
+pub fn extract_text_messages(messages: &[WeftMessage]) -> Vec<(Role, String)> {
     messages
         .iter()
-        .filter(|m| {
-            // Activity messages (source: Gateway, role: System) are for the client, not the LLM.
-            !(m.role == Role::System && m.source == Source::Gateway)
-        })
+        // Activity messages (source: Gateway, role: System) are gateway-internal
+        // telemetry -- routing events, hook results. Not conversational content.
+        .filter(|m| !(m.role == Role::System && m.source == Source::Gateway))
         .map(|m| {
             let text: String = m
                 .content
                 .iter()
                 .filter_map(|part| match part {
                     ContentPart::Text(t) => Some(t.as_str()),
+                    ContentPart::CommandResult(cr) => {
+                        // Serialize tool results as text for providers that don't
+                        // natively support structured tool output.
+                        // The engine has already formatted this.
+                        Some(cr.output.as_str())
+                    }
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -131,33 +151,6 @@ pub fn weft_messages_to_text(messages: &[WeftMessage]) -> Vec<(weft_core::Role, 
         })
         .filter(|(_, text)| !text.is_empty())
         .collect()
-}
-
-/// A response from a provider.
-#[derive(Debug, Clone)]
-pub enum ProviderResponse {
-    /// Chat completion response.
-    ChatCompletion(ChatCompletionOutput),
-    // Future variants:
-    // Embedding(EmbeddingOutput),
-    // ImageGeneration(ImageGenerationOutput),
-    // etc.
-}
-
-/// Output from a chat completion request.
-#[derive(Debug, Clone)]
-pub struct ChatCompletionOutput {
-    /// The assistant's response text.
-    pub text: String,
-    /// Token usage, if the provider reports it.
-    pub usage: Option<TokenUsage>,
-}
-
-/// Token usage reported by a provider.
-#[derive(Debug, Clone)]
-pub struct TokenUsage {
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
 }
 
 /// Error type for provider operations.
@@ -194,6 +187,31 @@ pub enum ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weft_core::{ContentPart, Role, Source, WeftMessage};
+
+    // ── Test helpers ──────────────────────────────────────────────────────
+
+    fn make_weft_message(role: Role, source: Source, text: &str) -> WeftMessage {
+        WeftMessage {
+            role,
+            source,
+            model: None,
+            content: vec![ContentPart::Text(text.to_string())],
+            delta: false,
+            message_index: 0,
+        }
+    }
+
+    fn make_weft_message_no_content(role: Role, source: Source) -> WeftMessage {
+        WeftMessage {
+            role,
+            source,
+            model: None,
+            content: vec![],
+            delta: false,
+            message_index: 0,
+        }
+    }
 
     // ── Capability tests ──────────────────────────────────────────────────
 
@@ -258,92 +276,98 @@ mod tests {
     // ── ProviderRequest / ProviderResponse construction tests ─────────────
 
     #[test]
-    fn test_chat_completion_input_construction() {
-        use weft_core::{ContentPart, Role, Source, WeftMessage};
-        let input = ChatCompletionInput {
-            system_prompt: "You are helpful.".to_string(),
-            messages: vec![WeftMessage {
-                role: Role::User,
-                source: Source::Client,
-                model: None,
-                content: vec![ContentPart::Text("Hello".to_string())],
-                delta: false,
-                message_index: 0,
-            }],
-            model: "gpt-4".to_string(),
-            max_tokens: 1024,
-            temperature: Some(0.7),
-            top_p: None,
-            top_k: None,
-            stop: vec![],
-            frequency_penalty: None,
-            presence_penalty: None,
-            seed: None,
-            response_format: None,
-        };
-        assert_eq!(input.system_prompt, "You are helpful.");
-        assert_eq!(input.messages.len(), 1);
-        assert_eq!(input.model, "gpt-4");
-        assert_eq!(input.max_tokens, 1024);
-        assert_eq!(input.temperature, Some(0.7));
-    }
-
-    #[test]
     fn test_provider_request_chat_completion_construction() {
-        use weft_core::{ContentPart, Role, Source, WeftMessage};
-        let request = ProviderRequest::ChatCompletion(ChatCompletionInput {
-            system_prompt: "sys".to_string(),
-            messages: vec![WeftMessage {
-                role: Role::User,
-                source: Source::Client,
-                model: None,
-                content: vec![ContentPart::Text("hi".to_string())],
-                delta: false,
-                message_index: 0,
-            }],
+        let request = ProviderRequest::ChatCompletion {
+            messages: vec![make_weft_message(Role::User, Source::Client, "hi")],
             model: "claude-test".to_string(),
-            max_tokens: 2048,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            stop: vec![],
-            frequency_penalty: None,
-            presence_penalty: None,
-            seed: None,
-            response_format: None,
-        });
-        assert!(matches!(request, ProviderRequest::ChatCompletion(_)));
+            options: SamplingOptions::default(),
+        };
+        assert!(matches!(request, ProviderRequest::ChatCompletion { .. }));
     }
 
     #[test]
-    fn test_chat_completion_output_construction() {
-        let output = ChatCompletionOutput {
-            text: "Hello!".to_string(),
+    fn test_provider_request_no_system_prompt_field() {
+        // The new enum variant has no system_prompt -- it's messages[0] if Role::System.
+        let system_msg = make_weft_message(Role::System, Source::Gateway, "You are helpful.");
+        let user_msg = make_weft_message(Role::User, Source::Client, "Hello");
+        let request = ProviderRequest::ChatCompletion {
+            messages: vec![system_msg, user_msg],
+            model: "gpt-4".to_string(),
+            options: SamplingOptions::default(),
+        };
+        // Destructure to verify field names
+        let ProviderRequest::ChatCompletion {
+            messages,
+            model,
+            options: _,
+        } = request;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, Role::System);
+        assert_eq!(model, "gpt-4");
+    }
+
+    #[test]
+    fn test_provider_response_chat_completion_construction() {
+        let message = WeftMessage {
+            role: Role::Assistant,
+            source: Source::Provider,
+            model: Some("gpt-4".to_string()),
+            content: vec![ContentPart::Text("response text".to_string())],
+            delta: false,
+            message_index: 0,
+        };
+        let response = ProviderResponse::ChatCompletion {
+            message,
+            usage: None,
+        };
+        assert!(matches!(response, ProviderResponse::ChatCompletion { .. }));
+        #[allow(irrefutable_let_patterns)]
+        let ProviderResponse::ChatCompletion { message, usage } = response else {
+            panic!("expected ChatCompletion response");
+        };
+        assert_eq!(message.role, Role::Assistant);
+        assert_eq!(message.source, Source::Provider);
+        assert!(usage.is_none());
+    }
+
+    #[test]
+    fn test_provider_response_carries_weft_message() {
+        let response = ProviderResponse::ChatCompletion {
+            message: WeftMessage {
+                role: Role::Assistant,
+                source: Source::Provider,
+                model: Some("test-model".to_string()),
+                content: vec![ContentPart::Text("Hello!".to_string())],
+                delta: false,
+                message_index: 0,
+            },
             usage: Some(TokenUsage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
             }),
         };
-        assert_eq!(output.text, "Hello!");
-        let usage = output.usage.expect("usage should be present");
-        assert_eq!(usage.prompt_tokens, 10);
-        assert_eq!(usage.completion_tokens, 5);
-    }
-
-    #[test]
-    fn test_provider_response_chat_completion_construction() {
-        let response = ProviderResponse::ChatCompletion(ChatCompletionOutput {
-            text: "response text".to_string(),
-            usage: None,
-        });
-        assert!(matches!(response, ProviderResponse::ChatCompletion(_)));
-        // Only ChatCompletion variant exists; when future variants land this becomes refutable.
         #[allow(irrefutable_let_patterns)]
-        let ProviderResponse::ChatCompletion(output) = response else {
-            panic!("expected ChatCompletion response");
+        let ProviderResponse::ChatCompletion { message, usage } = response else {
+            panic!("expected ChatCompletion");
         };
-        assert_eq!(output.text, "response text");
-        assert!(output.usage.is_none());
+        // Extract text from content parts
+        let text = message
+            .content
+            .iter()
+            .filter_map(|p| {
+                if let ContentPart::Text(t) = p {
+                    Some(t.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(text, "Hello!");
+        assert_eq!(message.model, Some("test-model".to_string()));
+        let u = usage.expect("usage should be present");
+        assert_eq!(u.prompt_tokens, 10);
+        assert_eq!(u.completion_tokens, 5);
     }
 
     #[test]
@@ -354,6 +378,143 @@ mod tests {
         };
         assert_eq!(usage.prompt_tokens, 100);
         assert_eq!(usage.completion_tokens, 50);
+    }
+
+    // ── extract_text_messages tests ───────────────────────────────────────
+
+    #[test]
+    fn test_extract_text_messages_basic() {
+        let messages = vec![make_weft_message(Role::User, Source::Client, "Hello")];
+        let pairs = extract_text_messages(&messages);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, Role::User);
+        assert_eq!(pairs[0].1, "Hello");
+    }
+
+    #[test]
+    fn test_extract_text_messages_filters_gateway_system() {
+        // System + Gateway messages (activity messages) must be filtered out.
+        let messages = vec![
+            make_weft_message(Role::System, Source::Gateway, "You are helpful."),
+            make_weft_message(Role::User, Source::Client, "Hello"),
+        ];
+        let pairs = extract_text_messages(&messages);
+        // System+Gateway is filtered, only User remains
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, Role::User);
+    }
+
+    #[test]
+    fn test_extract_text_messages_system_prompt_filtered_out() {
+        // The system prompt at messages[0] is Role::System, Source::Gateway.
+        // extract_text_messages filters it out -- providers handle it separately.
+        let system_msg = make_weft_message(Role::System, Source::Gateway, "System prompt here.");
+        let pairs = extract_text_messages(&[system_msg]);
+        assert!(
+            pairs.is_empty(),
+            "system+gateway message should be filtered"
+        );
+    }
+
+    #[test]
+    fn test_extract_text_messages_keeps_client_system_messages() {
+        // System messages from Source::Client (not gateway activity) are NOT filtered.
+        let messages = vec![
+            make_weft_message(Role::System, Source::Client, "Additional instructions"),
+            make_weft_message(Role::User, Source::Client, "Hello"),
+        ];
+        let pairs = extract_text_messages(&messages);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, Role::System);
+        assert_eq!(pairs[0].1, "Additional instructions");
+    }
+
+    #[test]
+    fn test_extract_text_messages_multiple_text_parts_concatenated() {
+        // Multiple Text content parts in one message are joined with newlines.
+        let msg = WeftMessage {
+            role: Role::User,
+            source: Source::Client,
+            model: None,
+            content: vec![
+                ContentPart::Text("Part one".to_string()),
+                ContentPart::Text("Part two".to_string()),
+            ],
+            delta: false,
+            message_index: 0,
+        };
+        let pairs = extract_text_messages(&[msg]);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].1, "Part one\nPart two");
+    }
+
+    #[test]
+    fn test_extract_text_messages_command_result_extracted() {
+        use weft_core::CommandResultContent;
+        let msg = WeftMessage {
+            role: Role::User,
+            source: Source::Tool,
+            model: None,
+            content: vec![ContentPart::CommandResult(CommandResultContent {
+                command: "search".to_string(),
+                success: true,
+                output: "Found 3 results.".to_string(),
+                error: None,
+            })],
+            delta: false,
+            message_index: 0,
+        };
+        let pairs = extract_text_messages(&[msg]);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].1, "Found 3 results.");
+    }
+
+    #[test]
+    fn test_extract_text_messages_non_text_content_omitted() {
+        use weft_core::{MediaContent, MediaSource};
+        let msg = WeftMessage {
+            role: Role::User,
+            source: Source::Client,
+            model: None,
+            content: vec![ContentPart::Image(MediaContent {
+                source: MediaSource::Url("https://example.com/img.png".to_string()),
+                media_type: Some("image/png".to_string()),
+            })],
+            delta: false,
+            message_index: 0,
+        };
+        // Image-only message produces empty text, so filtered out
+        let pairs = extract_text_messages(&[msg]);
+        assert!(
+            pairs.is_empty(),
+            "image-only message should be filtered (no text)"
+        );
+    }
+
+    #[test]
+    fn test_extract_text_messages_empty_text_messages_omitted() {
+        // Messages whose text content is empty after extraction are omitted.
+        let msg = make_weft_message_no_content(Role::User, Source::Client);
+        let pairs = extract_text_messages(&[msg]);
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn test_extract_text_messages_empty_input() {
+        let pairs = extract_text_messages(&[]);
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn test_extract_text_messages_preserves_roles() {
+        let messages = vec![
+            make_weft_message(Role::User, Source::Client, "user text"),
+            make_weft_message(Role::Assistant, Source::Provider, "assistant text"),
+        ];
+        let pairs = extract_text_messages(&messages);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, Role::User);
+        assert_eq!(pairs[1].0, Role::Assistant);
     }
 
     // ── ProviderError display formatting tests ────────────────────────────

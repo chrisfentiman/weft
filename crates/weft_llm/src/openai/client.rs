@@ -1,9 +1,10 @@
 use tracing::{debug, warn};
+use weft_core::{ContentPart, Role, SamplingOptions, Source, WeftMessage};
 
 use super::wire::{OpenAIMessage, OpenAIRequest, OpenAIResponse};
 use crate::{
-    ChatCompletionOutput, Provider, ProviderError, ProviderRequest, ProviderResponse, TokenUsage,
-    provider::weft_messages_to_text,
+    Provider, ProviderError, ProviderRequest, ProviderResponse, TokenUsage,
+    provider::extract_text_messages,
 };
 
 const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
@@ -11,7 +12,7 @@ const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
 /// OpenAI Chat Completions API provider.
 ///
 /// One provider instance corresponds to one API endpoint (credentials + base_url).
-/// The model identifier is passed per-request via `ChatCompletionInput.model`.
+/// The model identifier is passed per-request via `ProviderRequest::ChatCompletion.model`.
 pub struct OpenAIProvider {
     client: reqwest::Client,
     api_key: String,
@@ -34,26 +35,39 @@ impl OpenAIProvider {
 
     async fn chat_completion(
         &self,
-        input: crate::ChatCompletionInput,
-    ) -> Result<ChatCompletionOutput, ProviderError> {
-        use weft_core::Role;
-
-        // System prompt goes as first message with role "system".
-        // Extract text from WeftMessage content parts. weft_messages_to_text
-        // filters out gateway activity (source: Gateway, role: System).
-        let role_text_pairs = weft_messages_to_text(&input.messages);
-
+        messages: Vec<WeftMessage>,
+        model: String,
+        options: SamplingOptions,
+    ) -> Result<(WeftMessage, Option<TokenUsage>), ProviderError> {
         let mut wire_messages = Vec::new();
 
-        // Prepend the system_prompt as a system role message
-        if !input.system_prompt.is_empty() {
-            wire_messages.push(OpenAIMessage {
-                role: "system".to_string(),
-                content: input.system_prompt.clone(),
-            });
-        }
+        // Extract system prompt from messages[0] if present.
+        // For OpenAI, system messages are in the messages array with role "system".
+        // The system prompt (Role::System, Source::Gateway) is filtered out by
+        // extract_text_messages, so we handle it explicitly first.
+        let conversation_start = if messages.first().map(|m| m.role) == Some(Role::System) {
+            let system_text: String = messages[0]
+                .content
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !system_text.is_empty() {
+                wire_messages.push(OpenAIMessage {
+                    role: "system".to_string(),
+                    content: system_text,
+                });
+            }
+            1 // skip messages[0] in the remaining extraction
+        } else {
+            0 // no system prompt
+        };
 
-        for (role, text) in role_text_pairs {
+        // Extract text from remaining WeftMessages, skipping gateway activity messages.
+        for (role, text) in extract_text_messages(&messages[conversation_start..]) {
             let role_str = match role {
                 Role::System => "system",
                 Role::User => "user",
@@ -66,13 +80,22 @@ impl OpenAIProvider {
         }
 
         let request = OpenAIRequest {
-            model: input.model.clone(),
+            model: model.clone(),
             messages: wire_messages,
-            max_tokens: Some(input.max_tokens),
-            temperature: input.temperature,
+            max_tokens: options.max_tokens,
+            temperature: options.temperature,
+            top_p: options.top_p,
+            frequency_penalty: options.frequency_penalty,
+            presence_penalty: options.presence_penalty,
+            seed: options.seed,
+            stop: if options.stop.is_empty() {
+                None
+            } else {
+                Some(options.stop.clone())
+            },
         };
 
-        debug!(model = %input.model, max_tokens = input.max_tokens, "sending OpenAI request");
+        debug!(model = %model, "sending OpenAI request");
 
         let response = self
             .client
@@ -125,7 +148,16 @@ impl OpenAIProvider {
             completion_tokens: u.completion_tokens,
         });
 
-        Ok(ChatCompletionOutput { text, usage })
+        let response_message = WeftMessage {
+            role: Role::Assistant,
+            source: Source::Provider,
+            model: Some(model),
+            content: vec![ContentPart::Text(text)],
+            delta: false,
+            message_index: 0,
+        };
+
+        Ok((response_message, usage))
     }
 }
 
@@ -133,9 +165,13 @@ impl OpenAIProvider {
 impl Provider for OpenAIProvider {
     async fn execute(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         match request {
-            ProviderRequest::ChatCompletion(input) => {
-                let output = self.chat_completion(input).await?;
-                Ok(ProviderResponse::ChatCompletion(output))
+            ProviderRequest::ChatCompletion {
+                messages,
+                model,
+                options,
+            } => {
+                let (message, usage) = self.chat_completion(messages, model, options).await?;
+                Ok(ProviderResponse::ChatCompletion { message, usage })
             }
             // For now, only ChatCompletion is implemented.
             #[allow(unreachable_patterns)]
@@ -160,32 +196,27 @@ mod tests {
         OpenAIProvider::new("test-key".to_string(), Some(base_url.to_string()))
     }
 
-    fn make_messages() -> Vec<WeftMessage> {
-        vec![WeftMessage {
-            role: Role::User,
-            source: Source::Client,
+    /// Build a WeftMessage with a single text content part.
+    fn make_weft_message(role: Role, source: Source, text: &str) -> WeftMessage {
+        WeftMessage {
+            role,
+            source,
             model: None,
-            content: vec![ContentPart::Text("Hello".to_string())],
+            content: vec![ContentPart::Text(text.to_string())],
             delta: false,
             message_index: 0,
-        }]
+        }
     }
 
     fn make_request(model: &str) -> ProviderRequest {
-        ProviderRequest::ChatCompletion(crate::ChatCompletionInput {
-            system_prompt: "system".to_string(),
-            messages: make_messages(),
+        ProviderRequest::ChatCompletion {
+            messages: vec![
+                make_weft_message(Role::System, Source::Gateway, "system"),
+                make_weft_message(Role::User, Source::Client, "Hello"),
+            ],
             model: model.to_string(),
-            max_tokens: 4096,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            stop: vec![],
-            frequency_penalty: None,
-            presence_penalty: None,
-            seed: None,
-            response_format: None,
-        })
+            options: SamplingOptions::default(),
+        }
     }
 
     #[tokio::test]
@@ -216,15 +247,29 @@ mod tests {
             .await
             .expect("should succeed");
 
-        // Only ChatCompletion variant exists; when future variants land this becomes refutable.
         #[allow(irrefutable_let_patterns)]
-        let ProviderResponse::ChatCompletion(output) = result else {
+        let ProviderResponse::ChatCompletion { message, usage } = result else {
             panic!("expected ChatCompletion response");
         };
-        assert_eq!(output.text, "Hello! How can I help?");
-        let usage = output.usage.expect("usage should be present");
-        assert_eq!(usage.prompt_tokens, 12);
-        assert_eq!(usage.completion_tokens, 9);
+        // Extract text from WeftMessage content parts
+        let text = message
+            .content
+            .iter()
+            .filter_map(|p| {
+                if let ContentPart::Text(t) = p {
+                    Some(t.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(text, "Hello! How can I help?");
+        assert_eq!(message.role, Role::Assistant);
+        assert_eq!(message.source, Source::Provider);
+        let u = usage.expect("usage should be present");
+        assert_eq!(u.prompt_tokens, 12);
+        assert_eq!(u.completion_tokens, 9);
         mock.assert_async().await;
     }
 
@@ -270,7 +315,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_system_prompt_prepended_as_system_message() {
+    async fn test_system_prompt_from_messages_0_as_system_message() {
+        // System prompt at messages[0] (Role::System, Source::Gateway) is extracted
+        // and sent as the first OpenAI system message.
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("POST", "/")
@@ -296,22 +343,102 @@ mod tests {
             .await;
 
         let provider = make_provider(&server.url());
-        let request = ProviderRequest::ChatCompletion(crate::ChatCompletionInput {
-            system_prompt: "You are a helpful assistant.".to_string(),
-            messages: make_messages(),
+        let request = ProviderRequest::ChatCompletion {
+            messages: vec![
+                make_weft_message(
+                    Role::System,
+                    Source::Gateway,
+                    "You are a helpful assistant.",
+                ),
+                make_weft_message(Role::User, Source::Client, "Hello"),
+            ],
             model: "gpt-test".to_string(),
-            max_tokens: 4096,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            stop: vec![],
-            frequency_penalty: None,
-            presence_penalty: None,
-            seed: None,
-            response_format: None,
-        });
+            options: SamplingOptions::default(),
+        };
         let result = provider.execute(request).await;
 
+        assert!(result.is_ok());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_no_system_prompt_when_messages_0_is_user() {
+        // When messages[0] is Role::User (not System), no system message is prepended.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                    "usage": null
+                })
+                .to_string(),
+            )
+            .match_body(mockito::Matcher::PartialJsonString(
+                json!({
+                    "messages": [
+                        {"role": "user", "content": "Hello"}
+                    ]
+                })
+                .to_string(),
+            ))
+            .create_async()
+            .await;
+
+        let provider = make_provider(&server.url());
+        let request = ProviderRequest::ChatCompletion {
+            messages: vec![make_weft_message(Role::User, Source::Client, "Hello")],
+            model: "gpt-test".to_string(),
+            options: SamplingOptions::default(),
+        };
+        let result = provider.execute(request).await;
+
+        assert!(result.is_ok());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_gateway_activity_messages_not_sent() {
+        // Gateway activity messages (Role::System, Source::Gateway) beyond messages[0]
+        // are filtered out and not sent to OpenAI.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                    "usage": null
+                })
+                .to_string(),
+            )
+            .match_body(mockito::Matcher::PartialJsonString(
+                json!({
+                    "messages": [
+                        {"role": "system", "content": "sys prompt"},
+                        {"role": "user", "content": "Hello"}
+                    ]
+                })
+                .to_string(),
+            ))
+            .create_async()
+            .await;
+
+        let provider = make_provider(&server.url());
+        let request = ProviderRequest::ChatCompletion {
+            messages: vec![
+                make_weft_message(Role::System, Source::Gateway, "sys prompt"),
+                // This gateway activity message should be filtered
+                make_weft_message(Role::System, Source::Gateway, "routing activity"),
+                make_weft_message(Role::User, Source::Client, "Hello"),
+            ],
+            model: "gpt-test".to_string(),
+            options: SamplingOptions::default(),
+        };
+        let result = provider.execute(request).await;
         assert!(result.is_ok());
         mock.assert_async().await;
     }
@@ -330,40 +457,45 @@ mod tests {
                 })
                 .to_string(),
             )
-            .match_body(mockito::Matcher::PartialJsonString(
-                json!({
-                    "max_tokens": 256,
-                    "temperature": 0.5_f32
-                })
-                .to_string(),
-            ))
+            // Verify max_tokens and seed are serialized (exact integer match is safe)
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::PartialJsonString(json!({"max_tokens": 256}).to_string()),
+                mockito::Matcher::PartialJsonString(json!({"seed": 42_i64}).to_string()),
+                // Verify the sampling fields are present (regex, no float precision issues)
+                mockito::Matcher::Regex(r#""temperature"\s*:"#.to_string()),
+                mockito::Matcher::Regex(r#""top_p"\s*:"#.to_string()),
+                mockito::Matcher::Regex(r#""frequency_penalty"\s*:"#.to_string()),
+                mockito::Matcher::Regex(r#""presence_penalty"\s*:"#.to_string()),
+            ]))
             .create_async()
             .await;
 
         let provider = make_provider(&server.url());
-        let request = ProviderRequest::ChatCompletion(crate::ChatCompletionInput {
-            system_prompt: "system".to_string(),
-            messages: make_messages(),
+        let request = ProviderRequest::ChatCompletion {
+            messages: vec![make_weft_message(Role::User, Source::Client, "Hello")],
             model: "gpt-test".to_string(),
-            max_tokens: 256,
-            temperature: Some(0.5),
-            top_p: None,
-            top_k: None,
-            stop: vec![],
-            frequency_penalty: None,
-            presence_penalty: None,
-            seed: None,
-            response_format: None,
-        });
+            options: SamplingOptions {
+                max_tokens: Some(256),
+                temperature: Some(0.5),
+                top_p: Some(0.9),
+                top_k: None,
+                stop: vec![],
+                frequency_penalty: Some(0.1),
+                presence_penalty: Some(0.2),
+                seed: Some(42),
+                response_format: None,
+                activity: false,
+            },
+        };
         let result = provider.execute(request).await;
         assert!(result.is_ok());
         mock.assert_async().await;
     }
 
     #[tokio::test]
-    async fn test_empty_system_prompt_not_added() {
+    async fn test_stop_sequences_forwarded() {
         let mut server = mockito::Server::new_async().await;
-        let _mock = server
+        let mock = server
             .mock("POST", "/")
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -374,26 +506,72 @@ mod tests {
                 })
                 .to_string(),
             )
+            .match_body(mockito::Matcher::PartialJsonString(
+                json!({
+                    "stop": ["STOP", "END"]
+                })
+                .to_string(),
+            ))
             .create_async()
             .await;
 
         let provider = make_provider(&server.url());
-        let request = ProviderRequest::ChatCompletion(crate::ChatCompletionInput {
-            system_prompt: "".to_string(),
-            messages: make_messages(),
+        let request = ProviderRequest::ChatCompletion {
+            messages: vec![make_weft_message(Role::User, Source::Client, "Hello")],
             model: "gpt-test".to_string(),
-            max_tokens: 4096,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            stop: vec![],
-            frequency_penalty: None,
-            presence_penalty: None,
-            seed: None,
-            response_format: None,
-        });
+            options: SamplingOptions {
+                max_tokens: None,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                stop: vec!["STOP".to_string(), "END".to_string()],
+                frequency_penalty: None,
+                presence_penalty: None,
+                seed: None,
+                response_format: None,
+                activity: false,
+            },
+        };
         let result = provider.execute(request).await;
         assert!(result.is_ok());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_response_is_weft_message_with_correct_attribution() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "choices": [{"message": {"role": "assistant", "content": "Hi there!"}}],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 3}
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let provider = make_provider(&server.url());
+        let result = provider
+            .execute(ProviderRequest::ChatCompletion {
+                messages: vec![make_weft_message(Role::User, Source::Client, "Hello")],
+                model: "gpt-4".to_string(),
+                options: SamplingOptions::default(),
+            })
+            .await
+            .expect("should succeed");
+
+        #[allow(irrefutable_let_patterns)]
+        let ProviderResponse::ChatCompletion { message, .. } = result else {
+            panic!("expected ChatCompletion");
+        };
+        assert_eq!(message.role, Role::Assistant);
+        assert_eq!(message.source, Source::Provider);
+        assert_eq!(message.model, Some("gpt-4".to_string()));
+        assert!(!message.delta);
     }
 
     #[tokio::test]
@@ -418,9 +596,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_unsupported_variant_returns_unsupported() {
-        // There are no non-ChatCompletion variants yet, so we verify the match
-        // arm compiles and the ChatCompletion arm works. When future variants are
-        // added, they must return Unsupported from OpenAIProvider.
+        // Verify the ChatCompletion arm works and future variants would return Unsupported.
         let mut server = mockito::Server::new_async().await;
         let _mock = server
             .mock("POST", "/")
@@ -437,7 +613,6 @@ mod tests {
             .await;
 
         let provider = make_provider(&server.url());
-        // ChatCompletion should succeed — not unsupported
         let result = provider.execute(make_request("gpt-test")).await;
         assert!(
             result.is_ok(),

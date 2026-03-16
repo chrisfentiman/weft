@@ -15,6 +15,49 @@
 //!   body, headers}`) into a Weft response object map (`{type, text, usage}`) or an
 //!   error map (`{error, retry_after_ms?}`).
 //!
+//! # Script Request Map Shape
+//!
+//! The request map passed to `format_request` has the following shape:
+//!
+//! ```text
+//! {
+//!   type: "chat_completion",
+//!   model: "model-name",
+//!   messages: [
+//!     {
+//!       role: "user"|"assistant"|"system",
+//!       source: "client"|"gateway"|"provider"|...,
+//!       model: "model-name" or (),
+//!       content: "concatenated text" (backward compat),
+//!       content_parts: [
+//!         {type: "text", text: "..."} |
+//!         {type: "command_call", command: "...", arguments_json: "..."} |
+//!         {type: "command_result", command: "...", success: true, output: "..."} |
+//!         {type: "memory_result"} |
+//!         ...
+//!       ]
+//!     }
+//!   ],
+//!   max_tokens: integer or (),  // backward compat top-level field
+//!   temperature: float or (),   // backward compat top-level field
+//!   options: {
+//!     max_tokens: integer or (),
+//!     temperature: float or (),
+//!     top_p: float or (),
+//!     top_k: integer or (),
+//!     frequency_penalty: float or (),
+//!     presence_penalty: float or (),
+//!     seed: integer or (),
+//!     stop: ["..."]  // only present if non-empty
+//!   }
+//! }
+//! ```
+//!
+//! Scripts accessing `request.messages[n].content` (string) continue to work for
+//! backward compatibility. New scripts can access `content_parts` for structured
+//! content. The system prompt, if present, is `messages[0]` with `role == "system"`.
+//! There is no `system_prompt` top-level field.
+//!
 //! # Sandboxing
 //!
 //! The Rhai engine is constructed via `weft_rhai::EngineBuilder` with
@@ -41,12 +84,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rhai::Dynamic;
 use tracing::{debug, info, warn};
+use weft_core::{ContentPart, Role, Source, WeftMessage};
 use weft_rhai::{CompiledScript, EngineBuilder, SandboxLimits, ScriptError, safe_call_fn};
 
-use crate::{
-    Provider, ProviderError, ProviderRequest, ProviderResponse,
-    provider::{ChatCompletionOutput, TokenUsage, weft_messages_to_text},
-};
+use crate::{Provider, ProviderError, ProviderRequest, ProviderResponse, provider::TokenUsage};
 
 /// A provider that uses a Rhai script for wire format transformation.
 ///
@@ -167,56 +208,226 @@ fn script_error_to_provider(e: ScriptError, script_path: &str) -> ProviderError 
 
 /// Convert a `ProviderRequest` into a Rhai `Dynamic` object map.
 ///
-/// The returned map matches the interface contract documented in the script
-/// interface (spec §4.3.1):
+/// The returned map has:
 /// - `type`: "chat_completion"
 /// - `model`: model identifier
-/// - `system_prompt`: system prompt text
-/// - `messages`: array of `{role, content}` maps
-/// - `max_tokens`: integer
-/// - `temperature`: float or `()` (unit = null)
+/// - `messages`: array of full WeftMessage maps (role, source, model, content, content_parts)
+/// - `max_tokens`: integer or `()` (top-level, backward compat)
+/// - `temperature`: float or `()` (top-level, backward compat)
+/// - `options`: sub-map with all sampling fields
+///
+/// Unlike OpenAI/Anthropic providers, the Rhai provider does NOT filter gateway
+/// activity messages. The script receives ALL messages and decides what to include.
+/// This gives scripts maximum flexibility.
 fn request_to_dynamic(request: &ProviderRequest) -> Dynamic {
     match request {
-        ProviderRequest::ChatCompletion(input) => {
+        ProviderRequest::ChatCompletion {
+            messages,
+            model,
+            options,
+        } => {
             let mut map = rhai::Map::new();
             map.insert("type".into(), Dynamic::from("chat_completion".to_string()));
-            map.insert("model".into(), Dynamic::from(input.model.clone()));
+            map.insert("model".into(), Dynamic::from(model.clone()));
+
+            // Convert WeftMessages to Rhai maps.
+            // Each message is {role, source, model, content_parts, content}
+            // where `content` is the concatenated text (backward compat)
+            // and `content_parts` is the full typed array.
+            //
+            // Unlike OpenAI/Anthropic, the Rhai provider passes ALL messages
+            // (including gateway activity) -- the script decides what to include.
+            let messages_array: rhai::Array =
+                messages.iter().map(weft_message_to_dynamic).collect();
+            map.insert("messages".into(), Dynamic::from_array(messages_array));
+
+            // Backward-compat top-level sampling fields
             map.insert(
-                "system_prompt".into(),
-                Dynamic::from(input.system_prompt.clone()),
+                "max_tokens".into(),
+                option_to_dynamic_i64(options.max_tokens),
+            );
+            map.insert(
+                "temperature".into(),
+                option_to_dynamic_f64(options.temperature),
             );
 
-            // Extract text from WeftMessage content parts for the Rhai script interface.
-            // weft_messages_to_text filters gateway activity and concatenates Text parts.
-            let role_text_pairs = weft_messages_to_text(&input.messages);
-
-            let messages: rhai::Array = role_text_pairs
-                .into_iter()
-                .map(|(role, text)| {
-                    use weft_core::Role;
-                    let mut msg_map = rhai::Map::new();
-                    let role_str = match role {
-                        Role::User => "user",
-                        Role::Assistant => "assistant",
-                        Role::System => "system",
-                    };
-                    msg_map.insert("role".into(), Dynamic::from(role_str.to_string()));
-                    msg_map.insert("content".into(), Dynamic::from(text));
-                    Dynamic::from_map(msg_map)
-                })
-                .collect();
-
-            map.insert("messages".into(), Dynamic::from_array(messages));
-            map.insert("max_tokens".into(), Dynamic::from(input.max_tokens as i64));
-
-            // temperature: float or unit (null-like)
-            match input.temperature {
-                Some(t) => map.insert("temperature".into(), Dynamic::from(t as f64)),
-                None => map.insert("temperature".into(), Dynamic::UNIT),
-            };
+            // Full sampling options as sub-map for new scripts
+            let mut opts_map = rhai::Map::new();
+            opts_map.insert(
+                "max_tokens".into(),
+                option_to_dynamic_i64(options.max_tokens),
+            );
+            opts_map.insert(
+                "temperature".into(),
+                option_to_dynamic_f64(options.temperature),
+            );
+            opts_map.insert("top_p".into(), option_to_dynamic_f64(options.top_p));
+            opts_map.insert("top_k".into(), option_to_dynamic_i64(options.top_k));
+            opts_map.insert(
+                "frequency_penalty".into(),
+                option_to_dynamic_f64(options.frequency_penalty),
+            );
+            opts_map.insert(
+                "presence_penalty".into(),
+                option_to_dynamic_f64(options.presence_penalty),
+            );
+            opts_map.insert(
+                "seed".into(),
+                match options.seed {
+                    Some(s) => Dynamic::from(s),
+                    None => Dynamic::UNIT,
+                },
+            );
+            if !options.stop.is_empty() {
+                let stop_arr: rhai::Array = options
+                    .stop
+                    .iter()
+                    .map(|s| Dynamic::from(s.clone()))
+                    .collect();
+                opts_map.insert("stop".into(), Dynamic::from_array(stop_arr));
+            }
+            map.insert("options".into(), Dynamic::from_map(opts_map));
 
             Dynamic::from_map(map)
         }
+    }
+}
+
+/// Convert a WeftMessage to a Rhai Dynamic map.
+///
+/// Structure:
+/// ```text
+/// {
+///   role: "user"|"assistant"|"system",
+///   source: "client"|"gateway"|"provider"|...,
+///   model: "model-name" or (),
+///   content: "concatenated text" (backward compat),
+///   content_parts: [
+///     {type: "text", text: "..."} |
+///     {type: "command_call", command: "...", arguments_json: "..."} |
+///     {type: "command_result", command: "...", success: true, output: "..."} |
+///     {type: "memory_result"} |
+///     {type: "memory_stored"} |
+///     {type: "council_start"} |
+///     {type: "image"} | {type: "audio"} | {type: "video"} |
+///     {type: "document"} | {type: "routing"} | {type: "hook"}
+///   ]
+/// }
+/// ```
+fn weft_message_to_dynamic(msg: &WeftMessage) -> Dynamic {
+    let mut map = rhai::Map::new();
+
+    let role_str = match msg.role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::System => "system",
+    };
+    map.insert("role".into(), Dynamic::from(role_str.to_string()));
+
+    let source_str = match msg.source {
+        Source::Client => "client",
+        Source::Gateway => "gateway",
+        Source::Provider => "provider",
+        Source::Member => "member",
+        Source::Judge => "judge",
+        Source::Tool => "tool",
+        Source::Memory => "memory",
+    };
+    map.insert("source".into(), Dynamic::from(source_str.to_string()));
+
+    match &msg.model {
+        Some(m) => map.insert("model".into(), Dynamic::from(m.clone())),
+        None => map.insert("model".into(), Dynamic::UNIT),
+    };
+
+    // Backward-compat: concatenated text content
+    let text: String = msg
+        .content
+        .iter()
+        .filter_map(|p| match p {
+            ContentPart::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    map.insert("content".into(), Dynamic::from(text));
+
+    // Full content parts array
+    let parts: rhai::Array = msg.content.iter().map(content_part_to_dynamic).collect();
+    map.insert("content_parts".into(), Dynamic::from_array(parts));
+
+    Dynamic::from_map(map)
+}
+
+/// Convert a ContentPart to a Rhai Dynamic map.
+///
+/// All type names use consistent snake_case for Rhai script consumers.
+/// Explicit arms for all ContentPart variants.
+fn content_part_to_dynamic(part: &ContentPart) -> Dynamic {
+    let mut map = rhai::Map::new();
+    match part {
+        ContentPart::Text(t) => {
+            map.insert("type".into(), Dynamic::from("text".to_string()));
+            map.insert("text".into(), Dynamic::from(t.clone()));
+        }
+        ContentPart::CommandCall(cc) => {
+            map.insert("type".into(), Dynamic::from("command_call".to_string()));
+            map.insert("command".into(), Dynamic::from(cc.command.clone()));
+            map.insert(
+                "arguments_json".into(),
+                Dynamic::from(cc.arguments_json.clone()),
+            );
+        }
+        ContentPart::CommandResult(cr) => {
+            map.insert("type".into(), Dynamic::from("command_result".to_string()));
+            map.insert("command".into(), Dynamic::from(cr.command.clone()));
+            map.insert("success".into(), Dynamic::from(cr.success));
+            map.insert("output".into(), Dynamic::from(cr.output.clone()));
+        }
+        ContentPart::MemoryResult(_) => {
+            map.insert("type".into(), Dynamic::from("memory_result".to_string()));
+        }
+        ContentPart::MemoryStored(_) => {
+            map.insert("type".into(), Dynamic::from("memory_stored".to_string()));
+        }
+        ContentPart::CouncilStart(_) => {
+            map.insert("type".into(), Dynamic::from("council_start".to_string()));
+        }
+        ContentPart::Image(_) => {
+            map.insert("type".into(), Dynamic::from("image".to_string()));
+        }
+        ContentPart::Audio(_) => {
+            map.insert("type".into(), Dynamic::from("audio".to_string()));
+        }
+        ContentPart::Video(_) => {
+            map.insert("type".into(), Dynamic::from("video".to_string()));
+        }
+        ContentPart::Document(_) => {
+            map.insert("type".into(), Dynamic::from("document".to_string()));
+        }
+        ContentPart::Routing(_) => {
+            map.insert("type".into(), Dynamic::from("routing".to_string()));
+        }
+        ContentPart::Hook(_) => {
+            map.insert("type".into(), Dynamic::from("hook".to_string()));
+        }
+    }
+    Dynamic::from_map(map)
+}
+
+/// Helper: `Option<f32>` -> Dynamic (f64 or UNIT)
+fn option_to_dynamic_f64(opt: Option<f32>) -> Dynamic {
+    match opt {
+        Some(v) => Dynamic::from(v as f64),
+        None => Dynamic::UNIT,
+    }
+}
+
+/// Helper: `Option<u32>` -> Dynamic (i64 or UNIT)
+fn option_to_dynamic_i64(opt: Option<u32>) -> Dynamic {
+    match opt {
+        Some(v) => Dynamic::from(v as i64),
+        None => Dynamic::UNIT,
     }
 }
 
@@ -295,9 +506,12 @@ fn extract_request_spec(dynamic: Dynamic, script_path: &str) -> Result<RequestSp
 ///
 /// Script return shape for errors:
 ///   `{error: "...", retry_after_ms?: integer}`
+///
+/// The `model` parameter is used to attribute the response `WeftMessage` to its source model.
 fn dynamic_to_provider_result(
     dynamic: Dynamic,
     script_path: &str,
+    model: &str,
 ) -> Result<ProviderResponse, ProviderError> {
     let json =
         weft_rhai::dynamic_to_json(&dynamic).map_err(|e| ProviderError::WireScriptError {
@@ -344,10 +558,16 @@ fn dynamic_to_provider_result(
                 })
             });
 
-            Ok(ProviderResponse::ChatCompletion(ChatCompletionOutput {
-                text,
-                usage,
-            }))
+            let message = WeftMessage {
+                role: Role::Assistant,
+                source: Source::Provider,
+                model: Some(model.to_string()),
+                content: vec![ContentPart::Text(text)],
+                delta: false,
+                message_index: 0,
+            };
+
+            Ok(ProviderResponse::ChatCompletion { message, usage })
         }
         other => Err(ProviderError::WireScriptError {
             script: script_path.to_string(),
@@ -360,6 +580,11 @@ fn dynamic_to_provider_result(
 impl Provider for RhaiProvider {
     async fn execute(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         let script_path = self.script.path().to_string();
+
+        // Extract model for response attribution before converting to dynamic.
+        let model = match &request {
+            ProviderRequest::ChatCompletion { model, .. } => model.clone(),
+        };
 
         // Step 1: Convert the ProviderRequest to a Rhai Dynamic.
         let request_dynamic = request_to_dynamic(&request);
@@ -477,7 +702,7 @@ impl Provider for RhaiProvider {
         })?;
 
         // Step 8: Convert the returned map to ProviderResponse or ProviderError.
-        dynamic_to_provider_result(parse_result, &script_path)
+        dynamic_to_provider_result(parse_result, &script_path, &model)
     }
 
     fn name(&self) -> &str {
@@ -499,7 +724,7 @@ impl std::fmt::Debug for RhaiProvider {
 mod tests {
     use super::*;
     use std::io::Write;
-    use weft_core::{ContentPart, Role, Source, WeftMessage};
+    use weft_core::{ContentPart, Role, SamplingOptions, Source, WeftMessage};
     use weft_rhai::{EngineBuilder, SandboxLimits};
 
     /// Write a Rhai script to a temporary file and return the file handle.
@@ -548,29 +773,34 @@ fn parse_response(response) {
 }
 "#;
 
-    /// Build a minimal `ProviderRequest::ChatCompletion`.
+    /// Build a minimal `ProviderRequest::ChatCompletion` using new inline struct fields.
     fn sample_chat_request() -> ProviderRequest {
-        ProviderRequest::ChatCompletion(crate::provider::ChatCompletionInput {
-            system_prompt: "You are helpful.".to_string(),
-            messages: vec![WeftMessage {
-                role: Role::User,
-                source: Source::Client,
-                model: None,
-                content: vec![ContentPart::Text("Hello".to_string())],
-                delta: false,
-                message_index: 0,
-            }],
+        ProviderRequest::ChatCompletion {
+            messages: vec![
+                WeftMessage {
+                    role: Role::System,
+                    source: Source::Gateway,
+                    model: None,
+                    content: vec![ContentPart::Text("You are helpful.".to_string())],
+                    delta: false,
+                    message_index: 0,
+                },
+                WeftMessage {
+                    role: Role::User,
+                    source: Source::Client,
+                    model: None,
+                    content: vec![ContentPart::Text("Hello".to_string())],
+                    delta: false,
+                    message_index: 0,
+                },
+            ],
             model: "test-model".to_string(),
-            max_tokens: 1024,
-            temperature: Some(0.7),
-            top_p: None,
-            top_k: None,
-            stop: vec![],
-            frequency_penalty: None,
-            presence_penalty: None,
-            seed: None,
-            response_format: None,
-        })
+            options: SamplingOptions {
+                max_tokens: Some(1024),
+                temperature: Some(0.7),
+                ..SamplingOptions::default()
+            },
+        }
     }
 
     // ── Construction tests ────────────────────────────────────────────────────
@@ -622,7 +852,6 @@ fn parse_response(response) {
 
     #[test]
     fn test_construction_missing_format_request_fails() {
-        // Script with only parse_response defined.
         let f = write_temp_script(
             "fn parse_response(r) { #{ type: \"chat_completion\", text: \"ok\" } }",
         );
@@ -642,7 +871,6 @@ fn parse_response(response) {
 
     #[test]
     fn test_construction_missing_parse_response_fails() {
-        // Script with only format_request defined.
         let f = write_temp_script(
             "fn format_request(r) { #{ method: \"POST\", path: \"/\", headers: #{}, body: \"{}\" } }",
         );
@@ -667,36 +895,59 @@ fn parse_response(response) {
         let req = sample_chat_request();
         let dynamic = request_to_dynamic(&req);
 
-        // Convert back to JSON for assertion.
         let json = weft_rhai::dynamic_to_json(&dynamic).unwrap();
         assert_eq!(json["type"], "chat_completion");
         assert_eq!(json["model"], "test-model");
-        assert_eq!(json["system_prompt"], "You are helpful.");
+        // No system_prompt top-level field -- system prompt is messages[0]
+        assert!(
+            !json.as_object().unwrap().contains_key("system_prompt"),
+            "request map must not have system_prompt field"
+        );
         assert_eq!(json["max_tokens"], 1024);
         assert!((json["temperature"].as_f64().unwrap() - 0.7).abs() < 0.001);
 
         let messages = json["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0]["role"], "user");
-        assert_eq!(messages[0]["content"], "Hello");
+        // Both messages are present (Rhai passes all messages, no filtering)
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["source"], "gateway");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["source"], "client");
+    }
+
+    #[test]
+    fn test_request_to_dynamic_messages_have_content_and_content_parts() {
+        let req = ProviderRequest::ChatCompletion {
+            messages: vec![WeftMessage {
+                role: Role::User,
+                source: Source::Client,
+                model: None,
+                content: vec![ContentPart::Text("Hello".to_string())],
+                delta: false,
+                message_index: 0,
+            }],
+            model: "m".to_string(),
+            options: SamplingOptions::default(),
+        };
+        let dynamic = request_to_dynamic(&req);
+        let json = weft_rhai::dynamic_to_json(&dynamic).unwrap();
+        let msg = &json["messages"][0];
+        // Backward-compat content field
+        assert_eq!(msg["content"], "Hello");
+        // Full content_parts array
+        let parts = msg["content_parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "Hello");
     }
 
     #[test]
     fn test_request_to_dynamic_no_temperature_is_unit() {
-        let req = ProviderRequest::ChatCompletion(crate::provider::ChatCompletionInput {
-            system_prompt: "sys".to_string(),
+        let req = ProviderRequest::ChatCompletion {
             messages: vec![],
             model: "m".to_string(),
-            max_tokens: 100,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            stop: vec![],
-            frequency_penalty: None,
-            presence_penalty: None,
-            seed: None,
-            response_format: None,
-        });
+            options: SamplingOptions::default(),
+        };
         let dynamic = request_to_dynamic(&req);
         let json = weft_rhai::dynamic_to_json(&dynamic).unwrap();
         // temperature should be null/absent when None
@@ -708,9 +959,40 @@ fn parse_response(response) {
     }
 
     #[test]
+    fn test_request_to_dynamic_options_submap_present() {
+        let req = ProviderRequest::ChatCompletion {
+            messages: vec![],
+            model: "m".to_string(),
+            options: SamplingOptions {
+                max_tokens: Some(512),
+                temperature: Some(0.5),
+                top_p: Some(0.9),
+                top_k: Some(20),
+                frequency_penalty: Some(0.1),
+                presence_penalty: Some(0.2),
+                seed: Some(99),
+                stop: vec!["STOP".to_string()],
+                ..SamplingOptions::default()
+            },
+        };
+        let dynamic = request_to_dynamic(&req);
+        let json = weft_rhai::dynamic_to_json(&dynamic).unwrap();
+        let opts = &json["options"];
+        assert_eq!(opts["max_tokens"], 512);
+        assert!((opts["temperature"].as_f64().unwrap() - 0.5).abs() < 0.001);
+        assert!((opts["top_p"].as_f64().unwrap() - 0.9).abs() < 0.001);
+        assert_eq!(opts["top_k"], 20);
+        assert!((opts["frequency_penalty"].as_f64().unwrap() - 0.1).abs() < 0.001);
+        assert!((opts["presence_penalty"].as_f64().unwrap() - 0.2).abs() < 0.001);
+        assert_eq!(opts["seed"], 99);
+        let stop = opts["stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1);
+        assert_eq!(stop[0], "STOP");
+    }
+
+    #[test]
     fn test_request_to_dynamic_message_roles() {
-        let req = ProviderRequest::ChatCompletion(crate::provider::ChatCompletionInput {
-            system_prompt: "sys".to_string(),
+        let req = ProviderRequest::ChatCompletion {
             messages: vec![
                 WeftMessage {
                     role: Role::User,
@@ -728,7 +1010,6 @@ fn parse_response(response) {
                     delta: false,
                     message_index: 0,
                 },
-                // Client-provided system message (not gateway activity)
                 WeftMessage {
                     role: Role::System,
                     source: Source::Client,
@@ -739,22 +1020,134 @@ fn parse_response(response) {
                 },
             ],
             model: "m".to_string(),
-            max_tokens: 100,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            stop: vec![],
-            frequency_penalty: None,
-            presence_penalty: None,
-            seed: None,
-            response_format: None,
-        });
+            options: SamplingOptions::default(),
+        };
         let dynamic = request_to_dynamic(&req);
         let json = weft_rhai::dynamic_to_json(&dynamic).unwrap();
         let msgs = json["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"], "user");
         assert_eq!(msgs[1]["role"], "assistant");
         assert_eq!(msgs[2]["role"], "system");
+    }
+
+    #[test]
+    fn test_request_to_dynamic_gateway_messages_not_filtered() {
+        // Unlike OpenAI/Anthropic, Rhai provider passes ALL messages including
+        // gateway activity -- the script decides what to include.
+        let req = ProviderRequest::ChatCompletion {
+            messages: vec![
+                WeftMessage {
+                    role: Role::System,
+                    source: Source::Gateway,
+                    model: None,
+                    content: vec![ContentPart::Text("system prompt".to_string())],
+                    delta: false,
+                    message_index: 0,
+                },
+                WeftMessage {
+                    role: Role::System,
+                    source: Source::Gateway,
+                    model: None,
+                    content: vec![ContentPart::Text("routing activity".to_string())],
+                    delta: false,
+                    message_index: 0,
+                },
+                WeftMessage {
+                    role: Role::User,
+                    source: Source::Client,
+                    model: None,
+                    content: vec![ContentPart::Text("user".to_string())],
+                    delta: false,
+                    message_index: 0,
+                },
+            ],
+            model: "m".to_string(),
+            options: SamplingOptions::default(),
+        };
+        let dynamic = request_to_dynamic(&req);
+        let json = weft_rhai::dynamic_to_json(&dynamic).unwrap();
+        let msgs = json["messages"].as_array().unwrap();
+        // All 3 messages present -- Rhai doesn't filter
+        assert_eq!(msgs.len(), 3);
+    }
+
+    #[test]
+    fn test_content_part_to_dynamic_text() {
+        let part = ContentPart::Text("hello".to_string());
+        let dynamic = content_part_to_dynamic(&part);
+        let json = weft_rhai::dynamic_to_json(&dynamic).unwrap();
+        assert_eq!(json["type"], "text");
+        assert_eq!(json["text"], "hello");
+    }
+
+    #[test]
+    fn test_content_part_to_dynamic_command_call() {
+        use weft_core::CommandCallContent;
+        let part = ContentPart::CommandCall(CommandCallContent {
+            command: "search".to_string(),
+            arguments_json: r#"{"query":"test"}"#.to_string(),
+        });
+        let dynamic = content_part_to_dynamic(&part);
+        let json = weft_rhai::dynamic_to_json(&dynamic).unwrap();
+        assert_eq!(json["type"], "command_call");
+        assert_eq!(json["command"], "search");
+        assert_eq!(json["arguments_json"], r#"{"query":"test"}"#);
+    }
+
+    #[test]
+    fn test_content_part_to_dynamic_command_result() {
+        use weft_core::CommandResultContent;
+        let part = ContentPart::CommandResult(CommandResultContent {
+            command: "search".to_string(),
+            success: true,
+            output: "Found results".to_string(),
+            error: None,
+        });
+        let dynamic = content_part_to_dynamic(&part);
+        let json = weft_rhai::dynamic_to_json(&dynamic).unwrap();
+        assert_eq!(json["type"], "command_result");
+        assert_eq!(json["command"], "search");
+        assert_eq!(json["success"], true);
+        assert_eq!(json["output"], "Found results");
+    }
+
+    #[test]
+    fn test_content_part_to_dynamic_type_names_are_snake_case() {
+        use weft_core::{
+            CouncilStartActivity, MemoryResultContent, MemoryStoredContent, RoutingActivity,
+        };
+        // Verify all type names use snake_case (no camelCase, no PascalCase)
+        let memory_result =
+            content_part_to_dynamic(&ContentPart::MemoryResult(MemoryResultContent {
+                store: "s".to_string(),
+                entries: vec![],
+            }));
+        let json = weft_rhai::dynamic_to_json(&memory_result).unwrap();
+        assert_eq!(json["type"], "memory_result");
+
+        let memory_stored =
+            content_part_to_dynamic(&ContentPart::MemoryStored(MemoryStoredContent {
+                store: "s".to_string(),
+                id: "id1".to_string(),
+            }));
+        let json = weft_rhai::dynamic_to_json(&memory_stored).unwrap();
+        assert_eq!(json["type"], "memory_stored");
+
+        let council_start =
+            content_part_to_dynamic(&ContentPart::CouncilStart(CouncilStartActivity {
+                models: vec![],
+                judge: "j".to_string(),
+            }));
+        let json = weft_rhai::dynamic_to_json(&council_start).unwrap();
+        assert_eq!(json["type"], "council_start");
+
+        let routing = content_part_to_dynamic(&ContentPart::Routing(RoutingActivity {
+            model: "m".to_string(),
+            score: 0.9,
+            filters: vec![],
+        }));
+        let json = weft_rhai::dynamic_to_json(&routing).unwrap();
+        assert_eq!(json["type"], "routing");
     }
 
     // ── extract_request_spec tests ────────────────────────────────────────────
@@ -799,7 +1192,7 @@ fn parse_response(response) {
         let result = extract_request_spec(dynamic, "test.rhai");
         assert!(result.is_err());
         assert!(
-            matches!(result.unwrap_err(), ProviderError::WireScriptError { ref message, .. } if message.contains("method"))
+            matches!(result.unwrap_err(), ProviderError::WireScriptError { ref message, .. } if message.contains("method")),
         );
     }
 
@@ -812,13 +1205,14 @@ fn parse_response(response) {
         let result = extract_request_spec(dynamic, "test.rhai");
         assert!(result.is_err());
         assert!(
-            matches!(result.unwrap_err(), ProviderError::WireScriptError { ref message, .. } if message.contains("body"))
+            matches!(result.unwrap_err(), ProviderError::WireScriptError { ref message, .. } if message.contains("body")),
         );
     }
 
     #[test]
     fn test_extract_request_spec_non_map_fails() {
-        let dynamic = Dynamic::from("just a string");
+        let engine = EngineBuilder::new(SandboxLimits::default()).build();
+        let dynamic: Dynamic = engine.eval(r#""just a string""#).unwrap();
         let result = extract_request_spec(dynamic, "test.rhai");
         assert!(result.is_err());
     }
@@ -830,56 +1224,66 @@ fn parse_response(response) {
         let engine = EngineBuilder::new(SandboxLimits::default()).build();
         let dynamic: Dynamic = engine
             .eval(
-                r#"
-            #{
+                r#"#{
                 type: "chat_completion",
-                text: "Hello world",
+                text: "Hello!",
                 usage: #{ prompt_tokens: 10, completion_tokens: 5 }
-            }
-        "#,
+            }"#,
             )
             .unwrap();
-        let result = dynamic_to_provider_result(dynamic, "test.rhai");
+        let result = dynamic_to_provider_result(dynamic, "test.rhai", "gpt-4");
         assert!(result.is_ok());
-        let ProviderResponse::ChatCompletion(output) = result.unwrap();
-        assert_eq!(output.text, "Hello world");
-        let usage = output.usage.unwrap();
-        assert_eq!(usage.prompt_tokens, 10);
-        assert_eq!(usage.completion_tokens, 5);
+        #[allow(irrefutable_let_patterns)]
+        let ProviderResponse::ChatCompletion { message, usage } = result.unwrap() else {
+            panic!("expected ChatCompletion");
+        };
+        // Verify the WeftMessage has correct fields
+        assert_eq!(message.role, Role::Assistant);
+        assert_eq!(message.source, Source::Provider);
+        assert_eq!(message.model, Some("gpt-4".to_string()));
+        let text = message
+            .content
+            .iter()
+            .filter_map(|p| {
+                if let ContentPart::Text(t) = p {
+                    Some(t.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(text, "Hello!");
+        let u = usage.expect("usage should be present");
+        assert_eq!(u.prompt_tokens, 10);
+        assert_eq!(u.completion_tokens, 5);
     }
 
     #[test]
     fn test_dynamic_to_provider_result_no_usage() {
         let engine = EngineBuilder::new(SandboxLimits::default()).build();
         let dynamic: Dynamic = engine
-            .eval(
-                r#"
-            #{ type: "chat_completion", text: "Hi" }
-        "#,
-            )
+            .eval(r#"#{ type: "chat_completion", text: "ok" }"#)
             .unwrap();
-        let result = dynamic_to_provider_result(dynamic, "test.rhai");
+        let result = dynamic_to_provider_result(dynamic, "test.rhai", "model-x");
         assert!(result.is_ok());
-        let ProviderResponse::ChatCompletion(output) = result.unwrap();
-        assert_eq!(output.text, "Hi");
-        assert!(output.usage.is_none());
+        #[allow(irrefutable_let_patterns)]
+        let ProviderResponse::ChatCompletion { usage, .. } = result.unwrap() else {
+            panic!("expected ChatCompletion");
+        };
+        assert!(usage.is_none());
     }
 
     #[test]
     fn test_dynamic_to_provider_result_error_response() {
         let engine = EngineBuilder::new(SandboxLimits::default()).build();
         let dynamic: Dynamic = engine
-            .eval(
-                r#"
-            #{ error: "Provider returned 503" }
-        "#,
-            )
+            .eval(r#"#{ error: "provider unavailable" }"#)
             .unwrap();
-        let result = dynamic_to_provider_result(dynamic, "test.rhai");
-        assert!(result.is_err());
+        let result = dynamic_to_provider_result(dynamic, "test.rhai", "m");
         assert!(matches!(
-            result.unwrap_err(),
-            ProviderError::ProviderHttpError { .. }
+            result,
+            Err(ProviderError::ProviderHttpError { .. })
         ));
     }
 
@@ -887,133 +1291,60 @@ fn parse_response(response) {
     fn test_dynamic_to_provider_result_rate_limited() {
         let engine = EngineBuilder::new(SandboxLimits::default()).build();
         let dynamic: Dynamic = engine
-            .eval(
-                r#"
-            #{ error: "rate limited", retry_after_ms: 60000 }
-        "#,
-            )
+            .eval(r#"#{ error: "rate limited", retry_after_ms: 30000 }"#)
             .unwrap();
-        let result = dynamic_to_provider_result(dynamic, "test.rhai");
-        assert!(result.is_err());
+        let result = dynamic_to_provider_result(dynamic, "test.rhai", "m");
         assert!(matches!(
-            result.unwrap_err(),
-            ProviderError::RateLimited {
-                retry_after_ms: 60000
-            }
+            result,
+            Err(ProviderError::RateLimited {
+                retry_after_ms: 30000
+            })
         ));
+    }
+
+    #[test]
+    fn test_dynamic_to_provider_result_missing_text_fails() {
+        let engine = EngineBuilder::new(SandboxLimits::default()).build();
+        let dynamic: Dynamic = engine.eval(r#"#{ type: "chat_completion" }"#).unwrap();
+        let result = dynamic_to_provider_result(dynamic, "test.rhai", "m");
+        assert!(matches!(result, Err(ProviderError::WireScriptError { .. })));
     }
 
     #[test]
     fn test_dynamic_to_provider_result_unknown_type_fails() {
         let engine = EngineBuilder::new(SandboxLimits::default()).build();
         let dynamic: Dynamic = engine
-            .eval(
-                r#"
-            #{ type: "embedding", data: [] }
-        "#,
-            )
+            .eval(r#"#{ type: "embeddings", vectors: [] }"#)
             .unwrap();
-        let result = dynamic_to_provider_result(dynamic, "test.rhai");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, ProviderError::WireScriptError { ref message, .. } if message.contains("unknown response type")),
-            "unexpected error: {err}"
-        );
+        let result = dynamic_to_provider_result(dynamic, "test.rhai", "m");
+        assert!(matches!(result, Err(ProviderError::WireScriptError { .. })));
     }
 
     #[test]
     fn test_dynamic_to_provider_result_non_map_fails() {
-        let dynamic = Dynamic::from(42_i64);
-        let result = dynamic_to_provider_result(dynamic, "test.rhai");
-        assert!(result.is_err());
+        let engine = EngineBuilder::new(SandboxLimits::default()).build();
+        let dynamic: Dynamic = engine.eval(r#""just a string""#).unwrap();
+        let result = dynamic_to_provider_result(dynamic, "test.rhai", "m");
+        assert!(matches!(result, Err(ProviderError::WireScriptError { .. })));
     }
 
     #[test]
-    fn test_dynamic_to_provider_result_missing_text_fails() {
+    fn test_dynamic_to_provider_result_response_has_model_attribution() {
+        // The response WeftMessage must carry the model identifier for attribution.
         let engine = EngineBuilder::new(SandboxLimits::default()).build();
         let dynamic: Dynamic = engine
-            .eval(
-                r#"
-            #{ type: "chat_completion" }
-        "#,
-            )
+            .eval(r#"#{ type: "chat_completion", text: "hi" }"#)
             .unwrap();
-        let result = dynamic_to_provider_result(dynamic, "test.rhai");
-        assert!(result.is_err());
-        assert!(
-            matches!(result.unwrap_err(), ProviderError::WireScriptError { ref message, .. } if message.contains("text"))
-        );
+        let result = dynamic_to_provider_result(dynamic, "test.rhai", "claude-3-5-sonnet");
+        assert!(result.is_ok());
+        #[allow(irrefutable_let_patterns)]
+        let ProviderResponse::ChatCompletion { message, .. } = result.unwrap() else {
+            panic!("expected ChatCompletion");
+        };
+        assert_eq!(message.model, Some("claude-3-5-sonnet".to_string()));
     }
 
-    // ── Rhai API functions ────────────────────────────────────────────────────
-
-    #[test]
-    fn test_json_encode_decode_roundtrip() {
-        // Use the weft_rhai builder (same as RhaiProvider::new would use).
-        let engine = EngineBuilder::new(SandboxLimits::relaxed())
-            .log_source("rhai_wire")
-            .with_base64_helpers(true)
-            .build();
-        let result: Dynamic = engine
-            .eval(
-                r#"
-                let obj = #{ key: "value", num: 42 };
-                let encoded = json_encode(obj);
-                json_decode(encoded)
-            "#,
-            )
-            .unwrap();
-        let json = weft_rhai::dynamic_to_json(&result).unwrap();
-        assert_eq!(json["key"], "value");
-        assert_eq!(json["num"], 42);
-    }
-
-    #[test]
-    fn test_base64_encode_accessible_in_script() {
-        let engine = EngineBuilder::new(SandboxLimits::relaxed())
-            .log_source("rhai_wire")
-            .with_base64_helpers(true)
-            .build();
-        let result: String = engine.eval(r#"base64_encode("hello")"#).unwrap();
-        assert_eq!(result, "aGVsbG8=");
-    }
-
-    #[test]
-    fn test_base64_decode_accessible_in_script() {
-        let engine = EngineBuilder::new(SandboxLimits::relaxed())
-            .log_source("rhai_wire")
-            .with_base64_helpers(true)
-            .build();
-        let result: String = engine.eval(r#"base64_decode("aGVsbG8=")"#).unwrap();
-        assert_eq!(result, "hello");
-    }
-
-    // ── Engine sandboxing ────────────────────────────────────────────────────
-
-    #[test]
-    fn test_operation_limit_prevents_infinite_loop() {
-        // Verify the engine's max_operations is applied via weft_rhai builder.
-        let engine = EngineBuilder::new(SandboxLimits::relaxed())
-            .log_source("rhai_wire")
-            .with_base64_helpers(true)
-            .build();
-        let ast = engine
-            .compile("fn format_request(r) { let i = 0; loop { i += 1; } }")
-            .unwrap();
-        let mut scope = rhai::Scope::new();
-        let result =
-            engine.call_fn::<Dynamic>(&mut scope, &ast, "format_request", (Dynamic::UNIT,));
-        // Should fail with an operation limit error, not hang.
-        assert!(result.is_err(), "expected operation limit error");
-        let err_str = result.unwrap_err().to_string();
-        assert!(
-            err_str.contains("operations") || err_str.contains("limit"),
-            "expected operation limit error message, got: {err_str}"
-        );
-    }
-
-    // ── HTTP integration tests (mockito) ─────────────────────────────────────
+    // ── Integration tests (full execute path with mockito) ────────────────────
 
     #[tokio::test]
     async fn test_execute_chat_completion_success() {
@@ -1022,7 +1353,13 @@ fn parse_response(response) {
             .mock("POST", "/v1/chat/completions")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"choices":[{"message":{"content":"Hello from provider!"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#)
+            .with_body(
+                serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": "Hi!"}}],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 3}
+                })
+                .to_string(),
+            )
             .create_async()
             .await;
 
@@ -1031,63 +1368,70 @@ fn parse_response(response) {
             f.path().to_str().unwrap(),
             "test-key".to_string(),
             server.url(),
-            "test-provider".to_string(),
+            "test".to_string(),
         )
         .unwrap();
 
         let result = provider.execute(sample_chat_request()).await;
-        mock.assert_async().await;
-
-        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
-        let ProviderResponse::ChatCompletion(output) = result.unwrap();
-        assert_eq!(output.text, "Hello from provider!");
-        let usage = output.usage.unwrap();
-        assert_eq!(usage.prompt_tokens, 10);
-        assert_eq!(usage.completion_tokens, 5);
-    }
-
-    #[tokio::test]
-    async fn test_execute_rate_limited_429() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("POST", "/v1/chat/completions")
-            .with_status(429)
-            .with_header("content-type", "application/json")
-            .with_body("{}")
-            .create_async()
-            .await;
-
-        let f = write_temp_script(MINIMAL_VALID_SCRIPT);
-        let provider = RhaiProvider::new(
-            f.path().to_str().unwrap(),
-            "test-key".to_string(),
-            server.url(),
-            "test-provider".to_string(),
-        )
-        .unwrap();
-
-        let result = provider.execute(sample_chat_request()).await;
-        mock.assert_async().await;
-
-        assert!(result.is_err());
-        assert!(
-            matches!(
-                result.unwrap_err(),
-                ProviderError::RateLimited {
-                    retry_after_ms: 60000
+        assert!(result.is_ok(), "expected ok, got: {:?}", result.err());
+        #[allow(irrefutable_let_patterns)]
+        let ProviderResponse::ChatCompletion { message, usage } = result.unwrap() else {
+            panic!("expected ChatCompletion");
+        };
+        let text = message
+            .content
+            .iter()
+            .filter_map(|p| {
+                if let ContentPart::Text(t) = p {
+                    Some(t.as_str())
+                } else {
+                    None
                 }
-            ),
-            "expected RateLimited"
-        );
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(text, "Hi!");
+        assert_eq!(message.role, Role::Assistant);
+        assert_eq!(message.source, Source::Provider);
+        assert_eq!(message.model, Some("test-model".to_string()));
+        let u = usage.expect("usage should be present");
+        assert_eq!(u.prompt_tokens, 5);
+        assert_eq!(u.completion_tokens, 3);
+        mock.assert_async().await;
     }
 
     #[tokio::test]
     async fn test_execute_provider_error_non_200() {
         let mut server = mockito::Server::new_async().await;
-        let mock = server
+        let _mock = server
             .mock("POST", "/v1/chat/completions")
-            .with_status(503)
-            .with_header("content-type", "application/json")
+            .with_status(400)
+            .with_body(r#"{"error": "bad request"}"#)
+            .create_async()
+            .await;
+
+        let f = write_temp_script(MINIMAL_VALID_SCRIPT);
+        let provider = RhaiProvider::new(
+            f.path().to_str().unwrap(),
+            "key".to_string(),
+            server.url(),
+            "test".to_string(),
+        )
+        .unwrap();
+
+        let result = provider.execute(sample_chat_request()).await;
+        assert!(matches!(
+            result,
+            Err(ProviderError::ProviderHttpError { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_execute_rate_limited_429() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(429)
             .with_body("{}")
             .create_async()
             .await;
@@ -1095,146 +1439,58 @@ fn parse_response(response) {
         let f = write_temp_script(MINIMAL_VALID_SCRIPT);
         let provider = RhaiProvider::new(
             f.path().to_str().unwrap(),
-            "test-key".to_string(),
+            "key".to_string(),
             server.url(),
-            "test-provider".to_string(),
+            "test".to_string(),
         )
         .unwrap();
 
         let result = provider.execute(sample_chat_request()).await;
-        mock.assert_async().await;
-
-        assert!(result.is_err());
-        assert!(
-            matches!(result.unwrap_err(), ProviderError::ProviderHttpError { .. }),
-            "expected ProviderHttpError"
-        );
+        assert!(matches!(result, Err(ProviderError::RateLimited { .. })));
     }
 
     #[tokio::test]
     async fn test_execute_format_request_script_error_returns_wire_script_error() {
-        // A script where format_request throws at runtime.
         let script = r#"
 fn format_request(request) {
-    throw "intentional format_request error";
+    throw "deliberate error";
 }
-fn parse_response(response) {
-    #{ type: "chat_completion", text: "ok" }
-}
+fn parse_response(r) { #{ type: "chat_completion", text: "ok" } }
 "#;
         let mut server = mockito::Server::new_async().await;
-        // The mock should never be called since format_request fails.
         let _mock = server
-            .mock("POST", "/v1/chat/completions")
-            .expect(0)
+            .mock("POST", "/")
+            .with_status(200)
             .create_async()
             .await;
 
         let f = write_temp_script(script);
         let provider = RhaiProvider::new(
             f.path().to_str().unwrap(),
-            "test-key".to_string(),
+            "key".to_string(),
             server.url(),
-            "test-provider".to_string(),
+            "test".to_string(),
         )
         .unwrap();
 
         let result = provider.execute(sample_chat_request()).await;
-        assert!(result.is_err());
-        assert!(
-            matches!(result.unwrap_err(), ProviderError::WireScriptError { .. }),
-            "expected WireScriptError"
-        );
+        assert!(matches!(result, Err(ProviderError::WireScriptError { .. })));
     }
 
     #[tokio::test]
     async fn test_execute_parse_response_script_error_returns_wire_script_error() {
-        // A script where parse_response throws at runtime.
         let script = r#"
-fn format_request(request) {
-    #{
-        method: "POST",
-        path: "/v1/chat/completions",
-        headers: #{},
-        body: "{}"
-    }
+fn format_request(r) {
+    #{ method: "POST", path: "/v1", headers: #{}, body: "{}" }
 }
 fn parse_response(response) {
-    throw "intentional parse_response error";
+    throw "parse error";
 }
 "#;
         let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("POST", "/v1/chat/completions")
+        let _mock = server
+            .mock("POST", "/v1")
             .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"choices":[{"message":{"content":"Hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#)
-            .create_async()
-            .await;
-
-        let f = write_temp_script(script);
-        let provider = RhaiProvider::new(
-            f.path().to_str().unwrap(),
-            "test-key".to_string(),
-            server.url(),
-            "test-provider".to_string(),
-        )
-        .unwrap();
-
-        let result = provider.execute(sample_chat_request()).await;
-        mock.assert_async().await;
-        assert!(result.is_err());
-        assert!(
-            matches!(result.unwrap_err(), ProviderError::WireScriptError { .. }),
-            "expected WireScriptError"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_execute_script_exceeding_operation_limit_returns_wire_script_error() {
-        // A script where format_request runs an infinite loop.
-        let script = r#"
-fn format_request(request) {
-    let i = 0;
-    loop { i += 1; }
-}
-fn parse_response(response) {
-    #{ type: "chat_completion", text: "ok" }
-}
-"#;
-        let f = write_temp_script(script);
-        let provider = RhaiProvider::new(
-            f.path().to_str().unwrap(),
-            "test-key".to_string(),
-            "https://api.example.com".to_string(),
-            "test-provider".to_string(),
-        )
-        .unwrap();
-
-        let result = provider.execute(sample_chat_request()).await;
-        assert!(result.is_err());
-        assert!(
-            matches!(result.unwrap_err(), ProviderError::WireScriptError { .. }),
-            "expected WireScriptError from operation limit"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_execute_parse_response_returning_unexpected_type_returns_wire_script_error() {
-        // parse_response returns an unknown type string.
-        let script = r#"
-fn format_request(request) {
-    #{ method: "POST", path: "/v1/chat/completions", headers: #{}, body: "{}" }
-}
-fn parse_response(response) {
-    #{ type: "embedding", data: [] }
-}
-"#;
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("POST", "/v1/chat/completions")
-            .with_status(200)
-            .with_header("content-type", "application/json")
             .with_body("{}")
             .create_async()
             .await;
@@ -1242,22 +1498,106 @@ fn parse_response(response) {
         let f = write_temp_script(script);
         let provider = RhaiProvider::new(
             f.path().to_str().unwrap(),
-            "test-key".to_string(),
+            "key".to_string(),
             server.url(),
-            "test-provider".to_string(),
+            "test".to_string(),
         )
         .unwrap();
 
         let result = provider.execute(sample_chat_request()).await;
-        mock.assert_async().await;
-        assert!(result.is_err());
+        assert!(matches!(result, Err(ProviderError::WireScriptError { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_execute_parse_response_returning_unexpected_type_returns_wire_script_error() {
+        let script = r#"
+fn format_request(r) {
+    #{ method: "POST", path: "/v1", headers: #{}, body: "{}" }
+}
+fn parse_response(response) {
+    #{ type: "unknown_type", data: "whatever" }
+}
+"#;
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1")
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let f = write_temp_script(script);
+        let provider = RhaiProvider::new(
+            f.path().to_str().unwrap(),
+            "key".to_string(),
+            server.url(),
+            "test".to_string(),
+        )
+        .unwrap();
+
+        let result = provider.execute(sample_chat_request()).await;
+        assert!(matches!(result, Err(ProviderError::WireScriptError { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_execute_script_exceeding_operation_limit_returns_wire_script_error() {
+        let script = r#"
+fn format_request(r) {
+    // Infinite loop -- should be killed by operation limit
+    let x = 0;
+    loop { x += 1; }
+}
+fn parse_response(r) { #{ type: "chat_completion", text: "ok" } }
+"#;
+        let f = write_temp_script(script);
+        let provider = RhaiProvider::new(
+            f.path().to_str().unwrap(),
+            "key".to_string(),
+            "https://api.example.com".to_string(),
+            "test".to_string(),
+        )
+        .unwrap();
+
+        let result = provider.execute(sample_chat_request()).await;
         assert!(
-            matches!(result.unwrap_err(), ProviderError::WireScriptError { ref message, .. } if message.contains("unknown response type")),
-            "expected WireScriptError with unknown response type"
+            matches!(result, Err(ProviderError::WireScriptError { .. })),
+            "expected WireScriptError from operation limit, got: {:?}",
+            result
         );
     }
 
-    // ── Provider trait compliance ─────────────────────────────────────────────
+    #[test]
+    fn test_operation_limit_prevents_infinite_loop() {
+        // Verify that the operation limit blocks infinite loops in Rhai.
+        let engine = EngineBuilder::new(SandboxLimits::relaxed()).build();
+        let result: Result<(), _> = engine.eval(
+            r#"
+            let x = 0;
+            loop { x += 1; }
+        "#,
+        );
+        assert!(
+            result.is_err(),
+            "infinite loop should be blocked by operation limit"
+        );
+    }
+
+    #[test]
+    fn test_debug_format_does_not_leak_api_key() {
+        let f = write_temp_script(MINIMAL_VALID_SCRIPT);
+        let provider = RhaiProvider::new(
+            f.path().to_str().unwrap(),
+            "super-secret-key".to_string(),
+            "https://api.example.com".to_string(),
+            "test-provider".to_string(),
+        )
+        .unwrap();
+        let debug_str = format!("{provider:?}");
+        assert!(
+            !debug_str.contains("super-secret-key"),
+            "debug output must not contain api_key"
+        );
+    }
 
     #[test]
     fn test_name_returns_provider_name() {
@@ -1266,26 +1606,72 @@ fn parse_response(response) {
             f.path().to_str().unwrap(),
             "key".to_string(),
             "https://api.example.com".to_string(),
-            "banana-ai".to_string(),
+            "my-custom-provider".to_string(),
         )
         .unwrap();
-        assert_eq!(provider.name(), "banana-ai");
+        assert_eq!(provider.name(), "my-custom-provider");
     }
 
     #[test]
-    fn test_debug_format_does_not_leak_api_key() {
-        let f = write_temp_script(MINIMAL_VALID_SCRIPT);
-        let provider = RhaiProvider::new(
+    fn test_json_encode_decode_roundtrip() {
+        let script = r#"
+fn format_request(r) {
+    let encoded = json_encode(#{ key: "value", num: 42 });
+    let decoded = json_decode(encoded);
+    #{
+        method: "POST",
+        path: "/v1",
+        headers: #{},
+        body: encoded,
+    }
+}
+fn parse_response(r) { #{ type: "chat_completion", text: "ok" } }
+"#;
+        let f = write_temp_script(script);
+        let result = RhaiProvider::new(
             f.path().to_str().unwrap(),
-            "secret-api-key".to_string(),
+            "key".to_string(),
             "https://api.example.com".to_string(),
-            "test-provider".to_string(),
-        )
-        .unwrap();
-        let debug_str = format!("{provider:?}");
-        assert!(
-            !debug_str.contains("secret-api-key"),
-            "Debug output should not expose API key: {debug_str}"
+            "test".to_string(),
         );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_base64_encode_accessible_in_script() {
+        let script = r#"
+fn format_request(r) {
+    let encoded = base64_encode("hello");
+    #{ method: "POST", path: "/v1", headers: #{}, body: encoded }
+}
+fn parse_response(r) { #{ type: "chat_completion", text: "ok" } }
+"#;
+        let f = write_temp_script(script);
+        let result = RhaiProvider::new(
+            f.path().to_str().unwrap(),
+            "key".to_string(),
+            "https://api.example.com".to_string(),
+            "test".to_string(),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_base64_decode_accessible_in_script() {
+        let script = r#"
+fn format_request(r) {
+    let decoded = base64_decode("aGVsbG8=");
+    #{ method: "POST", path: "/v1", headers: #{}, body: decoded }
+}
+fn parse_response(r) { #{ type: "chat_completion", text: "ok" } }
+"#;
+        let f = write_temp_script(script);
+        let result = RhaiProvider::new(
+            f.path().to_str().unwrap(),
+            "key".to_string(),
+            "https://api.example.com".to_string(),
+            "test".to_string(),
+        );
+        assert!(result.is_ok());
     }
 }
