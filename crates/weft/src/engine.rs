@@ -325,9 +325,10 @@ impl GatewayEngine {
                 content: completion.text.clone(),
             });
 
-            // Inject command results as a user message in TOON format.
+            // Inject command results as an assistant message in TOON format.
+            // The assistant called the commands; results are part of its workflow.
             messages.push(Message {
-                role: Role::User,
+                role: Role::Assistant,
                 content: format_command_results_toon(&results),
             });
 
