@@ -212,6 +212,11 @@ impl ApiError {
             WeftError::Routing(_) => Self::internal(e.to_string()),
             WeftError::ModelNotFound { .. } => Self::internal(e.to_string()),
             WeftError::Command(_) => Self::internal(e.to_string()),
+            WeftError::MemoryStore(_) => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: e.to_string(),
+                retry_after_ms: None,
+            },
         }
     }
 }
@@ -413,6 +418,7 @@ mod tests {
                 domains: DomainsConfig::default(),
             },
             tool_registry: None,
+            memory: None,
             gateway: GatewayConfig {
                 system_prompt: "You are a test assistant.".to_string(),
                 max_command_iterations: 10,

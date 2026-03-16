@@ -848,6 +848,7 @@ mod tests {
                 domains: DomainsConfig::default(),
             },
             tool_registry: None,
+            memory: None,
             gateway: GatewayConfig {
                 system_prompt: "You are a test assistant.".to_string(),
                 max_command_iterations: 10,
@@ -894,6 +895,7 @@ mod tests {
                 domains: DomainsConfig::default(),
             },
             tool_registry: None,
+            memory: None,
             gateway: GatewayConfig {
                 system_prompt: "You are a test assistant.".to_string(),
                 max_command_iterations: 10,

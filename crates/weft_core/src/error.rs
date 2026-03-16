@@ -29,6 +29,8 @@ pub enum WeftError {
     Routing(String),
     #[error("model '{name}' not found in provider registry")]
     ModelNotFound { name: String },
+    #[error("memory store error: {0}")]
+    MemoryStore(String),
 }
 
 #[cfg(test)]
@@ -51,6 +53,7 @@ mod tests {
         let _ = WeftError::ModelNotFound {
             name: "fast".to_string(),
         };
+        let _ = WeftError::MemoryStore("store unavailable".to_string());
     }
 
     #[test]

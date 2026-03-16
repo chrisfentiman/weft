@@ -12,6 +12,8 @@ pub struct WeftConfig {
     /// Router configuration — the single source of truth for model routing
     /// and classification. Replaces the old `[llm]` and `[classifier]` sections.
     pub router: RouterConfig,
+    /// Memory store configuration. Optional -- absent means no memory stores.
+    pub memory: Option<MemoryConfig>,
 }
 
 impl WeftConfig {
@@ -34,7 +36,11 @@ impl WeftConfig {
     /// Checks all consistency constraints that cannot be expressed in the type system.
     /// Must be called after `resolve()`.
     pub fn validate(&self) -> Result<(), String> {
-        self.router.validate()
+        self.router.validate()?;
+        if let Some(ref memory) = self.memory {
+            memory.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -350,6 +356,142 @@ fn default_max_iterations() -> u32 {
 
 fn default_request_timeout_secs() -> u64 {
     300
+}
+
+// ── Memory configuration ─────────────────────────────────────────────────────
+
+/// Memory configuration. Optional -- absent means no memory stores.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct MemoryConfig {
+    /// Memory stores to connect to.
+    pub stores: Vec<MemoryStoreConfig>,
+}
+
+impl MemoryConfig {
+    /// Validate memory configuration.
+    ///
+    /// Checks store name uniqueness, example presence, capability presence,
+    /// and endpoint URI validity.
+    pub fn validate(&self) -> Result<(), String> {
+        // 1. Non-empty stores list is not required (memory section can have zero stores).
+        // 2. Store names must be unique.
+        let mut names = std::collections::HashSet::new();
+        for store in &self.stores {
+            if !names.insert(store.name.as_str()) {
+                return Err(format!("duplicate memory store name: '{}'", store.name));
+            }
+        }
+
+        for store in &self.stores {
+            // 3. Each store must have at least one example.
+            if store.examples.is_empty() {
+                return Err(format!(
+                    "memory store '{}' must have at least one example",
+                    store.name
+                ));
+            }
+
+            // 4. Each store's capabilities must be non-empty.
+            if store.capabilities.is_empty() {
+                return Err(format!(
+                    "memory store '{}' must have at least one capability (read, write)",
+                    store.name
+                ));
+            }
+
+            // 5. Validate endpoint URI using tonic.
+            tonic::transport::Endpoint::new(store.endpoint.clone())
+                .map_err(|e| format!("invalid endpoint URI for store '{}': {}", store.name, e))?;
+        }
+
+        // 6. Warn if no stores have read or write capability.
+        if !self.stores.is_empty() {
+            let any_readable = self.stores.iter().any(|s| s.can_read());
+            let any_writable = self.stores.iter().any(|s| s.can_write());
+            if !any_readable {
+                tracing::warn!("no memory stores have read capability — /recall has no targets");
+            }
+            if !any_writable {
+                tracing::warn!("no memory stores have write capability — /remember has no targets");
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// What a memory store can do. Config-level declaration by the admin --
+/// not part of the gRPC contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StoreCapability {
+    /// Store supports querying/retrieving memories.
+    Read,
+    /// Store supports persisting new memories.
+    Write,
+}
+
+/// A single memory store endpoint.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct MemoryStoreConfig {
+    /// Unique name for this store (e.g., "conversations", "code_knowledge").
+    /// Used as the routing candidate ID in the Memory domain.
+    pub name: String,
+    /// gRPC endpoint (e.g., "http://localhost:50052").
+    pub endpoint: String,
+    /// Connection timeout in milliseconds.
+    #[serde(default = "default_memory_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    /// Request timeout in milliseconds.
+    ///
+    /// **Deferred (v1):** This field is parsed and stored but NOT enforced
+    /// per-request on the gRPC client. The overall gateway request timeout
+    /// (`gateway.request_timeout_secs`) is the safety net. The field exists
+    /// for forward compatibility: when per-store timeouts are implemented
+    /// (via tonic's `timeout()` on the channel or per-request deadline),
+    /// existing configs will already have the value.
+    #[serde(default = "default_memory_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+    /// Maximum number of memories to retrieve per query.
+    #[serde(default = "default_max_results")]
+    pub max_results: u32,
+    /// What this store can do: `read`, `write`, or both.
+    /// Determines whether the store is eligible for `/recall` (read) and
+    /// `/remember` (write) operations. Defaults to `["read", "write"]` if omitted.
+    #[serde(default = "default_capabilities")]
+    pub capabilities: Vec<StoreCapability>,
+    /// Example queries that this store is best suited for.
+    /// Used by the semantic router to build centroid embeddings for the Memory domain.
+    /// Must contain at least one example.
+    pub examples: Vec<String>,
+}
+
+impl MemoryStoreConfig {
+    /// Whether this store supports read (query) operations.
+    pub fn can_read(&self) -> bool {
+        self.capabilities.contains(&StoreCapability::Read)
+    }
+
+    /// Whether this store supports write (store) operations.
+    pub fn can_write(&self) -> bool {
+        self.capabilities.contains(&StoreCapability::Write)
+    }
+}
+
+fn default_memory_connect_timeout_ms() -> u64 {
+    5000
+}
+
+fn default_memory_request_timeout_ms() -> u64 {
+    10000
+}
+
+fn default_max_results() -> u32 {
+    5
+}
+
+fn default_capabilities() -> Vec<StoreCapability> {
+    vec![StoreCapability::Read, StoreCapability::Write]
 }
 
 #[cfg(test)]
@@ -1074,5 +1216,283 @@ api_key = "sk-test"
 
         let mem_domain = config.router.domains.memory.as_ref().unwrap();
         assert!(!mem_domain.enabled);
+    }
+
+    // ── Memory config tests ───────────────────────────────────────────────────
+
+    fn minimal_router_toml_str() -> &'static str {
+        r#"
+[server]
+bind_address = "0.0.0.0:8080"
+
+[gateway]
+system_prompt = "You are helpful."
+
+[router]
+
+[router.classifier]
+model_path = "m.onnx"
+tokenizer_path = "t.json"
+
+[[router.providers]]
+name = "anthropic"
+kind = "anthropic"
+api_key = "sk-test"
+
+  [[router.providers.models]]
+  name = "main"
+  model = "claude-1"
+  examples = ["example"]
+"#
+    }
+
+    #[test]
+    fn test_weft_config_without_memory_section_parses() {
+        let config: WeftConfig = toml::from_str(minimal_router_toml_str()).unwrap();
+        assert!(
+            config.memory.is_none(),
+            "absent [memory] section should be None"
+        );
+    }
+
+    #[test]
+    fn test_weft_config_with_memory_section_parses() {
+        let toml = format!(
+            r#"{}
+[[memory.stores]]
+name = "conversations"
+endpoint = "http://localhost:50052"
+examples = ["What did we discuss yesterday?"]
+"#,
+            minimal_router_toml_str()
+        );
+        let config: WeftConfig = toml::from_str(&toml).unwrap();
+        let memory = config.memory.as_ref().unwrap();
+        assert_eq!(memory.stores.len(), 1);
+        assert_eq!(memory.stores[0].name, "conversations");
+        assert_eq!(memory.stores[0].endpoint, "http://localhost:50052");
+    }
+
+    #[test]
+    fn test_memory_store_config_defaults() {
+        let toml = format!(
+            r#"{}
+[[memory.stores]]
+name = "conversations"
+endpoint = "http://localhost:50052"
+examples = ["example"]
+"#,
+            minimal_router_toml_str()
+        );
+        let config: WeftConfig = toml::from_str(&toml).unwrap();
+        let store = &config.memory.as_ref().unwrap().stores[0];
+        assert_eq!(store.connect_timeout_ms, 5000);
+        assert_eq!(store.request_timeout_ms, 10000);
+        assert_eq!(store.max_results, 5);
+        // capabilities defaults to [read, write]
+        assert!(store.can_read());
+        assert!(store.can_write());
+    }
+
+    #[test]
+    fn test_memory_store_read_only_capability() {
+        let toml = format!(
+            r#"{}
+[[memory.stores]]
+name = "knowledge"
+endpoint = "http://localhost:50052"
+capabilities = ["read"]
+examples = ["How does X work?"]
+"#,
+            minimal_router_toml_str()
+        );
+        let config: WeftConfig = toml::from_str(&toml).unwrap();
+        let store = &config.memory.as_ref().unwrap().stores[0];
+        assert!(store.can_read());
+        assert!(!store.can_write());
+    }
+
+    #[test]
+    fn test_memory_store_write_only_capability() {
+        let toml = format!(
+            r#"{}
+[[memory.stores]]
+name = "audit"
+endpoint = "http://localhost:50052"
+capabilities = ["write"]
+examples = ["store user action"]
+"#,
+            minimal_router_toml_str()
+        );
+        let config: WeftConfig = toml::from_str(&toml).unwrap();
+        let store = &config.memory.as_ref().unwrap().stores[0];
+        assert!(!store.can_read());
+        assert!(store.can_write());
+    }
+
+    #[test]
+    fn test_memory_store_invalid_capability_rejected_by_serde() {
+        let toml = format!(
+            r#"{}
+[[memory.stores]]
+name = "bad"
+endpoint = "http://localhost:50052"
+capabilities = ["execute"]
+examples = ["example"]
+"#,
+            minimal_router_toml_str()
+        );
+        let result: Result<WeftConfig, _> = toml::from_str(&toml);
+        assert!(
+            result.is_err(),
+            "unknown capability 'execute' should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_memory_validate_duplicate_store_names() {
+        let toml = format!(
+            r#"{}
+[[memory.stores]]
+name = "conv"
+endpoint = "http://localhost:50052"
+examples = ["example 1"]
+
+[[memory.stores]]
+name = "conv"
+endpoint = "http://localhost:50053"
+examples = ["example 2"]
+"#,
+            minimal_router_toml_str()
+        );
+        let config: WeftConfig = toml::from_str(&toml).unwrap();
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("duplicate memory store name"));
+    }
+
+    #[test]
+    fn test_memory_validate_empty_examples_rejected() {
+        let memory_config = MemoryConfig {
+            stores: vec![MemoryStoreConfig {
+                name: "conv".to_string(),
+                endpoint: "http://localhost:50052".to_string(),
+                connect_timeout_ms: 5000,
+                request_timeout_ms: 10000,
+                max_results: 5,
+                capabilities: vec![StoreCapability::Read, StoreCapability::Write],
+                examples: vec![], // empty — should fail
+            }],
+        };
+        let result = memory_config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("at least one example"));
+    }
+
+    #[test]
+    fn test_memory_validate_empty_capabilities_rejected() {
+        let memory_config = MemoryConfig {
+            stores: vec![MemoryStoreConfig {
+                name: "conv".to_string(),
+                endpoint: "http://localhost:50052".to_string(),
+                connect_timeout_ms: 5000,
+                request_timeout_ms: 10000,
+                max_results: 5,
+                capabilities: vec![], // empty — should fail
+                examples: vec!["example".to_string()],
+            }],
+        };
+        let result = memory_config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("at least one capability"));
+    }
+
+    #[test]
+    fn test_memory_validate_invalid_endpoint_rejected() {
+        // An empty endpoint string is rejected by tonic::transport::Endpoint::new().
+        // Tonic accepts relative-looking strings, but empty string is always invalid.
+        let memory_config = MemoryConfig {
+            stores: vec![MemoryStoreConfig {
+                name: "conv".to_string(),
+                endpoint: String::new(), // empty string — always invalid
+                connect_timeout_ms: 5000,
+                request_timeout_ms: 10000,
+                max_results: 5,
+                capabilities: vec![StoreCapability::Read],
+                examples: vec!["example".to_string()],
+            }],
+        };
+        let result = memory_config.validate();
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("invalid endpoint URI"),
+            "should report invalid endpoint URI"
+        );
+    }
+
+    #[test]
+    fn test_memory_validate_valid_config_passes() {
+        let memory_config = MemoryConfig {
+            stores: vec![
+                MemoryStoreConfig {
+                    name: "conv".to_string(),
+                    endpoint: "http://localhost:50052".to_string(),
+                    connect_timeout_ms: 5000,
+                    request_timeout_ms: 10000,
+                    max_results: 5,
+                    capabilities: vec![StoreCapability::Read, StoreCapability::Write],
+                    examples: vec!["What did we discuss?".to_string()],
+                },
+                MemoryStoreConfig {
+                    name: "code".to_string(),
+                    endpoint: "http://localhost:50053".to_string(),
+                    connect_timeout_ms: 5000,
+                    request_timeout_ms: 10000,
+                    max_results: 3,
+                    capabilities: vec![StoreCapability::Read],
+                    examples: vec!["How does the parser work?".to_string()],
+                },
+            ],
+        };
+        assert!(memory_config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_memory_store_config_can_read_can_write() {
+        let rw_store = MemoryStoreConfig {
+            name: "rw".to_string(),
+            endpoint: "http://localhost:50052".to_string(),
+            connect_timeout_ms: 5000,
+            request_timeout_ms: 10000,
+            max_results: 5,
+            capabilities: vec![StoreCapability::Read, StoreCapability::Write],
+            examples: vec!["example".to_string()],
+        };
+        assert!(rw_store.can_read());
+        assert!(rw_store.can_write());
+
+        let ro_store = MemoryStoreConfig {
+            name: "ro".to_string(),
+            endpoint: "http://localhost:50052".to_string(),
+            connect_timeout_ms: 5000,
+            request_timeout_ms: 10000,
+            max_results: 5,
+            capabilities: vec![StoreCapability::Read],
+            examples: vec!["example".to_string()],
+        };
+        assert!(ro_store.can_read());
+        assert!(!ro_store.can_write());
+
+        let wo_store = MemoryStoreConfig {
+            name: "wo".to_string(),
+            endpoint: "http://localhost:50052".to_string(),
+            connect_timeout_ms: 5000,
+            request_timeout_ms: 10000,
+            max_results: 5,
+            capabilities: vec![StoreCapability::Write],
+            examples: vec!["example".to_string()],
+        };
+        assert!(!wo_store.can_read());
+        assert!(wo_store.can_write());
     }
 }
