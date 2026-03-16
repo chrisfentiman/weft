@@ -203,6 +203,15 @@ impl HookRegistry {
         }
     }
 
+    /// Construct a registry from a pre-built event-to-hooks map.
+    ///
+    /// Used in tests to build registries with inline executor implementations
+    /// without going through `from_config` (which requires real Rhai scripts or URLs).
+    #[cfg(test)]
+    pub(crate) fn from_registered(hooks: HashMap<HookEvent, Vec<RegisteredHook>>) -> Self {
+        Self { hooks }
+    }
+
     // Used in Phase 4 when hooks are wired into the engine request loop.
     #[allow(dead_code)]
     /// Run all hooks for the given event, in priority order.

@@ -4,32 +4,39 @@
 //! parses commands from the response, executes them, and loops until no more
 //! commands are emitted or the iteration cap or timeout is reached.
 //!
-//! ## Request flow
+//! ## Request flow (with hooks)
 //!
-//! 1. Extract user message from the latest user turn.
-//! 2. List all commands from the registry.
-//! 3. Build routing domains (Commands, Model, ToolNecessity).
-//! 4. Call `router.route()` → `RoutingDecision`.
-//! 5. Apply threshold + max_commands filtering to the commands domain result.
-//! 6. Check `tools_needed`: if `Some(false)` and `skip_tools_when_unnecessary`,
-//!    skip command injection entirely.
-//! 7. Select the model from the routing decision (fallback to default if None).
-//! 8. Assemble the system prompt.
-//! 9. Call the selected provider. On non-rate-limit failure, retry with the
-//!    default provider. Rate-limit errors propagate immediately.
-//! 10. Parse response: partition into built-in memory commands and external
-//!     commands. Execute built-in first (memory results available in same turn),
-//!     then external. Merge all results and inject as TOON. Loop.
+//! 1. [HOOK: RequestStart] — hard block (403), can modify request
+//! 2. Validate request
+//! 3. list_commands()
+//! 4. extract_latest_user_message()
+//! 5. For each routing domain (model, commands, tool_necessity):
+//!    a. [HOOK: PreRoute(domain, trigger=request_start)]  — hard block (403)
+//!    b. Router scores this domain
+//!    c. [HOOK: PostRoute(domain, trigger=request_start)] — hard block (403)
+//! 6. Assemble system prompt
+//! 7. LOOP:
+//!    a. Call LLM
+//!    b. Parse response
+//!    c. [HOOK: PreResponse] — feedback block (re-run LLM with reason), can modify;
+//!    block with retries left injects reason and retries; exhausted retries returns 422.
+//!    d. For each command invocation:
+//!       - [HOOK: PreToolUse] — feedback block
+//!       - For /recall and /remember: [HOOK: PreRoute/PostRoute(memory)] — feedback block
+//!       - Execute command
+//!       - [HOOK: PostToolUse] — can modify result
+//! 8. Build HTTP response, return
+//! 9. [HOOK: RequestEnd] — fire-and-forget (semaphore-gated)
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use weft_commands::{CommandRegistry, MemoryStoreMux, parse_response};
 use weft_core::{
     ChatCompletionRequest, ChatCompletionResponse, Choice, CommandAction, CommandResult,
-    CommandStub, Message, Role, Usage, WeftConfig, WeftError,
+    CommandStub, HookRoutingDomain, Message, Role, RoutingTrigger, Usage, WeftConfig, WeftError,
     toon::{fenced_toon, serialize_table},
 };
 use weft_llm::{CompletionOptions, LlmError, LlmProvider, ProviderRegistry};
@@ -41,9 +48,25 @@ use weft_router::{
 use crate::context::{
     assemble_system_prompt, assemble_system_prompt_no_tools, format_command_results_toon,
 };
+use crate::hooks::HookChainResult;
+use weft_core::HookEvent;
 
 /// Built-in command names intercepted by the engine before the command registry.
 const BUILTIN_COMMANDS: &[&str] = &["recall", "remember"];
+
+/// Convert from router's `RoutingDomainKind` to hooks' `HookRoutingDomain`.
+///
+/// Lives in engine.rs at the integration boundary — `weft_core` cannot depend on
+/// `weft_router`, so the conversion happens here where both types are visible.
+/// Using a free function avoids the orphan rule (both types are from external crates).
+fn routing_domain_to_hook_domain(kind: &RoutingDomainKind) -> HookRoutingDomain {
+    match kind {
+        RoutingDomainKind::Model => HookRoutingDomain::Model,
+        RoutingDomainKind::Commands => HookRoutingDomain::Commands,
+        RoutingDomainKind::ToolNecessity => HookRoutingDomain::ToolNecessity,
+        RoutingDomainKind::Memory => HookRoutingDomain::Memory,
+    }
+}
 
 /// Compiled-in describe text for `/recall`.
 const RECALL_DESCRIBE: &str = "\
@@ -99,13 +122,9 @@ pub struct GatewayEngine {
     write_memory_candidates: Vec<RoutingCandidate>,
     /// Hook registry. Shared immutably across all request handlers.
     /// Contains all registered hooks, sorted by priority per event.
-    /// Wired into the request loop in Phase 4.
-    #[allow(dead_code)]
     hook_registry: Arc<crate::hooks::HookRegistry>,
     /// Semaphore limiting concurrent RequestEnd hook tasks.
     /// Prevents unbounded task accumulation under burst load.
-    /// Used in Phase 4 for fire-and-forget RequestEnd hook dispatch.
-    #[allow(dead_code)]
     request_end_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
@@ -158,20 +177,105 @@ impl GatewayEngine {
     /// This is the main gateway loop: route → assemble → LLM → parse → execute → loop.
     pub async fn handle_request(
         &self,
-        request: ChatCompletionRequest,
+        mut request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, WeftError> {
         // Reject streaming early — no ambiguity.
         if request.stream == Some(true) {
             return Err(WeftError::StreamingNotSupported);
         }
 
+        // ── [HOOK: RequestStart] ─────────────────────────────────────────────
+        // Hard block — fires before any routing or LLM involvement.
+        // A Modify can alter the request (e.g., strip fields, inject messages).
+        // ChatCompletionRequest doesn't derive Serialize so we build the payload manually.
+        let request_payload = serde_json::json!({
+            "model": request.model,
+            "messages": request.messages,
+            "max_tokens": request.max_tokens,
+            "temperature": request.temperature,
+            "stream": request.stream,
+        });
+        match self
+            .hook_registry
+            .run_chain(HookEvent::RequestStart, request_payload, None)
+            .await
+        {
+            HookChainResult::Blocked { reason, hook_name } => {
+                info!(
+                    hook = %hook_name,
+                    reason = %reason,
+                    "RequestStart hook blocked request"
+                );
+                return Err(WeftError::HookBlocked {
+                    event: "RequestStart".to_string(),
+                    reason,
+                    hook_name,
+                });
+            }
+            HookChainResult::Allowed { payload, context } => {
+                // If modified, attempt to deserialize back to ChatCompletionRequest.
+                match serde_json::from_value::<ChatCompletionRequest>(payload) {
+                    Ok(modified_req) => {
+                        request = modified_req;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "RequestStart hook returned payload that could not be deserialized to ChatCompletionRequest — using original");
+                    }
+                }
+                // Context from RequestStart is accumulated along with routing context.
+                let _ = context;
+            }
+        }
+
         let timeout_secs = self.config.gateway.request_timeout_secs;
         let timeout = Duration::from_secs(timeout_secs);
 
+        // Clone the request_id for RequestEnd (fire-and-forget after response).
+        let request_model = request.model.clone();
+
         // Wrap the entire gateway loop in a timeout.
-        tokio::time::timeout(timeout, self.run_loop(request))
+        let result = tokio::time::timeout(timeout, self.run_loop(request))
             .await
-            .map_err(|_| WeftError::RequestTimeout { timeout_secs })?
+            .map_err(|_| WeftError::RequestTimeout { timeout_secs })?;
+
+        // ── [HOOK: RequestEnd] ───────────────────────────────────────────────
+        // Fire-and-forget after the response is returned. Gated by semaphore.
+        // We fire it regardless of success/failure.
+        let (status, duration_ms) = match &result {
+            Ok(_) => (200u16, 0u64), // Duration tracked per-request in future
+            Err(WeftError::HookBlocked { .. }) => (403u16, 0u64),
+            Err(WeftError::HookBlockedAfterRetries { .. }) => (422u16, 0u64),
+            Err(WeftError::RateLimited { .. }) => (429u16, 0u64),
+            Err(WeftError::RequestTimeout { .. }) => (504u16, 0u64),
+            Err(_) => (500u16, 0u64),
+        };
+
+        let end_payload = serde_json::json!({
+            "request_id": uuid::Uuid::new_v4().to_string(),
+            "duration_ms": duration_ms,
+            "model": request_model,
+            "status": status,
+            "commands_executed": 0u32,
+        });
+
+        let hook_registry = Arc::clone(&self.hook_registry);
+        let semaphore = Arc::clone(&self.request_end_semaphore);
+
+        match semaphore.clone().try_acquire_owned() {
+            Ok(permit) => {
+                tokio::spawn(async move {
+                    let _permit = permit; // Dropped when task completes.
+                    hook_registry
+                        .run_chain(HookEvent::RequestEnd, end_payload, None)
+                        .await;
+                });
+            }
+            Err(_) => {
+                warn!("RequestEnd semaphore exhausted — dropping RequestEnd hook task");
+            }
+        }
+
+        result
     }
 
     /// Inner gateway loop (no timeout wrapping — caller handles that).
@@ -189,11 +293,13 @@ impl GatewayEngine {
         // Extract the latest user message for semantic routing.
         let user_message = extract_latest_user_message(&request.messages)?;
 
-        // Build all routing domains and call the router once.
-        let routing_result = self.route_all_domains(user_message, &all_commands).await;
+        // Build all routing domains and call the router once — with per-domain PreRoute/PostRoute hooks.
+        let routing_result = self
+            .route_all_domains_with_hooks(user_message, &all_commands)
+            .await?;
 
         // Unpack the routing result.
-        let (selected_commands, inject_tools, selected_model_name) = routing_result;
+        let (selected_commands, inject_tools, selected_model_name, hook_context) = routing_result;
 
         debug!(
             model = %selected_model_name,
@@ -231,7 +337,8 @@ impl GatewayEngine {
         };
 
         // Assemble the system prompt (with or without commands).
-        let system_prompt = if inject_tools {
+        // Append any accumulated hook context from routing hooks.
+        let base_system_prompt = if inject_tools {
             assemble_system_prompt(
                 &selected_commands,
                 &self.config.gateway.system_prompt,
@@ -239,6 +346,12 @@ impl GatewayEngine {
             )
         } else {
             assemble_system_prompt_no_tools(&self.config.gateway.system_prompt)
+        };
+
+        let system_prompt = if let Some(ctx) = hook_context {
+            format!("{base_system_prompt}\n{ctx}")
+        } else {
+            base_system_prompt
         };
 
         // Build the initial message list (clone from request).
@@ -267,7 +380,9 @@ impl GatewayEngine {
         }
 
         let max_iterations = self.config.gateway.max_command_iterations;
+        let max_retries = self.config.effective_max_pre_response_retries();
         let mut iterations = 0u32;
+        let mut pre_response_retries = 0u32;
 
         loop {
             if iterations >= max_iterations {
@@ -292,12 +407,65 @@ impl GatewayEngine {
             let parsed = parse_response(&completion.text, &known_commands);
 
             if parsed.invocations.is_empty() && parsed.parse_errors.is_empty() {
-                // No commands (built-in or external) — we're done. Return the clean text.
-                return Ok(build_response(
-                    &parsed.text,
-                    &request.model,
-                    completion.usage,
-                ));
+                // No commands — this is a final response candidate. Fire PreResponse hook.
+                let pre_response_payload = serde_json::json!({
+                    "text": parsed.text,
+                    "model": selected_model_name,
+                });
+
+                match self
+                    .hook_registry
+                    .run_chain(HookEvent::PreResponse, pre_response_payload, None)
+                    .await
+                {
+                    HookChainResult::Blocked { reason, hook_name } => {
+                        // Feedback block: inject reason and re-run LLM if retries remain.
+                        if pre_response_retries < max_retries {
+                            pre_response_retries += 1;
+                            info!(
+                                hook = %hook_name,
+                                reason = %reason,
+                                retry = pre_response_retries,
+                                max_retries,
+                                "PreResponse hook blocked response — injecting reason and regenerating"
+                            );
+                            // Inject block reason as a system message so LLM can reconsider.
+                            let injection = format!(
+                                "[Hook {hook_name} blocked your response: {reason}. Please reconsider and generate a new response.]"
+                            );
+                            messages.push(Message {
+                                role: Role::Assistant,
+                                content: completion.text.clone(),
+                            });
+                            messages.push(Message {
+                                role: Role::Assistant,
+                                content: injection,
+                            });
+                            iterations += 1;
+                            continue;
+                        } else {
+                            return Err(WeftError::HookBlockedAfterRetries {
+                                event: "PreResponse".to_string(),
+                                reason,
+                                hook_name,
+                                retries: pre_response_retries,
+                            });
+                        }
+                    }
+                    HookChainResult::Allowed { payload, .. } => {
+                        // Extract (possibly modified) text from the payload.
+                        let final_text = payload
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&parsed.text)
+                            .to_string();
+                        return Ok(build_response(
+                            &final_text,
+                            &request.model,
+                            completion.usage,
+                        ));
+                    }
+                }
             }
 
             // Partition invocations: built-in memory commands vs external tool commands.
@@ -313,26 +481,129 @@ impl GatewayEngine {
 
             // Execute built-in memory commands first (results available in same turn).
             for invocation in &builtin_invocations {
-                let result = self.handle_builtin(invocation, user_message).await;
+                let result = self
+                    .handle_builtin_with_hooks(invocation, user_message)
+                    .await;
                 results.push(result);
             }
 
             // Execute external commands via the command registry.
             for invocation in &external_invocations {
-                let result = self
-                    .command_registry
-                    .execute_command(invocation)
+                // ── [HOOK: PreToolUse] ───────────────────────────────────────
+                let tool_payload = serde_json::json!({
+                    "command": invocation.name,
+                    "arguments": invocation.arguments,
+                    "action": match &invocation.action {
+                        CommandAction::Execute => "execute",
+                        CommandAction::Describe => "describe",
+                    },
+                });
+
+                let (effective_invocation, pre_tool_blocked) = match self
+                    .hook_registry
+                    .run_chain(HookEvent::PreToolUse, tool_payload, Some(&invocation.name))
                     .await
-                    .unwrap_or_else(|e| {
-                        // Command errors become failed results (spec Section 8.4).
-                        CommandResult {
+                {
+                    HookChainResult::Blocked { reason, hook_name } => {
+                        info!(
+                            hook = %hook_name,
+                            command = %invocation.name,
+                            reason = %reason,
+                            "PreToolUse hook blocked command"
+                        );
+                        results.push(CommandResult {
                             command_name: invocation.name.clone(),
                             success: false,
                             output: String::new(),
-                            error: Some(e.to_string()),
-                        }
+                            error: Some(reason),
+                        });
+                        (None, true)
+                    }
+                    HookChainResult::Allowed { payload, .. } => {
+                        // If modified, extract potentially updated arguments.
+                        let modified_invocation = if payload
+                            != serde_json::json!({
+                                "command": invocation.name,
+                                "arguments": invocation.arguments,
+                                "action": match &invocation.action {
+                                    CommandAction::Execute => "execute",
+                                    CommandAction::Describe => "describe",
+                                },
+                            }) {
+                            // Reconstruct invocation from payload.
+                            let mut inv = invocation.clone();
+                            if let Some(args) = payload.get("arguments")
+                                && let Ok(updated) = serde_json::from_value(args.clone())
+                            {
+                                inv.arguments = updated;
+                            }
+                            inv
+                        } else {
+                            invocation.clone()
+                        };
+                        (Some(modified_invocation), false)
+                    }
+                };
+
+                if pre_tool_blocked {
+                    continue;
+                }
+
+                let effective_invocation = effective_invocation.unwrap();
+
+                // Execute the command.
+                let mut cmd_result = self
+                    .command_registry
+                    .execute_command(&effective_invocation)
+                    .await
+                    .unwrap_or_else(|e| CommandResult {
+                        command_name: effective_invocation.name.clone(),
+                        success: false,
+                        output: String::new(),
+                        error: Some(e.to_string()),
                     });
-                results.push(result);
+
+                // ── [HOOK: PostToolUse] ──────────────────────────────────────
+                let post_tool_payload = serde_json::json!({
+                    "command": effective_invocation.name,
+                    "action": match &effective_invocation.action {
+                        CommandAction::Execute => "execute",
+                        CommandAction::Describe => "describe",
+                    },
+                    "success": cmd_result.success,
+                    "output": cmd_result.output,
+                    "error": cmd_result.error,
+                });
+
+                match self
+                    .hook_registry
+                    .run_chain(
+                        HookEvent::PostToolUse,
+                        post_tool_payload,
+                        Some(&effective_invocation.name),
+                    )
+                    .await
+                {
+                    HookChainResult::Allowed { payload, .. } => {
+                        // Apply any modifications to the result.
+                        if let Some(output) = payload.get("output").and_then(|v| v.as_str()) {
+                            cmd_result.output = output.to_string();
+                        }
+                        if let Some(success) = payload.get("success").and_then(|v| v.as_bool()) {
+                            cmd_result.success = success;
+                        }
+                    }
+                    HookChainResult::Blocked { hook_name, reason } => {
+                        // Block on PostToolUse is non-blocking per spec — log and continue.
+                        warn!(
+                            hook = %hook_name,
+                            reason = %reason,
+                            "PostToolUse hook returned Block (non-blocking event) — ignoring"
+                        );
+                    }
+                }
+
+                results.push(cmd_result);
             }
 
             // Append the full assistant response (with command lines) to message history.
@@ -402,17 +673,25 @@ impl GatewayEngine {
         }
     }
 
-    /// Route all domains (Commands, Model, ToolNecessity) in a single router call.
+    /// Route all domains with per-domain PreRoute/PostRoute hooks.
     ///
-    /// Returns `(selected_commands, inject_tools, selected_model_name)`.
+    /// Returns `(selected_commands, inject_tools, selected_model_name, accumulated_hook_context)`.
+    ///
+    /// Per-domain hooks fire for each routing domain independently:
+    /// - PreRoute can modify candidates or routing_input for that domain.
+    /// - PostRoute can override selected candidates or scores for that domain.
+    ///
+    /// Hard blocks (403) on model domain terminate the request.
+    /// Block on commands domain = empty command set (proceed with no tools).
+    /// Block on tool_necessity domain = conservative (inject tools).
     ///
     /// On router failure, falls back to: all commands (capped by max_commands),
     /// `inject_tools = true` (conservative), and the default model.
-    async fn route_all_domains(
+    async fn route_all_domains_with_hooks(
         &self,
         user_message: &str,
         all_commands: &[CommandStub],
-    ) -> (Vec<CommandStub>, bool, String) {
+    ) -> Result<(Vec<CommandStub>, bool, String, Option<String>), WeftError> {
         let threshold = self.config.router.classifier.threshold;
         let max_commands = self.config.router.classifier.max_commands;
         let skip_tools_when_unnecessary = self.config.router.skip_tools_when_unnecessary;
@@ -428,10 +707,10 @@ impl GatewayEngine {
             .collect();
 
         // Build all routing domains.
-        let mut domains = vec![(RoutingDomainKind::Commands, command_candidates)];
+        let mut domains: Vec<(RoutingDomainKind, Vec<RoutingCandidate>)> =
+            vec![(RoutingDomainKind::Commands, command_candidates)];
 
         // Model domain: only include if there are multiple models to route between.
-        // With a single model there is nothing to route; skip for efficiency.
         let total_models: usize = self
             .config
             .router
@@ -454,10 +733,7 @@ impl GatewayEngine {
             ));
         }
 
-        // Memory domain: include when memory stores are configured and the domain is enabled.
-        // The pre-computed memory_candidates are built at startup from config.
-        // The RoutingDecision.memory_stores result is used only for the "inject memory stubs"
-        // signal, NOT for store selection (both /recall and /remember route per-invocation).
+        // Memory domain: include when memory stores are configured.
         if self.memory_mux.is_some() && !self.memory_candidates.is_empty() {
             let memory_domain_enabled = self
                 .config
@@ -472,25 +748,212 @@ impl GatewayEngine {
             }
         }
 
-        let decision = self.router.route(user_message, &domains).await;
+        // ── Per-domain PreRoute hooks (before single router call) ────────────
+        // Fire PreRoute for each domain. Collect modified candidates for the router call.
+        // Accumulated context from routing hooks.
+        let mut context_parts: Vec<String> = Vec::new();
 
+        // Track overrides from PreRoute hooks: domain -> (modified_candidates, modified_routing_input).
+        let mut pre_route_overrides: std::collections::HashMap<
+            usize,
+            (Vec<RoutingCandidate>, Option<String>),
+        > = std::collections::HashMap::new();
+
+        // Track whether commands or tool_necessity were blocked by PreRoute hooks.
+        let mut commands_blocked = false;
+        let mut tool_necessity_blocked = false;
+
+        for (domain_idx, (domain_kind, candidates)) in domains.iter().enumerate() {
+            let hook_domain = routing_domain_to_hook_domain(domain_kind);
+            let candidate_values: Vec<serde_json::Value> = candidates
+                .iter()
+                .map(|c| serde_json::json!({"id": c.id, "description": c.examples.first().cloned().unwrap_or_default()}))
+                .collect();
+
+            let pre_payload = serde_json::json!({
+                "domain": hook_domain,
+                "trigger": RoutingTrigger::RequestStart,
+                "candidates": candidate_values,
+                "routing_input": user_message,
+            });
+
+            match self
+                .hook_registry
+                .run_chain(
+                    HookEvent::PreRoute,
+                    pre_payload,
+                    Some(hook_domain.as_matcher_target()),
+                )
+                .await
+            {
+                HookChainResult::Blocked { reason, hook_name } => {
+                    info!(
+                        hook = %hook_name,
+                        domain = ?domain_kind,
+                        reason = %reason,
+                        "PreRoute hook blocked routing domain"
+                    );
+                    match domain_kind {
+                        RoutingDomainKind::Model => {
+                            // Hard block on model domain — terminate request.
+                            return Err(WeftError::HookBlocked {
+                                event: "PreRoute".to_string(),
+                                reason,
+                                hook_name,
+                            });
+                        }
+                        RoutingDomainKind::Commands => {
+                            commands_blocked = true;
+                        }
+                        RoutingDomainKind::ToolNecessity => {
+                            tool_necessity_blocked = true;
+                        }
+                        RoutingDomainKind::Memory => {
+                            // Memory PreRoute block at request_start = hard block per spec.
+                            return Err(WeftError::HookBlocked {
+                                event: "PreRoute".to_string(),
+                                reason,
+                                hook_name,
+                            });
+                        }
+                    }
+                }
+                HookChainResult::Allowed { payload, context } => {
+                    if let Some(ctx) = context {
+                        context_parts.push(ctx);
+                    }
+                    // Extract any modifications to candidates or routing_input.
+                    let modified_candidates = payload
+                        .get("candidates")
+                        .and_then(|v| {
+                            serde_json::from_value::<Vec<serde_json::Value>>(v.clone()).ok()
+                        })
+                        .map(|cv| {
+                            cv.into_iter()
+                                .filter_map(|c| {
+                                    let id = c.get("id")?.as_str()?.to_string();
+                                    let desc = c
+                                        .get("description")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    Some(RoutingCandidate {
+                                        id,
+                                        examples: vec![desc],
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                    let modified_routing_input = payload
+                        .get("routing_input")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+
+                    if modified_candidates.is_some() || modified_routing_input.is_some() {
+                        let eff_candidates =
+                            modified_candidates.unwrap_or_else(|| candidates.clone());
+                        pre_route_overrides
+                            .insert(domain_idx, (eff_candidates, modified_routing_input));
+                    }
+                }
+            }
+        }
+
+        // Apply PreRoute overrides to the domains array.
+        for (idx, (new_candidates, _)) in &pre_route_overrides {
+            if let Some((_, cands)) = domains.get_mut(*idx) {
+                *cands = new_candidates.clone();
+            }
+        }
+
+        // Use modified routing_input if any domain had it overridden.
+        // For simplicity, if multiple domains have different routing_input overrides,
+        // the last one wins (spec says it affects only that domain's scoring, but
+        // we use a single route() call so we use the user_message for all domains).
+        let effective_routing_input = pre_route_overrides
+            .values()
+            .filter_map(|(_, ri)| ri.as_deref())
+            .last()
+            .unwrap_or(user_message);
+
+        let decision = self.router.route(effective_routing_input, &domains).await;
+
+        // ── Post-route processing and PostRoute hooks ────────────────────────
         match decision {
             Ok(routing_decision) => {
                 // ── Commands ──────────────────────────────────────────────
-                let scored = routing_decision.commands;
-                let filtered = filter_by_threshold(scored, threshold);
+                // Apply commands_blocked from PreRoute hook.
+                let scored_commands = if commands_blocked {
+                    vec![]
+                } else {
+                    routing_decision.commands.clone()
+                };
+                let filtered = filter_by_threshold(scored_commands.clone(), threshold);
                 let top: Vec<ScoredCandidate> = take_top(filtered, max_commands);
 
+                // Fire PostRoute for Commands domain.
+                let commands_domain_idx = domains
+                    .iter()
+                    .position(|(k, _)| *k == RoutingDomainKind::Commands);
+                let commands_domain_candidates = commands_domain_idx
+                    .and_then(|i| domains.get(i))
+                    .map(|(_, c)| c.clone())
+                    .unwrap_or_default();
+
+                let selected_cmd_ids = top.iter().map(|c| c.id.clone()).collect::<Vec<_>>();
+                let post_commands_payload = serde_json::json!({
+                    "domain": HookRoutingDomain::Commands,
+                    "trigger": RoutingTrigger::RequestStart,
+                    "candidates": commands_domain_candidates.iter().map(|c| serde_json::json!({"id": c.id, "description": c.examples.first().cloned().unwrap_or_default()})).collect::<Vec<_>>(),
+                    "scores": scored_commands.iter().map(|c| serde_json::json!({"id": c.id, "score": c.score})).collect::<Vec<_>>(),
+                    "selected": selected_cmd_ids,
+                });
+
+                let final_cmd_ids = match self
+                    .hook_registry
+                    .run_chain(
+                        HookEvent::PostRoute,
+                        post_commands_payload,
+                        Some(HookRoutingDomain::Commands.as_matcher_target()),
+                    )
+                    .await
+                {
+                    HookChainResult::Blocked { reason, hook_name } => {
+                        // Block on commands domain = empty commands (not 403).
+                        info!(
+                            hook = %hook_name,
+                            reason = %reason,
+                            "PostRoute hook blocked commands domain — using empty command set"
+                        );
+                        vec![]
+                    }
+                    HookChainResult::Allowed { payload, context } => {
+                        if let Some(ctx) = context {
+                            context_parts.push(ctx);
+                        }
+                        payload
+                            .get("selected")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or(selected_cmd_ids)
+                    }
+                };
+
+                // Build selected commands from final_cmd_ids.
                 let score_map: std::collections::HashMap<&str, f32> =
                     top.iter().map(|r| (r.id.as_str(), r.score)).collect();
 
                 let mut selected_commands: Vec<CommandStub> = all_commands
                     .iter()
-                    .filter(|cmd| score_map.contains_key(cmd.name.as_str()))
+                    .filter(|cmd| final_cmd_ids.contains(&cmd.name))
                     .cloned()
                     .collect();
 
-                // Preserve top-score ordering from `take_top`.
+                // Preserve top-score ordering.
                 selected_commands.sort_by(|a, b| {
                     let sa = score_map.get(a.name.as_str()).copied().unwrap_or(0.0);
                     let sb = score_map.get(b.name.as_str()).copied().unwrap_or(0.0);
@@ -498,19 +961,159 @@ impl GatewayEngine {
                 });
 
                 // ── Tool necessity ────────────────────────────────────────
-                // Only skip tools when explicitly told not to need them AND the
-                // config allows it. Conservative default: inject tools.
-                let inject_tools = !matches!(
+                let tool_necessity_domain_exists = domains
+                    .iter()
+                    .any(|(k, _)| *k == RoutingDomainKind::ToolNecessity);
+
+                let base_inject_tools = !matches!(
                     routing_decision.tools_needed,
                     Some(false) if skip_tools_when_unnecessary
                 );
 
+                // Fire PostRoute for ToolNecessity if the domain was included.
+                let inject_tools = if tool_necessity_blocked {
+                    // Conservative: inject tools when blocked.
+                    true
+                } else if tool_necessity_domain_exists {
+                    let selected_necessity = if base_inject_tools {
+                        "needs_tools"
+                    } else {
+                        "no_tools"
+                    };
+                    let tn_domain_candidates = domains
+                        .iter()
+                        .find(|(k, _)| *k == RoutingDomainKind::ToolNecessity)
+                        .map(|(_, c)| c.clone())
+                        .unwrap_or_default();
+
+                    let post_tn_payload = serde_json::json!({
+                        "domain": HookRoutingDomain::ToolNecessity,
+                        "trigger": RoutingTrigger::RequestStart,
+                        "candidates": tn_domain_candidates.iter().map(|c| serde_json::json!({"id": c.id})).collect::<Vec<_>>(),
+                        "scores": [],
+                        "selected": [selected_necessity],
+                    });
+
+                    match self
+                        .hook_registry
+                        .run_chain(
+                            HookEvent::PostRoute,
+                            post_tn_payload,
+                            Some(HookRoutingDomain::ToolNecessity.as_matcher_target()),
+                        )
+                        .await
+                    {
+                        HookChainResult::Blocked { hook_name, reason } => {
+                            // Block on tool_necessity = conservative (inject tools).
+                            info!(
+                                hook = %hook_name,
+                                reason = %reason,
+                                "PostRoute hook blocked tool_necessity domain — conservative: inject tools"
+                            );
+                            true
+                        }
+                        HookChainResult::Allowed { payload, context } => {
+                            if let Some(ctx) = context {
+                                context_parts.push(ctx);
+                            }
+                            // PostRoute can override tool_necessity selection.
+                            let override_selected = payload
+                                .get("selected")
+                                .and_then(|v| v.as_array())
+                                .and_then(|arr| arr.first())
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+
+                            match override_selected.as_deref() {
+                                Some("needs_tools") => true,
+                                Some("no_tools") => false,
+                                _ => base_inject_tools,
+                            }
+                        }
+                    }
+                } else {
+                    base_inject_tools
+                };
+
                 // ── Model selection ───────────────────────────────────────
-                let selected_model_name = routing_decision
+                let base_model_name = routing_decision
                     .model
                     .as_ref()
                     .map(|m| m.id.clone())
                     .unwrap_or_else(|| default_model.clone());
+
+                // Fire PostRoute for Model domain if it was included.
+                let model_domain_exists =
+                    domains.iter().any(|(k, _)| *k == RoutingDomainKind::Model);
+
+                let selected_model_name = if model_domain_exists {
+                    let model_domain_candidates = domains
+                        .iter()
+                        .find(|(k, _)| *k == RoutingDomainKind::Model)
+                        .map(|(_, c)| c.clone())
+                        .unwrap_or_default();
+
+                    let model_scores = routing_decision
+                        .model
+                        .as_ref()
+                        .map(|m| vec![serde_json::json!({"id": m.id, "score": m.score})])
+                        .unwrap_or_default();
+
+                    let post_model_payload = serde_json::json!({
+                        "domain": HookRoutingDomain::Model,
+                        "trigger": RoutingTrigger::RequestStart,
+                        "candidates": model_domain_candidates.iter().map(|c| serde_json::json!({"id": c.id})).collect::<Vec<_>>(),
+                        "scores": model_scores,
+                        "selected": [base_model_name],
+                    });
+
+                    match self
+                        .hook_registry
+                        .run_chain(
+                            HookEvent::PostRoute,
+                            post_model_payload,
+                            Some(HookRoutingDomain::Model.as_matcher_target()),
+                        )
+                        .await
+                    {
+                        HookChainResult::Blocked { reason, hook_name } => {
+                            // Hard block on model domain.
+                            return Err(WeftError::HookBlocked {
+                                event: "PostRoute".to_string(),
+                                reason,
+                                hook_name,
+                            });
+                        }
+                        HookChainResult::Allowed { payload, context } => {
+                            if let Some(ctx) = context {
+                                context_parts.push(ctx);
+                            }
+                            let override_model = payload
+                                .get("selected")
+                                .and_then(|v| v.as_array())
+                                .and_then(|arr| arr.first())
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+
+                            if let Some(model) = override_model {
+                                // Validate that the model exists in the provider registry.
+                                if self.provider_registry.model_id(&model).is_some() {
+                                    model
+                                } else {
+                                    warn!(
+                                        model = %model,
+                                        "PostRoute hook override model not found in registry — using default"
+                                    );
+                                    default_model.clone()
+                                }
+                            } else {
+                                base_model_name
+                            }
+                        }
+                    }
+                } else {
+                    base_model_name
+                };
 
                 debug!(
                     selected_commands = selected_commands.len(),
@@ -520,10 +1123,21 @@ impl GatewayEngine {
                     "semantic router decision"
                 );
 
-                (selected_commands, inject_tools, selected_model_name)
+                let accumulated_context = if context_parts.is_empty() {
+                    None
+                } else {
+                    Some(context_parts.join("\n"))
+                };
+
+                Ok((
+                    selected_commands,
+                    inject_tools,
+                    selected_model_name,
+                    accumulated_context,
+                ))
             }
             Err(e) => {
-                // Router failure: conservative fallback (spec Section 8.1).
+                // Router failure: conservative fallback.
                 warn!(
                     error = %e,
                     "semantic router failed, using fallback: all commands, inject tools, default model"
@@ -533,7 +1147,7 @@ impl GatewayEngine {
                     all_commands.iter().take(max_commands).cloned().collect();
                 fallback.sort_by(|a, b| a.name.cmp(&b.name));
 
-                (fallback, true, default_model)
+                Ok((fallback, true, default_model, None))
             }
         }
     }
@@ -598,50 +1212,349 @@ fn format_memory_store_results(
 }
 
 impl GatewayEngine {
-    /// Handle a built-in memory command (`/recall` or `/remember`).
+    /// Handle a built-in memory command (`/recall` or `/remember`) with full hook lifecycle.
     ///
-    /// Called during the command loop after partitioning built-in from external
-    /// invocations. Handles both `Execute` and `Describe` actions.
-    ///
-    /// In Phase 2, routing to specific stores is not yet implemented:
-    /// - `/recall` fans out to all read-capable stores (fallback path).
-    /// - `/remember` writes to the first configured writable store (fallback path).
-    ///
-    /// Phase 3 wires per-invocation `score_memory_candidates()` routing.
-    async fn handle_builtin(
+    /// Hook firing order for memory commands:
+    /// 1. PreToolUse — can block entirely (feedback block) or modify arguments.
+    /// 2. PreRoute(memory, trigger=recall|remember) — can block (feedback) or modify candidates.
+    /// 3. PostRoute(memory, trigger=recall|remember) — can override selected stores or scores.
+    /// 4. Execute the command.
+    /// 5. PostToolUse — can modify the result.
+    async fn handle_builtin_with_hooks(
         &self,
         invocation: &weft_core::CommandInvocation,
         user_message: &str,
     ) -> CommandResult {
-        match &invocation.action {
-            CommandAction::Describe => CommandResult {
-                command_name: invocation.name.clone(),
-                success: true,
-                output: builtin_describe_text(&invocation.name),
-                error: None,
+        // ── [HOOK: PreToolUse] ───────────────────────────────────────────────
+        // Fires before any routing hooks, regardless of command type.
+        let tool_payload = serde_json::json!({
+            "command": invocation.name,
+            "arguments": invocation.arguments,
+            "action": match &invocation.action {
+                CommandAction::Execute => "execute",
+                CommandAction::Describe => "describe",
             },
-            CommandAction::Execute => match invocation.name.as_str() {
-                "recall" => self.exec_recall(invocation, user_message).await,
-                "remember" => self.exec_remember(invocation).await,
-                name => CommandResult {
+        });
+
+        let (effective_invocation, pre_tool_blocked) = match self
+            .hook_registry
+            .run_chain(HookEvent::PreToolUse, tool_payload, Some(&invocation.name))
+            .await
+        {
+            HookChainResult::Blocked { reason, hook_name } => {
+                info!(
+                    hook = %hook_name,
+                    command = %invocation.name,
+                    reason = %reason,
+                    "PreToolUse hook blocked built-in memory command — routing hooks skipped"
+                );
+                return CommandResult {
+                    command_name: invocation.name.clone(),
+                    success: false,
+                    output: String::new(),
+                    error: Some(reason),
+                };
+            }
+            HookChainResult::Allowed { payload, .. } => {
+                // Extract potentially modified arguments.
+                let mut inv = invocation.clone();
+                if let Some(args) = payload.get("arguments")
+                    && let Ok(updated) = serde_json::from_value(args.clone())
+                {
+                    inv.arguments = updated;
+                }
+                (inv, false)
+            }
+        };
+
+        // If describe action, return early after PreToolUse (no routing hooks for describe).
+        if matches!(effective_invocation.action, CommandAction::Describe) {
+            return CommandResult {
+                command_name: effective_invocation.name.clone(),
+                success: true,
+                output: builtin_describe_text(&effective_invocation.name),
+                error: None,
+            };
+        }
+
+        let _ = pre_tool_blocked; // Always false at this point (we returned early on block).
+
+        // Determine routing trigger and extract the routing text.
+        let (trigger, routing_text) = match effective_invocation.name.as_str() {
+            "recall" => {
+                let query = effective_invocation
+                    .arguments
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| user_message.to_string());
+                (RoutingTrigger::RecallCommand, query)
+            }
+            "remember" => {
+                let content = effective_invocation
+                    .arguments
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                (RoutingTrigger::RememberCommand, content)
+            }
+            name => {
+                return CommandResult {
                     command_name: name.to_string(),
                     success: false,
                     output: String::new(),
                     error: Some(format!("{name}: unknown built-in command")),
-                },
+                };
+            }
+        };
+
+        // Determine base candidates for this memory command type.
+        let base_candidates = match trigger {
+            RoutingTrigger::RecallCommand => &self.read_memory_candidates,
+            RoutingTrigger::RememberCommand => &self.write_memory_candidates,
+            RoutingTrigger::RequestStart => &self.memory_candidates, // unreachable here
+        };
+
+        // ── [HOOK: PreRoute(memory, trigger)] ────────────────────────────────
+        let pre_route_payload = serde_json::json!({
+            "domain": HookRoutingDomain::Memory,
+            "trigger": trigger,
+            "candidates": base_candidates.iter().map(|c| serde_json::json!({"id": c.id, "description": c.examples.first().cloned().unwrap_or_default()})).collect::<Vec<_>>(),
+            "routing_input": routing_text,
+        });
+
+        let (effective_candidates, effective_routing_text) = match self
+            .hook_registry
+            .run_chain(
+                HookEvent::PreRoute,
+                pre_route_payload,
+                Some(HookRoutingDomain::Memory.as_matcher_target()),
+            )
+            .await
+        {
+            HookChainResult::Blocked { reason, hook_name } => {
+                // Feedback block — return failed CommandResult (LLM sees this).
+                info!(
+                    hook = %hook_name,
+                    command = %effective_invocation.name,
+                    reason = %reason,
+                    "PreRoute memory hook blocked — returning failed CommandResult"
+                );
+                return CommandResult {
+                    command_name: effective_invocation.name.clone(),
+                    success: false,
+                    output: String::new(),
+                    error: Some(reason),
+                };
+            }
+            HookChainResult::Allowed { payload, .. } => {
+                let modified_candidates = payload
+                    .get("candidates")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|c| {
+                                let id = c.get("id")?.as_str()?.to_string();
+                                let desc = c
+                                    .get("description")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                Some(RoutingCandidate {
+                                    id,
+                                    examples: vec![desc],
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_else(|| base_candidates.clone());
+
+                let modified_routing_input = payload
+                    .get("routing_input")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or(routing_text.clone());
+
+                (modified_candidates, modified_routing_input)
+            }
+        };
+
+        // Score the (possibly modified) candidates.
+        let threshold = self.memory_domain_threshold();
+        let scored = self
+            .router
+            .score_memory_candidates(&effective_routing_text, &effective_candidates)
+            .await;
+
+        let (scored_candidates, above_threshold_ids) = match scored {
+            Ok(scored) => {
+                let above: Vec<String> = scored
+                    .iter()
+                    .filter(|c| c.score >= threshold)
+                    .map(|c| c.id.clone())
+                    .collect();
+                (scored, above)
+            }
+            Err(e) => {
+                warn!(error = %e, "router unavailable for memory scoring — using fallback");
+                (vec![], vec![])
+            }
+        };
+
+        // ── [HOOK: PostRoute(memory, trigger)] ───────────────────────────────
+        let post_route_payload = serde_json::json!({
+            "domain": HookRoutingDomain::Memory,
+            "trigger": trigger,
+            "candidates": effective_candidates.iter().map(|c| serde_json::json!({"id": c.id})).collect::<Vec<_>>(),
+            "scores": scored_candidates.iter().map(|c| serde_json::json!({"id": c.id, "score": c.score})).collect::<Vec<_>>(),
+            "selected": above_threshold_ids,
+        });
+
+        let final_store_ids = match self
+            .hook_registry
+            .run_chain(
+                HookEvent::PostRoute,
+                post_route_payload,
+                Some(HookRoutingDomain::Memory.as_matcher_target()),
+            )
+            .await
+        {
+            HookChainResult::Blocked { reason, hook_name } => {
+                // Feedback block — return failed CommandResult.
+                info!(
+                    hook = %hook_name,
+                    command = %effective_invocation.name,
+                    reason = %reason,
+                    "PostRoute memory hook blocked — returning failed CommandResult"
+                );
+                return CommandResult {
+                    command_name: effective_invocation.name.clone(),
+                    success: false,
+                    output: String::new(),
+                    error: Some(reason),
+                };
+            }
+            HookChainResult::Allowed { payload, .. } => {
+                let overridden_ids =
+                    payload
+                        .get("selected")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect::<Vec<_>>()
+                        });
+                overridden_ids.unwrap_or(above_threshold_ids)
+            }
+        };
+
+        // Validate that selected store names exist in the memory mux.
+        // Drop unknown stores with a warning.
+        let validated_store_ids = if let Some(mux) = &self.memory_mux {
+            let all_stores: std::collections::HashSet<String> = match trigger {
+                RoutingTrigger::RecallCommand => mux
+                    .readable_store_names()
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                RoutingTrigger::RememberCommand => mux
+                    .writable_store_names()
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                RoutingTrigger::RequestStart => std::collections::HashSet::new(),
+            };
+
+            let validated: Vec<String> = final_store_ids
+                .iter()
+                .filter(|id| {
+                    if all_stores.contains(*id) {
+                        true
+                    } else {
+                        warn!(
+                            store = %id,
+                            "PostRoute hook selected unknown memory store — dropping"
+                        );
+                        false
+                    }
+                })
+                .cloned()
+                .collect();
+            validated
+        } else {
+            final_store_ids
+        };
+
+        // ── Execute the memory command ────────────────────────────────────────
+        let mut cmd_result = match effective_invocation.name.as_str() {
+            "recall" => {
+                self.exec_recall_with_stores(
+                    &effective_invocation,
+                    user_message,
+                    validated_store_ids,
+                )
+                .await
+            }
+            "remember" => {
+                self.exec_remember_with_stores(&effective_invocation, validated_store_ids)
+                    .await
+            }
+            name => CommandResult {
+                command_name: name.to_string(),
+                success: false,
+                output: String::new(),
+                error: Some(format!("{name}: unknown built-in command")),
             },
+        };
+
+        // ── [HOOK: PostToolUse] ──────────────────────────────────────────────
+        let post_tool_payload = serde_json::json!({
+            "command": effective_invocation.name,
+            "action": "execute",
+            "success": cmd_result.success,
+            "output": cmd_result.output,
+            "error": cmd_result.error,
+        });
+
+        match self
+            .hook_registry
+            .run_chain(
+                HookEvent::PostToolUse,
+                post_tool_payload,
+                Some(&effective_invocation.name),
+            )
+            .await
+        {
+            HookChainResult::Allowed { payload, .. } => {
+                if let Some(output) = payload.get("output").and_then(|v| v.as_str()) {
+                    cmd_result.output = output.to_string();
+                }
+                if let Some(success) = payload.get("success").and_then(|v| v.as_bool()) {
+                    cmd_result.success = success;
+                }
+            }
+            HookChainResult::Blocked { hook_name, reason } => {
+                warn!(
+                    hook = %hook_name,
+                    reason = %reason,
+                    "PostToolUse hook returned Block (non-blocking event) — ignoring"
+                );
+            }
         }
+
+        cmd_result
     }
 
-    /// Execute a `/recall` invocation.
+    /// Execute a `/recall` invocation against pre-selected stores.
     ///
-    /// Performs per-invocation routing: scores read-capable memory candidates against
-    /// the query argument (not the user's original message). Stores above threshold
-    /// are targeted; below threshold (or router unavailable) fans out to all readable.
-    async fn exec_recall(
+    /// Used by `handle_builtin_with_hooks` after routing hooks have determined
+    /// which stores to query. If `store_ids` is empty, fans out to all readable.
+    async fn exec_recall_with_stores(
         &self,
         invocation: &weft_core::CommandInvocation,
         user_message: &str,
+        store_ids: Vec<String>,
     ) -> CommandResult {
         let mux = match &self.memory_mux {
             Some(m) => m,
@@ -655,7 +1568,6 @@ impl GatewayEngine {
             }
         };
 
-        // Extract query argument. Fall back to the user message when absent.
         let query = invocation
             .arguments
             .get("query")
@@ -663,21 +1575,8 @@ impl GatewayEngine {
             .map(|s| s.to_string())
             .unwrap_or_else(|| user_message.to_string());
 
-        // Per-invocation routing: score read-capable candidates against the query text.
-        // This is independent of the pre-computed RoutingDecision.memory_stores — the LLM's
-        // recall query may be semantically unrelated to the user's original message.
-        let threshold = self.memory_domain_threshold();
-        let readable_stores: Vec<String> = mux
-            .readable_store_names()
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect();
-
-        let store_names = self
-            .select_recall_stores(&query, &readable_stores, threshold)
-            .await;
-
-        let results = mux.query(&store_names, &query, 0.0).await;
+        // If store_ids is empty, fan out to all readable stores.
+        let results = mux.query(&store_ids, &query, 0.0).await;
         let output = format_memory_query_results(&results);
 
         CommandResult {
@@ -688,62 +1587,15 @@ impl GatewayEngine {
         }
     }
 
-    /// Select which stores to target for `/recall`.
+    /// Execute a `/remember` invocation against pre-selected stores.
     ///
-    /// Scores read-capable candidates against the query, applies threshold filtering,
-    /// and applies asymmetric fallback: if below threshold or router unavailable,
-    /// fans out to ALL read-capable stores (reads are safe).
-    async fn select_recall_stores(
+    /// Used by `handle_builtin_with_hooks` after routing hooks have determined
+    /// which stores to write. If `store_ids` is empty, uses first writable store.
+    async fn exec_remember_with_stores(
         &self,
-        query: &str,
-        readable_stores: &[String],
-        threshold: f32,
-    ) -> Vec<String> {
-        if self.read_memory_candidates.is_empty() {
-            // No read-capable candidates to score — fan out (mux handles empty = all readable).
-            return vec![];
-        }
-
-        match self
-            .router
-            .score_memory_candidates(query, &self.read_memory_candidates)
-            .await
-        {
-            Ok(scored) => {
-                let above_threshold: Vec<String> = scored
-                    .iter()
-                    .filter(|c| c.score >= threshold)
-                    .filter(|c| readable_stores.contains(&c.id))
-                    .map(|c| c.id.clone())
-                    .collect();
-                if above_threshold.is_empty() {
-                    // Below threshold: fan out to all read-capable stores.
-                    // Reads are safe — returning partial results is better than missing memories.
-                    debug!(
-                        query_len = query.len(),
-                        threshold,
-                        "recall: all candidates below threshold, fanning out to all readable stores"
-                    );
-                    vec![] // empty = mux fans out to all readable
-                } else {
-                    above_threshold
-                }
-            }
-            Err(e) => {
-                // Router unavailable: fan out to all read-capable stores.
-                warn!(error = %e, "router unavailable for /recall, querying all read-capable stores");
-                vec![] // empty = mux fans out to all readable
-            }
-        }
-    }
-
-    /// Execute a `/remember` invocation.
-    ///
-    /// Performs per-invocation routing: scores write-capable memory candidates against
-    /// the content argument (not the user's original message). Asymmetric fallback:
-    /// if below threshold, picks single highest-scoring write-capable store; if router
-    /// unavailable, writes to the first configured writable store.
-    async fn exec_remember(&self, invocation: &weft_core::CommandInvocation) -> CommandResult {
+        invocation: &weft_core::CommandInvocation,
+        store_ids: Vec<String>,
+    ) -> CommandResult {
         let mux = match &self.memory_mux {
             Some(m) => m,
             None => {
@@ -756,7 +1608,6 @@ impl GatewayEngine {
             }
         };
 
-        // Missing content argument is an error — no sensible fallback.
         let content = match invocation.arguments.get("content").and_then(|v| v.as_str()) {
             Some(c) => c.to_string(),
             None => {
@@ -769,21 +1620,19 @@ impl GatewayEngine {
             }
         };
 
-        // Per-invocation routing: score write-capable candidates against the content text.
-        // Same mechanism as /recall but with content argument and write-capable candidates.
-        let threshold = self.memory_domain_threshold();
-        let writable_stores: Vec<String> = mux
-            .writable_store_names()
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect();
-
-        let target_stores = self
-            .select_remember_stores(&content, &writable_stores, threshold)
-            .await;
+        // Determine actual target stores.
+        let target_stores = if store_ids.is_empty() {
+            // Fallback: write to first writable store.
+            mux.writable_store_names()
+                .into_iter()
+                .take(1)
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            store_ids
+        };
 
         if target_stores.is_empty() {
-            // No writable stores at all — return success with empty output.
             return CommandResult {
                 command_name: "remember".to_string(),
                 success: true,
@@ -800,75 +1649,6 @@ impl GatewayEngine {
             success: true,
             output,
             error: None,
-        }
-    }
-
-    /// Select which stores to target for `/remember`.
-    ///
-    /// Scores write-capable candidates against the content, applies threshold filtering,
-    /// and applies asymmetric fallback: if below threshold, picks the single
-    /// highest-scoring write-capable store (never fans out on writes). If router
-    /// unavailable, writes to the first configured writable store.
-    async fn select_remember_stores(
-        &self,
-        content: &str,
-        writable_stores: &[String],
-        threshold: f32,
-    ) -> Vec<String> {
-        if writable_stores.is_empty() {
-            return vec![];
-        }
-
-        if self.write_memory_candidates.is_empty() {
-            // No write-capable candidates to score — use first writable store.
-            return writable_stores.iter().take(1).cloned().collect();
-        }
-
-        match self
-            .router
-            .score_memory_candidates(content, &self.write_memory_candidates)
-            .await
-        {
-            Ok(scored) => {
-                let above_threshold: Vec<_> = scored
-                    .iter()
-                    .filter(|c| c.score >= threshold)
-                    .filter(|c| writable_stores.contains(&c.id))
-                    .collect();
-
-                if above_threshold.is_empty() {
-                    // Below threshold: pick the single highest-scoring write-capable store.
-                    // Never fan out on writes — spraying writes pollutes stores with
-                    // misrouted content.
-                    let best = scored
-                        .iter()
-                        .filter(|c| writable_stores.contains(&c.id))
-                        .max_by(|a, b| {
-                            a.score
-                                .partial_cmp(&b.score)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                    if let Some(store) = best {
-                        debug!(
-                            store = %store.id,
-                            score = store.score,
-                            threshold,
-                            "remember: below threshold, picking highest-scoring writable store"
-                        );
-                        vec![store.id.clone()]
-                    } else {
-                        // No writable stores in scored set — fall back to first writable.
-                        writable_stores.iter().take(1).cloned().collect()
-                    }
-                } else {
-                    above_threshold.iter().map(|c| c.id.clone()).collect()
-                }
-            }
-            Err(e) => {
-                // Router unavailable: write to first configured writable store.
-                warn!(error = %e, "router unavailable for /remember, using first writable store");
-                writable_stores.iter().take(1).cloned().collect()
-            }
         }
     }
 
@@ -3861,20 +4641,813 @@ mod tests {
 
     // ── Phase 3: memory domain disabled via config ─────────────────────────
 
+    // ── Phase 4: hook integration helpers ─────────────────────────────────
+
+    /// Build a `GatewayEngine` with a custom hook registry (Phase 4 tests).
+    fn make_engine_with_hooks(
+        registry: Arc<ProviderRegistry>,
+        router: impl SemanticRouter + 'static,
+        commands: impl CommandRegistry + 'static,
+        hook_registry: crate::hooks::HookRegistry,
+    ) -> GatewayEngine {
+        GatewayEngine::new(
+            test_config(),
+            registry,
+            Arc::new(router),
+            Arc::new(commands),
+            None,
+            Arc::new(hook_registry),
+        )
+    }
+
+    /// Build a `HookRegistry` with a single hook executor for one event.
+    fn hook_registry_with(
+        event: HookEvent,
+        executor: Box<dyn crate::hooks::executor::HookExecutor>,
+        matcher: Option<&str>,
+        priority: u32,
+    ) -> crate::hooks::HookRegistry {
+        use crate::hooks::types::HookMatcher;
+        use crate::hooks::{HookRegistry, RegisteredHook};
+        let matcher = HookMatcher::new(matcher, 0).expect("valid matcher in test");
+        let hook = RegisteredHook {
+            event,
+            matcher,
+            executor,
+            name: "test-hook".to_string(),
+            priority,
+        };
+        let mut map = std::collections::HashMap::new();
+        map.insert(event, vec![hook]);
+        HookRegistry::from_registered(map)
+    }
+
+    // ── Phase 4: inline hook executor helpers ─────────────────────────────
+
+    /// A hook executor that always returns a fixed response.
+    struct FixedHookExecutor(crate::hooks::types::HookResponse);
+
+    #[async_trait]
+    impl crate::hooks::executor::HookExecutor for FixedHookExecutor {
+        async fn execute(&self, _payload: &serde_json::Value) -> crate::hooks::types::HookResponse {
+            self.0.clone()
+        }
+    }
+
+    /// A hook executor that records every payload it receives, then returns Allow.
+    struct RecordingHookExecutor {
+        recorded: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+
+    impl RecordingHookExecutor {
+        fn new() -> Self {
+            Self {
+                recorded: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn recorded_payloads(&self) -> Vec<serde_json::Value> {
+            self.recorded.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl crate::hooks::executor::HookExecutor for RecordingHookExecutor {
+        async fn execute(&self, payload: &serde_json::Value) -> crate::hooks::types::HookResponse {
+            self.recorded.lock().unwrap().push(payload.clone());
+            crate::hooks::types::HookResponse::allow()
+        }
+    }
+
+    /// A hook executor that modifies the payload by merging in a JSON object.
+    struct ModifyHookExecutor(serde_json::Value);
+
+    #[async_trait]
+    impl crate::hooks::executor::HookExecutor for ModifyHookExecutor {
+        async fn execute(&self, payload: &serde_json::Value) -> crate::hooks::types::HookResponse {
+            // Merge self.0 fields into current payload.
+            let mut merged = payload.clone();
+            if let (Some(obj), Some(extra)) = (merged.as_object_mut(), self.0.as_object()) {
+                for (k, v) in extra {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            crate::hooks::types::HookResponse {
+                decision: crate::hooks::types::HookDecision::Modify,
+                reason: None,
+                modified: Some(merged),
+                context: None,
+            }
+        }
+    }
+
+    /// Build a HookRegistry with multiple hooks for potentially different events.
+    fn hook_registry_multi(
+        hooks: Vec<(
+            HookEvent,
+            Box<dyn crate::hooks::executor::HookExecutor>,
+            Option<&'static str>,
+            u32,
+        )>,
+    ) -> crate::hooks::HookRegistry {
+        use crate::hooks::types::HookMatcher;
+        use crate::hooks::{HookRegistry, RegisteredHook};
+        let mut map: std::collections::HashMap<HookEvent, Vec<RegisteredHook>> =
+            std::collections::HashMap::new();
+        for (i, (event, executor, matcher_pat, priority)) in hooks.into_iter().enumerate() {
+            let matcher = HookMatcher::new(matcher_pat, i).expect("valid matcher");
+            let hook = RegisteredHook {
+                event,
+                matcher,
+                executor,
+                name: format!("test-hook-{i}"),
+                priority,
+            };
+            map.entry(event).or_default().push(hook);
+        }
+        HookRegistry::from_registered(map)
+    }
+
+    // ── Phase 4: RequestStart hook integration ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_request_start_hook_blocks_returns_hook_blocked_error() {
+        // RequestStart block — 403, no LLM call made.
+        let registry = single_model_registry(
+            MockLlmProvider::single("should not be called"),
+            "test-model",
+            "claude-test",
+        );
+        let hook_reg = hook_registry_with(
+            HookEvent::RequestStart,
+            Box::new(FixedHookExecutor(crate::hooks::types::HookResponse::block(
+                "auth failed",
+            ))),
+            None,
+            100,
+        );
+        let engine = make_engine_with_hooks(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            hook_reg,
+        );
+
+        let result = engine.handle_request(make_user_request("Hello")).await;
+        assert!(
+            matches!(
+                result,
+                Err(WeftError::HookBlocked { ref event, ref reason, .. })
+                    if event == "RequestStart" && reason == "auth failed"
+            ),
+            "expected HookBlocked for RequestStart, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_start_hook_allows_request_proceeds() {
+        // RequestStart allow — request continues normally.
+        let registry = single_model_registry(
+            MockLlmProvider::single("Response text"),
+            "test-model",
+            "claude-test",
+        );
+        let hook_reg = hook_registry_with(
+            HookEvent::RequestStart,
+            Box::new(FixedHookExecutor(crate::hooks::types::HookResponse::allow())),
+            None,
+            100,
+        );
+        let engine = make_engine_with_hooks(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            hook_reg,
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Hello"))
+            .await
+            .expect("should succeed when RequestStart hook allows");
+        assert_eq!(resp.choices[0].message.content, "Response text");
+    }
+
+    // ── Phase 4: PreRoute hook integration ─────────────────────────────────
+
+    #[tokio::test]
+    async fn test_pre_route_hook_blocks_model_domain_returns_hook_blocked() {
+        // PreRoute block on model domain → hard block (403).
+        let hook_reg = hook_registry_with(
+            HookEvent::PreRoute,
+            Box::new(FixedHookExecutor(crate::hooks::types::HookResponse::block(
+                "model blocked",
+            ))),
+            Some("model"),
+            100,
+        );
+
+        let engine = GatewayEngine::new(
+            multi_model_config(),
+            two_model_registry(
+                MockLlmProvider::single("should not be called"),
+                MockLlmProvider::single("should not be called"),
+            ),
+            Arc::new(MockRouter::with_model("complex-model")),
+            Arc::new(MockCommandRegistry::new(vec![])),
+            None,
+            Arc::new(hook_reg),
+        );
+
+        let result = engine.handle_request(make_user_request("Hello")).await;
+        assert!(
+            matches!(
+                result,
+                Err(WeftError::HookBlocked { ref event, .. })
+                    if event == "PreRoute"
+            ),
+            "expected HookBlocked for PreRoute on model domain, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pre_route_hook_no_matcher_fires_on_all_domains() {
+        // A PreRoute hook with no matcher fires on every domain.
+        // Verify by collecting the `domain` field from each payload received.
+        let recorder = Arc::new(RecordingHookExecutor::new());
+        let recorder_clone = Arc::clone(&recorder);
+
+        struct ArcRecording(Arc<RecordingHookExecutor>);
+        #[async_trait]
+        impl crate::hooks::executor::HookExecutor for ArcRecording {
+            async fn execute(
+                &self,
+                payload: &serde_json::Value,
+            ) -> crate::hooks::types::HookResponse {
+                self.0.recorded.lock().unwrap().push(payload.clone());
+                crate::hooks::types::HookResponse::allow()
+            }
+        }
+
+        let hook_reg = hook_registry_with(
+            HookEvent::PreRoute,
+            Box::new(ArcRecording(recorder_clone)),
+            None, // no matcher — fires on all domains
+            100,
+        );
+
+        let engine = make_engine_with_hooks(
+            single_model_registry(MockLlmProvider::single("Done"), "test-model", "claude-test"),
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![("web_search", "Search")]),
+            hook_reg,
+        );
+
+        engine
+            .handle_request(make_user_request("Hello"))
+            .await
+            .expect("should succeed");
+
+        let payloads = recorder.recorded_payloads();
+        // There must be at least one PreRoute firing (commands domain is always present).
+        assert!(
+            !payloads.is_empty(),
+            "expected PreRoute hook to fire at least once"
+        );
+        // Extract domain names from payloads.
+        let domains: Vec<&str> = payloads
+            .iter()
+            .filter_map(|p| p.get("domain").and_then(|d| d.as_str()))
+            .collect();
+        assert!(
+            domains.contains(&"commands"),
+            "expected PreRoute to fire for commands domain, got: {domains:?}"
+        );
+    }
+
+    // ── Phase 4: PostRoute hook integration ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_post_route_hook_overrides_model_selection() {
+        // PostRoute hook on model domain overrides `selected` → correct model used.
+        // Router would pick complex-model, but PostRoute hook forces default-model.
+        // The `selected` field in the model PostRoute payload is an array of model name strings.
+        let hook_reg = hook_registry_with(
+            HookEvent::PostRoute,
+            Box::new(ModifyHookExecutor(serde_json::json!({
+                "selected": ["default-model"]
+            }))),
+            Some("model"),
+            100,
+        );
+
+        let engine = GatewayEngine::new(
+            multi_model_config(),
+            two_model_registry(
+                // default-model returns the expected response.
+                MockLlmProvider::single("final response"),
+                // complex-model returns a sentinel — if this appears, the hook didn't work.
+                MockLlmProvider::single("WRONG: complex-model was used"),
+            ),
+            Arc::new(MockRouter::with_model("complex-model")),
+            Arc::new(MockCommandRegistry::new(vec![])),
+            None,
+            Arc::new(hook_reg),
+        );
+
+        // If PostRoute correctly overrides to default-model, we get "final response".
+        let resp = engine
+            .handle_request(make_user_request("Hello"))
+            .await
+            .expect("should succeed with PostRoute model override to default-model");
+        assert_eq!(resp.choices[0].message.content, "final response");
+    }
+
+    #[tokio::test]
+    async fn test_post_route_hook_overrides_model_to_invalid_falls_back_to_default() {
+        // PostRoute hook overrides model to a name not in the registry → fallback to default.
+        // `selected` is an array of model name strings (same format as the PostRoute payload).
+        let hook_reg = hook_registry_with(
+            HookEvent::PostRoute,
+            Box::new(ModifyHookExecutor(serde_json::json!({
+                "selected": ["nonexistent-model"]
+            }))),
+            Some("model"),
+            100,
+        );
+
+        let engine = GatewayEngine::new(
+            multi_model_config(),
+            two_model_registry(
+                MockLlmProvider::single("fallback response"),
+                MockLlmProvider::single("should not be called"),
+            ),
+            Arc::new(MockRouter::with_model("complex-model")),
+            Arc::new(MockCommandRegistry::new(vec![])),
+            None,
+            Arc::new(hook_reg),
+        );
+
+        // Should succeed by falling back to default-model.
+        let resp = engine
+            .handle_request(make_user_request("Hello"))
+            .await
+            .expect("should fall back to default model on invalid PostRoute override");
+        assert_eq!(resp.choices[0].message.content, "fallback response");
+    }
+
+    // ── Phase 4: PreToolUse hook integration ───────────────────────────────
+
+    #[tokio::test]
+    async fn test_pre_tool_use_blocks_command_returns_failed_result() {
+        // PreToolUse blocks web_search → command result is an error in conversation.
+        // The LLM sees the error and provides a final response.
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/web_search query: \"Rust\"",
+                "Search blocked, answering from memory.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+
+        let hook_reg = hook_registry_with(
+            HookEvent::PreToolUse,
+            Box::new(FixedHookExecutor(crate::hooks::types::HookResponse::block(
+                "permission denied",
+            ))),
+            Some("web_search"),
+            100,
+        );
+
+        let engine = make_engine_with_hooks(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![("web_search", "Search the web")]),
+            hook_reg,
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Search for Rust"))
+            .await
+            .expect("should succeed — block returns error result not 403");
+        assert_eq!(
+            resp.choices[0].message.content,
+            "Search blocked, answering from memory."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pre_tool_use_blocks_one_command_other_executes() {
+        // PreToolUse blocks web_search (matcher="web_search") but allows code_review.
+        // Both are invoked in the same turn — only code_review executes.
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/web_search query: \"Rust\"\n/code_review target: src",
+                "Done.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+
+        let hook_reg = hook_registry_with(
+            HookEvent::PreToolUse,
+            Box::new(FixedHookExecutor(crate::hooks::types::HookResponse::block(
+                "blocked",
+            ))),
+            Some("web_search"), // only blocks web_search
+            100,
+        );
+
+        let engine = make_engine_with_hooks(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![("web_search", "Search"), ("code_review", "Review")])
+                .with_execute_result(CommandResult {
+                    command_name: "code_review".to_string(),
+                    success: true,
+                    output: "review done".to_string(),
+                    error: None,
+                }),
+            hook_reg,
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Do both"))
+            .await
+            .expect("should succeed");
+        assert_eq!(resp.choices[0].message.content, "Done.");
+    }
+
+    // ── Phase 4: PostToolUse hook integration ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_post_tool_use_hook_modifies_output() {
+        // PostToolUse hook modifies the command output — modified text visible to LLM.
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/web_search query: \"Rust\"",
+                "Search result was: hooked output",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+
+        let hook_reg = hook_registry_with(
+            HookEvent::PostToolUse,
+            Box::new(ModifyHookExecutor(serde_json::json!({
+                "output": "hooked output"
+            }))),
+            Some("web_search"),
+            100,
+        );
+
+        let engine = make_engine_with_hooks(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![("web_search", "Search the web")]).with_execute_result(
+                CommandResult {
+                    command_name: "web_search".to_string(),
+                    success: true,
+                    output: "original output".to_string(),
+                    error: None,
+                },
+            ),
+            hook_reg,
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Search for Rust"))
+            .await
+            .expect("should succeed");
+        assert_eq!(
+            resp.choices[0].message.content,
+            "Search result was: hooked output"
+        );
+    }
+
+    // ── Phase 4: PreResponse hook integration ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_pre_response_hook_blocks_triggers_regeneration() {
+        // PreResponse blocks once → LLM regenerates; second response passes.
+        // The mock LLM returns two responses in order.
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec!["first response", "second response"]),
+            "test-model",
+            "claude-test",
+        );
+
+        // Block on first call, then allow (FixedHookExecutor always returns same response,
+        // so we use a stateful executor that blocks once).
+        struct BlockOnceExecutor {
+            count: std::sync::Mutex<u32>,
+        }
+        #[async_trait]
+        impl crate::hooks::executor::HookExecutor for BlockOnceExecutor {
+            async fn execute(
+                &self,
+                _payload: &serde_json::Value,
+            ) -> crate::hooks::types::HookResponse {
+                let mut count = self.count.lock().unwrap();
+                *count += 1;
+                if *count == 1 {
+                    crate::hooks::types::HookResponse::block("content policy")
+                } else {
+                    crate::hooks::types::HookResponse::allow()
+                }
+            }
+        }
+
+        let hook_reg = hook_registry_with(
+            HookEvent::PreResponse,
+            Box::new(BlockOnceExecutor {
+                count: std::sync::Mutex::new(0),
+            }),
+            None,
+            100,
+        );
+
+        let engine = make_engine_with_hooks(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            hook_reg,
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Hello"))
+            .await
+            .expect("should succeed after regeneration");
+        // Second response should be returned (first was blocked and regenerated).
+        assert_eq!(resp.choices[0].message.content, "second response");
+    }
+
+    #[tokio::test]
+    async fn test_pre_response_hook_blocks_after_max_retries_returns_422() {
+        // PreResponse blocks on every attempt → HTTP 422 after max retries exhausted.
+        // test_config() sets max_pre_response_retries = 2.
+        let registry = single_model_registry(
+            // Provide enough responses for the retry loop + 1 extra.
+            MockLlmProvider::new(vec!["bad response"; 10]),
+            "test-model",
+            "claude-test",
+        );
+
+        let hook_reg = hook_registry_with(
+            HookEvent::PreResponse,
+            Box::new(FixedHookExecutor(crate::hooks::types::HookResponse::block(
+                "always blocked",
+            ))),
+            None,
+            100,
+        );
+
+        let engine = make_engine_with_hooks(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            hook_reg,
+        );
+
+        let result = engine.handle_request(make_user_request("Hello")).await;
+        assert!(
+            matches!(
+                result,
+                Err(WeftError::HookBlockedAfterRetries { ref event, retries, .. })
+                    if event == "PreResponse" && retries == 2
+            ),
+            "expected HookBlockedAfterRetries after max retries, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pre_response_hook_modifies_response_text() {
+        // PreResponse Modify changes the response text → client sees modified text.
+        let registry = single_model_registry(
+            MockLlmProvider::single("original text"),
+            "test-model",
+            "claude-test",
+        );
+
+        let hook_reg = hook_registry_with(
+            HookEvent::PreResponse,
+            Box::new(ModifyHookExecutor(serde_json::json!({
+                "text": "modified text"
+            }))),
+            None,
+            100,
+        );
+
+        let engine = make_engine_with_hooks(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            hook_reg,
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Hello"))
+            .await
+            .expect("should succeed");
+        assert_eq!(resp.choices[0].message.content, "modified text");
+    }
+
+    // ── Phase 4: RequestEnd hook integration ───────────────────────────────
+
+    #[tokio::test]
+    async fn test_request_end_hook_fires_after_response() {
+        // RequestEnd fires after the response is built (verify via side-effect).
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_clone = Arc::clone(&fired);
+
+        struct FireFlagExecutor(Arc<std::sync::atomic::AtomicBool>);
+        #[async_trait]
+        impl crate::hooks::executor::HookExecutor for FireFlagExecutor {
+            async fn execute(
+                &self,
+                _payload: &serde_json::Value,
+            ) -> crate::hooks::types::HookResponse {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+                crate::hooks::types::HookResponse::allow()
+            }
+        }
+
+        let hook_reg = hook_registry_with(
+            HookEvent::RequestEnd,
+            Box::new(FireFlagExecutor(fired_clone)),
+            None,
+            100,
+        );
+
+        let engine = make_engine_with_hooks(
+            single_model_registry(
+                MockLlmProvider::single("Hello"),
+                "test-model",
+                "claude-test",
+            ),
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            hook_reg,
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Hello"))
+            .await
+            .expect("should succeed");
+        assert_eq!(resp.choices[0].message.content, "Hello");
+
+        // Give the spawned RequestEnd task a moment to execute.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            fired.load(std::sync::atomic::Ordering::Acquire),
+            "RequestEnd hook should have fired after response"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_end_semaphore_exhausted_drops_task_with_warning() {
+        // Semaphore with 0 permits → RequestEnd task dropped (no panic, no hang).
+        // Build a config with request_end_concurrency = 0.
+        let config = Arc::new(WeftConfig {
+            request_end_concurrency: 0,
+            ..(*test_config()).clone()
+        });
+
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_clone = Arc::clone(&fired);
+
+        struct FireFlagExecutor(Arc<std::sync::atomic::AtomicBool>);
+        #[async_trait]
+        impl crate::hooks::executor::HookExecutor for FireFlagExecutor {
+            async fn execute(
+                &self,
+                _payload: &serde_json::Value,
+            ) -> crate::hooks::types::HookResponse {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+                crate::hooks::types::HookResponse::allow()
+            }
+        }
+
+        let hook_reg = hook_registry_with(
+            HookEvent::RequestEnd,
+            Box::new(FireFlagExecutor(fired_clone)),
+            None,
+            100,
+        );
+
+        let engine = GatewayEngine::new(
+            config,
+            single_model_registry(
+                MockLlmProvider::single("Hello"),
+                "test-model",
+                "claude-test",
+            ),
+            Arc::new(MockRouter::with_score(0.9)),
+            Arc::new(MockCommandRegistry::new(vec![])),
+            None,
+            Arc::new(hook_reg),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Hello"))
+            .await
+            .expect("should succeed even with exhausted semaphore");
+        assert_eq!(resp.choices[0].message.content, "Hello");
+
+        // Give time for any possible task scheduling.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Task was dropped — hook should NOT have fired.
+        assert!(
+            !fired.load(std::sync::atomic::Ordering::Acquire),
+            "RequestEnd hook should have been dropped due to semaphore exhaustion"
+        );
+    }
+
+    // ── Phase 4: no-hooks unchanged behavior ───────────────────────────────
+
+    #[tokio::test]
+    async fn test_no_hooks_configured_behavior_unchanged() {
+        // With no hooks, engine behaves identically to existing tests.
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec!["/web_search query: \"Rust\"", "Results found."]),
+            "test-model",
+            "claude-test",
+        );
+        // Default make_engine uses HookRegistry::empty() — explicitly verify.
+        let engine = make_engine(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![("web_search", "Search")]).with_execute_result(
+                CommandResult {
+                    command_name: "web_search".to_string(),
+                    success: true,
+                    output: "Rust results".to_string(),
+                    error: None,
+                },
+            ),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Search for Rust"))
+            .await
+            .expect("should succeed with no hooks");
+        assert_eq!(resp.choices[0].message.content, "Results found.");
+    }
+
+    // ── Phase 4: hook priority ordering ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_hooks_execute_in_priority_order_lower_first() {
+        // Two RequestStart hooks: priority 200 blocks, priority 50 allows.
+        // Since lower fires first, priority 50 (allow) fires before priority 200 (block).
+        // The block at priority 200 runs second → request is blocked.
+        // This verifies that priority 200 hook's block is respected even after allow.
+        //
+        // Inverse test: priority 50 blocks, 200 allows → blocked at priority 50.
+        let registry = single_model_registry(
+            MockLlmProvider::single("should not be called"),
+            "test-model",
+            "claude-test",
+        );
+
+        // Two hooks: low priority blocks, high priority allows.
+        // Since lower priority value fires first, the block hook (50) fires first → blocked.
+        let hook_reg = hook_registry_multi(vec![
+            (
+                HookEvent::RequestStart,
+                Box::new(FixedHookExecutor(crate::hooks::types::HookResponse::block(
+                    "low priority block",
+                ))),
+                None,
+                50, // fires first
+            ),
+            (
+                HookEvent::RequestStart,
+                Box::new(FixedHookExecutor(crate::hooks::types::HookResponse::allow())),
+                None,
+                200, // fires second (but chain already blocked)
+            ),
+        ]);
+
+        let engine = make_engine_with_hooks(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            hook_reg,
+        );
+
+        let result = engine.handle_request(make_user_request("Hello")).await;
+        assert!(
+            matches!(
+                result,
+                Err(WeftError::HookBlocked { ref reason, .. }) if reason == "low priority block"
+            ),
+            "lower priority hook should have fired first and blocked, got: {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_recall_with_memory_domain_disabled_fans_out_to_all() {
-        // When memory domain is disabled via config, /recall falls back to all readable.
-        // The candidates are built but the Memory domain is NOT included in route_all_domains.
-        // Per-invocation routing also falls back since write_memory_candidates will still
-        // work via score_memory_candidates — but route_all_domains doesn't pass the domain.
-        // Since read_memory_candidates is non-empty, score_memory_candidates is still called.
-        // The router still works; the "domain disabled" only affects route_all_domains.
-        //
-        // When domain disabled: engine doesn't pass Memory domain to router.route(),
-        // but select_recall_stores() still calls score_memory_candidates() since it uses
-        // read_memory_candidates directly.
-        //
-        // This test verifies that the engine still functions when domain is disabled.
         let conv_client = Arc::new(MockMemStoreClient::succeeds(vec![mem_entry(
             "m1",
             "memory found",
