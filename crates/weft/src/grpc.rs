@@ -693,12 +693,12 @@ mod tests {
     use weft_commands::{CommandError, CommandRegistry};
     use weft_core::{
         ClassifierConfig, CommandDescription, CommandInvocation, CommandResult, CommandStub,
-        DomainsConfig, GatewayConfig, ModelEntry, ProviderConfig, RouterConfig, ServerConfig,
-        WeftConfig, WireFormat,
+        ContentPart, DomainsConfig, GatewayConfig, ModelEntry, ProviderConfig, Role, RouterConfig,
+        ServerConfig, Source, WeftConfig, WeftMessage, WireFormat,
     };
     use weft_llm::{
-        Capability, ChatCompletionOutput, Provider, ProviderError, ProviderRegistry,
-        ProviderRequest, ProviderResponse, TokenUsage,
+        Capability, Provider, ProviderError, ProviderRegistry, ProviderRequest, ProviderResponse,
+        TokenUsage,
     };
     use weft_proto::weft::v1::weft_server::Weft;
     use weft_router::{
@@ -725,13 +725,20 @@ mod tests {
             &self,
             _request: ProviderRequest,
         ) -> Result<ProviderResponse, ProviderError> {
-            Ok(ProviderResponse::ChatCompletion(ChatCompletionOutput {
-                text: self.text.clone(),
+            Ok(ProviderResponse::ChatCompletion {
+                message: WeftMessage {
+                    role: Role::Assistant,
+                    source: Source::Provider,
+                    model: None,
+                    content: vec![ContentPart::Text(self.text.clone())],
+                    delta: false,
+                    message_index: 0,
+                },
                 usage: Some(TokenUsage {
                     prompt_tokens: 10,
                     completion_tokens: 5,
                 }),
-            }))
+            })
         }
 
         fn name(&self) -> &str {

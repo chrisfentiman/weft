@@ -43,13 +43,13 @@ use tracing::{debug, info, warn};
 use weft_commands::{CommandRegistry, MemoryStoreMux, parse_response};
 use weft_core::{
     CommandAction, CommandResult, CommandStub, ContentPart, HookRoutingDomain, Role,
-    RoutingTrigger, Source, WeftConfig, WeftError, WeftMessage, WeftRequest, WeftResponse,
-    WeftTiming, WeftUsage,
+    RoutingTrigger, SamplingOptions, Source, WeftConfig, WeftError, WeftMessage, WeftRequest,
+    WeftResponse, WeftTiming, WeftUsage,
     toon::{fenced_toon, serialize_table},
 };
 use weft_llm::{
-    Capability, ChatCompletionInput, ChatCompletionOutput, Provider, ProviderError,
-    ProviderRegistry, ProviderRequest, ProviderResponse, TokenUsage,
+    Capability, Provider, ProviderError, ProviderRegistry, ProviderRequest, ProviderResponse,
+    TokenUsage,
 };
 use weft_router::{
     RoutingCandidate, RoutingDomainKind, ScoredCandidate, SemanticRouter, filter_by_threshold,
@@ -454,24 +454,40 @@ impl GatewayEngine {
                 });
             }
 
-            // Build the provider request for this model.
-            let provider_request = ProviderRequest::ChatCompletion(ChatCompletionInput {
-                system_prompt: system_prompt.clone(),
-                messages: messages.clone(),
-                model: model_id.clone().unwrap_or_default(),
-                max_tokens: max_tokens.unwrap_or(4096),
-                temperature: request.options.temperature,
-                top_p: request.options.top_p,
-                top_k: request.options.top_k,
-                stop: request.options.stop.clone(),
-                frequency_penalty: request.options.frequency_penalty,
-                presence_penalty: request.options.presence_penalty,
-                seed: request.options.seed,
-                response_format: request.options.response_format.clone(),
+            // Prepend the system prompt as messages[0] with Role::System, Source::Gateway.
+            // This is the Weft Wire convention: the system prompt is not a separate field —
+            // it is the first message, and providers extract it per their wire format requirements.
+            let mut provider_messages = Vec::with_capacity(messages.len() + 1);
+            provider_messages.push(WeftMessage {
+                role: Role::System,
+                source: Source::Gateway,
+                model: None,
+                content: vec![ContentPart::Text(system_prompt.clone())],
+                delta: false,
+                message_index: 0,
             });
+            provider_messages.extend(messages.iter().cloned());
+
+            // Build the provider request for this model.
+            let provider_request = ProviderRequest::ChatCompletion {
+                messages: provider_messages,
+                model: model_id.clone().unwrap_or_default(),
+                options: SamplingOptions {
+                    max_tokens: Some(max_tokens.unwrap_or(4096)),
+                    temperature: request.options.temperature,
+                    top_p: request.options.top_p,
+                    top_k: request.options.top_k,
+                    stop: request.options.stop.clone(),
+                    frequency_penalty: request.options.frequency_penalty,
+                    presence_penalty: request.options.presence_penalty,
+                    seed: request.options.seed,
+                    response_format: request.options.response_format.clone(),
+                    activity: false, // Never passed to provider
+                },
+            };
 
             // Call the selected provider, with fallback to default on non-rate-limit error.
-            let completion = self
+            let (completion_message, completion_usage) = self
                 .call_with_fallback(
                     provider.clone(),
                     &selected_model_name,
@@ -480,8 +496,19 @@ impl GatewayEngine {
                 )
                 .await?;
 
+            // Extract text from the response WeftMessage.
+            let completion_text: String = completion_message
+                .content
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
             // Parse the response for slash commands.
-            let parsed = parse_response(&completion.text, &known_commands);
+            let parsed = parse_response(&completion_text, &known_commands);
 
             if parsed.invocations.is_empty() && parsed.parse_errors.is_empty() {
                 // No commands — this is a final response candidate. Fire PreResponse hook.
@@ -516,7 +543,7 @@ impl GatewayEngine {
                                 role: Role::Assistant,
                                 source: Source::Provider,
                                 model: Some(selected_model_name.clone()),
-                                content: vec![ContentPart::Text(completion.text.clone())],
+                                content: vec![ContentPart::Text(completion_text.clone())],
                                 delta: false,
                                 message_index: 0,
                             });
@@ -551,7 +578,7 @@ impl GatewayEngine {
                                 &request.routing.raw,
                                 final_text,
                                 &selected_model_name,
-                                completion.usage,
+                                completion_usage,
                                 &activity_events,
                                 request.options.activity,
                             ),
@@ -704,7 +731,7 @@ impl GatewayEngine {
                 role: Role::Assistant,
                 source: Source::Provider,
                 model: Some(selected_model_name.clone()),
-                content: vec![ContentPart::Text(completion.text.clone())],
+                content: vec![ContentPart::Text(completion_text.clone())],
                 delta: false,
                 message_index: 0,
             });
@@ -736,14 +763,14 @@ impl GatewayEngine {
         selected_model_name: &str,
         request: ProviderRequest,
         temperature: Option<f32>,
-    ) -> Result<ChatCompletionOutput, WeftError> {
+    ) -> Result<(WeftMessage, Option<TokenUsage>), WeftError> {
         // The required capability for this call path is always chat_completions.
         let required_capability = Capability::new(Capability::CHAT_COMPLETIONS);
 
         let result = provider.execute(request.clone()).await;
         #[allow(unreachable_patterns)]
         match result {
-            Ok(ProviderResponse::ChatCompletion(output)) => Ok(output),
+            Ok(ProviderResponse::ChatCompletion { message, usage }) => Ok((message, usage)),
             Ok(_) => Err(WeftError::Llm(
                 "unexpected response type from provider".to_string(),
             )),
@@ -777,18 +804,29 @@ impl GatewayEngine {
 
                 // Build a new request with the default model's identifiers.
                 let fallback_request = match request {
-                    ProviderRequest::ChatCompletion(mut input) => {
-                        input.model = self
+                    ProviderRequest::ChatCompletion {
+                        messages,
+                        model: _,
+                        options,
+                    } => {
+                        let fallback_model_id = self
                             .provider_registry
                             .model_id(default_name)
                             .map(String::from)
                             .unwrap_or_default();
-                        input.max_tokens = self
+                        let fallback_max_tokens = self
                             .provider_registry
                             .max_tokens_for(default_name)
                             .unwrap_or(4096);
-                        input.temperature = temperature;
-                        ProviderRequest::ChatCompletion(input)
+                        ProviderRequest::ChatCompletion {
+                            messages,
+                            model: fallback_model_id,
+                            options: SamplingOptions {
+                                max_tokens: Some(fallback_max_tokens),
+                                temperature,
+                                ..options
+                            },
+                        }
                     }
                     #[allow(unreachable_patterns)]
                     other => other,
@@ -796,7 +834,7 @@ impl GatewayEngine {
 
                 #[allow(unreachable_patterns)]
                 match default_provider.execute(fallback_request).await {
-                    Ok(ProviderResponse::ChatCompletion(output)) => Ok(output),
+                    Ok(ProviderResponse::ChatCompletion { message, usage }) => Ok((message, usage)),
                     Ok(_) => Err(WeftError::Llm(
                         "unexpected response type from default provider".to_string(),
                     )),
@@ -2058,8 +2096,8 @@ mod tests {
         WeftRequest, WireFormat,
     };
     use weft_llm::{
-        Capability, ChatCompletionOutput, Provider, ProviderError, ProviderRegistry,
-        ProviderRequest, ProviderResponse, TokenUsage,
+        Capability, Provider, ProviderError, ProviderRegistry, ProviderRequest, ProviderResponse,
+        TokenUsage,
     };
     use weft_router::{
         RouterError, RoutingCandidate, RoutingDecision, RoutingDomainKind, ScoredCandidate,
@@ -2100,13 +2138,20 @@ mod tests {
             } else {
                 guard[0].clone()
             };
-            Ok(ProviderResponse::ChatCompletion(ChatCompletionOutput {
-                text,
+            Ok(ProviderResponse::ChatCompletion {
+                message: WeftMessage {
+                    role: Role::Assistant,
+                    source: Source::Provider,
+                    model: None,
+                    content: vec![ContentPart::Text(text)],
+                    delta: false,
+                    message_index: 0,
+                },
                 usage: Some(TokenUsage {
                     prompt_tokens: 10,
                     completion_tokens: 5,
                 }),
-            }))
+            })
         }
 
         fn name(&self) -> &str {
@@ -2142,13 +2187,20 @@ mod tests {
             // Record the model from the request. Only ChatCompletion exists now;
             // when future variants land, update this to handle them.
             #[allow(irrefutable_let_patterns)]
-            if let ProviderRequest::ChatCompletion(ref input) = request {
-                *self.recorded_model.lock().unwrap() = Some(input.model.clone());
+            if let ProviderRequest::ChatCompletion { ref model, .. } = request {
+                *self.recorded_model.lock().unwrap() = Some(model.clone());
             }
-            Ok(ProviderResponse::ChatCompletion(ChatCompletionOutput {
-                text: self.response.clone(),
+            Ok(ProviderResponse::ChatCompletion {
+                message: WeftMessage {
+                    role: Role::Assistant,
+                    source: Source::Provider,
+                    model: None,
+                    content: vec![ContentPart::Text(self.response.clone())],
+                    delta: false,
+                    message_index: 0,
+                },
                 usage: None,
-            }))
+            })
         }
 
         fn name(&self) -> &str {
@@ -2925,10 +2977,17 @@ mod tests {
                 _request: ProviderRequest,
             ) -> Result<ProviderResponse, ProviderError> {
                 tokio::time::sleep(Duration::from_secs(60)).await;
-                Ok(ProviderResponse::ChatCompletion(ChatCompletionOutput {
-                    text: "never".to_string(),
+                Ok(ProviderResponse::ChatCompletion {
+                    message: WeftMessage {
+                        role: Role::Assistant,
+                        source: Source::Provider,
+                        model: None,
+                        content: vec![ContentPart::Text("never".to_string())],
+                        delta: false,
+                        message_index: 0,
+                    },
                     usage: None,
-                }))
+                })
             }
 
             fn name(&self) -> &str {
@@ -3222,15 +3281,36 @@ mod tests {
                 &self,
                 request: ProviderRequest,
             ) -> Result<ProviderResponse, ProviderError> {
-                // Only ChatCompletion exists now; allow until future variants land.
+                // Extract the system prompt from messages[0] (Role::System convention).
                 #[allow(irrefutable_let_patterns)]
-                if let ProviderRequest::ChatCompletion(ref input) = request {
-                    *self.captured.lock().unwrap() = Some(input.system_prompt.clone());
+                if let ProviderRequest::ChatCompletion { ref messages, .. } = request {
+                    let system_text = messages
+                        .first()
+                        .filter(|m| m.role == Role::System)
+                        .map(|m| {
+                            m.content
+                                .iter()
+                                .filter_map(|p| match p {
+                                    ContentPart::Text(t) => Some(t.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default();
+                    *self.captured.lock().unwrap() = Some(system_text);
                 }
-                Ok(ProviderResponse::ChatCompletion(ChatCompletionOutput {
-                    text: self.response_text.to_string(),
+                Ok(ProviderResponse::ChatCompletion {
+                    message: WeftMessage {
+                        role: Role::Assistant,
+                        source: Source::Provider,
+                        model: None,
+                        content: vec![ContentPart::Text(self.response_text.to_string())],
+                        delta: false,
+                        message_index: 0,
+                    },
                     usage: None,
-                }))
+                })
             }
 
             fn name(&self) -> &str {
@@ -3302,15 +3382,36 @@ mod tests {
                 &self,
                 request: ProviderRequest,
             ) -> Result<ProviderResponse, ProviderError> {
-                // Only ChatCompletion exists now; allow until future variants land.
+                // Extract the system prompt from messages[0] (Role::System convention).
                 #[allow(irrefutable_let_patterns)]
-                if let ProviderRequest::ChatCompletion(ref input) = request {
-                    *self.captured.lock().unwrap() = Some(input.system_prompt.clone());
+                if let ProviderRequest::ChatCompletion { ref messages, .. } = request {
+                    let system_text = messages
+                        .first()
+                        .filter(|m| m.role == Role::System)
+                        .map(|m| {
+                            m.content
+                                .iter()
+                                .filter_map(|p| match p {
+                                    ContentPart::Text(t) => Some(t.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default();
+                    *self.captured.lock().unwrap() = Some(system_text);
                 }
-                Ok(ProviderResponse::ChatCompletion(ChatCompletionOutput {
-                    text: "response".to_string(),
+                Ok(ProviderResponse::ChatCompletion {
+                    message: WeftMessage {
+                        role: Role::Assistant,
+                        source: Source::Provider,
+                        model: None,
+                        content: vec![ContentPart::Text("response".to_string())],
+                        delta: false,
+                        message_index: 0,
+                    },
                     usage: None,
-                }))
+                })
             }
 
             fn name(&self) -> &str {
@@ -3389,15 +3490,36 @@ mod tests {
                 &self,
                 request: ProviderRequest,
             ) -> Result<ProviderResponse, ProviderError> {
-                // Only ChatCompletion exists now; allow until future variants land.
+                // Extract the system prompt from messages[0] (Role::System convention).
                 #[allow(irrefutable_let_patterns)]
-                if let ProviderRequest::ChatCompletion(ref input) = request {
-                    *self.captured.lock().unwrap() = Some(input.system_prompt.clone());
+                if let ProviderRequest::ChatCompletion { ref messages, .. } = request {
+                    let system_text = messages
+                        .first()
+                        .filter(|m| m.role == Role::System)
+                        .map(|m| {
+                            m.content
+                                .iter()
+                                .filter_map(|p| match p {
+                                    ContentPart::Text(t) => Some(t.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default();
+                    *self.captured.lock().unwrap() = Some(system_text);
                 }
-                Ok(ProviderResponse::ChatCompletion(ChatCompletionOutput {
-                    text: "response".to_string(),
+                Ok(ProviderResponse::ChatCompletion {
+                    message: WeftMessage {
+                        role: Role::Assistant,
+                        source: Source::Provider,
+                        model: None,
+                        content: vec![ContentPart::Text("response".to_string())],
+                        delta: false,
+                        message_index: 0,
+                    },
                     usage: None,
-                }))
+                })
             }
 
             fn name(&self) -> &str {
@@ -6691,7 +6813,7 @@ mod tests {
     async fn test_end_to_end_uses_provider_execute_path() {
         // End-to-end: request flows through Provider::execute() and produces correct response.
         // Verifies the full path from handle_request -> run_loop -> call_with_fallback ->
-        // provider.execute(ProviderRequest::ChatCompletion) -> ChatCompletionOutput.
+        // provider.execute(ProviderRequest::ChatCompletion) -> ProviderResponse::ChatCompletion.
         let provider = MockLlmProvider::single("Hello from provider");
         let registry = single_model_registry(provider, "test-model", "claude-test");
 

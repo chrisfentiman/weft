@@ -123,7 +123,10 @@ mod tests {
     #[test]
     fn test_invalid_request_display() {
         let err = WeftError::InvalidRequest("messages must not be empty".to_string());
-        assert_eq!(err.to_string(), "invalid request: messages must not be empty");
+        assert_eq!(
+            err.to_string(),
+            "invalid request: messages must not be empty"
+        );
     }
 
     #[test]

@@ -110,10 +110,9 @@ fn is_valid_source_for_content(source: Source, part: &ContentPart) -> bool {
         | ContentPart::Document(_) => true,
 
         // Command calls: only LLM sources
-        ContentPart::CommandCall(_) => matches!(
-            source,
-            Source::Provider | Source::Member | Source::Judge
-        ),
+        ContentPart::CommandCall(_) => {
+            matches!(source, Source::Provider | Source::Member | Source::Judge)
+        }
 
         // Activity: only gateway
         ContentPart::Routing(_) | ContentPart::Hook(_) | ContentPart::CouncilStart(_) => {
@@ -574,10 +573,7 @@ impl TryFrom<proto::ChatRequest> for WeftRequest {
 
         let routing = ModelRoutingInstruction::parse(&req.model);
 
-        let options = req
-            .options
-            .map(SamplingOptions::from)
-            .unwrap_or_default();
+        let options = req.options.map(SamplingOptions::from).unwrap_or_default();
 
         Ok(WeftRequest {
             messages: messages?,
@@ -629,7 +625,11 @@ impl From<proto::SamplingOptions> for SamplingOptions {
             } else {
                 Some(opts.presence_penalty)
             },
-            seed: if opts.seed == 0 { None } else { Some(opts.seed) },
+            seed: if opts.seed == 0 {
+                None
+            } else {
+                Some(opts.seed)
+            },
             response_format,
             activity: opts.activity,
         }
@@ -669,9 +669,9 @@ impl From<WeftResponse> for proto::ChatResponse {
 mod tests {
     use super::*;
     use crate::message::{
-        CommandCallContent, CommandResultContent, DocumentContent, HookActivity, MediaContent,
-        MediaSource, MemoryResultContent, MemoryResultEntry, MemoryStoredContent, RoutingActivity,
-        CouncilStartActivity,
+        CommandCallContent, CommandResultContent, CouncilStartActivity, DocumentContent,
+        HookActivity, MediaContent, MediaSource, MemoryResultContent, MemoryResultEntry,
+        MemoryStoredContent, RoutingActivity,
     };
 
     // ── Helpers ────────────────────────────────────────────────────────────
@@ -1038,9 +1038,7 @@ mod tests {
         assert_eq!(err.message_source, Source::Client);
         assert_eq!(err.content_index, 0);
         assert_eq!(err.content_type, "CommandCall");
-        assert!(err
-            .allowed_sources
-            .contains(&Source::Provider));
+        assert!(err.allowed_sources.contains(&Source::Provider));
     }
 
     // ── Request validation ────────────────────────────────────────────────
@@ -1637,10 +1635,7 @@ mod tests {
         let weft_req = WeftRequest::try_from(proto_req).unwrap();
         assert_eq!(weft_req.messages.len(), 1);
         assert_eq!(weft_req.routing.raw, "auto");
-        assert_eq!(
-            weft_req.routing.mode,
-            crate::routing::RoutingMode::Auto
-        );
+        assert_eq!(weft_req.routing.mode, crate::routing::RoutingMode::Auto);
     }
 
     #[test]
