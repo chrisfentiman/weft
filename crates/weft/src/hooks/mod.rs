@@ -63,8 +63,6 @@ pub(crate) struct RegisteredHook {
     /// Optional compiled matcher.
     pub matcher: HookMatcher,
     /// The hook executor (Rhai, HTTP, or future Weft).
-    /// Used in Phase 4 when hooks are wired into the engine request loop.
-    #[allow(dead_code)]
     pub executor: Box<dyn HookExecutor>,
     /// Display name for logging (derived from config: script path for Rhai, URL for HTTP).
     pub name: String,
@@ -85,10 +83,9 @@ impl std::fmt::Debug for RegisteredHook {
 
 /// Result of running a hook chain.
 ///
-/// Consumed by the engine in Phase 4 to determine whether to block or
+/// Consumed by the engine to determine whether to block or
 /// pass the modified payload to the next stage.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) enum HookChainResult {
     /// All hooks allowed (or no hooks registered for this event).
     /// Contains the final payload (possibly modified by Modify hooks)
@@ -107,8 +104,7 @@ pub(crate) enum HookChainResult {
 /// Shared via `Arc` (all fields are `Send + Sync`).
 pub(crate) struct HookRegistry {
     /// Hooks indexed by event type, in priority-sorted order.
-    /// Read in Phase 4 by `run_chain` during the engine request loop.
-    #[allow(dead_code)]
+    /// Read by `run_chain` during the engine request loop.
     hooks: HashMap<HookEvent, Vec<RegisteredHook>>,
 }
 
@@ -193,10 +189,9 @@ impl HookRegistry {
 
     /// Construct an empty registry (no hooks configured).
     ///
-    /// Used when `WeftConfig::hooks` is empty. No allocations at request time —
-    /// `run_chain` returns `Allowed` immediately when no hooks are registered.
-    // Used in engine test helpers and future phase wiring.
-    #[allow(dead_code)]
+    /// Used in tests where no hook behavior is needed. No allocations at request
+    /// time — `run_chain` returns `Allowed` immediately when no hooks are registered.
+    #[cfg(test)]
     pub(crate) fn empty() -> Self {
         Self {
             hooks: HashMap::new(),
@@ -212,8 +207,6 @@ impl HookRegistry {
         Self { hooks }
     }
 
-    // Used in Phase 4 when hooks are wired into the engine request loop.
-    #[allow(dead_code)]
     /// Run all hooks for the given event, in priority order.
     ///
     /// Returns the final payload (possibly modified) and whether the chain was blocked.
@@ -339,8 +332,6 @@ impl HookRegistry {
 }
 
 /// Truncate a string to at most `max_bytes` bytes, preserving UTF-8 boundaries.
-// Used by run_chain for context accumulation (Phase 1 infrastructure; called in Phase 4).
-#[allow(dead_code)]
 fn truncate_bytes(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
@@ -356,8 +347,6 @@ fn truncate_bytes(s: &str, max_bytes: usize) -> String {
 }
 
 /// Truncate a string to at most `max_bytes` bytes, appending `suffix` if truncated.
-// Used by run_chain for total context cap (Phase 1 infrastructure; called in Phase 4).
-#[allow(dead_code)]
 fn truncate_bytes_with_suffix(s: &str, max_bytes: usize, suffix: &str) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
