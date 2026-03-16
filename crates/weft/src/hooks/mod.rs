@@ -455,6 +455,75 @@ mod tests {
     }
 
     #[test]
+    fn test_from_config_rhai_hook_with_valid_script_registered() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"fn hook(e) { #{ decision: \"allow\" } }")
+            .unwrap();
+        let config = vec![HookConfig {
+            event: HookEvent::PreToolUse,
+            matcher: None,
+            hook_type: HookType::Rhai,
+            script: Some(f.path().to_str().unwrap().to_string()),
+            url: None,
+            agent: None,
+            timeout_ms: None,
+            secret: None,
+            priority: 100,
+        }];
+        let registry = HookRegistry::from_config(&config, test_http_client()).unwrap();
+        assert_eq!(registry.hook_count(HookEvent::PreToolUse), 1);
+    }
+
+    #[test]
+    fn test_from_config_rhai_hook_with_syntax_error_fails() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"fn hook(e) { let x = ; }").unwrap(); // syntax error
+        let config = vec![HookConfig {
+            event: HookEvent::PreToolUse,
+            matcher: None,
+            hook_type: HookType::Rhai,
+            script: Some(f.path().to_str().unwrap().to_string()),
+            url: None,
+            agent: None,
+            timeout_ms: None,
+            secret: None,
+            priority: 100,
+        }];
+        let result = HookRegistry::from_config(&config, test_http_client());
+        assert!(result.is_err(), "syntax error should fail construction");
+    }
+
+    #[tokio::test]
+    async fn test_rhai_hook_executes_via_run_chain() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"fn hook(e) { #{ decision: \"block\", reason: \"blocked by rhai\" } }")
+            .unwrap();
+        let config = vec![HookConfig {
+            event: HookEvent::RequestStart,
+            matcher: None,
+            hook_type: HookType::Rhai,
+            script: Some(f.path().to_str().unwrap().to_string()),
+            url: None,
+            agent: None,
+            timeout_ms: None,
+            secret: None,
+            priority: 100,
+        }];
+        let registry = HookRegistry::from_config(&config, test_http_client()).unwrap();
+        let payload = serde_json::json!({"messages": []});
+        let result = registry
+            .run_chain(HookEvent::RequestStart, payload, None)
+            .await;
+        assert!(matches!(
+            result,
+            HookChainResult::Blocked { reason, .. } if reason == "blocked by rhai"
+        ));
+    }
+
+    #[test]
     fn test_from_config_http_hook_registered() {
         let config = vec![HookConfig {
             event: HookEvent::PreToolUse,
