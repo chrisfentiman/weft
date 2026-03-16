@@ -261,6 +261,7 @@ mod tests {
         http::{Request, StatusCode},
     };
     use serde_json::{Value, json};
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tower::ServiceExt;
     use weft_commands::{CommandError, CommandRegistry};
@@ -269,7 +270,9 @@ mod tests {
         DomainsConfig, GatewayConfig, LlmProviderKind, Message, ModelEntry, ProviderConfig,
         RouterConfig, ServerConfig, WeftConfig,
     };
-    use weft_llm::{CompletionOptions, CompletionResponse, LlmError, LlmProvider};
+    use weft_llm::{
+        CompletionOptions, CompletionResponse, LlmError, LlmProvider, ProviderRegistry,
+    };
     use weft_router::{
         RouterError, RoutingCandidate, RoutingDecision, RoutingDomainKind, SemanticRouter,
     };
@@ -418,10 +421,28 @@ mod tests {
         })
     }
 
+    fn make_registry(llm: impl LlmProvider + 'static) -> Arc<ProviderRegistry> {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "test-model".to_string(),
+            Arc::new(llm) as Arc<dyn LlmProvider>,
+        );
+        let mut model_ids = HashMap::new();
+        model_ids.insert("test-model".to_string(), "claude-test".to_string());
+        let mut max_tokens = HashMap::new();
+        max_tokens.insert("test-model".to_string(), 1024u32);
+        Arc::new(ProviderRegistry::new(
+            providers,
+            model_ids,
+            max_tokens,
+            "test-model".to_string(),
+        ))
+    }
+
     fn make_router(llm: impl LlmProvider + 'static) -> Router {
         let engine = GatewayEngine::new(
             test_config(),
-            Arc::new(llm),
+            make_registry(llm),
             Arc::new(MockRouter),
             Arc::new(MockRegistry),
         );
@@ -573,7 +594,7 @@ mod tests {
     async fn test_health_endpoint_returns_200() {
         let engine = GatewayEngine::new(
             test_config(),
-            Arc::new(MockLlmProvider::ok("irrelevant")),
+            make_registry(MockLlmProvider::ok("irrelevant")),
             Arc::new(MockRouter),
             Arc::new(MockRegistry),
         );

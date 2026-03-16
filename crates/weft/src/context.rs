@@ -39,7 +39,7 @@ Rules:
 - Text outside of slash commands is your response to the user.
 - Wait for command results before drawing conclusions from them."#;
 
-/// Assemble the full system prompt.
+/// Assemble the full system prompt with command stubs injected as a TOON fenced block.
 ///
 /// Order: foundational prompt (with fenced TOON command stubs) + agent system prompt.
 ///
@@ -69,6 +69,19 @@ pub fn assemble_system_prompt(
     } else {
         format!("{foundational}\n\n{agent_system_prompt}")
     }
+}
+
+/// Assemble a system prompt without command injection.
+///
+/// Used when the semantic router determines tools are not needed for this turn
+/// (`tools_needed = Some(false)` and `skip_tools_when_unnecessary = true`).
+/// The system prompt is just the agent system prompt — no foundational command
+/// instructions, no TOON block.
+///
+/// If the LLM emits slash commands anyway, the parser runs with an empty known-
+/// commands set and treats them as prose (spec Section 6.4).
+pub fn assemble_system_prompt_no_tools(agent_system_prompt: &str) -> String {
+    agent_system_prompt.to_string()
 }
 
 /// Format command results as TOON for injection back into the conversation.
@@ -213,6 +226,34 @@ mod tests {
         let prompt = assemble_system_prompt(&stubs, "");
         // Rows in TOON array syntax are 2-space indented
         assert!(prompt.contains("  web_search, Search the web"));
+    }
+
+    // ── assemble_system_prompt_no_tools ───────────────────────────────────
+
+    #[test]
+    fn test_no_tools_prompt_contains_only_agent_prompt() {
+        let prompt = assemble_system_prompt_no_tools("You are a helpful assistant.");
+        assert_eq!(prompt, "You are a helpful assistant.");
+    }
+
+    #[test]
+    fn test_no_tools_prompt_has_no_toon_blocks() {
+        let prompt = assemble_system_prompt_no_tools("Answer without tools.");
+        assert!(!prompt.contains("```toon"), "must not contain TOON blocks");
+        assert!(
+            !prompt.contains("commands["),
+            "must not contain command stubs"
+        );
+        assert!(
+            !prompt.contains("You have access to commands"),
+            "must not contain foundational prompt"
+        );
+    }
+
+    #[test]
+    fn test_no_tools_prompt_empty_agent() {
+        let prompt = assemble_system_prompt_no_tools("");
+        assert_eq!(prompt, "");
     }
 
     // ── format_command_results_toon ────────────────────────────────────────

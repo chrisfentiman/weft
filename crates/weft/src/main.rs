@@ -7,17 +7,18 @@ mod context;
 mod engine;
 mod server;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
 use std::path::PathBuf;
-use tracing::info;
+use tracing::{info, warn};
 use weft_commands::{GrpcToolRegistryClient, ToolRegistryCommandAdapter};
 use weft_core::{LlmProviderKind, WeftConfig};
-use weft_llm::{AnthropicProvider, OpenAIProvider};
-use weft_router::ModernBertRouter;
+use weft_llm::{AnthropicProvider, OpenAIProvider, ProviderRegistry};
+use weft_router::{ModernBertRouter, RoutingCandidate, RoutingDomainKind};
 
-use crate::engine::GatewayEngine;
+use crate::engine::{GatewayEngine, tool_necessity_candidates};
 use crate::server::build_router;
 
 /// Weft — AI orchestration gateway
@@ -75,50 +76,189 @@ async fn main() {
 
     info!(path = %cli.config.display(), "configuration loaded");
 
-    let default_model = config.router.effective_default_model();
+    // ── Startup log: providers and models (spec Section 12) ───────────────
+
     let provider_count = config.router.providers.len();
     let model_count: usize = config.router.providers.iter().map(|p| p.models.len()).sum();
+    let default_model = config.router.effective_default_model().to_string();
+
+    // Find the provider name for the default model.
+    let default_provider_name = config
+        .router
+        .providers
+        .iter()
+        .find(|p| p.models.iter().any(|m| m.name == default_model))
+        .map(|p| p.name.as_str())
+        .unwrap_or("unknown");
+
     info!(
         providers = provider_count,
         models = model_count,
         default_model = %default_model,
+        default_provider = %default_provider_name,
         "router configured"
     );
 
+    // Log which routing domains are enabled.
+    let tool_skipping = config.router.skip_tools_when_unnecessary;
+    let model_domain_threshold = config
+        .router
+        .domains
+        .model
+        .as_ref()
+        .and_then(|d| d.threshold);
+    let tool_domain_enabled = config
+        .router
+        .domains
+        .tool_necessity
+        .as_ref()
+        .map(|d| d.enabled)
+        .unwrap_or(true);
+
+    info!(
+        commands_domain = true,
+        model_domain = (model_count > 1),
+        tool_necessity_domain = (tool_skipping && tool_domain_enabled),
+        memory_domain = false,
+        model_domain_threshold = ?model_domain_threshold,
+        tool_skipping_active = tool_skipping,
+        "routing domains configured"
+    );
+
+    // Warn about models with fewer than 3 examples (spec Section 11.9).
+    for provider in &config.router.providers {
+        for model in &provider.models {
+            if model.examples.len() < 3 {
+                warn!(
+                    model = %model.name,
+                    provider = %provider.name,
+                    examples = model.examples.len(),
+                    "model has fewer than 3 examples — centroid quality may be poor (minimum 3 recommended)"
+                );
+            }
+            info!(
+                model = %model.name,
+                provider = %provider.name,
+                examples = model.examples.len(),
+                "model registered"
+            );
+        }
+    }
+
     let config = Arc::new(config);
 
-    // ── Construct LLM provider ─────────────────────────────────────────────
+    // ── Build ProviderRegistry ─────────────────────────────────────────────
     //
-    // Phase 1: single provider from the first provider entry.
-    // Phase 4 replaces this with ProviderRegistry.
+    // One `LlmProvider` instance per `ProviderConfig`. Multiple model entries
+    // under the same provider share the same `Arc<dyn LlmProvider>`.
+    //
+    // Build a map from provider name -> Arc<dyn LlmProvider> first, then
+    // iterate resolved models to build the registry maps.
 
-    let first_provider = &config.router.providers[0];
-    let llm_provider: Arc<dyn weft_llm::LlmProvider> = match &first_provider.kind {
-        LlmProviderKind::Anthropic => Arc::new(AnthropicProvider::new(
-            first_provider.api_key.clone(),
-            first_provider.base_url.clone(),
-        )),
-        LlmProviderKind::OpenAI => Arc::new(OpenAIProvider::new(
-            first_provider.api_key.clone(),
-            first_provider.base_url.clone(),
-        )),
-    };
+    let resolved_models = config.router.resolve_models();
+
+    // One provider instance per unique provider name.
+    let mut provider_instances: HashMap<String, Arc<dyn weft_llm::LlmProvider>> = HashMap::new();
+    for provider_config in &config.router.providers {
+        let instance: Arc<dyn weft_llm::LlmProvider> = match &provider_config.kind {
+            LlmProviderKind::Anthropic => Arc::new(AnthropicProvider::new(
+                provider_config.api_key.clone(),
+                provider_config.base_url.clone(),
+            )),
+            LlmProviderKind::OpenAI => Arc::new(OpenAIProvider::new(
+                provider_config.api_key.clone(),
+                provider_config.base_url.clone(),
+            )),
+        };
+        provider_instances.insert(provider_config.name.clone(), instance);
+    }
+
+    // Build registry maps: model routing name -> provider/model_id/max_tokens.
+    let mut registry_providers: HashMap<String, Arc<dyn weft_llm::LlmProvider>> = HashMap::new();
+    let mut registry_model_ids: HashMap<String, String> = HashMap::new();
+    let mut registry_max_tokens: HashMap<String, u32> = HashMap::new();
+
+    for resolved in &resolved_models {
+        let provider_arc = provider_instances
+            .get(&resolved.provider_name)
+            .expect("provider instance must exist for resolved model")
+            .clone();
+        registry_providers.insert(resolved.name.clone(), provider_arc);
+        registry_model_ids.insert(resolved.name.clone(), resolved.model.clone());
+        registry_max_tokens.insert(resolved.name.clone(), resolved.max_tokens);
+    }
+
+    let provider_registry = Arc::new(ProviderRegistry::new(
+        registry_providers,
+        registry_model_ids,
+        registry_max_tokens,
+        default_model.clone(),
+    ));
+
+    // ── Build pre-embed candidates for the router ──────────────────────────
+    //
+    // Pre-embed model candidates and tool-necessity candidates at startup.
+    // Command candidates are embedded lazily (they come from a remote registry).
+
+    let model_candidates: Vec<RoutingCandidate> = resolved_models
+        .iter()
+        .map(|m| RoutingCandidate {
+            id: m.name.clone(),
+            examples: m.examples.clone(),
+        })
+        .collect();
+
+    let tool_candidates = tool_necessity_candidates();
+
+    let mut pre_embed: Vec<(RoutingDomainKind, Vec<RoutingCandidate>)> = Vec::new();
+
+    // Only pre-embed model candidates if there are multiple models to route between.
+    if model_candidates.len() > 1 {
+        pre_embed.push((RoutingDomainKind::Model, model_candidates));
+    }
+
+    // Pre-embed tool-necessity candidates if tool-skipping is enabled.
+    if config.router.skip_tools_when_unnecessary {
+        pre_embed.push((RoutingDomainKind::ToolNecessity, tool_candidates));
+    }
+
+    // ── Build domain thresholds from config ───────────────────────────────
+
+    let mut domain_thresholds: HashMap<RoutingDomainKind, f32> = HashMap::new();
+
+    if let Some(model_domain) = &config.router.domains.model
+        && let Some(t) = model_domain.threshold
+    {
+        domain_thresholds.insert(RoutingDomainKind::Model, t);
+    }
+    if let Some(tool_domain) = &config.router.domains.tool_necessity
+        && let Some(t) = tool_domain.threshold
+    {
+        domain_thresholds.insert(RoutingDomainKind::ToolNecessity, t);
+    }
+    if let Some(mem_domain) = &config.router.domains.memory
+        && let Some(t) = mem_domain.threshold
+    {
+        domain_thresholds.insert(RoutingDomainKind::Memory, t);
+    }
 
     // ── Construct semantic router ──────────────────────────────────────────
     //
-    // `ModernBertRouter::new` is infallible — it falls back to passthrough mode
+    // `ModernBertRouter::new` is infallible — falls back to passthrough mode
     // if the model or tokenizer can't be loaded, logging a warning internally.
 
     let router: Arc<dyn weft_router::SemanticRouter> = {
         let r = ModernBertRouter::new(
             &config.router.classifier.model_path,
             &config.router.classifier.tokenizer_path,
-            &[], // No pre-embedding at startup — candidates are embedded lazily per-request
-            std::collections::HashMap::new(), // Phase 4 wires domain thresholds from config
+            &pre_embed,
+            domain_thresholds,
         )
         .await;
         info!(
             model_path = %config.router.classifier.model_path,
+            threshold = config.router.classifier.threshold,
+            max_commands = config.router.classifier.max_commands,
             "semantic router initialized"
         );
         Arc::new(r)
@@ -145,7 +285,12 @@ async fn main() {
 
     // ── Wire the gateway engine ────────────────────────────────────────────
 
-    let engine = GatewayEngine::new(Arc::clone(&config), llm_provider, router, command_registry);
+    let engine = GatewayEngine::new(
+        Arc::clone(&config),
+        provider_registry,
+        router,
+        command_registry,
+    );
 
     // ── Start the HTTP server ──────────────────────────────────────────────
 

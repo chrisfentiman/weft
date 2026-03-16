@@ -1,8 +1,23 @@
 //! Gateway engine: the core loop that wires all components together.
 //!
-//! The engine classifies commands, assembles context, calls the LLM, parses
-//! commands from the response, executes them, and loops until no more commands
-//! are emitted or the iteration cap or timeout is reached.
+//! The engine routes requests semantically, assembles context, calls the LLM,
+//! parses commands from the response, executes them, and loops until no more
+//! commands are emitted or the iteration cap or timeout is reached.
+//!
+//! ## Request flow
+//!
+//! 1. Extract user message from the latest user turn.
+//! 2. List all commands from the registry.
+//! 3. Build routing domains (Commands, Model, ToolNecessity).
+//! 4. Call `router.route()` → `RoutingDecision`.
+//! 5. Apply threshold + max_commands filtering to the commands domain result.
+//! 6. Check `tools_needed`: if `Some(false)` and `skip_tools_when_unnecessary`,
+//!    skip command injection entirely.
+//! 7. Select the model from the routing decision (fallback to default if None).
+//! 8. Assemble the system prompt.
+//! 9. Call the selected provider. On non-rate-limit failure, retry with the
+//!    default provider. Rate-limit errors propagate immediately.
+//! 10. Parse response, execute commands, loop.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -14,13 +29,15 @@ use weft_core::{
     ChatCompletionRequest, ChatCompletionResponse, Choice, CommandResult, CommandStub, Message,
     Role, Usage, WeftConfig, WeftError,
 };
-use weft_llm::{CompletionOptions, LlmProvider};
+use weft_llm::{CompletionOptions, LlmError, LlmProvider, ProviderRegistry};
 use weft_router::{
     RoutingCandidate, RoutingDomainKind, ScoredCandidate, SemanticRouter, filter_by_threshold,
     take_top,
 };
 
-use crate::context::{assemble_system_prompt, format_command_results_toon};
+use crate::context::{
+    assemble_system_prompt, assemble_system_prompt_no_tools, format_command_results_toon,
+};
 
 /// The gateway engine: holds shared components and drives the request loop.
 ///
@@ -29,7 +46,7 @@ use crate::context::{assemble_system_prompt, format_command_results_toon};
 #[derive(Clone)]
 pub struct GatewayEngine {
     config: Arc<WeftConfig>,
-    llm_provider: Arc<dyn LlmProvider>,
+    provider_registry: Arc<ProviderRegistry>,
     router: Arc<dyn SemanticRouter>,
     command_registry: Arc<dyn CommandRegistry>,
 }
@@ -43,13 +60,13 @@ impl GatewayEngine {
     /// Construct a new gateway engine.
     pub fn new(
         config: Arc<WeftConfig>,
-        llm_provider: Arc<dyn LlmProvider>,
+        provider_registry: Arc<ProviderRegistry>,
         router: Arc<dyn SemanticRouter>,
         command_registry: Arc<dyn CommandRegistry>,
     ) -> Self {
         Self {
             config,
-            llm_provider,
+            provider_registry,
             router,
             command_registry,
         }
@@ -91,27 +108,54 @@ impl GatewayEngine {
         // Extract the latest user message for semantic routing.
         let user_message = extract_latest_user_message(&request.messages)?;
 
-        // Semantic routing: filter commands relevant to this request.
-        // Phase 1: Commands-only domain. Full multi-domain routing in Phase 4.
-        let selected_commands = self.route_and_filter(user_message, &all_commands).await;
+        // Build all routing domains and call the router once.
+        let routing_result = self.route_all_domains(user_message, &all_commands).await;
 
-        // Assemble the system prompt with foundational + TOON stubs + agent prompt.
-        let system_prompt =
-            assemble_system_prompt(&selected_commands, &self.config.gateway.system_prompt);
+        // Unpack the routing result.
+        let (selected_commands, inject_tools, selected_model_name) = routing_result;
+
+        debug!(
+            model = %selected_model_name,
+            inject_tools = inject_tools,
+            selected_commands = selected_commands.len(),
+            "routing decision applied"
+        );
+
+        // Look up the provider and model_id for the selected model.
+        let provider = self.provider_registry.get(&selected_model_name);
+        let model_id = self
+            .provider_registry
+            .model_id(&selected_model_name)
+            .map(String::from);
+        let max_tokens = self
+            .provider_registry
+            .max_tokens_for(&selected_model_name)
+            .or(request.max_tokens);
+
+        // Assemble the system prompt (with or without commands).
+        let system_prompt = if inject_tools {
+            assemble_system_prompt(&selected_commands, &self.config.gateway.system_prompt)
+        } else {
+            assemble_system_prompt_no_tools(&self.config.gateway.system_prompt)
+        };
 
         // Build the initial message list (clone from request).
         let mut messages = request.messages.clone();
 
         let options = CompletionOptions {
-            max_tokens: request.max_tokens,
+            max_tokens,
             temperature: request.temperature,
-            // Phase 1: model field not yet wired — engine.rs uses a single provider.
-            // Full provider registry integration in Phase 4.
-            model: None,
+            model: model_id.clone(),
         };
 
         // Build the set of known command names for the parser.
-        let known_commands: HashSet<String> = all_commands.iter().map(|c| c.name.clone()).collect();
+        // If tool skipping is active, use an empty set so any stray slash commands
+        // in the LLM response are treated as prose (spec Section 6.4).
+        let known_commands: HashSet<String> = if inject_tools {
+            all_commands.iter().map(|c| c.name.clone()).collect()
+        } else {
+            HashSet::new()
+        };
 
         let max_iterations = self.config.gateway.max_command_iterations;
         let mut iterations = 0u32;
@@ -123,26 +167,21 @@ impl GatewayEngine {
                 });
             }
 
-            // Call the LLM.
+            // Call the selected LLM provider, with fallback to default on non-rate-limit error.
             let completion = self
-                .llm_provider
-                .complete(&system_prompt, &messages, &options)
-                .await
-                .map_err(|e| {
-                    use weft_llm::LlmError;
-                    match &e {
-                        // Map rate-limit to a typed WeftError variant.
-                        LlmError::RateLimited { retry_after_ms } => WeftError::RateLimited {
-                            retry_after_ms: *retry_after_ms,
-                        },
-                        _ => WeftError::Llm(e.to_string()),
-                    }
-                })?;
+                .call_with_fallback(
+                    provider.clone(),
+                    &selected_model_name,
+                    &system_prompt,
+                    &messages,
+                    &options,
+                    request.temperature,
+                )
+                .await?;
 
             // Parse the response for slash commands.
             let parsed = parse_response(&completion.text, &known_commands);
 
-            // Collect any parse-error results alongside invocation results.
             if parsed.invocations.is_empty() && parsed.parse_errors.is_empty() {
                 // No commands — we're done. Return the clean text.
                 return Ok(build_response(
@@ -192,19 +231,74 @@ impl GatewayEngine {
         }
     }
 
-    /// Route commands relevant to the user message and apply threshold + max filtering.
+    /// Call the LLM provider, falling back to the default provider on non-rate-limit failure.
     ///
-    /// On router failure, falls back to all commands (fallback behavior).
-    async fn route_and_filter(
+    /// Fallback rules (spec Section 6.3):
+    /// - `RateLimited`: always propagate immediately, no retry.
+    /// - Any other error from a non-default model: retry with the default provider.
+    /// - Any other error from the default model (or after fallback retry fails): propagate.
+    async fn call_with_fallback(
+        &self,
+        provider: Arc<dyn LlmProvider>,
+        selected_model_name: &str,
+        system_prompt: &str,
+        messages: &[Message],
+        options: &CompletionOptions,
+        temperature: Option<f32>,
+    ) -> Result<weft_llm::CompletionResponse, WeftError> {
+        match provider.complete(system_prompt, messages, options).await {
+            Ok(response) => Ok(response),
+            Err(LlmError::RateLimited { retry_after_ms }) => {
+                // Rate limit: propagate immediately, no fallback.
+                Err(WeftError::RateLimited { retry_after_ms })
+            }
+            Err(e) if selected_model_name != self.provider_registry.default_name() => {
+                // Non-default model failed with a non-rate-limit error: try the default.
+                warn!(
+                    model = selected_model_name,
+                    error = %e,
+                    "model failed, falling back to default"
+                );
+                let default_name = self.provider_registry.default_name();
+                let default_provider = self.provider_registry.default_provider();
+                let default_options = CompletionOptions {
+                    model: self
+                        .provider_registry
+                        .model_id(default_name)
+                        .map(String::from),
+                    max_tokens: self.provider_registry.max_tokens_for(default_name),
+                    temperature,
+                };
+                default_provider
+                    .complete(system_prompt, messages, &default_options)
+                    .await
+                    .map_err(|e| WeftError::Llm(e.to_string()))
+            }
+            Err(e) => {
+                // Default model failed (or selected was already default): propagate.
+                Err(WeftError::Llm(e.to_string()))
+            }
+        }
+    }
+
+    /// Route all domains (Commands, Model, ToolNecessity) in a single router call.
+    ///
+    /// Returns `(selected_commands, inject_tools, selected_model_name)`.
+    ///
+    /// On router failure, falls back to: all commands (capped by max_commands),
+    /// `inject_tools = true` (conservative), and the default model.
+    async fn route_all_domains(
         &self,
         user_message: &str,
         all_commands: &[CommandStub],
-    ) -> Vec<CommandStub> {
+    ) -> (Vec<CommandStub>, bool, String) {
         let threshold = self.config.router.classifier.threshold;
         let max_commands = self.config.router.classifier.max_commands;
+        let skip_tools_when_unnecessary = self.config.router.skip_tools_when_unnecessary;
+        let default_model = self.provider_registry.default_name().to_string();
 
         // Build the Commands domain candidates: each command as "{name}: {description}".
-        let candidates: Vec<RoutingCandidate> = all_commands
+        let command_candidates: Vec<RoutingCandidate> = all_commands
             .iter()
             .map(|cmd| RoutingCandidate {
                 id: cmd.name.clone(),
@@ -212,57 +306,145 @@ impl GatewayEngine {
             })
             .collect();
 
-        let domains = vec![(RoutingDomainKind::Commands, candidates)];
+        // Build all routing domains.
+        let mut domains = vec![(RoutingDomainKind::Commands, command_candidates)];
+
+        // Model domain: only include if there are multiple models to route between.
+        // With a single model there is nothing to route; skip for efficiency.
+        let total_models: usize = self
+            .config
+            .router
+            .providers
+            .iter()
+            .map(|p| p.models.len())
+            .sum();
+        if total_models > 1 {
+            let model_candidates = build_model_candidates(&self.config);
+            if !model_candidates.is_empty() {
+                domains.push((RoutingDomainKind::Model, model_candidates));
+            }
+        }
+
+        // ToolNecessity domain: include if tool-skipping is enabled in config.
+        if skip_tools_when_unnecessary {
+            domains.push((
+                RoutingDomainKind::ToolNecessity,
+                tool_necessity_candidates(),
+            ));
+        }
 
         let decision = self.router.route(user_message, &domains).await;
 
         match decision {
             Ok(routing_decision) => {
+                // ── Commands ──────────────────────────────────────────────
                 let scored = routing_decision.commands;
-
-                // Filter by threshold, then take top N.
                 let filtered = filter_by_threshold(scored, threshold);
                 let top: Vec<ScoredCandidate> = take_top(filtered, max_commands);
 
-                // Convert back to CommandStub by matching names.
                 let score_map: std::collections::HashMap<&str, f32> =
                     top.iter().map(|r| (r.id.as_str(), r.score)).collect();
 
-                let mut selected: Vec<CommandStub> = all_commands
+                let mut selected_commands: Vec<CommandStub> = all_commands
                     .iter()
                     .filter(|cmd| score_map.contains_key(cmd.name.as_str()))
                     .cloned()
                     .collect();
 
-                // Preserve the top-score ordering from `take_top`.
-                selected.sort_by(|a, b| {
+                // Preserve top-score ordering from `take_top`.
+                selected_commands.sort_by(|a, b| {
                     let sa = score_map.get(a.name.as_str()).copied().unwrap_or(0.0);
                     let sb = score_map.get(b.name.as_str()).copied().unwrap_or(0.0);
                     sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
                 });
 
-                debug!(
-                    selected_count = selected.len(),
-                    total_count = all_commands.len(),
-                    "semantic router selected commands"
+                // ── Tool necessity ────────────────────────────────────────
+                // Only skip tools when explicitly told not to need them AND the
+                // config allows it. Conservative default: inject tools.
+                let inject_tools = !matches!(
+                    routing_decision.tools_needed,
+                    Some(false) if skip_tools_when_unnecessary
                 );
 
-                selected
+                // ── Model selection ───────────────────────────────────────
+                let selected_model_name = routing_decision
+                    .model
+                    .as_ref()
+                    .map(|m| m.id.clone())
+                    .unwrap_or_else(|| default_model.clone());
+
+                debug!(
+                    selected_commands = selected_commands.len(),
+                    total_commands = all_commands.len(),
+                    inject_tools = inject_tools,
+                    model = %selected_model_name,
+                    "semantic router decision"
+                );
+
+                (selected_commands, inject_tools, selected_model_name)
             }
             Err(e) => {
-                // Router failure: fall back to all commands, sorted alphabetically.
+                // Router failure: conservative fallback (spec Section 8.1).
                 warn!(
                     error = %e,
-                    "semantic router failed, falling back to all commands"
+                    "semantic router failed, using fallback: all commands, inject tools, default model"
                 );
 
                 let mut fallback: Vec<CommandStub> =
                     all_commands.iter().take(max_commands).cloned().collect();
                 fallback.sort_by(|a, b| a.name.cmp(&b.name));
-                fallback
+
+                (fallback, true, default_model)
             }
         }
     }
+}
+
+/// Build the Model domain routing candidates from config.
+///
+/// Each `ModelEntry` in all providers becomes a `RoutingCandidate` with
+/// the model routing name as `id` and its examples array.
+fn build_model_candidates(config: &WeftConfig) -> Vec<RoutingCandidate> {
+    config
+        .router
+        .providers
+        .iter()
+        .flat_map(|p| {
+            p.models.iter().map(|m| RoutingCandidate {
+                id: m.name.clone(),
+                examples: m.examples.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Static ToolNecessity candidates.
+///
+/// These examples are tunable defaults. They are hardcoded in one place for
+/// easy modification without changing multiple callsites.
+pub fn tool_necessity_candidates() -> Vec<RoutingCandidate> {
+    vec![
+        RoutingCandidate {
+            id: "needs_tools".to_string(),
+            examples: vec![
+                "Search the web for the latest news about Rust".to_string(),
+                "Look up the current stock price of Apple".to_string(),
+                "Run this code and show me the output".to_string(),
+                "Find documents about our Q3 strategy".to_string(),
+                "Execute a database query for user counts".to_string(),
+            ],
+        },
+        RoutingCandidate {
+            id: "no_tools".to_string(),
+            examples: vec![
+                "What is the capital of France?".to_string(),
+                "Explain how async/await works in Rust".to_string(),
+                "Write a poem about the ocean".to_string(),
+                "What do you think about functional programming?".to_string(),
+                "Hello, how are you today?".to_string(),
+            ],
+        },
+    ]
 }
 
 /// Extract the text of the last user message from the conversation.
@@ -320,16 +502,20 @@ fn build_response(
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use weft_commands::{CommandError, CommandRegistry};
     use weft_core::{
         ClassifierConfig, CommandAction, CommandDescription, CommandInvocation, CommandResult,
-        CommandStub, GatewayConfig, LlmProviderKind, Message, ModelEntry, ProviderConfig, Role,
-        RouterConfig, ServerConfig, WeftConfig,
+        CommandStub, DomainsConfig, GatewayConfig, LlmProviderKind, Message, ModelEntry,
+        ProviderConfig, Role, RouterConfig, ServerConfig, WeftConfig,
     };
-    use weft_llm::{CompletionOptions, CompletionResponse, LlmError, LlmProvider};
+    use weft_llm::{
+        CompletionOptions, CompletionResponse, LlmError, LlmProvider, ProviderRegistry,
+    };
     use weft_router::{
-        RouterError, RoutingCandidate, RoutingDecision, RoutingDomainKind, SemanticRouter,
+        RouterError, RoutingCandidate, RoutingDecision, RoutingDomainKind, ScoredCandidate,
+        SemanticRouter,
     };
 
     // ── Mock implementations ───────────────────────────────────────────────
@@ -378,6 +564,41 @@ mod tests {
         }
     }
 
+    /// An LLM that records which model was requested and returns a fixed response.
+    struct RecordingLlmProvider {
+        response: String,
+        recorded_model: std::sync::Mutex<Option<String>>,
+    }
+
+    impl RecordingLlmProvider {
+        fn new(response: &str) -> Self {
+            Self {
+                response: response.to_string(),
+                recorded_model: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn recorded_model(&self) -> Option<String> {
+            self.recorded_model.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for RecordingLlmProvider {
+        async fn complete(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            options: &CompletionOptions,
+        ) -> Result<CompletionResponse, LlmError> {
+            *self.recorded_model.lock().unwrap() = options.model.clone();
+            Ok(CompletionResponse {
+                text: self.response.clone(),
+                usage: None,
+            })
+        }
+    }
+
     /// An LLM that always returns a rate-limit error.
     struct RateLimitedLlmProvider;
 
@@ -410,14 +631,39 @@ mod tests {
         }
     }
 
-    /// A mock router that always succeeds with configurable scores.
+    /// A mock router with configurable per-domain behavior.
     struct MockRouter {
-        score: f32,
+        /// Score assigned to all Commands domain candidates.
+        command_score: f32,
+        /// Model to select (None = use default).
+        model_decision: Option<String>,
+        /// Tools needed decision.
+        tools_needed: Option<bool>,
     }
 
     impl MockRouter {
         fn with_score(score: f32) -> Self {
-            Self { score }
+            Self {
+                command_score: score,
+                model_decision: None,
+                tools_needed: None,
+            }
+        }
+
+        fn with_model(model: &str) -> Self {
+            Self {
+                command_score: 1.0,
+                model_decision: Some(model.to_string()),
+                tools_needed: None,
+            }
+        }
+
+        fn with_tools_needed(needed: bool) -> Self {
+            Self {
+                command_score: 1.0,
+                model_decision: None,
+                tools_needed: Some(needed),
+            }
         }
 
         fn failing() -> FailingRouter {
@@ -434,14 +680,32 @@ mod tests {
         ) -> Result<RoutingDecision, RouterError> {
             let mut decision = RoutingDecision::empty();
             for (kind, candidates) in domains {
-                if let RoutingDomainKind::Commands = kind {
-                    decision.commands = candidates
-                        .iter()
-                        .map(|c| weft_router::ScoredCandidate {
-                            id: c.id.clone(),
-                            score: self.score,
-                        })
-                        .collect();
+                match kind {
+                    RoutingDomainKind::Commands => {
+                        decision.commands = candidates
+                            .iter()
+                            .map(|c| ScoredCandidate {
+                                id: c.id.clone(),
+                                score: self.command_score,
+                            })
+                            .collect();
+                    }
+                    RoutingDomainKind::Model => {
+                        if let Some(ref model_id) = self.model_decision {
+                            // Return the configured model as the top scorer
+                            decision.model =
+                                candidates.iter().find(|c| c.id == *model_id).map(|c| {
+                                    ScoredCandidate {
+                                        id: c.id.clone(),
+                                        score: 0.9,
+                                    }
+                                });
+                        }
+                    }
+                    RoutingDomainKind::ToolNecessity => {
+                        decision.tools_needed = self.tools_needed;
+                    }
+                    RoutingDomainKind::Memory => {}
                 }
             }
             Ok(decision)
@@ -581,7 +845,53 @@ mod tests {
                     }],
                 }],
                 skip_tools_when_unnecessary: true,
-                domains: weft_core::DomainsConfig::default(),
+                domains: DomainsConfig::default(),
+            },
+            tool_registry: None,
+            gateway: GatewayConfig {
+                system_prompt: "You are a test assistant.".to_string(),
+                max_command_iterations: 10,
+                request_timeout_secs: 30,
+            },
+        })
+    }
+
+    /// Build a multi-model WeftConfig for routing tests.
+    fn multi_model_config() -> Arc<WeftConfig> {
+        Arc::new(WeftConfig {
+            server: ServerConfig {
+                bind_address: "127.0.0.1:8080".to_string(),
+            },
+            router: RouterConfig {
+                classifier: ClassifierConfig {
+                    model_path: "models/test.onnx".to_string(),
+                    tokenizer_path: "models/tokenizer.json".to_string(),
+                    threshold: 0.0,
+                    max_commands: 20,
+                },
+                default_model: Some("default-model".to_string()),
+                providers: vec![ProviderConfig {
+                    name: "test-provider".to_string(),
+                    kind: LlmProviderKind::Anthropic,
+                    api_key: "test-key".to_string(),
+                    base_url: None,
+                    models: vec![
+                        ModelEntry {
+                            name: "default-model".to_string(),
+                            model: "claude-default".to_string(),
+                            max_tokens: 1024,
+                            examples: vec!["general question".to_string()],
+                        },
+                        ModelEntry {
+                            name: "complex-model".to_string(),
+                            model: "claude-complex".to_string(),
+                            max_tokens: 4096,
+                            examples: vec!["complex reasoning task".to_string()],
+                        },
+                    ],
+                }],
+                skip_tools_when_unnecessary: true,
+                domains: DomainsConfig::default(),
             },
             tool_registry: None,
             gateway: GatewayConfig {
@@ -605,25 +915,90 @@ mod tests {
         }
     }
 
+    /// Build a single-model `ProviderRegistry` backed by the given provider.
+    fn single_model_registry(
+        provider: impl LlmProvider + 'static,
+        model_name: &str,
+        model_id: &str,
+    ) -> Arc<ProviderRegistry> {
+        let mut providers = HashMap::new();
+        providers.insert(
+            model_name.to_string(),
+            Arc::new(provider) as Arc<dyn LlmProvider>,
+        );
+        let mut model_ids = HashMap::new();
+        model_ids.insert(model_name.to_string(), model_id.to_string());
+        let mut max_tokens = HashMap::new();
+        max_tokens.insert(model_name.to_string(), 1024u32);
+        Arc::new(ProviderRegistry::new(
+            providers,
+            model_ids,
+            max_tokens,
+            model_name.to_string(),
+        ))
+    }
+
+    /// Build a two-model `ProviderRegistry` for fallback tests.
+    fn two_model_registry(
+        default_provider: impl LlmProvider + 'static,
+        non_default_provider: impl LlmProvider + 'static,
+    ) -> Arc<ProviderRegistry> {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "default-model".to_string(),
+            Arc::new(default_provider) as Arc<dyn LlmProvider>,
+        );
+        providers.insert(
+            "complex-model".to_string(),
+            Arc::new(non_default_provider) as Arc<dyn LlmProvider>,
+        );
+        let mut model_ids = HashMap::new();
+        model_ids.insert("default-model".to_string(), "claude-default".to_string());
+        model_ids.insert("complex-model".to_string(), "claude-complex".to_string());
+        let mut max_tokens = HashMap::new();
+        max_tokens.insert("default-model".to_string(), 1024u32);
+        max_tokens.insert("complex-model".to_string(), 4096u32);
+        Arc::new(ProviderRegistry::new(
+            providers,
+            model_ids,
+            max_tokens,
+            "default-model".to_string(),
+        ))
+    }
+
     fn make_engine(
-        llm: impl LlmProvider + 'static,
+        registry: Arc<ProviderRegistry>,
         router: impl SemanticRouter + 'static,
-        registry: impl CommandRegistry + 'static,
+        commands: impl CommandRegistry + 'static,
     ) -> GatewayEngine {
         GatewayEngine::new(
             test_config(),
-            Arc::new(llm),
+            registry,
             Arc::new(router),
-            Arc::new(registry),
+            Arc::new(commands),
         )
+    }
+
+    fn make_engine_with_config(
+        config: Arc<WeftConfig>,
+        registry: Arc<ProviderRegistry>,
+        router: impl SemanticRouter + 'static,
+        commands: impl CommandRegistry + 'static,
+    ) -> GatewayEngine {
+        GatewayEngine::new(config, registry, Arc::new(router), Arc::new(commands))
     }
 
     // ── Test: no-command response (single pass) ────────────────────────────
 
     #[tokio::test]
     async fn test_no_command_response_single_pass() {
-        let engine = make_engine(
+        let registry = single_model_registry(
             MockLlmProvider::single("Hello, I can help you with that!"),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine(
+            registry,
             MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![]),
         );
@@ -646,13 +1021,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_command_executes_and_loops() {
-        let engine = make_engine(
+        let registry = single_model_registry(
             MockLlmProvider::new(vec![
-                // First response: issue a command
                 "/web_search query: \"Rust async\"",
-                // Second response (after command result): clean answer
                 "Here are the results I found.",
             ]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine(
+            registry,
             MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![("web_search", "Search the web")]).with_execute_result(
                 CommandResult {
@@ -679,12 +1057,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_commands_executed_sequentially() {
-        // LLM emits two commands in one response, then finishes
-        let engine = make_engine(
+        let registry = single_model_registry(
             MockLlmProvider::new(vec![
                 "/web_search query: \"Rust\"\n/code_review target: src",
                 "Done with both commands.",
             ]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine(
+            registry,
             MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![
                 ("web_search", "Search the web"),
@@ -710,7 +1092,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_max_iterations_exceeded() {
-        // Config with max 2 iterations
         let config = Arc::new(WeftConfig {
             gateway: GatewayConfig {
                 system_prompt: "test".to_string(),
@@ -720,20 +1101,23 @@ mod tests {
             ..(*test_config()).clone()
         });
 
-        // LLM always emits a command — infinite loop
-        let engine = GatewayEngine::new(
+        let registry = single_model_registry(
+            MockLlmProvider::single("/web_search query: \"loop\""),
+            "test-model",
+            "claude-test",
+        );
+
+        let engine = make_engine_with_config(
             config,
-            Arc::new(MockLlmProvider::single("/web_search query: \"loop\"")),
-            Arc::new(MockRouter::with_score(0.9)),
-            Arc::new(
-                MockCommandRegistry::new(vec![("web_search", "Search")]).with_execute_result(
-                    CommandResult {
-                        command_name: "web_search".to_string(),
-                        success: true,
-                        output: "still looping".to_string(),
-                        error: None,
-                    },
-                ),
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![("web_search", "Search")]).with_execute_result(
+                CommandResult {
+                    command_name: "web_search".to_string(),
+                    success: true,
+                    output: "still looping".to_string(),
+                    error: None,
+                },
             ),
         );
 
@@ -752,11 +1136,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_command_failure_injected_as_error_result() {
-        let engine = make_engine(
+        let registry = single_model_registry(
             MockLlmProvider::new(vec![
                 "/web_search query: \"Rust\"",
                 "The search failed, but I can still answer.",
             ]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine(
+            registry,
             MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![("web_search", "Search the web")]).with_execute_result(
                 CommandResult {
@@ -783,8 +1172,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_router_failure_falls_back_to_all_commands() {
-        let engine = make_engine(
+        let registry = single_model_registry(
             MockLlmProvider::single("No commands needed."),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine(
+            registry,
             MockRouter::failing(),
             MockCommandRegistry::new(vec![
                 ("web_search", "Search the web"),
@@ -805,11 +1199,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_describe_action_handled_by_registry() {
-        let engine = make_engine(
+        let registry = single_model_registry(
             MockLlmProvider::new(vec![
                 "/web_search --describe",
                 "Now I understand the command.",
             ]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine(
+            registry,
             MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![("web_search", "Search the web")]).with_describe_result(
                 CommandDescription {
@@ -836,8 +1235,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_streaming_rejected() {
-        let engine = make_engine(
+        let registry = single_model_registry(
             MockLlmProvider::single("irrelevant"),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine(
+            registry,
             MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![]),
         );
@@ -856,7 +1260,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_timeout() {
-        // Very short timeout: 0 seconds = immediately timeout
         let config = Arc::new(WeftConfig {
             gateway: GatewayConfig {
                 system_prompt: "test".to_string(),
@@ -877,7 +1280,6 @@ mod tests {
                 _: &[Message],
                 _: &CompletionOptions,
             ) -> Result<CompletionResponse, LlmError> {
-                // Sleep for a very long time
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 Ok(CompletionResponse {
                     text: "never".to_string(),
@@ -886,11 +1288,12 @@ mod tests {
             }
         }
 
-        let engine = GatewayEngine::new(
+        let registry = single_model_registry(SlowLlmProvider, "test-model", "claude-test");
+        let engine = make_engine_with_config(
             config,
-            Arc::new(SlowLlmProvider),
-            Arc::new(MockRouter::with_score(0.9)),
-            Arc::new(MockCommandRegistry::new(vec![])),
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
         );
 
         let result = engine.handle_request(make_user_request("Hello")).await;
@@ -905,8 +1308,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_response_format_matches_openai_schema() {
-        let engine = make_engine(
+        let registry = single_model_registry(
             MockLlmProvider::single("Test response"),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine(
+            registry,
             MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![]),
         );
@@ -916,7 +1324,6 @@ mod tests {
             .await
             .expect("should succeed");
 
-        // Validate required OpenAI response fields
         assert!(
             resp.id.starts_with("chatcmpl-"),
             "id must start with chatcmpl-"
@@ -944,8 +1351,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_user_message_returns_error() {
-        let engine = make_engine(
+        let registry = single_model_registry(
             MockLlmProvider::single("irrelevant"),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine(
+            registry,
             MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![]),
         );
@@ -962,7 +1374,6 @@ mod tests {
         };
 
         let result = engine.handle_request(req).await;
-        // Should fail because there is no user message
         assert!(result.is_err(), "expected error for missing user message");
     }
 
@@ -970,8 +1381,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limit_error_propagated() {
+        let registry = single_model_registry(RateLimitedLlmProvider, "test-model", "claude-test");
         let engine = make_engine(
-            RateLimitedLlmProvider,
+            registry,
             MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![]),
         );
@@ -993,8 +1405,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_llm_error_propagated() {
+        // Single-model registry: failing provider IS the default, so no fallback.
+        let registry = single_model_registry(FailingLlmProvider, "test-model", "claude-test");
         let engine = make_engine(
-            FailingLlmProvider,
+            registry,
             MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![]),
         );
@@ -1011,8 +1425,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_commands_failure_propagated() {
-        let engine = make_engine(
+        let registry = single_model_registry(
             MockLlmProvider::single("irrelevant"),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine(
+            registry,
             MockRouter::with_score(0.9),
             MockCommandRegistry::with_list_failure(),
         );
@@ -1029,8 +1448,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_llm_response_is_valid() {
+        let registry =
+            single_model_registry(MockLlmProvider::single(""), "test-model", "claude-test");
         let engine = make_engine(
-            MockLlmProvider::single(""),
+            registry,
             MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![]),
         );
@@ -1047,8 +1468,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_usage_extracted_from_provider() {
+        let registry =
+            single_model_registry(MockLlmProvider::single("Done"), "test-model", "claude-test");
         let engine = make_engine(
-            MockLlmProvider::single("Done"),
+            registry,
             MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![]),
         );
@@ -1062,5 +1485,411 @@ mod tests {
         assert_eq!(resp.usage.prompt_tokens, 10);
         assert_eq!(resp.usage.completion_tokens, 5);
         assert_eq!(resp.usage.total_tokens, 15);
+    }
+
+    // ── Test: model selection uses router decision ─────────────────────────
+
+    #[tokio::test]
+    async fn test_model_selection_uses_router_decision() {
+        // Router selects "complex-model"; we verify the correct model_id is passed.
+        let recording_provider = Arc::new(RecordingLlmProvider::new("response"));
+        let default_provider = Arc::new(MockLlmProvider::single("default response"));
+
+        let mut providers = HashMap::new();
+        providers.insert(
+            "default-model".to_string(),
+            default_provider as Arc<dyn LlmProvider>,
+        );
+        providers.insert(
+            "complex-model".to_string(),
+            recording_provider.clone() as Arc<dyn LlmProvider>,
+        );
+
+        let mut model_ids = HashMap::new();
+        model_ids.insert("default-model".to_string(), "claude-default".to_string());
+        model_ids.insert("complex-model".to_string(), "claude-complex".to_string());
+
+        let mut max_tokens_map = HashMap::new();
+        max_tokens_map.insert("default-model".to_string(), 1024u32);
+        max_tokens_map.insert("complex-model".to_string(), 4096u32);
+
+        let registry = Arc::new(ProviderRegistry::new(
+            providers,
+            model_ids,
+            max_tokens_map,
+            "default-model".to_string(),
+        ));
+
+        let engine = make_engine_with_config(
+            multi_model_config(),
+            registry,
+            MockRouter::with_model("complex-model"),
+            MockCommandRegistry::new(vec![]),
+        );
+
+        engine
+            .handle_request(make_user_request("Complex task"))
+            .await
+            .expect("should succeed");
+
+        // Verify the correct model_id was passed to the recording provider
+        assert_eq!(
+            recording_provider.recorded_model(),
+            Some("claude-complex".to_string()),
+            "complex-model provider must receive the correct model_id"
+        );
+    }
+
+    // ── Test: tool skipping when tools_needed = Some(false) ───────────────
+
+    #[tokio::test]
+    async fn test_tool_skipping_when_tools_not_needed() {
+        // Provider records the system prompt to verify no command stubs
+        struct SystemPromptCapture {
+            captured: std::sync::Mutex<Option<String>>,
+        }
+
+        #[async_trait]
+        impl LlmProvider for SystemPromptCapture {
+            async fn complete(
+                &self,
+                system_prompt: &str,
+                _messages: &[Message],
+                _options: &CompletionOptions,
+            ) -> Result<CompletionResponse, LlmError> {
+                *self.captured.lock().unwrap() = Some(system_prompt.to_string());
+                Ok(CompletionResponse {
+                    text: "no tools needed".to_string(),
+                    usage: None,
+                })
+            }
+        }
+
+        let capture = Arc::new(SystemPromptCapture {
+            captured: std::sync::Mutex::new(None),
+        });
+
+        let registry = single_model_registry(
+            {
+                struct WrappedCapture(Arc<SystemPromptCapture>);
+                #[async_trait]
+                impl LlmProvider for WrappedCapture {
+                    async fn complete(
+                        &self,
+                        system_prompt: &str,
+                        messages: &[Message],
+                        options: &CompletionOptions,
+                    ) -> Result<CompletionResponse, LlmError> {
+                        self.0.complete(system_prompt, messages, options).await
+                    }
+                }
+                WrappedCapture(capture.clone())
+            },
+            "test-model",
+            "claude-test",
+        );
+
+        let engine = make_engine(
+            registry,
+            MockRouter::with_tools_needed(false),
+            MockCommandRegistry::new(vec![("web_search", "Search the web")]),
+        );
+
+        engine
+            .handle_request(make_user_request("What is the capital of France?"))
+            .await
+            .expect("should succeed");
+
+        let captured = capture.captured.lock().unwrap().clone().unwrap_or_default();
+        // When tools are skipped, the system prompt must NOT contain command stubs
+        assert!(
+            !captured.contains("```toon"),
+            "system prompt should not contain toon block when tools are skipped: {captured}"
+        );
+        assert!(
+            !captured.contains("web_search"),
+            "system prompt should not contain command stubs when tools are skipped"
+        );
+    }
+
+    // ── Test: tool injection when tools_needed = Some(true) ───────────────
+
+    #[tokio::test]
+    async fn test_tool_injection_when_tools_needed() {
+        struct SystemPromptCapture {
+            captured: std::sync::Mutex<Option<String>>,
+        }
+
+        #[async_trait]
+        impl LlmProvider for SystemPromptCapture {
+            async fn complete(
+                &self,
+                system_prompt: &str,
+                _messages: &[Message],
+                _options: &CompletionOptions,
+            ) -> Result<CompletionResponse, LlmError> {
+                *self.captured.lock().unwrap() = Some(system_prompt.to_string());
+                Ok(CompletionResponse {
+                    text: "response".to_string(),
+                    usage: None,
+                })
+            }
+        }
+
+        let capture = Arc::new(SystemPromptCapture {
+            captured: std::sync::Mutex::new(None),
+        });
+
+        let registry = single_model_registry(
+            {
+                struct W(Arc<SystemPromptCapture>);
+                #[async_trait]
+                impl LlmProvider for W {
+                    async fn complete(
+                        &self,
+                        sp: &str,
+                        m: &[Message],
+                        o: &CompletionOptions,
+                    ) -> Result<CompletionResponse, LlmError> {
+                        self.0.complete(sp, m, o).await
+                    }
+                }
+                W(capture.clone())
+            },
+            "test-model",
+            "claude-test",
+        );
+
+        let engine = make_engine(
+            registry,
+            MockRouter::with_tools_needed(true),
+            MockCommandRegistry::new(vec![("web_search", "Search the web")]),
+        );
+
+        engine
+            .handle_request(make_user_request("Search for something"))
+            .await
+            .expect("should succeed");
+
+        let captured = capture.captured.lock().unwrap().clone().unwrap_or_default();
+        // Commands must be injected
+        assert!(
+            captured.contains("```toon"),
+            "system prompt must contain toon block when tools are needed"
+        );
+        assert!(
+            captured.contains("web_search"),
+            "system prompt must contain command stubs when tools are needed"
+        );
+    }
+
+    // ── Test: tool injection when tools_needed = None (conservative) ──────
+
+    #[tokio::test]
+    async fn test_tool_injection_when_tools_needed_is_none() {
+        // tools_needed = None -> conservative default: inject commands
+        let router = MockRouter {
+            command_score: 1.0,
+            model_decision: None,
+            tools_needed: None, // undecided
+        };
+
+        struct SystemPromptCapture {
+            captured: std::sync::Mutex<Option<String>>,
+        }
+
+        #[async_trait]
+        impl LlmProvider for SystemPromptCapture {
+            async fn complete(
+                &self,
+                system_prompt: &str,
+                _messages: &[Message],
+                _options: &CompletionOptions,
+            ) -> Result<CompletionResponse, LlmError> {
+                *self.captured.lock().unwrap() = Some(system_prompt.to_string());
+                Ok(CompletionResponse {
+                    text: "response".to_string(),
+                    usage: None,
+                })
+            }
+        }
+
+        let capture = Arc::new(SystemPromptCapture {
+            captured: std::sync::Mutex::new(None),
+        });
+
+        let registry = single_model_registry(
+            {
+                struct W(Arc<SystemPromptCapture>);
+                #[async_trait]
+                impl LlmProvider for W {
+                    async fn complete(
+                        &self,
+                        sp: &str,
+                        m: &[Message],
+                        o: &CompletionOptions,
+                    ) -> Result<CompletionResponse, LlmError> {
+                        self.0.complete(sp, m, o).await
+                    }
+                }
+                W(capture.clone())
+            },
+            "test-model",
+            "claude-test",
+        );
+
+        let engine = make_engine(
+            registry,
+            router,
+            MockCommandRegistry::new(vec![("web_search", "Search the web")]),
+        );
+
+        engine
+            .handle_request(make_user_request("Tell me about Rust"))
+            .await
+            .expect("should succeed");
+
+        let captured = capture.captured.lock().unwrap().clone().unwrap_or_default();
+        // None -> conservative: inject commands
+        assert!(
+            captured.contains("web_search"),
+            "tools_needed=None must default to injecting commands"
+        );
+    }
+
+    // ── Test: model fallback on non-rate-limit error ───────────────────────
+
+    #[tokio::test]
+    async fn test_model_fallback_on_non_rate_limit_error() {
+        // complex-model fails with RequestFailed; default-model succeeds.
+        let registry = two_model_registry(
+            MockLlmProvider::single("fallback response"),
+            FailingLlmProvider,
+        );
+
+        let engine = make_engine_with_config(
+            multi_model_config(),
+            registry,
+            MockRouter::with_model("complex-model"),
+            MockCommandRegistry::new(vec![]),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Complex task"))
+            .await
+            .expect("fallback to default must succeed");
+
+        assert_eq!(resp.choices[0].message.content, "fallback response");
+    }
+
+    // ── Test: rate limit does NOT trigger fallback ─────────────────────────
+
+    #[tokio::test]
+    async fn test_rate_limit_does_not_trigger_fallback() {
+        // complex-model is rate-limited; must not fall back.
+        let registry = two_model_registry(
+            MockLlmProvider::single("default would succeed"),
+            RateLimitedLlmProvider,
+        );
+
+        let engine = make_engine_with_config(
+            multi_model_config(),
+            registry,
+            MockRouter::with_model("complex-model"),
+            MockCommandRegistry::new(vec![]),
+        );
+
+        let result = engine
+            .handle_request(make_user_request("Complex task"))
+            .await;
+        assert!(
+            matches!(result, Err(WeftError::RateLimited { .. })),
+            "rate limit must propagate without fallback, got: {:?}",
+            result
+        );
+    }
+
+    // ── Test: default model failure propagates error ───────────────────────
+
+    #[tokio::test]
+    async fn test_default_model_failure_propagates_error() {
+        // Only the default model exists and it fails — no fallback available.
+        let registry = single_model_registry(FailingLlmProvider, "test-model", "claude-test");
+
+        let engine = make_engine(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+        );
+
+        let result = engine.handle_request(make_user_request("Hello")).await;
+        assert!(
+            matches!(result, Err(WeftError::Llm(_))),
+            "default model failure must propagate as Llm error, got: {:?}",
+            result
+        );
+    }
+
+    // ── Test: selected model IS default, no retry on failure ──────────────
+
+    #[tokio::test]
+    async fn test_selected_model_is_default_no_retry() {
+        // Router selects "default-model" which is also the default — fails once,
+        // must NOT retry (would infinite loop).
+        let registry = two_model_registry(FailingLlmProvider, MockLlmProvider::single("alt"));
+
+        let engine = make_engine_with_config(
+            multi_model_config(),
+            registry,
+            // Router selects "default-model" (same as the registry's default)
+            MockRouter::with_model("default-model"),
+            MockCommandRegistry::new(vec![]),
+        );
+
+        let result = engine
+            .handle_request(make_user_request("Simple task"))
+            .await;
+        assert!(
+            matches!(result, Err(WeftError::Llm(_))),
+            "selected=default failure must propagate without retry, got: {:?}",
+            result
+        );
+    }
+
+    // ── Test: context assembly uses TOON fenced blocks ─────────────────────
+
+    #[tokio::test]
+    async fn test_context_assembly_uses_toon_fenced_blocks() {
+        use crate::context::assemble_system_prompt;
+        use weft_core::CommandStub;
+
+        let stubs = vec![CommandStub {
+            name: "web_search".to_string(),
+            description: "Search the web".to_string(),
+        }];
+        let prompt = assemble_system_prompt(&stubs, "You are a helpful assistant.");
+
+        assert!(prompt.contains("```toon"), "must use fenced TOON blocks");
+        assert!(
+            prompt.contains("commands[1]{name, description}:"),
+            "must use TOON typed array syntax"
+        );
+    }
+
+    // ── Test: no fenced blocks when tool skipping is active ───────────────
+
+    #[tokio::test]
+    async fn test_no_fenced_blocks_when_tool_skipping() {
+        use crate::context::assemble_system_prompt_no_tools;
+
+        let prompt = assemble_system_prompt_no_tools("You are a helpful assistant.");
+        assert!(
+            !prompt.contains("```toon"),
+            "must not contain toon blocks when tools are skipped"
+        );
+        assert!(
+            !prompt.contains("commands["),
+            "must not contain command stubs when tools are skipped"
+        );
     }
 }
