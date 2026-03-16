@@ -18,7 +18,7 @@ use weft_commands::{
     GrpcMemoryStoreClient, GrpcToolRegistryClient, MemoryStoreMux, ToolRegistryCommandAdapter,
 };
 use weft_core::{WeftConfig, WireFormat};
-use weft_llm::{AnthropicProvider, OpenAIProvider, ProviderRegistry};
+use weft_llm::{AnthropicProvider, Capability, OpenAIProvider, ProviderRegistry};
 use weft_router::{ModernBertRouter, RoutingCandidate, RoutingDomainKind};
 
 use crate::engine::{GatewayEngine, tool_necessity_candidates};
@@ -196,10 +196,11 @@ async fn main() {
         provider_instances.insert(provider_config.name.clone(), instance);
     }
 
-    // Build registry maps: model routing name -> provider/model_id/max_tokens.
+    // Build registry maps: model routing name -> provider/model_id/max_tokens/capabilities.
     let mut registry_providers: HashMap<String, Arc<dyn weft_llm::Provider>> = HashMap::new();
     let mut registry_model_ids: HashMap<String, String> = HashMap::new();
     let mut registry_max_tokens: HashMap<String, u32> = HashMap::new();
+    let mut registry_capabilities: HashMap<String, HashSet<Capability>> = HashMap::new();
 
     for resolved in &resolved_models {
         let provider_arc = provider_instances
@@ -209,12 +210,20 @@ async fn main() {
         registry_providers.insert(resolved.name.clone(), provider_arc);
         registry_model_ids.insert(resolved.name.clone(), resolved.model.clone());
         registry_max_tokens.insert(resolved.name.clone(), resolved.max_tokens);
+        // Convert Vec<String> capabilities to HashSet<Capability> newtypes.
+        let caps: HashSet<Capability> = resolved
+            .capabilities
+            .iter()
+            .map(|s| Capability::new(s.clone()))
+            .collect();
+        registry_capabilities.insert(resolved.name.clone(), caps);
     }
 
     let provider_registry = Arc::new(ProviderRegistry::new(
         registry_providers,
         registry_model_ids,
         registry_max_tokens,
+        registry_capabilities,
         default_model.clone(),
     ));
 

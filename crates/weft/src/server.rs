@@ -278,7 +278,7 @@ mod tests {
         http::{Request, StatusCode},
     };
     use serde_json::{Value, json};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use tower::ServiceExt;
     use weft_commands::{CommandError, CommandRegistry};
@@ -288,8 +288,8 @@ mod tests {
         WeftConfig, WireFormat,
     };
     use weft_llm::{
-        ChatCompletionOutput, Provider, ProviderError, ProviderRegistry, ProviderRequest,
-        ProviderResponse, TokenUsage,
+        Capability, ChatCompletionOutput, Provider, ProviderError, ProviderRegistry,
+        ProviderRequest, ProviderResponse, TokenUsage,
     };
     use weft_router::{
         RouterError, RoutingCandidate, RoutingDecision, RoutingDomainKind, SemanticRouter,
@@ -473,10 +473,18 @@ mod tests {
         model_ids.insert("test-model".to_string(), "claude-test".to_string());
         let mut max_tokens = HashMap::new();
         max_tokens.insert("test-model".to_string(), 1024u32);
+        let mut caps: HashMap<String, HashSet<Capability>> = HashMap::new();
+        caps.insert(
+            "test-model".to_string(),
+            [Capability::new(Capability::CHAT_COMPLETIONS)]
+                .into_iter()
+                .collect(),
+        );
         Arc::new(ProviderRegistry::new(
             providers,
             model_ids,
             max_tokens,
+            caps,
             "test-model".to_string(),
         ))
     }

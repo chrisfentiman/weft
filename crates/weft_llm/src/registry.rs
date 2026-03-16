@@ -1,35 +1,41 @@
-//! Provider registry: maps model routing names to provider instances.
+//! Provider registry: maps model routing names to provider instances,
+//! with capability indexing for capability-aware routing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::Provider;
+use crate::provider::Capability;
 
-/// Registry of named providers. The gateway selects a provider
-/// by model name based on the semantic router's model decision.
+/// Registry of named providers with capability indexing.
 ///
-/// Thread-safe: providers are Arc'd and the HashMap is immutable after construction.
+/// Thread-safe: providers are Arc'd and all maps are immutable after construction.
 ///
-/// Key insight: model names are globally unique, so the registry maps
-/// model_name -> provider. One provider instance may appear multiple times
-/// (once per model it serves), but each Arc is cheap.
+/// Supports two access patterns:
+/// 1. By model name (existing): `get("claude-sonnet")` -> provider
+/// 2. By capability (new): `models_with_capability(&cap)` -> &HashSet<String>
 pub struct ProviderRegistry {
-    /// Named providers. Key is the model routing name (e.g., "complex", "fast").
+    /// Named providers. Key is the model routing name.
     providers: HashMap<String, Arc<dyn Provider>>,
     /// Name of the default model.
     default_name: String,
-    /// Model identifier for each routing name. Used to set the model field on API requests.
+    /// Model identifier for each routing name.
     model_ids: HashMap<String, String>,
     /// Max tokens per model routing name.
     max_tokens: HashMap<String, u32>,
+    /// Capabilities per model routing name.
+    capabilities: HashMap<String, HashSet<Capability>>,
+    /// Reverse index: capability -> set of model routing names that support it.
+    capability_index: HashMap<Capability, HashSet<String>>,
 }
 
 impl ProviderRegistry {
-    /// Construct a new provider registry.
+    /// Construct a new provider registry with capability indexing.
     ///
     /// `providers`: Map of model_routing_name -> provider. Must contain at least one entry.
     /// `model_ids`: Map of model_routing_name -> model API identifier.
     /// `max_tokens`: Map of model_routing_name -> max tokens.
+    /// `capabilities`: Map of model_routing_name -> set of capabilities.
     /// `default_name`: Must be a key in `providers`.
     ///
     /// # Panics
@@ -44,6 +50,7 @@ impl ProviderRegistry {
         providers: HashMap<String, Arc<dyn Provider>>,
         model_ids: HashMap<String, String>,
         max_tokens: HashMap<String, u32>,
+        capabilities: HashMap<String, HashSet<Capability>>,
         default_name: String,
     ) -> Self {
         assert!(
@@ -55,11 +62,25 @@ impl ProviderRegistry {
             "default provider '{}' not found in registry",
             default_name
         );
+
+        // Build the reverse capability index: capability -> set of model routing names.
+        let mut capability_index: HashMap<Capability, HashSet<String>> = HashMap::new();
+        for (model_name, caps) in &capabilities {
+            for cap in caps {
+                capability_index
+                    .entry(cap.clone())
+                    .or_default()
+                    .insert(model_name.clone());
+            }
+        }
+
         Self {
             providers,
             default_name,
             model_ids,
             max_tokens,
+            capabilities,
+            capability_index,
         }
     }
 
@@ -88,6 +109,26 @@ impl ProviderRegistry {
     /// Get the default model name.
     pub fn default_name(&self) -> &str {
         &self.default_name
+    }
+
+    /// Get all model routing names that support a given capability.
+    ///
+    /// Returns an empty set if no models support the capability.
+    pub fn models_with_capability(&self, capability: &Capability) -> &HashSet<String> {
+        static EMPTY: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(HashSet::new);
+        self.capability_index.get(capability).unwrap_or(&EMPTY)
+    }
+
+    /// Check if a specific model supports a given capability.
+    pub fn model_has_capability(&self, model_name: &str, capability: &Capability) -> bool {
+        self.capabilities
+            .get(model_name)
+            .is_some_and(|caps| caps.contains(capability))
+    }
+
+    /// Get the capabilities of a specific model.
+    pub fn model_capabilities(&self, model_name: &str) -> Option<&HashSet<Capability>> {
+        self.capabilities.get(model_name)
     }
 }
 
@@ -124,6 +165,18 @@ mod tests {
         })
     }
 
+    fn chat_cap() -> Capability {
+        Capability::new(Capability::CHAT_COMPLETIONS)
+    }
+
+    fn embed_cap() -> Capability {
+        Capability::new(Capability::EMBEDDINGS)
+    }
+
+    fn vision_cap() -> Capability {
+        Capability::new(Capability::VISION)
+    }
+
     fn build_registry() -> ProviderRegistry {
         let mut providers = HashMap::new();
         providers.insert("complex".to_string(), stub("anthropic-complex"));
@@ -143,13 +196,29 @@ mod tests {
         max_tokens.insert("fast".to_string(), 2048u32);
         max_tokens.insert("general".to_string(), 4096u32);
 
-        ProviderRegistry::new(providers, model_ids, max_tokens, "complex".to_string())
+        // complex: chat + vision; fast: chat only; general: chat only
+        let mut capabilities: HashMap<String, HashSet<Capability>> = HashMap::new();
+        capabilities.insert(
+            "complex".to_string(),
+            [chat_cap(), vision_cap()].into_iter().collect(),
+        );
+        capabilities.insert("fast".to_string(), [chat_cap()].into_iter().collect());
+        capabilities.insert("general".to_string(), [chat_cap()].into_iter().collect());
+
+        ProviderRegistry::new(
+            providers,
+            model_ids,
+            max_tokens,
+            capabilities,
+            "complex".to_string(),
+        )
     }
 
     #[test]
     fn test_new_panics_on_empty_providers() {
         let result = std::panic::catch_unwind(|| {
             ProviderRegistry::new(
+                HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
@@ -166,6 +235,7 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ProviderRegistry::new(
                 providers,
+                HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
                 "nonexistent".to_string(),
@@ -222,5 +292,124 @@ mod tests {
         assert_eq!(registry.default_name(), "complex");
         // default_provider() should not panic
         let _ = registry.default_provider();
+    }
+
+    // ── Capability index tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_models_with_capability_chat_completions() {
+        let registry = build_registry();
+        let models = registry.models_with_capability(&chat_cap());
+        // All three models support chat_completions
+        assert_eq!(models.len(), 3);
+        assert!(models.contains("complex"));
+        assert!(models.contains("fast"));
+        assert!(models.contains("general"));
+    }
+
+    #[test]
+    fn test_models_with_capability_vision() {
+        let registry = build_registry();
+        let models = registry.models_with_capability(&vision_cap());
+        // Only "complex" supports vision
+        assert_eq!(models.len(), 1);
+        assert!(models.contains("complex"));
+        assert!(!models.contains("fast"));
+        assert!(!models.contains("general"));
+    }
+
+    #[test]
+    fn test_models_with_capability_unknown_returns_empty() {
+        let registry = build_registry();
+        let models = registry.models_with_capability(&embed_cap());
+        // No model has embeddings capability in the test registry
+        assert!(models.is_empty());
+    }
+
+    #[test]
+    fn test_model_has_capability_true() {
+        let registry = build_registry();
+        assert!(registry.model_has_capability("complex", &chat_cap()));
+        assert!(registry.model_has_capability("complex", &vision_cap()));
+        assert!(registry.model_has_capability("fast", &chat_cap()));
+        assert!(registry.model_has_capability("general", &chat_cap()));
+    }
+
+    #[test]
+    fn test_model_has_capability_false_for_undeclared() {
+        let registry = build_registry();
+        // "fast" does not have vision
+        assert!(!registry.model_has_capability("fast", &vision_cap()));
+        // "general" does not have vision
+        assert!(!registry.model_has_capability("general", &vision_cap()));
+        // "complex" does not have embeddings
+        assert!(!registry.model_has_capability("complex", &embed_cap()));
+    }
+
+    #[test]
+    fn test_model_has_capability_unknown_model_returns_false() {
+        let registry = build_registry();
+        assert!(!registry.model_has_capability("nonexistent", &chat_cap()));
+    }
+
+    #[test]
+    fn test_model_capabilities_returns_correct_set() {
+        let registry = build_registry();
+        let caps = registry
+            .model_capabilities("complex")
+            .expect("complex should have capabilities");
+        assert!(caps.contains(&chat_cap()));
+        assert!(caps.contains(&vision_cap()));
+        assert_eq!(caps.len(), 2);
+    }
+
+    #[test]
+    fn test_model_capabilities_returns_none_for_unknown() {
+        let registry = build_registry();
+        assert!(registry.model_capabilities("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_capability_index_construction_is_correct() {
+        // Build a registry where we know exactly who has what,
+        // then verify the reverse index is constructed correctly.
+        let mut providers = HashMap::new();
+        providers.insert("a".to_string(), stub("pa"));
+        providers.insert("b".to_string(), stub("pb"));
+
+        let mut capabilities: HashMap<String, HashSet<Capability>> = HashMap::new();
+        capabilities.insert(
+            "a".to_string(),
+            [Capability::new("x"), Capability::new("y")]
+                .into_iter()
+                .collect(),
+        );
+        capabilities.insert(
+            "b".to_string(),
+            [Capability::new("y"), Capability::new("z")]
+                .into_iter()
+                .collect(),
+        );
+
+        let registry = ProviderRegistry::new(
+            providers,
+            HashMap::new(),
+            HashMap::new(),
+            capabilities,
+            "a".to_string(),
+        );
+
+        let x_models = registry.models_with_capability(&Capability::new("x"));
+        assert_eq!(x_models.len(), 1);
+        assert!(x_models.contains("a"));
+
+        let y_models = registry.models_with_capability(&Capability::new("y"));
+        assert_eq!(y_models.len(), 2);
+        assert!(y_models.contains("a"));
+        assert!(y_models.contains("b"));
+
+        let z_models = registry.models_with_capability(&Capability::new("z"));
+        assert_eq!(z_models.len(), 1);
+        assert!(z_models.contains("b"));
     }
 }
