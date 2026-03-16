@@ -217,6 +217,8 @@ impl ApiError {
                 message: e.to_string(),
                 retry_after_ms: None,
             },
+            // Configuration error: no models support the required capability.
+            WeftError::NoEligibleModels { .. } => Self::bad_request(e.to_string()),
             // Hard block: hook terminated the request before LLM involvement.
             WeftError::HookBlocked { .. } => Self {
                 status: StatusCode::FORBIDDEN,

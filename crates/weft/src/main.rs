@@ -18,7 +18,7 @@ use weft_commands::{
     GrpcMemoryStoreClient, GrpcToolRegistryClient, MemoryStoreMux, ToolRegistryCommandAdapter,
 };
 use weft_core::{WeftConfig, WireFormat};
-use weft_llm::{AnthropicProvider, Capability, OpenAIProvider, ProviderRegistry};
+use weft_llm::{AnthropicProvider, Capability, OpenAIProvider, ProviderRegistry, RhaiProvider};
 use weft_router::{ModernBertRouter, RoutingCandidate, RoutingDomainKind};
 
 use crate::engine::{GatewayEngine, tool_necessity_candidates};
@@ -180,17 +180,31 @@ async fn main() {
             )),
             WireFormat::Custom => {
                 // wire_script presence validated by config.validate() above.
-                // File existence check is deferred to Phase 4 (RhaiProvider construction).
-                // For now, use OpenAI provider as a placeholder until Phase 4 implements RhaiProvider.
-                // This branch should not be reached in production until Phase 4 is complete.
-                warn!(
-                    provider = %provider_config.name,
-                    "custom wire_format not yet fully implemented — using OpenAI provider as placeholder"
-                );
-                Arc::new(OpenAIProvider::new(
+                // base_url is required for custom providers (no sensible default).
+                let script_path = provider_config.wire_script.as_deref().unwrap_or("");
+                let base_url = provider_config.base_url.clone().unwrap_or_default();
+                match RhaiProvider::new(
+                    script_path,
                     provider_config.api_key.clone(),
-                    provider_config.base_url.clone(),
-                ))
+                    base_url,
+                    provider_config.name.clone(),
+                ) {
+                    Ok(rhai_provider) => {
+                        info!(
+                            provider = %provider_config.name,
+                            script = %script_path,
+                            "custom wire format provider initialized"
+                        );
+                        Arc::new(rhai_provider)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "error: provider '{}': failed to initialize custom wire format provider: {e}",
+                            provider_config.name
+                        );
+                        std::process::exit(1);
+                    }
+                }
             }
         };
         provider_instances.insert(provider_config.name.clone(), instance);

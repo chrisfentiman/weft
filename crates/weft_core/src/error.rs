@@ -31,6 +31,10 @@ pub enum WeftError {
     ModelNotFound { name: String },
     #[error("memory store error: {0}")]
     MemoryStore(String),
+    /// No models are configured with the required capability.
+    /// This is a configuration error — the operator must add a model that supports the capability.
+    #[error("no models configured with capability '{capability}'")]
+    NoEligibleModels { capability: String },
     /// Hard block — request terminated immediately (RequestStart, PreRoute, PostRoute).
     #[error("hook blocked at {event}: {reason} (hook: {hook_name})")]
     HookBlocked {
@@ -69,6 +73,9 @@ mod tests {
             name: "fast".to_string(),
         };
         let _ = WeftError::MemoryStore("store unavailable".to_string());
+        let _ = WeftError::NoEligibleModels {
+            capability: "embeddings".to_string(),
+        };
     }
 
     #[test]
