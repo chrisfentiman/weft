@@ -520,6 +520,19 @@ fn is_kv_line(line: &str) -> bool {
     !key.is_empty() && !value.is_empty()
 }
 
+/// Check whether a line (already stripped of its indent) is a section header.
+///
+/// A section header ends with `:` and has a non-empty label before the colon with
+/// no value after it. Labels may contain spaces (e.g., `multi word label:`).
+fn is_section_header(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.ends_with(':') {
+        return false;
+    }
+    let label = trimmed[..trimmed.len() - 1].trim();
+    !label.is_empty()
+}
+
 /// Parse nodes at the given indent level from the lines of `input`.
 /// Lines that belong to a deeper indent level are consumed as children.
 fn parse_nodes(input: &str, base_indent: usize) -> Result<Vec<ToonNode>, ToonParseError> {
@@ -688,6 +701,12 @@ fn collect_section_children(
 
         if try_parse_array_header(stripped).is_some() {
             has_typed_array = true;
+            continue;
+        }
+
+        // Section headers are structured content -- a nested `label:` should
+        // not trigger the text-block fallback (Spec 11.12).
+        if is_section_header(stripped) {
             continue;
         }
 
@@ -1623,6 +1642,44 @@ mod tests {
                         ToonValue::String("Memory".into()),
                     ],
                 ],
+            }],
+        };
+        let serialized = serialize_document(&doc);
+        let parsed = parse_document(&serialized).unwrap();
+        assert_eq!(doc, parsed);
+    }
+
+    #[test]
+    fn test_parse_document_nested_sections() {
+        let input = "outer:\n  inner:\n    key: value\n";
+        let doc = parse_document(input).unwrap();
+        let expected = ToonDocument {
+            nodes: vec![ToonNode::Section {
+                label: "outer".into(),
+                children: vec![ToonNode::Section {
+                    label: "inner".into(),
+                    children: vec![ToonNode::KeyValue {
+                        key: "key".into(),
+                        value: ToonValue::String("value".into()),
+                    }],
+                }],
+            }],
+        };
+        assert_eq!(doc, expected);
+    }
+
+    #[test]
+    fn test_round_trip_nested_sections() {
+        let doc = ToonDocument {
+            nodes: vec![ToonNode::Section {
+                label: "outer".into(),
+                children: vec![ToonNode::Section {
+                    label: "inner".into(),
+                    children: vec![ToonNode::KeyValue {
+                        key: "key".into(),
+                        value: ToonValue::String("value".into()),
+                    }],
+                }],
             }],
         };
         let serialized = serialize_document(&doc);
