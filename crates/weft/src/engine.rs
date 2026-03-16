@@ -5883,10 +5883,7 @@ mod tests {
     async fn test_pre_route_memory_blocks_recall_returns_failed_command_result() {
         // PreRoute hook with matcher "memory" blocks the recall routing phase ->
         // a failed CommandResult is returned to the LLM (feedback block).
-        let mux = make_single_rw_mux(
-            "conv",
-            Arc::new(MockMemStoreClient::succeeds(vec![])),
-        );
+        let mux = make_single_rw_mux("conv", Arc::new(MockMemStoreClient::succeeds(vec![])));
 
         let hook_reg = hook_registry_with(
             HookEvent::PreRoute,
@@ -5962,8 +5959,18 @@ mod tests {
         }
 
         let mux = make_mux_with_stores(vec![
-            ("store-a", true, true, Arc::new(TrackingMemStoreClient(store_a_clone))),
-            ("store-b", true, true, Arc::new(TrackingMemStoreClient(store_b_clone))),
+            (
+                "store-a",
+                true,
+                true,
+                Arc::new(TrackingMemStoreClient(store_a_clone)),
+            ),
+            (
+                "store-b",
+                true,
+                true,
+                Arc::new(TrackingMemStoreClient(store_b_clone)),
+            ),
         ]);
 
         // PostRoute on memory domain: override selected to ["store-b"].

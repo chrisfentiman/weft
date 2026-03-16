@@ -15,6 +15,7 @@ pub mod anthropic;
 pub mod openai;
 pub mod provider;
 pub mod registry;
+pub mod rhai_provider;
 
 pub use anthropic::AnthropicProvider;
 pub use openai::OpenAIProvider;
@@ -23,6 +24,7 @@ pub use provider::{
     ProviderResponse, TokenUsage,
 };
 pub use registry::ProviderRegistry;
+pub use rhai_provider::RhaiProvider;
 
 use async_trait::async_trait;
 
