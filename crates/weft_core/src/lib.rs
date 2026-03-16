@@ -15,8 +15,8 @@ pub use command::{
     CommandAction, CommandDescription, CommandInvocation, CommandResult, CommandStub,
 };
 pub use config::{
-    ClassifierConfig, GatewayConfig, LlmConfig, LlmProviderKind, ServerConfig, ToolRegistryConfig,
-    WeftConfig,
+    ClassifierConfig, DomainConfig, DomainsConfig, GatewayConfig, LlmProviderKind, ModelEntry,
+    ProviderConfig, ResolvedModel, RouterConfig, ServerConfig, ToolRegistryConfig, WeftConfig,
 };
 pub use error::WeftError;
 pub use message::{ChatCompletionRequest, ChatCompletionResponse, Choice, Message, Role, Usage};

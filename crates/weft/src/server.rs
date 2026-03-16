@@ -125,7 +125,8 @@ async fn chat_completions_handler(
 async fn health_handler(State(engine): State<GatewayEngine>) -> Json<HealthResponse> {
     // Classifier is considered loaded if it doesn't immediately fail a trivial classify.
     // Since we don't want to hit the real ONNX model here, we check the config path exists.
-    let classifier_loaded = std::path::Path::new(&engine.config().classifier.model_path).exists();
+    let classifier_loaded =
+        std::path::Path::new(&engine.config().router.classifier.model_path).exists();
 
     // Tool registry: we don't ping the gRPC server from the health check. Report based
     // on whether tool_registry config is present (connected status is checked lazily).
@@ -208,7 +209,8 @@ impl ApiError {
             },
             WeftError::CommandLoopExceeded { .. } => Self::internal(e.to_string()),
             WeftError::Llm(_) => Self::internal(e.to_string()),
-            WeftError::Classifier(_) => Self::internal(e.to_string()),
+            WeftError::Routing(_) => Self::internal(e.to_string()),
+            WeftError::ModelNotFound { .. } => Self::internal(e.to_string()),
             WeftError::Command(_) => Self::internal(e.to_string()),
         }
     }
@@ -261,13 +263,16 @@ mod tests {
     use serde_json::{Value, json};
     use std::sync::Arc;
     use tower::ServiceExt;
-    use weft_classifier::{ClassificationResult, ClassifierError, SemanticClassifier};
     use weft_commands::{CommandError, CommandRegistry};
     use weft_core::{
         ClassifierConfig, CommandDescription, CommandInvocation, CommandResult, CommandStub,
-        GatewayConfig, LlmConfig, LlmProviderKind, Message, ServerConfig, WeftConfig,
+        DomainsConfig, GatewayConfig, LlmProviderKind, Message, ModelEntry, ProviderConfig,
+        RouterConfig, ServerConfig, WeftConfig,
     };
     use weft_llm::{CompletionOptions, CompletionResponse, LlmError, LlmProvider};
+    use weft_router::{
+        RouterError, RoutingCandidate, RoutingDecision, RoutingDomainKind, SemanticRouter,
+    };
 
     // ── Test mocks (same as in engine.rs tests) ────────────────────────────
 
@@ -331,22 +336,28 @@ mod tests {
         }
     }
 
-    struct MockClassifier;
+    struct MockRouter;
 
     #[async_trait]
-    impl SemanticClassifier for MockClassifier {
-        async fn classify(
+    impl SemanticRouter for MockRouter {
+        async fn route(
             &self,
-            _: &str,
-            commands: &[CommandStub],
-        ) -> Result<Vec<ClassificationResult>, ClassifierError> {
-            Ok(commands
-                .iter()
-                .map(|c| ClassificationResult {
-                    command_name: c.name.clone(),
-                    score: 1.0,
-                })
-                .collect())
+            _user_message: &str,
+            domains: &[(RoutingDomainKind, Vec<RoutingCandidate>)],
+        ) -> Result<RoutingDecision, RouterError> {
+            let mut decision = RoutingDecision::empty();
+            for (kind, candidates) in domains {
+                if let RoutingDomainKind::Commands = kind {
+                    decision.commands = candidates
+                        .iter()
+                        .map(|c| weft_router::ScoredCandidate {
+                            id: c.id.clone(),
+                            score: 1.0,
+                        })
+                        .collect();
+                }
+            }
+            Ok(decision)
         }
     }
 
@@ -375,18 +386,28 @@ mod tests {
             server: ServerConfig {
                 bind_address: "127.0.0.1:0".to_string(),
             },
-            llm: LlmConfig {
-                provider: LlmProviderKind::Anthropic,
-                api_key: "test-key".to_string(),
-                model: "claude-test".to_string(),
-                max_tokens: 1024,
-                base_url: None,
-            },
-            classifier: ClassifierConfig {
-                model_path: "models/test.onnx".to_string(),
-                tokenizer_path: "models/tokenizer.json".to_string(),
-                threshold: 0.0,
-                max_commands: 20,
+            router: RouterConfig {
+                classifier: ClassifierConfig {
+                    model_path: "models/test.onnx".to_string(),
+                    tokenizer_path: "models/tokenizer.json".to_string(),
+                    threshold: 0.0,
+                    max_commands: 20,
+                },
+                default_model: Some("test-model".to_string()),
+                providers: vec![ProviderConfig {
+                    name: "test-provider".to_string(),
+                    kind: LlmProviderKind::Anthropic,
+                    api_key: "test-key".to_string(),
+                    base_url: None,
+                    models: vec![ModelEntry {
+                        name: "test-model".to_string(),
+                        model: "claude-test".to_string(),
+                        max_tokens: 1024,
+                        examples: vec!["test query".to_string()],
+                    }],
+                }],
+                skip_tools_when_unnecessary: true,
+                domains: DomainsConfig::default(),
             },
             tool_registry: None,
             gateway: GatewayConfig {
@@ -401,7 +422,7 @@ mod tests {
         let engine = GatewayEngine::new(
             test_config(),
             Arc::new(llm),
-            Arc::new(MockClassifier),
+            Arc::new(MockRouter),
             Arc::new(MockRegistry),
         );
         build_router(engine)
@@ -553,7 +574,7 @@ mod tests {
         let engine = GatewayEngine::new(
             test_config(),
             Arc::new(MockLlmProvider::ok("irrelevant")),
-            Arc::new(MockClassifier),
+            Arc::new(MockRouter),
             Arc::new(MockRegistry),
         );
         let router = build_router(engine);

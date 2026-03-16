@@ -9,13 +9,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tracing::{debug, warn};
-use weft_classifier::{ClassificationResult, SemanticClassifier, filter_by_threshold, take_top};
 use weft_commands::{CommandRegistry, parse_response};
 use weft_core::{
     ChatCompletionRequest, ChatCompletionResponse, Choice, CommandResult, CommandStub, Message,
     Role, Usage, WeftConfig, WeftError,
 };
 use weft_llm::{CompletionOptions, LlmProvider};
+use weft_router::{
+    RoutingCandidate, RoutingDomainKind, ScoredCandidate, SemanticRouter, filter_by_threshold,
+    take_top,
+};
 
 use crate::context::{assemble_system_prompt, format_command_results_toon};
 
@@ -27,7 +30,7 @@ use crate::context::{assemble_system_prompt, format_command_results_toon};
 pub struct GatewayEngine {
     config: Arc<WeftConfig>,
     llm_provider: Arc<dyn LlmProvider>,
-    classifier: Arc<dyn SemanticClassifier>,
+    router: Arc<dyn SemanticRouter>,
     command_registry: Arc<dyn CommandRegistry>,
 }
 
@@ -41,20 +44,20 @@ impl GatewayEngine {
     pub fn new(
         config: Arc<WeftConfig>,
         llm_provider: Arc<dyn LlmProvider>,
-        classifier: Arc<dyn SemanticClassifier>,
+        router: Arc<dyn SemanticRouter>,
         command_registry: Arc<dyn CommandRegistry>,
     ) -> Self {
         Self {
             config,
             llm_provider,
-            classifier,
+            router,
             command_registry,
         }
     }
 
     /// Handle a single chat completion request.
     ///
-    /// This is the main gateway loop: classify → assemble → LLM → parse → execute → loop.
+    /// This is the main gateway loop: route → assemble → LLM → parse → execute → loop.
     pub async fn handle_request(
         &self,
         request: ChatCompletionRequest,
@@ -85,11 +88,12 @@ impl GatewayEngine {
             .await
             .map_err(|e| WeftError::Command(e.to_string()))?;
 
-        // Extract the latest user message for semantic classification.
+        // Extract the latest user message for semantic routing.
         let user_message = extract_latest_user_message(&request.messages)?;
 
-        // Semantic classification: filter commands relevant to this request.
-        let selected_commands = self.classify_and_filter(user_message, &all_commands).await;
+        // Semantic routing: filter commands relevant to this request.
+        // Phase 1: Commands-only domain. Full multi-domain routing in Phase 4.
+        let selected_commands = self.route_and_filter(user_message, &all_commands).await;
 
         // Assemble the system prompt with foundational + TOON stubs + agent prompt.
         let system_prompt =
@@ -101,6 +105,9 @@ impl GatewayEngine {
         let options = CompletionOptions {
             max_tokens: request.max_tokens,
             temperature: request.temperature,
+            // Phase 1: model field not yet wired — engine.rs uses a single provider.
+            // Full provider registry integration in Phase 4.
+            model: None,
         };
 
         // Build the set of known command names for the parser.
@@ -169,9 +176,6 @@ impl GatewayEngine {
                 results.push(result);
             }
 
-            // If there were only parse errors (no valid invocations) and they were all
-            // from `parse_errors`, the LLM still gets the error results. Continue the loop.
-
             // Append the full assistant response (with command lines) to message history.
             messages.push(Message {
                 role: Role::Assistant,
@@ -188,30 +192,41 @@ impl GatewayEngine {
         }
     }
 
-    /// Classify commands relevant to the user message and apply threshold + max filtering.
+    /// Route commands relevant to the user message and apply threshold + max filtering.
     ///
-    /// On classifier failure, falls back to all commands (spec Section 5.5).
-    async fn classify_and_filter(
+    /// On router failure, falls back to all commands (fallback behavior).
+    async fn route_and_filter(
         &self,
         user_message: &str,
         all_commands: &[CommandStub],
     ) -> Vec<CommandStub> {
-        let threshold = self.config.classifier.threshold;
-        let max_commands = self.config.classifier.max_commands;
+        let threshold = self.config.router.classifier.threshold;
+        let max_commands = self.config.router.classifier.max_commands;
 
-        let scores = self.classifier.classify(user_message, all_commands).await;
+        // Build the Commands domain candidates: each command as "{name}: {description}".
+        let candidates: Vec<RoutingCandidate> = all_commands
+            .iter()
+            .map(|cmd| RoutingCandidate {
+                id: cmd.name.clone(),
+                examples: vec![format!("{}: {}", cmd.name, cmd.description)],
+            })
+            .collect();
 
-        match scores {
-            Ok(results) => {
+        let domains = vec![(RoutingDomainKind::Commands, candidates)];
+
+        let decision = self.router.route(user_message, &domains).await;
+
+        match decision {
+            Ok(routing_decision) => {
+                let scored = routing_decision.commands;
+
                 // Filter by threshold, then take top N.
-                let filtered = filter_by_threshold(results, threshold);
-                let top: Vec<ClassificationResult> = take_top(filtered, max_commands);
+                let filtered = filter_by_threshold(scored, threshold);
+                let top: Vec<ScoredCandidate> = take_top(filtered, max_commands);
 
                 // Convert back to CommandStub by matching names.
-                let score_map: std::collections::HashMap<&str, f32> = top
-                    .iter()
-                    .map(|r| (r.command_name.as_str(), r.score))
-                    .collect();
+                let score_map: std::collections::HashMap<&str, f32> =
+                    top.iter().map(|r| (r.id.as_str(), r.score)).collect();
 
                 let mut selected: Vec<CommandStub> = all_commands
                     .iter()
@@ -229,16 +244,16 @@ impl GatewayEngine {
                 debug!(
                     selected_count = selected.len(),
                     total_count = all_commands.len(),
-                    "semantic classifier selected commands"
+                    "semantic router selected commands"
                 );
 
                 selected
             }
             Err(e) => {
-                // Classifier failure: fall back to all commands, sorted alphabetically.
+                // Router failure: fall back to all commands, sorted alphabetically.
                 warn!(
                     error = %e,
-                    "semantic classifier failed, falling back to all commands"
+                    "semantic router failed, falling back to all commands"
                 );
 
                 let mut fallback: Vec<CommandStub> =
@@ -306,13 +321,16 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::sync::Arc;
-    use weft_classifier::{ClassificationResult, ClassifierError, SemanticClassifier};
     use weft_commands::{CommandError, CommandRegistry};
     use weft_core::{
-        CommandAction, CommandDescription, CommandInvocation, CommandResult, CommandStub,
-        GatewayConfig, LlmConfig, LlmProviderKind, Message, Role, ServerConfig, WeftConfig,
+        ClassifierConfig, CommandAction, CommandDescription, CommandInvocation, CommandResult,
+        CommandStub, GatewayConfig, LlmProviderKind, Message, ModelEntry, ProviderConfig, Role,
+        RouterConfig, ServerConfig, WeftConfig,
     };
     use weft_llm::{CompletionOptions, CompletionResponse, LlmError, LlmProvider};
+    use weft_router::{
+        RouterError, RoutingCandidate, RoutingDecision, RoutingDomainKind, SemanticRouter,
+    };
 
     // ── Mock implementations ───────────────────────────────────────────────
 
@@ -392,48 +410,54 @@ mod tests {
         }
     }
 
-    /// A mock classifier that always succeeds with configurable scores.
-    struct MockClassifier {
+    /// A mock router that always succeeds with configurable scores.
+    struct MockRouter {
         score: f32,
     }
 
-    impl MockClassifier {
+    impl MockRouter {
         fn with_score(score: f32) -> Self {
             Self { score }
         }
 
-        fn failing() -> FailingClassifier {
-            FailingClassifier
+        fn failing() -> FailingRouter {
+            FailingRouter
         }
     }
 
     #[async_trait]
-    impl SemanticClassifier for MockClassifier {
-        async fn classify(
+    impl SemanticRouter for MockRouter {
+        async fn route(
             &self,
             _user_message: &str,
-            commands: &[CommandStub],
-        ) -> Result<Vec<ClassificationResult>, ClassifierError> {
-            Ok(commands
-                .iter()
-                .map(|c| ClassificationResult {
-                    command_name: c.name.clone(),
-                    score: self.score,
-                })
-                .collect())
+            domains: &[(RoutingDomainKind, Vec<RoutingCandidate>)],
+        ) -> Result<RoutingDecision, RouterError> {
+            let mut decision = RoutingDecision::empty();
+            for (kind, candidates) in domains {
+                if let RoutingDomainKind::Commands = kind {
+                    decision.commands = candidates
+                        .iter()
+                        .map(|c| weft_router::ScoredCandidate {
+                            id: c.id.clone(),
+                            score: self.score,
+                        })
+                        .collect();
+                }
+            }
+            Ok(decision)
         }
     }
 
-    struct FailingClassifier;
+    struct FailingRouter;
 
     #[async_trait]
-    impl SemanticClassifier for FailingClassifier {
-        async fn classify(
+    impl SemanticRouter for FailingRouter {
+        async fn route(
             &self,
             _: &str,
-            _: &[CommandStub],
-        ) -> Result<Vec<ClassificationResult>, ClassifierError> {
-            Err(ClassifierError::ModelNotLoaded)
+            _: &[(RoutingDomainKind, Vec<RoutingCandidate>)],
+        ) -> Result<RoutingDecision, RouterError> {
+            Err(RouterError::ModelNotLoaded)
         }
     }
 
@@ -536,18 +560,28 @@ mod tests {
             server: ServerConfig {
                 bind_address: "127.0.0.1:8080".to_string(),
             },
-            llm: LlmConfig {
-                provider: LlmProviderKind::Anthropic,
-                api_key: "test-key".to_string(),
-                model: "claude-test".to_string(),
-                max_tokens: 1024,
-                base_url: None,
-            },
-            classifier: weft_core::ClassifierConfig {
-                model_path: "models/test.onnx".to_string(),
-                tokenizer_path: "models/tokenizer.json".to_string(),
-                threshold: 0.0, // All commands pass in tests
-                max_commands: 20,
+            router: RouterConfig {
+                classifier: ClassifierConfig {
+                    model_path: "models/test.onnx".to_string(),
+                    tokenizer_path: "models/tokenizer.json".to_string(),
+                    threshold: 0.0, // All commands pass in tests
+                    max_commands: 20,
+                },
+                default_model: Some("test-model".to_string()),
+                providers: vec![ProviderConfig {
+                    name: "test-provider".to_string(),
+                    kind: LlmProviderKind::Anthropic,
+                    api_key: "test-key".to_string(),
+                    base_url: None,
+                    models: vec![ModelEntry {
+                        name: "test-model".to_string(),
+                        model: "claude-test".to_string(),
+                        max_tokens: 1024,
+                        examples: vec!["test query".to_string()],
+                    }],
+                }],
+                skip_tools_when_unnecessary: true,
+                domains: weft_core::DomainsConfig::default(),
             },
             tool_registry: None,
             gateway: GatewayConfig {
@@ -573,13 +607,13 @@ mod tests {
 
     fn make_engine(
         llm: impl LlmProvider + 'static,
-        classifier: impl SemanticClassifier + 'static,
+        router: impl SemanticRouter + 'static,
         registry: impl CommandRegistry + 'static,
     ) -> GatewayEngine {
         GatewayEngine::new(
             test_config(),
             Arc::new(llm),
-            Arc::new(classifier),
+            Arc::new(router),
             Arc::new(registry),
         )
     }
@@ -590,7 +624,7 @@ mod tests {
     async fn test_no_command_response_single_pass() {
         let engine = make_engine(
             MockLlmProvider::single("Hello, I can help you with that!"),
-            MockClassifier::with_score(0.9),
+            MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![]),
         );
 
@@ -619,7 +653,7 @@ mod tests {
                 // Second response (after command result): clean answer
                 "Here are the results I found.",
             ]),
-            MockClassifier::with_score(0.9),
+            MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![("web_search", "Search the web")]).with_execute_result(
                 CommandResult {
                     command_name: "web_search".to_string(),
@@ -651,7 +685,7 @@ mod tests {
                 "/web_search query: \"Rust\"\n/code_review target: src",
                 "Done with both commands.",
             ]),
-            MockClassifier::with_score(0.9),
+            MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![
                 ("web_search", "Search the web"),
                 ("code_review", "Review code"),
@@ -690,7 +724,7 @@ mod tests {
         let engine = GatewayEngine::new(
             config,
             Arc::new(MockLlmProvider::single("/web_search query: \"loop\"")),
-            Arc::new(MockClassifier::with_score(0.9)),
+            Arc::new(MockRouter::with_score(0.9)),
             Arc::new(
                 MockCommandRegistry::new(vec![("web_search", "Search")]).with_execute_result(
                     CommandResult {
@@ -723,7 +757,7 @@ mod tests {
                 "/web_search query: \"Rust\"",
                 "The search failed, but I can still answer.",
             ]),
-            MockClassifier::with_score(0.9),
+            MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![("web_search", "Search the web")]).with_execute_result(
                 CommandResult {
                     command_name: "web_search".to_string(),
@@ -745,24 +779,24 @@ mod tests {
         );
     }
 
-    // ── Test: classifier fallback ──────────────────────────────────────────
+    // ── Test: router fallback ──────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_classifier_failure_falls_back_to_all_commands() {
+    async fn test_router_failure_falls_back_to_all_commands() {
         let engine = make_engine(
             MockLlmProvider::single("No commands needed."),
-            MockClassifier::failing(),
+            MockRouter::failing(),
             MockCommandRegistry::new(vec![
                 ("web_search", "Search the web"),
                 ("code_review", "Review code"),
             ]),
         );
 
-        // Should succeed even with a failing classifier (fallback to all commands)
+        // Should succeed even with a failing router (fallback to all commands)
         let resp = engine
             .handle_request(make_user_request("Hello"))
             .await
-            .expect("classifier fallback must not fail the request");
+            .expect("router fallback must not fail the request");
 
         assert!(!resp.choices[0].message.content.is_empty());
     }
@@ -776,7 +810,7 @@ mod tests {
                 "/web_search --describe",
                 "Now I understand the command.",
             ]),
-            MockClassifier::with_score(0.9),
+            MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![("web_search", "Search the web")]).with_describe_result(
                 CommandDescription {
                     name: "web_search".to_string(),
@@ -804,7 +838,7 @@ mod tests {
     async fn test_streaming_rejected() {
         let engine = make_engine(
             MockLlmProvider::single("irrelevant"),
-            MockClassifier::with_score(0.9),
+            MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![]),
         );
 
@@ -822,12 +856,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_timeout() {
-        // Very short timeout: 1 millisecond
+        // Very short timeout: 0 seconds = immediately timeout
         let config = Arc::new(WeftConfig {
             gateway: GatewayConfig {
                 system_prompt: "test".to_string(),
                 max_command_iterations: 10,
-                request_timeout_secs: 0, // 0 seconds = immediately timeout
+                request_timeout_secs: 0,
             },
             ..(*test_config()).clone()
         });
@@ -855,7 +889,7 @@ mod tests {
         let engine = GatewayEngine::new(
             config,
             Arc::new(SlowLlmProvider),
-            Arc::new(MockClassifier::with_score(0.9)),
+            Arc::new(MockRouter::with_score(0.9)),
             Arc::new(MockCommandRegistry::new(vec![])),
         );
 
@@ -873,7 +907,7 @@ mod tests {
     async fn test_response_format_matches_openai_schema() {
         let engine = make_engine(
             MockLlmProvider::single("Test response"),
-            MockClassifier::with_score(0.9),
+            MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![]),
         );
 
@@ -912,7 +946,7 @@ mod tests {
     async fn test_no_user_message_returns_error() {
         let engine = make_engine(
             MockLlmProvider::single("irrelevant"),
-            MockClassifier::with_score(0.9),
+            MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![]),
         );
 
@@ -938,7 +972,7 @@ mod tests {
     async fn test_rate_limit_error_propagated() {
         let engine = make_engine(
             RateLimitedLlmProvider,
-            MockClassifier::with_score(0.9),
+            MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![]),
         );
 
@@ -961,7 +995,7 @@ mod tests {
     async fn test_llm_error_propagated() {
         let engine = make_engine(
             FailingLlmProvider,
-            MockClassifier::with_score(0.9),
+            MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![]),
         );
 
@@ -979,7 +1013,7 @@ mod tests {
     async fn test_list_commands_failure_propagated() {
         let engine = make_engine(
             MockLlmProvider::single("irrelevant"),
-            MockClassifier::with_score(0.9),
+            MockRouter::with_score(0.9),
             MockCommandRegistry::with_list_failure(),
         );
 
@@ -997,7 +1031,7 @@ mod tests {
     async fn test_empty_llm_response_is_valid() {
         let engine = make_engine(
             MockLlmProvider::single(""),
-            MockClassifier::with_score(0.9),
+            MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![]),
         );
 
@@ -1015,7 +1049,7 @@ mod tests {
     async fn test_usage_extracted_from_provider() {
         let engine = make_engine(
             MockLlmProvider::single("Done"),
-            MockClassifier::with_score(0.9),
+            MockRouter::with_score(0.9),
             MockCommandRegistry::new(vec![]),
         );
 

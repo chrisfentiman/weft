@@ -1,5 +1,5 @@
 [package]
-name = "weft_classifier"
+name = "weft_router"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

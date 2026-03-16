@@ -1,31 +1,166 @@
 # config/weft.example.toml
+#
+# Weft gateway configuration — router-only format.
+# The [llm] and [classifier] sections from previous versions are removed.
+# All LLM provider and routing configuration is now under [router].
 
 [server]
+# Address and port to listen on.
 bind_address = "0.0.0.0:8080"
 
-[llm]
-provider = "anthropic"
-api_key = "env:ANTHROPIC_API_KEY"
-model = "claude-sonnet-4-20250514"
-max_tokens = 4096
-# base_url = "https://api.anthropic.com"  # optional override
-
-[classifier]
-model_path = "models/modernbert-classifier.onnx"
-tokenizer_path = "models/tokenizer.json"
-threshold = 0.3
-max_commands = 20
-
-[tool_registry]
-endpoint = "http://localhost:50051"
-connect_timeout_ms = 5000
-request_timeout_ms = 30000
-
 [gateway]
+# System prompt prepended to every conversation.
 system_prompt = """
 You are a helpful assistant with access to tools.
 Use the available commands when they would help answer the user's question.
 Be concise and accurate.
 """
+# Maximum number of command execution iterations per request.
 max_command_iterations = 10
+# Overall request timeout in seconds (covers all LLM calls and command executions).
 request_timeout_secs = 300
+
+# ── Router Configuration ───────────────────────────────────────────────────
+#
+# The [router] section replaces the old [llm] and [classifier] sections.
+# It contains:
+#   - classifier: ONNX bi-encoder for semantic routing
+#   - providers: LLM API endpoints (each with nested models)
+#   - default_model: routing name of the default model (fallback)
+#   - skip_tools_when_unnecessary: skip command injection when router decides tools aren't needed
+#   - domains: per-domain threshold and enablement overrides
+
+[router]
+# Name of the default model. Must match a model name from one of the providers.
+# If absent, the first model of the first provider is used as default.
+default_model = "main"
+
+# Whether to skip command injection when the router determines tools aren't needed.
+# Default: true. Set to false to always inject commands.
+skip_tools_when_unnecessary = true
+
+[router.classifier]
+# Path to the ONNX bi-encoder model file.
+model_path = "models/modernbert-classifier.onnx"
+# Path to the HuggingFace tokenizer.json file.
+tokenizer_path = "models/tokenizer.json"
+# Relevance score threshold for command selection (0.0–1.0).
+# Commands scoring below this threshold are excluded from the context.
+threshold = 0.3
+# Maximum number of commands to include regardless of threshold.
+max_commands = 20
+
+# ── Single-Provider Example ────────────────────────────────────────────────
+#
+# Minimal configuration: one Anthropic provider, one model.
+#
+# [[router.providers]] defines a provider (an API endpoint).
+# [[router.providers.models]] defines models nested under a provider.
+# One provider can serve many models — they all share the same api_key and base_url.
+
+[[router.providers]]
+# Unique name for this provider (used in logging).
+name = "anthropic"
+# Provider type: "anthropic" or "openai"
+kind = "anthropic"
+# API key. Use "env:VAR_NAME" to load from an environment variable.
+api_key = "env:ANTHROPIC_API_KEY"
+# base_url is optional — defaults to the official Anthropic API endpoint.
+# base_url = "https://api.anthropic.com/v1/messages"
+
+  [[router.providers.models]]
+  # Unique routing name for this model (used to select the model at request time).
+  # Must be globally unique across all providers.
+  name = "main"
+  # Model identifier sent to the provider API.
+  model = "claude-sonnet-4-20250514"
+  # Maximum tokens in the response.
+  max_tokens = 4096
+  # Example queries this model is best suited for.
+  # The router embeds all examples, averages them into a centroid vector,
+  # and routes requests based on semantic similarity to the centroid.
+  # Use at least 3 examples for a meaningful centroid.
+  examples = [
+    "Explain how async/await works in Rust",
+    "What is the capital of France?",
+    "Help me debug this error",
+    "Write a function that sorts a list",
+  ]
+
+# ── Optional: Tool Registry ────────────────────────────────────────────────
+#
+# Remove or comment out this section if you are not using a tool registry.
+
+[tool_registry]
+# gRPC endpoint for the tool registry service.
+endpoint = "http://localhost:50051"
+# Connection timeout in milliseconds.
+connect_timeout_ms = 5000
+# Per-request timeout in milliseconds.
+request_timeout_ms = 30000
+
+# ── Multi-Provider Example (commented out) ────────────────────────────────
+#
+# Uncomment and adapt for multi-provider / multi-model routing.
+# Each provider entry adds models to the routing pool.
+# The semantic router selects the best model per request.
+
+# [router]
+# default_model = "complex"
+# skip_tools_when_unnecessary = true
+#
+# [router.classifier]
+# model_path = "models/modernbert-classifier.onnx"
+# tokenizer_path = "models/tokenizer.json"
+# threshold = 0.3
+# max_commands = 20
+#
+# # Model domain: only select a non-default model when confidence exceeds 0.5.
+# [router.domains.model]
+# threshold = 0.5
+#
+# [router.domains.tool_necessity]
+# enabled = true
+#
+# [[router.providers]]
+# name = "anthropic"
+# kind = "anthropic"
+# api_key = "env:ANTHROPIC_API_KEY"
+#
+#   [[router.providers.models]]
+#   name = "complex"
+#   model = "claude-sonnet-4-20250514"
+#   max_tokens = 8192
+#   examples = [
+#     "Design a distributed system with fault tolerance",
+#     "Analyze this algorithm's time complexity",
+#     "Write a parser that handles edge cases",
+#     "Compare the tradeoffs between X and Y",
+#   ]
+#
+#   [[router.providers.models]]
+#   name = "fast"
+#   model = "claude-haiku-4-5-20251001"
+#   max_tokens = 2048
+#   examples = [
+#     "Hi, how are you?",
+#     "What time is it in Tokyo?",
+#     "Summarize this paragraph",
+#     "Translate this to Spanish",
+#   ]
+#
+# [[router.providers]]
+# name = "local"
+# kind = "openai"
+# api_key = "unused"                                    # Local providers ignore auth headers
+# base_url = "http://localhost:11434/v1/chat/completions"
+#
+#   [[router.providers.models]]
+#   name = "general"
+#   model = "llama3.2"
+#   max_tokens = 4096
+#   examples = [
+#     "Draft an internal memo about project status",
+#     "Review this confidential contract",
+#     "Analyze our proprietary data",
+#   ]

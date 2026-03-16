@@ -1,18 +1,23 @@
 //! ModernBERT bi-encoder via ONNX Runtime.
 //!
-//! Loads a ModernBERT ONNX model and tokenizer, pre-computes command embeddings
+//! Loads a ModernBERT ONNX model and tokenizer, pre-computes candidate embeddings
 //! at construction time if provided, and scores user messages against those
-//! embeddings via cosine similarity at query time. Unknown commands are embedded
-//! lazily during `classify()` and cached for subsequent calls.
+//! embeddings via cosine similarity at query time. Unknown candidates are embedded
+//! lazily during `route()` and cached for subsequent calls.
 //!
-//! The bi-encoder approach embeds query and commands separately:
-//! - Command embeddings: computed lazily on first encounter, then cached.
+//! The bi-encoder approach embeds query and candidates separately:
+//! - Candidate embeddings: computed lazily on first encounter, then cached.
 //! - Query embedding: computed per request (~20-50ms CPU).
 //! - Similarity: dot product of L2-normalized vectors (cosine similarity).
 //!
-//! Fallback: if the ONNX model or tokenizer fails to load, the classifier
-//! returns all commands unfiltered. This keeps the gateway functional even
-//! when the model is misconfigured.
+//! Fallback: if the ONNX model or tokenizer fails to load, the router
+//! returns all commands unfiltered (score 1.0). This keeps the gateway
+//! functional even when the model is misconfigured.
+//!
+//! **Phase 1 note:** This implementation wraps the existing classify logic to handle
+//! the Commands domain, producing a RoutingDecision with only `commands` populated.
+//! Full multi-domain routing (Model, ToolNecessity, Memory) with centroid embeddings
+//! is implemented in Phase 3.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,10 +28,12 @@ use ort::session::Session;
 use ort::value::Value;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
-use weft_core::CommandStub;
 
 use crate::tokenizer::BertTokenizer;
-use crate::{ClassificationResult, ClassifierError, SemanticClassifier};
+use crate::{
+    RouterError, RoutingCandidate, RoutingDecision, RoutingDomainKind, ScoredCandidate,
+    SemanticRouter,
+};
 
 /// Combined session and embedding cache, held inside a single `Mutex`.
 ///
@@ -34,20 +41,20 @@ use crate::{ClassificationResult, ClassifierError, SemanticClassifier};
 /// happen inside inference calls, which already hold the session mutex.
 struct SessionState {
     session: Session,
-    /// L2-normalized command embeddings keyed by command name.
+    /// L2-normalized candidate embeddings keyed by cache key (`"{prefix}:{id}"`).
     embeddings: HashMap<String, Vec<f32>>,
 }
 
-/// ModernBERT bi-encoder classifier.
+/// ModernBERT bi-encoder router.
 ///
 /// Wraps an ONNX session and a HuggingFace tokenizer. Builds L2-normalized
-/// embeddings for command stubs lazily during `classify()` (or eagerly at
-/// construction time if commands are provided). At query time, embeds the user
-/// message and computes cosine similarity against cached command embeddings.
+/// embeddings for routing candidates lazily during `route()` (or eagerly at
+/// construction time if candidates are provided). At query time, embeds the
+/// user message and computes cosine similarity against cached candidate embeddings.
 ///
 /// Thread-safe: `Session` is protected by a `tokio::sync::Mutex`. The
 /// tokenizer is `Send + Sync` and needs no locking.
-pub struct ModernBertClassifier {
+pub struct ModernBertRouter {
     /// ONNX Runtime session plus embedding cache, or `None` in fallback mode.
     ///
     /// Both the session and the cache are behind a single Mutex because cache
@@ -57,15 +64,15 @@ pub struct ModernBertClassifier {
     tokenizer: Option<Arc<BertTokenizer>>,
 }
 
-impl ModernBertClassifier {
-    /// Build a classifier, loading the ONNX model and tokenizer from disk.
+impl ModernBertRouter {
+    /// Build a router, loading the ONNX model and tokenizer from disk.
     ///
-    /// If `commands` is non-empty, their embeddings are pre-computed now as a
+    /// If `pre_embed` is non-empty, candidate embeddings are pre-computed now as a
     /// warm-start optimisation. If empty (`&[]`), the cache starts empty and
-    /// commands are embedded lazily on the first `classify()` call.
+    /// candidates are embedded lazily on the first `route()` call.
     ///
     /// If the model or tokenizer cannot be loaded, logs a warning and constructs
-    /// the classifier in fallback mode (no filtering, returns all commands).
+    /// the router in fallback mode (no filtering, returns all commands with score 1.0).
     ///
     /// The constructor is `async` because it must use `.lock().await` on the
     /// session mutex. `blocking_lock()` panics when called from within the tokio
@@ -73,15 +80,19 @@ impl ModernBertClassifier {
     ///
     /// `model_path`: Path to the ONNX model file.
     /// `tokenizer_path`: Path to the HuggingFace `tokenizer.json` file.
-    /// `commands`: Command stubs to pre-embed. Pass `&[]` to skip pre-embedding.
-    pub async fn new(model_path: &str, tokenizer_path: &str, commands: &[CommandStub]) -> Self {
+    /// `pre_embed`: Candidates to pre-embed at startup. Pass `&[]` to skip.
+    pub async fn new(
+        model_path: &str,
+        tokenizer_path: &str,
+        pre_embed: &[(RoutingDomainKind, Vec<RoutingCandidate>)],
+    ) -> Self {
         let tokenizer = match BertTokenizer::from_file(tokenizer_path) {
             Ok(t) => {
                 debug!("tokenizer loaded from '{tokenizer_path}'");
                 Some(Arc::new(t))
             }
             Err(e) => {
-                warn!("classifier falling back to passthrough: {e}");
+                warn!("router falling back to passthrough: {e}");
                 None
             }
         };
@@ -98,7 +109,7 @@ impl ModernBertClassifier {
                     })))
                 }
                 Err(e) => {
-                    warn!("classifier falling back to passthrough: ONNX load failed: {e}");
+                    warn!("router falling back to passthrough: ONNX load failed: {e}");
                     None
                 }
             }
@@ -106,27 +117,35 @@ impl ModernBertClassifier {
             None
         };
 
-        // Pre-embed any commands provided at construction time.
+        // Pre-embed any candidates provided at construction time.
         // The session mutex is freshly created and uncontested here, but we use
         // `.lock().await` because the constructor is called from within the tokio
         // runtime. `blocking_lock()` would panic in that context.
         if let (Some(state), Some(tok)) = (&session, &tokenizer) {
             let mut guard = state.lock().await;
-            for cmd in commands {
-                let text = format!("{}: {}", cmd.name, cmd.description);
-                match embed_text(tok, &mut guard.session, &text) {
-                    Ok(mut v) => {
-                        l2_normalize(&mut v);
-                        guard.embeddings.insert(cmd.name.clone(), v);
-                    }
-                    Err(e) => {
-                        warn!("failed to embed command '{}': {e}", cmd.name);
+            let mut count = 0;
+            for (domain_kind, candidates) in pre_embed {
+                for candidate in candidates {
+                    let cache_key = format!("{}:{}", domain_kind.cache_prefix(), candidate.id);
+                    // For Phase 1: pre-embed using the first example as the
+                    // representative text (single-example behavior).
+                    // Phase 3 replaces this with full centroid computation.
+                    if let Some(text) = candidate.examples.first() {
+                        match embed_text(tok, &mut guard.session, text) {
+                            Ok(mut v) => {
+                                l2_normalize(&mut v);
+                                guard.embeddings.insert(cache_key, v);
+                                count += 1;
+                            }
+                            Err(e) => {
+                                warn!("failed to pre-embed candidate '{}': {e}", candidate.id);
+                            }
+                        }
                     }
                 }
             }
-            let count = guard.embeddings.len();
             if count > 0 {
-                debug!("pre-computed embeddings for {count} commands");
+                debug!("pre-computed embeddings for {count} candidates");
             }
         }
 
@@ -136,18 +155,16 @@ impl ModernBertClassifier {
         }
     }
 
-    /// Returns `true` if the classifier is in fallback mode (no model loaded).
+    /// Returns `true` if the router is in fallback mode (no model loaded).
     pub fn is_fallback(&self) -> bool {
         self.state.is_none()
     }
 
-    /// Returns the number of commands whose embeddings are currently cached.
+    /// Returns the number of cached embeddings.
     ///
-    /// In fallback mode this is always 0. In normal mode it reflects the number
-    /// of commands that have been successfully embedded (at construction or
-    /// lazily during `classify()`).
+    /// In fallback mode this is always 0.
     #[cfg(test)]
-    pub async fn cached_command_count(&self) -> usize {
+    pub async fn cached_count(&self) -> usize {
         match &self.state {
             None => 0,
             Some(state) => state.lock().await.embeddings.len(),
@@ -156,77 +173,90 @@ impl ModernBertClassifier {
 }
 
 #[async_trait]
-impl SemanticClassifier for ModernBertClassifier {
-    async fn classify(
+impl SemanticRouter for ModernBertRouter {
+    /// Route a user message against all provided domains.
+    ///
+    /// **Phase 1 implementation:** Handles the Commands domain using the existing
+    /// per-command embedding logic. For Model, ToolNecessity, and Memory domains,
+    /// falls back to conservative defaults (None/empty). Full multi-domain centroid
+    /// routing is implemented in Phase 3.
+    async fn route(
         &self,
         user_message: &str,
-        commands: &[CommandStub],
-    ) -> Result<Vec<ClassificationResult>, ClassifierError> {
-        // Fallback: model not loaded — return all commands with score 1.0.
+        domains: &[(RoutingDomainKind, Vec<RoutingCandidate>)],
+    ) -> Result<RoutingDecision, RouterError> {
+        // Fallback: model not loaded — return fallback decision.
         let (state, tokenizer) = match (&self.state, &self.tokenizer) {
             (Some(s), Some(t)) => (s, t),
             _ => {
-                debug!("classifier in fallback mode, returning all commands");
-                // Spec Section 5.5: fallback returns all commands sorted alphabetically.
-                let mut results: Vec<ClassificationResult> = commands
-                    .iter()
-                    .map(|c| ClassificationResult {
-                        command_name: c.name.clone(),
-                        score: 1.0,
-                    })
-                    .collect();
-                results.sort_by(|a, b| a.command_name.cmp(&b.command_name));
-                return Ok(results);
+                debug!("router in fallback mode, returning fallback decision");
+                return Ok(RoutingDecision::fallback(domains));
             }
         };
 
-        // Acquire the session lock once for the entire classify call.
-        // Both cache writes and inference happen inside this critical section,
-        // which is correct per spec Section 5.3 and Section 10.3.
         let mut guard = state.lock().await;
 
-        // Spec Section 5.3: embed any commands not yet in the cache (lazy embedding).
-        for cmd in commands {
-            if !guard.embeddings.contains_key(&cmd.name) {
-                let text = format!("{}: {}", cmd.name, cmd.description);
-                match embed_text(tokenizer, &mut guard.session, &text) {
-                    Ok(mut v) => {
-                        l2_normalize(&mut v);
-                        guard.embeddings.insert(cmd.name.clone(), v);
-                        debug!("lazily embedded command '{}'", cmd.name);
+        // Embed the user message once.
+        let mut query_vec = embed_text(tokenizer, &mut guard.session, user_message)
+            .map_err(|e| RouterError::InferenceFailed(format!("query embedding: {e}")))?;
+        l2_normalize(&mut query_vec);
+
+        let mut decision = RoutingDecision::empty();
+
+        for (domain_kind, candidates) in domains {
+            match domain_kind {
+                RoutingDomainKind::Commands => {
+                    // Lazily embed any commands not yet in cache.
+                    for candidate in candidates {
+                        let cache_key = format!("{}:{}", domain_kind.cache_prefix(), candidate.id);
+                        if !guard.embeddings.contains_key(&cache_key) {
+                            // For Commands: use the first example as the representative text.
+                            if let Some(text) = candidate.examples.first() {
+                                match embed_text(tokenizer, &mut guard.session, text) {
+                                    Ok(mut v) => {
+                                        l2_normalize(&mut v);
+                                        guard.embeddings.insert(cache_key, v);
+                                        debug!("lazily embedded command '{}'", candidate.id);
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "failed to lazily embed command '{}': {e}",
+                                            candidate.id
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
-                    Err(e) => {
-                        warn!("failed to lazily embed command '{}': {e}", cmd.name);
-                        // Omit from cache so the next call retries embedding.
-                    }
+
+                    // Score all commands.
+                    let scored: Vec<ScoredCandidate> = candidates
+                        .iter()
+                        .map(|c| {
+                            let cache_key = format!("{}:{}", domain_kind.cache_prefix(), c.id);
+                            let score = guard
+                                .embeddings
+                                .get(&cache_key)
+                                .map(|emb| cosine_similarity(&query_vec, emb))
+                                .unwrap_or(0.0);
+                            ScoredCandidate {
+                                id: c.id.clone(),
+                                score,
+                            }
+                        })
+                        .collect();
+
+                    decision.commands = scored;
                 }
+                // Phase 1: Model, ToolNecessity, Memory are not yet implemented.
+                // These domains produce no output here. Full implementation in Phase 3.
+                RoutingDomainKind::Model
+                | RoutingDomainKind::ToolNecessity
+                | RoutingDomainKind::Memory => {}
             }
         }
 
-        // Embed the user message.
-        let mut query_vec =
-            embed_text(tokenizer, &mut guard.session, user_message).map_err(|e| {
-                ClassifierError::InferenceFailed(format!("query embedding failed: {e}"))
-            })?;
-        l2_normalize(&mut query_vec);
-
-        // Score each command against the query using cached embeddings.
-        let results = commands
-            .iter()
-            .map(|cmd| {
-                let score = guard
-                    .embeddings
-                    .get(&cmd.name)
-                    .map(|emb| cosine_similarity(&query_vec, emb))
-                    .unwrap_or(0.0);
-                ClassificationResult {
-                    command_name: cmd.name.clone(),
-                    score,
-                }
-            })
-            .collect();
-
-        Ok(results)
+        Ok(decision)
     }
 }
 
@@ -335,16 +365,18 @@ pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weft_core::CommandStub;
 
-    fn make_commands(names: &[(&str, &str)]) -> Vec<CommandStub> {
-        names
-            .iter()
-            .map(|(n, d)| CommandStub {
-                name: n.to_string(),
-                description: d.to_string(),
-            })
-            .collect()
+    fn make_commands_domain(names: &[(&str, &str)]) -> (RoutingDomainKind, Vec<RoutingCandidate>) {
+        (
+            RoutingDomainKind::Commands,
+            names
+                .iter()
+                .map(|(n, d)| RoutingCandidate {
+                    id: n.to_string(),
+                    examples: vec![format!("{n}: {d}")],
+                })
+                .collect(),
+        )
     }
 
     // ---- L2 normalization ----
@@ -432,195 +464,116 @@ mod tests {
 
     #[tokio::test]
     async fn test_fallback_when_model_missing() {
-        let commands = make_commands(&[
+        let (domain, candidates) = make_commands_domain(&[
             ("web_search", "Search the web"),
             ("recall", "Retrieve from memory"),
         ]);
 
-        let classifier = ModernBertClassifier::new(
+        let router = ModernBertRouter::new(
             "/nonexistent/path/model.onnx",
             "/nonexistent/path/tokenizer.json",
-            &commands,
+            &[],
         )
         .await;
 
         assert!(
-            classifier.is_fallback(),
+            router.is_fallback(),
             "should be in fallback mode when model is missing"
         );
 
-        let results = classifier
-            .classify("find something", &commands)
+        let domains = vec![(domain, candidates)];
+        let decision = router
+            .route("find something", &domains)
             .await
-            .expect("classify should succeed in fallback mode");
+            .expect("route should succeed in fallback mode");
 
-        assert_eq!(results.len(), 2, "should return all commands in fallback");
-        for result in &results {
-            assert_eq!(result.score, 1.0, "fallback scores should be 1.0");
+        assert_eq!(
+            decision.commands.len(),
+            2,
+            "should return all commands in fallback"
+        );
+        for c in &decision.commands {
+            assert_eq!(c.score, 1.0, "fallback scores should be 1.0");
         }
     }
 
     #[tokio::test]
     async fn test_fallback_returns_all_commands() {
-        let commands = make_commands(&[
+        let (domain, candidates) = make_commands_domain(&[
             ("cmd_a", "Does A"),
             ("cmd_b", "Does B"),
             ("cmd_c", "Does C"),
         ]);
 
-        let classifier =
-            ModernBertClassifier::new("/bad/model.onnx", "/bad/tokenizer.json", &commands).await;
+        let router = ModernBertRouter::new("/bad/model.onnx", "/bad/tokenizer.json", &[]).await;
 
-        let results = classifier
-            .classify("some query", &commands)
+        let decision = router
+            .route("some query", &[(domain, candidates)])
             .await
             .expect("fallback should not error");
 
-        let names: Vec<&str> = results.iter().map(|r| r.command_name.as_str()).collect();
-        assert!(names.contains(&"cmd_a"));
-        assert!(names.contains(&"cmd_b"));
-        assert!(names.contains(&"cmd_c"));
+        let ids: Vec<&str> = decision.commands.iter().map(|c| c.id.as_str()).collect();
+        assert!(ids.contains(&"cmd_a"));
+        assert!(ids.contains(&"cmd_b"));
+        assert!(ids.contains(&"cmd_c"));
     }
 
     #[tokio::test]
     async fn test_fallback_empty_commands() {
-        let classifier =
-            ModernBertClassifier::new("/bad/model.onnx", "/bad/tokenizer.json", &[]).await;
+        let router = ModernBertRouter::new("/bad/model.onnx", "/bad/tokenizer.json", &[]).await;
 
-        let results = classifier
-            .classify("something", &[])
+        let decision = router
+            .route("something", &[(RoutingDomainKind::Commands, vec![])])
             .await
             .expect("empty commands should not error");
 
-        assert!(results.is_empty());
+        assert!(decision.commands.is_empty());
     }
-
-    // ---- Fallback scores all commands 1.0 ----
 
     #[tokio::test]
     async fn test_fallback_scores_all_commands_1_0() {
-        // Fallback mode: every command passed to classify() returns score 1.0,
-        // regardless of what commands (if any) were provided to the constructor.
-        let commands_at_startup = make_commands(&[("known", "A known command")]);
-        let classifier = ModernBertClassifier::new(
-            "/bad/model.onnx",
-            "/bad/tokenizer.json",
-            &commands_at_startup,
-        )
-        .await;
+        let router = ModernBertRouter::new("/bad/model.onnx", "/bad/tokenizer.json", &[]).await;
 
-        let extra_commands = make_commands(&[("unknown_extra", "Not in cache")]);
-        let results = classifier
-            .classify("something", &extra_commands)
+        let candidates = vec![RoutingCandidate {
+            id: "unknown_extra".to_string(),
+            examples: vec!["unknown_extra: Not in cache".to_string()],
+        }];
+
+        let decision = router
+            .route("something", &[(RoutingDomainKind::Commands, candidates)])
             .await
             .expect("should not error");
 
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].score, 1.0);
+        assert_eq!(decision.commands.len(), 1);
+        assert_eq!(decision.commands[0].score, 1.0);
     }
-
-    // ---- Lazy embedding: cache starts empty, populated on first classify() ----
-
-    #[tokio::test]
-    async fn test_lazy_embedding_cache_starts_empty() {
-        // Constructor called with no commands: cache should be empty.
-        // In fallback mode (no model), cached_command_count is always 0.
-        let classifier =
-            ModernBertClassifier::new("/bad/model.onnx", "/bad/tokenizer.json", &[]).await;
-
-        assert_eq!(
-            classifier.cached_command_count().await,
-            0,
-            "cache should be empty when constructed with no commands"
-        );
-    }
-
-    // ---- Cache reuse: second classify() returns consistent results ----
-
-    #[tokio::test]
-    async fn test_cache_reuse_consistent_results() {
-        // In fallback mode: two classify() calls with the same commands return
-        // the same set of command names (fallback is stable).
-        let commands = make_commands(&[
-            ("cmd_alpha", "Does alpha things"),
-            ("cmd_beta", "Does beta things"),
-        ]);
-        let classifier =
-            ModernBertClassifier::new("/bad/model.onnx", "/bad/tokenizer.json", &[]).await;
-
-        let result_a = classifier
-            .classify("query one", &commands)
-            .await
-            .expect("first classify should succeed");
-        let result_b = classifier
-            .classify("query two", &commands)
-            .await
-            .expect("second classify should succeed");
-
-        let names_a: Vec<&str> = result_a.iter().map(|r| r.command_name.as_str()).collect();
-        let names_b: Vec<&str> = result_b.iter().map(|r| r.command_name.as_str()).collect();
-        assert_eq!(
-            names_a, names_b,
-            "classify() must return consistent results across calls"
-        );
-    }
-
-    // ---- Embedding cache populated at construction ----
-
-    #[tokio::test]
-    async fn test_embedding_cache_populated_at_construction() {
-        // Fallback mode: no embeddings are cached (model never ran).
-        let commands = make_commands(&[
-            ("cmd_alpha", "Does alpha things"),
-            ("cmd_beta", "Does beta things"),
-        ]);
-        let classifier =
-            ModernBertClassifier::new("/bad/model.onnx", "/bad/tokenizer.json", &commands).await;
-
-        assert_eq!(
-            classifier.cached_command_count().await,
-            0,
-            "fallback classifier should have no cached embeddings"
-        );
-
-        // Results are consistent across multiple calls.
-        let result_a = classifier
-            .classify("query one", &commands)
-            .await
-            .expect("first classify should succeed");
-        let result_b = classifier
-            .classify("query two", &commands)
-            .await
-            .expect("second classify should succeed");
-
-        let names_a: Vec<&str> = result_a.iter().map(|r| r.command_name.as_str()).collect();
-        let names_b: Vec<&str> = result_b.iter().map(|r| r.command_name.as_str()).collect();
-        assert_eq!(names_a, names_b, "results must be consistent across calls");
-    }
-
-    // ---- Fallback alphabetical ordering ----
 
     #[tokio::test]
     async fn test_fallback_results_sorted_alphabetically() {
-        // Spec Section 5.5: fallback returns commands sorted alphabetically by name.
-        let commands = make_commands(&[
+        let (domain, candidates) = make_commands_domain(&[
             ("zebra", "Last alphabetically"),
             ("alpha", "First alphabetically"),
             ("middle", "Middle alphabetically"),
         ]);
-        let classifier =
-            ModernBertClassifier::new("/bad/model.onnx", "/bad/tokenizer.json", &commands).await;
 
-        let results = classifier
-            .classify("anything", &commands)
+        let router = ModernBertRouter::new("/bad/model.onnx", "/bad/tokenizer.json", &[]).await;
+
+        let decision = router
+            .route("anything", &[(domain, candidates)])
             .await
             .expect("fallback should not error");
 
-        let names: Vec<&str> = results.iter().map(|r| r.command_name.as_str()).collect();
+        let ids: Vec<&str> = decision.commands.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(
-            names,
+            ids,
             vec!["alpha", "middle", "zebra"],
-            "fallback results must be sorted alphabetically by command_name"
+            "fallback results must be sorted alphabetically"
         );
+    }
+
+    #[tokio::test]
+    async fn test_cache_starts_empty() {
+        let router = ModernBertRouter::new("/bad/model.onnx", "/bad/tokenizer.json", &[]).await;
+        assert_eq!(router.cached_count().await, 0);
     }
 }
