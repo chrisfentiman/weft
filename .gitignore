@@ -34,3 +34,4 @@ models/*.json
 
 # Local config (contains secrets / overrides)
 config/weft.toml
+config/mockd.yaml
