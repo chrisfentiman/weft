@@ -23,6 +23,7 @@ use weft_llm::{AnthropicProvider, Capability, OpenAIProvider, ProviderRegistry, 
 use weft_router::{ModernBertRouter, RoutingCandidate, RoutingDomainKind};
 
 use crate::engine::{GatewayEngine, tool_necessity_candidates};
+use crate::grpc::WeftService;
 use crate::server::build_router;
 
 /// Weft — AI orchestration gateway
@@ -443,9 +444,17 @@ async fn main() {
         hook_registry,
     );
 
-    // ── Start the HTTP server ──────────────────────────────────────────────
+    // ── Wire WeftService (shared between gRPC and HTTP) ────────────────────
+    //
+    // WeftService is the single code path to the engine. Both the tonic gRPC
+    // server and the axum HTTP router hold an Arc<WeftService> and call
+    // handle_weft_request() — no separate engine references in the HTTP handler.
 
-    let router = build_router(engine);
+    let weft_service = Arc::new(WeftService::new(engine));
+
+    // ── Start the combined gRPC + HTTP server ──────────────────────────────
+
+    let router = build_router(Arc::clone(&weft_service));
     let bind_address = &config.server.bind_address;
 
     if let Err(e) = server::serve(router, bind_address).await {

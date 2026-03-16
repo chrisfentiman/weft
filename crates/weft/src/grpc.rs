@@ -1,13 +1,14 @@
 //! tonic gRPC service implementation for the Weft Wire protocol.
-#![allow(dead_code)] // Functions and types wired in Phase 5
 //!
 //! `WeftService` implements the `Weft` gRPC service defined in `weft.proto`.
 //! It is the single code path to the engine — both the tonic `chat()` RPC method
 //! and the OpenAI compat HTTP handler (Phase 5) call `handle_weft_request()`.
 //!
-//! Phase 4 scope:
+//! `WeftService` is constructed once in `main.rs` and shared between the gRPC
+//! server and the OpenAI compat HTTP handler via `Arc<WeftService>`.
+//!
+//! - `Chat` unary RPC: single request → single response
 //! - `ChatStream` server-streaming RPC: buffer-then-forward, activity events, delta flag
-//! - `Chat` unary RPC: activity events wired in via `options.activity`
 //! - `Live`: returns `Unimplemented` (reserved for future)
 //!
 //! Error mapping: `WeftError` → `tonic::Status` covers all variants.
@@ -48,13 +49,18 @@ impl WeftService {
         Self { engine }
     }
 
-    /// Core request handler shared by both the gRPC trait methods and (in Phase 5)
-    /// the OpenAI compat HTTP handler. This is the ONLY code path to the engine.
+    /// Core request handler shared by both the gRPC trait methods and the OpenAI
+    /// compat HTTP handler. This is the ONLY code path to the engine.
     ///
     /// Validates the request, runs the engine, returns the domain response.
     pub async fn handle_weft_request(&self, req: WeftRequest) -> Result<WeftResponse, WeftError> {
         validate_request(&req)?;
         self.engine.handle_request(req).await
+    }
+
+    /// Expose engine configuration for health checks and server diagnostics.
+    pub fn engine_config(&self) -> &weft_core::WeftConfig {
+        self.engine.config()
     }
 }
 

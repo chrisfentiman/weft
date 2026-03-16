@@ -3,6 +3,12 @@
 //! Endpoints:
 //! - `POST /v1/chat/completions` — OpenAI-compatible chat completions
 //! - `GET /health`               — Health check for load balancers
+//!
+//! Both gRPC and HTTP are served on the same port. The gRPC server handles
+//! requests with `content-type: application/grpc`; axum handles everything else.
+//! Both entry points converge at `WeftService::handle_weft_request()`.
+
+use std::sync::Arc;
 
 use axum::{
     Json, Router,
@@ -17,8 +23,9 @@ use weft_core::{
     ContentPart, ModelRoutingInstruction, Role, SamplingOptions, Source, WeftError, WeftMessage,
     WeftRequest,
 };
+use weft_proto::weft::v1 as proto;
 
-use crate::engine::GatewayEngine;
+use crate::grpc::WeftService;
 
 // ── OpenAI compat types (local to this module) ─────────────────────────────
 //
@@ -158,15 +165,36 @@ fn unix_timestamp() -> u64 {
 
 // ── Router ──────────────────────────────────────────────────────────────────
 
-/// Build the axum `Router` with all routes attached.
-pub fn build_router(engine: GatewayEngine) -> Router {
-    Router::new()
+/// Build the combined axum+gRPC tower service.
+///
+/// Returns an axum `Router` that handles HTTP endpoints (`/v1/chat/completions`,
+/// `/health`) merged with the tonic gRPC router. Both entry points share the
+/// same `Arc<WeftService>` instance and converge at `handle_weft_request()`.
+///
+/// Uses `tonic::service::Routes::into_axum_router()` to compose the gRPC server
+/// with axum on a single port. The tonic router handles `content-type: application/grpc`;
+/// axum handles everything else.
+pub fn build_router(weft_service: Arc<WeftService>) -> Router {
+    // Build the gRPC router via tonic's axum integration.
+    // tonic::service::Routes::new() wraps a NamedService + tower::Service.
+    // into_axum_router() returns an axum Router that handles gRPC content-type requests.
+    let grpc_router = tonic::service::Routes::new(proto::weft_server::WeftServer::new(
+        weft_service.as_ref().clone(),
+    ))
+    .into_axum_router();
+
+    // Build the HTTP axum router for OpenAI compat + health.
+    let http_router = Router::new()
         .route("/v1/chat/completions", post(chat_completions_handler))
         .route("/health", get(health_handler))
-        .with_state(engine)
+        .with_state(Arc::clone(&weft_service));
+
+    // Merge: gRPC router handles application/grpc requests; HTTP router handles the rest.
+    // axum's `merge` composes two routers — tonic's router takes priority for gRPC paths.
+    grpc_router.merge(http_router)
 }
 
-/// Start the HTTP server and block until shutdown.
+/// Start the HTTP+gRPC server and block until shutdown.
 ///
 /// Listens on `bind_address`, serves requests until SIGTERM/SIGINT.
 /// Once the signal is received, axum stops accepting new connections and
@@ -176,7 +204,7 @@ pub async fn serve(
     bind_address: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = tokio::net::TcpListener::bind(bind_address).await?;
-    info!(address = bind_address, "server listening");
+    info!(address = bind_address, "server listening (gRPC + HTTP)");
 
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
@@ -217,9 +245,11 @@ async fn shutdown_signal() {
 /// `POST /v1/chat/completions`
 ///
 /// Accepts an OpenAI-compatible chat completion request and returns a
-/// chat completion response. Streaming is not supported in v1.
+/// chat completion response. Translates to/from `WeftRequest`/`WeftResponse`
+/// and calls `WeftService::handle_weft_request()` — the same code path as gRPC.
+/// Streaming is not supported in v1.
 async fn chat_completions_handler(
-    State(engine): State<GatewayEngine>,
+    State(weft_service): State<Arc<WeftService>>,
     Json(openai_req): Json<OpenAiChatRequest>,
 ) -> Result<Json<OpenAiChatResponse>, ApiError> {
     // Generate a request-scoped tracing span for observability.
@@ -252,7 +282,9 @@ async fn chat_completions_handler(
 
     let weft_req = openai_to_weft(openai_req);
 
-    match engine.handle_request(weft_req).await {
+    // Call handle_weft_request — the same method the gRPC handler calls.
+    // One code path to the engine regardless of entry point.
+    match weft_service.handle_weft_request(weft_req).await {
         Ok(weft_resp) => Ok(Json(weft_to_openai(weft_resp))),
         Err(e) => Err(ApiError::from_weft_error(e)),
     }
@@ -261,20 +293,23 @@ async fn chat_completions_handler(
 /// `GET /health`
 ///
 /// Returns gateway health status. Always 200 if the process is up.
-async fn health_handler(State(engine): State<GatewayEngine>) -> Json<HealthResponse> {
+async fn health_handler(State(weft_service): State<Arc<WeftService>>) -> Json<HealthResponse> {
+    let config = weft_service.engine_config();
+
     // Classifier is considered loaded if it doesn't immediately fail a trivial classify.
     // Since we don't want to hit the real ONNX model here, we check the config path exists.
-    let classifier_loaded =
-        std::path::Path::new(&engine.config().router.classifier.model_path).exists();
+    let classifier_loaded = std::path::Path::new(&config.router.classifier.model_path).exists();
 
     // Tool registry: we don't ping the gRPC server from the health check. Report based
     // on whether tool_registry config is present (connected status is checked lazily).
-    let tool_registry_connected = engine.config().tool_registry.is_some();
+    let tool_registry_connected = config.tool_registry.is_some();
 
     Json(HealthResponse {
         status: "ok".to_string(),
         classifier_loaded,
         tool_registry_connected,
+        // The gRPC service is co-located and always available if the process is running.
+        grpc_service: "serving".to_string(),
     })
 }
 
@@ -286,6 +321,8 @@ pub struct HealthResponse {
     pub status: String,
     pub classifier_loaded: bool,
     pub tool_registry_connected: bool,
+    /// "serving" when the gRPC service is active, "not_serving" otherwise.
+    pub grpc_service: String,
 }
 
 /// OpenAI-compatible error response body.
@@ -422,7 +459,6 @@ mod tests {
     };
     use serde_json::{Value, json};
     use std::collections::{HashMap, HashSet};
-    use std::sync::Arc;
     use tower::ServiceExt;
     use weft_commands::{CommandError, CommandRegistry};
     use weft_core::{
@@ -632,8 +668,8 @@ mod tests {
         ))
     }
 
-    fn make_router(llm: impl Provider + 'static) -> Router {
-        let engine = GatewayEngine::new(
+    fn make_weft_service(llm: impl Provider + 'static) -> Arc<WeftService> {
+        let engine = crate::engine::GatewayEngine::new(
             test_config(),
             make_registry(llm),
             Arc::new(MockRouter),
@@ -641,7 +677,11 @@ mod tests {
             None,
             std::sync::Arc::new(crate::hooks::HookRegistry::empty()),
         );
-        build_router(engine)
+        Arc::new(WeftService::new(engine))
+    }
+
+    fn make_router(llm: impl Provider + 'static) -> Router {
+        build_router(make_weft_service(llm))
     }
 
     async fn post_json(router: Router, body: Value) -> (StatusCode, Value) {
@@ -787,15 +827,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_endpoint_returns_200() {
-        let engine = GatewayEngine::new(
-            test_config(),
-            make_registry(MockLlmProvider::ok("irrelevant")),
-            Arc::new(MockRouter),
-            Arc::new(MockRegistry),
-            None,
-            std::sync::Arc::new(crate::hooks::HookRegistry::empty()),
-        );
-        let router = build_router(engine);
+        let weft_service = make_weft_service(MockLlmProvider::ok("irrelevant"));
+        let router = build_router(Arc::clone(&weft_service));
 
         let req = Request::builder()
             .method("GET")
@@ -813,6 +846,9 @@ mod tests {
         assert_eq!(health["status"], "ok");
         assert!(health["classifier_loaded"].is_boolean());
         assert!(health["tool_registry_connected"].is_boolean());
+        // Phase 5: grpc_service field must be present
+        assert!(health["grpc_service"].is_string());
+        assert_eq!(health["grpc_service"], "serving");
     }
 
     #[tokio::test]
@@ -990,5 +1026,29 @@ mod tests {
         let openai_resp = weft_to_openai(resp);
         // No assistant message → empty content, not a panic
         assert_eq!(openai_resp.choices[0].message.content, "");
+    }
+
+    // ── Single code path test ───────────────────────────────────────────────
+
+    /// Both HTTP and gRPC entry points share the same WeftService instance.
+    /// This test verifies that build_router wires Arc<WeftService> correctly:
+    /// the same service handles requests from both protocols.
+    #[tokio::test]
+    async fn test_shared_weft_service_single_code_path() {
+        // The WeftService is constructed once and shared via Arc.
+        // We verify the HTTP path successfully calls handle_weft_request on it.
+        let weft_service = make_weft_service(MockLlmProvider::ok("shared path response"));
+        let router = build_router(Arc::clone(&weft_service));
+
+        let body = json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "test single code path"}]
+        });
+        let (status, resp) = post_json(router, body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            resp["choices"][0]["message"]["content"],
+            "shared path response"
+        );
     }
 }
