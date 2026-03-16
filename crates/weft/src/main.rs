@@ -205,7 +205,7 @@ async fn main() {
 
     // ── Build pre-embed candidates for the router ──────────────────────────
     //
-    // Pre-embed model candidates and tool-necessity candidates at startup.
+    // Pre-embed model, tool-necessity, and memory candidates at startup.
     // Command candidates are embedded lazily (they come from a remote registry).
 
     let model_candidates: Vec<RoutingCandidate> = resolved_models
@@ -218,6 +218,21 @@ async fn main() {
 
     let tool_candidates = tool_necessity_candidates();
 
+    // Build memory candidates from config for pre-embedding and per-invocation routing.
+    let memory_candidates: Vec<RoutingCandidate> = config
+        .memory
+        .as_ref()
+        .map(|mc| {
+            mc.stores
+                .iter()
+                .map(|store| RoutingCandidate {
+                    id: store.name.clone(),
+                    examples: store.examples.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut pre_embed: Vec<(RoutingDomainKind, Vec<RoutingCandidate>)> = Vec::new();
 
     // Only pre-embed model candidates if there are multiple models to route between.
@@ -228,6 +243,11 @@ async fn main() {
     // Pre-embed tool-necessity candidates if tool-skipping is enabled.
     if config.router.skip_tools_when_unnecessary {
         pre_embed.push((RoutingDomainKind::ToolNecessity, tool_candidates));
+    }
+
+    // Pre-embed memory candidates if any stores are configured.
+    if !memory_candidates.is_empty() {
+        pre_embed.push((RoutingDomainKind::Memory, memory_candidates));
     }
 
     // ── Build domain thresholds from config ───────────────────────────────

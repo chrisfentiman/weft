@@ -367,6 +367,21 @@ mod tests {
             }
             Ok(decision)
         }
+
+        async fn score_memory_candidates(
+            &self,
+            _text: &str,
+            candidates: &[RoutingCandidate],
+        ) -> Result<Vec<weft_router::ScoredCandidate>, RouterError> {
+            // Score all candidates 1.0 for server tests (memory routing not tested here).
+            Ok(candidates
+                .iter()
+                .map(|c| weft_router::ScoredCandidate {
+                    id: c.id.clone(),
+                    score: 1.0,
+                })
+                .collect())
+        }
     }
 
     struct MockRegistry;

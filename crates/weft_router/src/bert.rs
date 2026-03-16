@@ -286,6 +286,72 @@ impl SemanticRouter for ModernBertRouter {
 
         Ok(decision)
     }
+
+    /// Score memory store candidates against arbitrary text.
+    ///
+    /// Used for per-invocation routing by both `/recall` and `/remember`.
+    /// Embeds `text` using the same model as `route()`, then computes cosine
+    /// similarity against each candidate's pre-embedded centroid.
+    ///
+    /// Unknown candidates are embedded lazily and cached (same as in `route()`).
+    /// Returns `Err(RouterError::ModelNotLoaded)` when in fallback mode.
+    async fn score_memory_candidates(
+        &self,
+        text: &str,
+        candidates: &[RoutingCandidate],
+    ) -> Result<Vec<ScoredCandidate>, RouterError> {
+        let (state, tokenizer) = match (&self.state, &self.tokenizer) {
+            (Some(s), Some(t)) => (s, t),
+            _ => return Err(RouterError::ModelNotLoaded),
+        };
+
+        let mut guard = state.lock().await;
+
+        // Embed the input text.
+        let mut query_vec = embed_text(tokenizer, &mut guard.session, text)
+            .map_err(|e| RouterError::InferenceFailed(format!("memory score embedding: {e}")))?;
+        l2_normalize(&mut query_vec);
+
+        // Use Memory domain cache prefix for all memory store candidates.
+        let domain_prefix = RoutingDomainKind::Memory.cache_prefix();
+
+        // Ensure all candidates have cached centroid embeddings.
+        for candidate in candidates {
+            let cache_key = format!("{domain_prefix}:{}", candidate.id);
+            if !guard.embeddings.contains_key(&cache_key) {
+                match compute_centroid(tokenizer, &mut guard.session, &candidate.examples) {
+                    Ok(centroid) => {
+                        guard.embeddings.insert(cache_key, centroid);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "failed to compute centroid for memory candidate '{}': {e}",
+                            candidate.id
+                        );
+                    }
+                }
+            }
+        }
+
+        // Score all candidates.
+        let scored: Vec<ScoredCandidate> = candidates
+            .iter()
+            .map(|c| {
+                let cache_key = format!("{domain_prefix}:{}", c.id);
+                let score = guard
+                    .embeddings
+                    .get(&cache_key)
+                    .map(|emb| cosine_similarity(&query_vec, emb))
+                    .unwrap_or(0.0);
+                ScoredCandidate {
+                    id: c.id.clone(),
+                    score,
+                }
+            })
+            .collect();
+
+        Ok(scored)
+    }
 }
 
 /// Compute the centroid embedding for a slice of example texts.

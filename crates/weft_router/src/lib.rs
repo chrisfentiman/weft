@@ -32,6 +32,21 @@ pub trait SemanticRouter: Send + Sync + 'static {
         user_message: &str,
         domains: &[(RoutingDomainKind, Vec<RoutingCandidate>)],
     ) -> Result<RoutingDecision, RouterError>;
+
+    /// Score memory store candidates against the given text.
+    ///
+    /// Used for per-invocation routing by both `/recall` (with the query argument)
+    /// and `/remember` (with the content argument). Each invocation routes
+    /// independently based on its own argument content, not the user's original message.
+    ///
+    /// Returns scored candidates (unsorted, unfiltered — caller applies threshold and
+    /// capability filtering). Returns `Err(RouterError::ModelNotLoaded)` if the
+    /// embedding model is unavailable (fallback mode).
+    async fn score_memory_candidates(
+        &self,
+        text: &str,
+        candidates: &[RoutingCandidate],
+    ) -> Result<Vec<ScoredCandidate>, RouterError>;
 }
 
 #[derive(Debug, thiserror::Error)]

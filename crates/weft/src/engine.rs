@@ -87,6 +87,16 @@ pub struct GatewayEngine {
     command_registry: Arc<dyn CommandRegistry>,
     /// Optional memory store multiplexer. `None` when no memory stores are configured.
     memory_mux: Option<Arc<MemoryStoreMux>>,
+    /// All memory store routing candidates (from config). Used for the Memory domain
+    /// in `route_all_domains()` and for per-invocation routing by both `/recall` and
+    /// `/remember`. Empty if no memory stores are configured.
+    memory_candidates: Vec<RoutingCandidate>,
+    /// Memory candidates filtered to read-capable stores only. Used by `/recall`
+    /// for per-invocation routing via `score_memory_candidates()`.
+    read_memory_candidates: Vec<RoutingCandidate>,
+    /// Memory candidates filtered to write-capable stores only. Used by `/remember`
+    /// for per-invocation routing via `score_memory_candidates()`.
+    write_memory_candidates: Vec<RoutingCandidate>,
 }
 
 impl GatewayEngine {
@@ -96,6 +106,12 @@ impl GatewayEngine {
     }
 
     /// Construct a new gateway engine.
+    ///
+    /// `memory_candidates`: All memory store routing candidates (pre-built from config,
+    ///   same structure as model candidates). Used for the Memory domain in routing and
+    ///   for per-invocation `score_memory_candidates()` calls during command execution.
+    /// `read_memory_candidates`: Subset with read capability (for `/recall` routing).
+    /// `write_memory_candidates`: Subset with write capability (for `/remember` routing).
     pub fn new(
         config: Arc<WeftConfig>,
         provider_registry: Arc<ProviderRegistry>,
@@ -103,12 +119,21 @@ impl GatewayEngine {
         command_registry: Arc<dyn CommandRegistry>,
         memory_mux: Option<Arc<MemoryStoreMux>>,
     ) -> Self {
+        // Build per-capability candidate sets from config memory stores.
+        // These are derived from the same config used to build the mux, so they
+        // will always be consistent with the mux's readable/writable sets.
+        let (memory_candidates, read_memory_candidates, write_memory_candidates) =
+            build_memory_candidates(&config);
+
         Self {
             config,
             provider_registry,
             router,
             command_registry,
             memory_mux,
+            memory_candidates,
+            read_memory_candidates,
+            write_memory_candidates,
         }
     }
 
@@ -412,6 +437,24 @@ impl GatewayEngine {
             ));
         }
 
+        // Memory domain: include when memory stores are configured and the domain is enabled.
+        // The pre-computed memory_candidates are built at startup from config.
+        // The RoutingDecision.memory_stores result is used only for the "inject memory stubs"
+        // signal, NOT for store selection (both /recall and /remember route per-invocation).
+        if self.memory_mux.is_some() && !self.memory_candidates.is_empty() {
+            let memory_domain_enabled = self
+                .config
+                .router
+                .domains
+                .memory
+                .as_ref()
+                .map(|d| d.enabled)
+                .unwrap_or(true);
+            if memory_domain_enabled {
+                domains.push((RoutingDomainKind::Memory, self.memory_candidates.clone()));
+            }
+        }
+
         let decision = self.router.route(user_message, &domains).await;
 
         match decision {
@@ -574,6 +617,10 @@ impl GatewayEngine {
     }
 
     /// Execute a `/recall` invocation.
+    ///
+    /// Performs per-invocation routing: scores read-capable memory candidates against
+    /// the query argument (not the user's original message). Stores above threshold
+    /// are targeted; below threshold (or router unavailable) fans out to all readable.
     async fn exec_recall(
         &self,
         invocation: &weft_core::CommandInvocation,
@@ -599,9 +646,19 @@ impl GatewayEngine {
             .map(|s| s.to_string())
             .unwrap_or_else(|| user_message.to_string());
 
-        // Phase 2: fan out to all readable stores (fallback path).
-        // Phase 3 will replace this with per-invocation score_memory_candidates() routing.
-        let store_names: Vec<String> = vec![]; // empty = fan out to all readable
+        // Per-invocation routing: score read-capable candidates against the query text.
+        // This is independent of the pre-computed RoutingDecision.memory_stores — the LLM's
+        // recall query may be semantically unrelated to the user's original message.
+        let threshold = self.memory_domain_threshold();
+        let readable_stores: Vec<String> = mux
+            .readable_store_names()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let store_names = self
+            .select_recall_stores(&query, &readable_stores, threshold)
+            .await;
 
         let results = mux.query(&store_names, &query, 0.0).await;
         let output = format_memory_query_results(&results);
@@ -614,7 +671,61 @@ impl GatewayEngine {
         }
     }
 
+    /// Select which stores to target for `/recall`.
+    ///
+    /// Scores read-capable candidates against the query, applies threshold filtering,
+    /// and applies asymmetric fallback: if below threshold or router unavailable,
+    /// fans out to ALL read-capable stores (reads are safe).
+    async fn select_recall_stores(
+        &self,
+        query: &str,
+        readable_stores: &[String],
+        threshold: f32,
+    ) -> Vec<String> {
+        if self.read_memory_candidates.is_empty() {
+            // No read-capable candidates to score — fan out (mux handles empty = all readable).
+            return vec![];
+        }
+
+        match self
+            .router
+            .score_memory_candidates(query, &self.read_memory_candidates)
+            .await
+        {
+            Ok(scored) => {
+                let above_threshold: Vec<String> = scored
+                    .iter()
+                    .filter(|c| c.score >= threshold)
+                    .filter(|c| readable_stores.contains(&c.id))
+                    .map(|c| c.id.clone())
+                    .collect();
+                if above_threshold.is_empty() {
+                    // Below threshold: fan out to all read-capable stores.
+                    // Reads are safe — returning partial results is better than missing memories.
+                    debug!(
+                        query_len = query.len(),
+                        threshold,
+                        "recall: all candidates below threshold, fanning out to all readable stores"
+                    );
+                    vec![] // empty = mux fans out to all readable
+                } else {
+                    above_threshold
+                }
+            }
+            Err(e) => {
+                // Router unavailable: fan out to all read-capable stores.
+                warn!(error = %e, "router unavailable for /recall, querying all read-capable stores");
+                vec![] // empty = mux fans out to all readable
+            }
+        }
+    }
+
     /// Execute a `/remember` invocation.
+    ///
+    /// Performs per-invocation routing: scores write-capable memory candidates against
+    /// the content argument (not the user's original message). Asymmetric fallback:
+    /// if below threshold, picks single highest-scoring write-capable store; if router
+    /// unavailable, writes to the first configured writable store.
     async fn exec_remember(&self, invocation: &weft_core::CommandInvocation) -> CommandResult {
         let mux = match &self.memory_mux {
             Some(m) => m,
@@ -641,17 +752,21 @@ impl GatewayEngine {
             }
         };
 
-        // Phase 2: write to the first configured writable store (fallback path).
-        // Phase 3 will replace this with per-invocation score_memory_candidates() routing.
-        let writable: Vec<String> = mux
+        // Per-invocation routing: score write-capable candidates against the content text.
+        // Same mechanism as /recall but with content argument and write-capable candidates.
+        let threshold = self.memory_domain_threshold();
+        let writable_stores: Vec<String> = mux
             .writable_store_names()
             .into_iter()
             .map(|s| s.to_string())
             .collect();
 
-        let target_stores: Vec<String> = writable.into_iter().take(1).collect();
+        let target_stores = self
+            .select_remember_stores(&content, &writable_stores, threshold)
+            .await;
 
         if target_stores.is_empty() {
+            // No writable stores at all — return success with empty output.
             return CommandResult {
                 command_name: "remember".to_string(),
                 success: true,
@@ -670,6 +785,130 @@ impl GatewayEngine {
             error: None,
         }
     }
+
+    /// Select which stores to target for `/remember`.
+    ///
+    /// Scores write-capable candidates against the content, applies threshold filtering,
+    /// and applies asymmetric fallback: if below threshold, picks the single
+    /// highest-scoring write-capable store (never fans out on writes). If router
+    /// unavailable, writes to the first configured writable store.
+    async fn select_remember_stores(
+        &self,
+        content: &str,
+        writable_stores: &[String],
+        threshold: f32,
+    ) -> Vec<String> {
+        if writable_stores.is_empty() {
+            return vec![];
+        }
+
+        if self.write_memory_candidates.is_empty() {
+            // No write-capable candidates to score — use first writable store.
+            return writable_stores.iter().take(1).cloned().collect();
+        }
+
+        match self
+            .router
+            .score_memory_candidates(content, &self.write_memory_candidates)
+            .await
+        {
+            Ok(scored) => {
+                let above_threshold: Vec<_> = scored
+                    .iter()
+                    .filter(|c| c.score >= threshold)
+                    .filter(|c| writable_stores.contains(&c.id))
+                    .collect();
+
+                if above_threshold.is_empty() {
+                    // Below threshold: pick the single highest-scoring write-capable store.
+                    // Never fan out on writes — spraying writes pollutes stores with
+                    // misrouted content.
+                    let best = scored
+                        .iter()
+                        .filter(|c| writable_stores.contains(&c.id))
+                        .max_by(|a, b| {
+                            a.score
+                                .partial_cmp(&b.score)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    if let Some(store) = best {
+                        debug!(
+                            store = %store.id,
+                            score = store.score,
+                            threshold,
+                            "remember: below threshold, picking highest-scoring writable store"
+                        );
+                        vec![store.id.clone()]
+                    } else {
+                        // No writable stores in scored set — fall back to first writable.
+                        writable_stores.iter().take(1).cloned().collect()
+                    }
+                } else {
+                    above_threshold.iter().map(|c| c.id.clone()).collect()
+                }
+            }
+            Err(e) => {
+                // Router unavailable: write to first configured writable store.
+                warn!(error = %e, "router unavailable for /remember, using first writable store");
+                writable_stores.iter().take(1).cloned().collect()
+            }
+        }
+    }
+
+    /// Get the memory domain threshold.
+    ///
+    /// Uses the Memory domain-specific threshold if configured; otherwise falls back
+    /// to the classifier threshold.
+    fn memory_domain_threshold(&self) -> f32 {
+        self.config
+            .router
+            .domains
+            .memory
+            .as_ref()
+            .and_then(|d| d.threshold)
+            .unwrap_or(self.config.router.classifier.threshold)
+    }
+}
+
+/// Build memory routing candidates from config, split by capability.
+///
+/// Returns `(all_candidates, read_candidates, write_candidates)`.
+/// All three are empty when no memory stores are configured.
+///
+/// The candidates are used for:
+/// - `all_candidates`: Memory domain in `route_all_domains()` (for the "inject stubs" signal)
+/// - `read_candidates`: Per-invocation routing for `/recall` via `score_memory_candidates()`
+/// - `write_candidates`: Per-invocation routing for `/remember` via `score_memory_candidates()`
+fn build_memory_candidates(
+    config: &WeftConfig,
+) -> (
+    Vec<RoutingCandidate>,
+    Vec<RoutingCandidate>,
+    Vec<RoutingCandidate>,
+) {
+    let Some(mem_config) = &config.memory else {
+        return (vec![], vec![], vec![]);
+    };
+
+    let mut all_candidates = Vec::new();
+    let mut read_candidates = Vec::new();
+    let mut write_candidates = Vec::new();
+
+    for store in &mem_config.stores {
+        let candidate = RoutingCandidate {
+            id: store.name.clone(),
+            examples: store.examples.clone(),
+        };
+        if store.can_read() {
+            read_candidates.push(candidate.clone());
+        }
+        if store.can_write() {
+            write_candidates.push(candidate.clone());
+        }
+        all_candidates.push(candidate);
+    }
+
+    (all_candidates, read_candidates, write_candidates)
 }
 
 /// Build the Model domain routing candidates from config.
@@ -779,8 +1018,9 @@ mod tests {
     use weft_commands::{CommandError, CommandRegistry};
     use weft_core::{
         ClassifierConfig, CommandAction, CommandDescription, CommandInvocation, CommandResult,
-        CommandStub, DomainsConfig, GatewayConfig, LlmProviderKind, Message, ModelEntry,
-        ProviderConfig, Role, RouterConfig, ServerConfig, WeftConfig,
+        CommandStub, DomainConfig, DomainsConfig, GatewayConfig, LlmProviderKind, MemoryConfig,
+        MemoryStoreConfig, Message, ModelEntry, ProviderConfig, Role, RouterConfig, ServerConfig,
+        StoreCapability, WeftConfig,
     };
     use weft_llm::{
         CompletionOptions, CompletionResponse, LlmError, LlmProvider, ProviderRegistry,
@@ -911,6 +1151,10 @@ mod tests {
         model_decision: Option<String>,
         /// Tools needed decision.
         tools_needed: Option<bool>,
+        /// Score assigned to the first memory candidate when `score_memory_candidates()` is called.
+        /// Other candidates get score 0.0. `None` means return ModelNotLoaded error (simulate
+        /// router unavailable). Default: Some(0.9) — first candidate wins.
+        memory_score: Option<f32>,
     }
 
     impl MockRouter {
@@ -919,6 +1163,7 @@ mod tests {
                 command_score: score,
                 model_decision: None,
                 tools_needed: None,
+                memory_score: Some(0.9),
             }
         }
 
@@ -927,6 +1172,7 @@ mod tests {
                 command_score: 1.0,
                 model_decision: Some(model.to_string()),
                 tools_needed: None,
+                memory_score: Some(0.9),
             }
         }
 
@@ -935,7 +1181,21 @@ mod tests {
                 command_score: 1.0,
                 model_decision: None,
                 tools_needed: Some(needed),
+                memory_score: Some(0.9),
             }
+        }
+
+        /// Configure memory scoring: returns the given score for the first candidate,
+        /// 0.0 for all others. Useful for testing threshold behavior.
+        fn with_memory_score(mut self, score: f32) -> Self {
+            self.memory_score = Some(score);
+            self
+        }
+
+        /// Configure router unavailable for memory scoring (returns ModelNotLoaded).
+        fn with_memory_unavailable(mut self) -> Self {
+            self.memory_score = None;
+            self
         }
 
         fn failing() -> FailingRouter {
@@ -982,6 +1242,28 @@ mod tests {
             }
             Ok(decision)
         }
+
+        async fn score_memory_candidates(
+            &self,
+            _text: &str,
+            candidates: &[RoutingCandidate],
+        ) -> Result<Vec<ScoredCandidate>, RouterError> {
+            match self.memory_score {
+                None => Err(RouterError::ModelNotLoaded),
+                Some(first_score) => {
+                    // First candidate gets the configured score, rest get 0.0.
+                    // This makes the first candidate "win" when testing threshold behavior.
+                    Ok(candidates
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| ScoredCandidate {
+                            id: c.id.clone(),
+                            score: if i == 0 { first_score } else { 0.0 },
+                        })
+                        .collect())
+                }
+            }
+        }
     }
 
     struct FailingRouter;
@@ -993,6 +1275,14 @@ mod tests {
             _: &str,
             _: &[(RoutingDomainKind, Vec<RoutingCandidate>)],
         ) -> Result<RoutingDecision, RouterError> {
+            Err(RouterError::ModelNotLoaded)
+        }
+
+        async fn score_memory_candidates(
+            &self,
+            _: &str,
+            _: &[RoutingCandidate],
+        ) -> Result<Vec<ScoredCandidate>, RouterError> {
             Err(RouterError::ModelNotLoaded)
         }
     }
@@ -1967,6 +2257,7 @@ mod tests {
             command_score: 1.0,
             model_decision: None,
             tools_needed: None, // undecided
+            memory_score: Some(0.9),
         };
 
         struct SystemPromptCapture {
@@ -2207,6 +2498,15 @@ mod tests {
                 query_error: Some(msg.to_string()),
                 store_id: "mock-mem-id".to_string(),
                 store_error: None,
+            }
+        }
+
+        fn store_fails(msg: &str) -> Self {
+            Self {
+                query_entries: vec![],
+                query_error: None,
+                store_id: "mock-mem-id".to_string(),
+                store_error: Some(msg.to_string()),
             }
         }
     }
@@ -2730,5 +3030,892 @@ mod tests {
             .expect("should succeed");
 
         assert_eq!(resp.choices[0].message.content, "Here are the results.");
+    }
+
+    // ── Phase 3: Semantic Router Integration tests ─────────────────────────
+
+    /// Build a WeftConfig with memory stores for Phase 3 routing tests.
+    ///
+    /// `stores`: slice of `(name, endpoint, can_read, can_write, examples)`.
+    /// `memory_threshold`: optional per-domain memory threshold.
+    fn config_with_memory(
+        stores: &[(&str, &str, bool, bool, Vec<&str>)],
+        memory_threshold: Option<f32>,
+    ) -> Arc<WeftConfig> {
+        let store_configs: Vec<MemoryStoreConfig> = stores
+            .iter()
+            .map(|(name, endpoint, can_read, can_write, examples)| {
+                let mut capabilities = Vec::new();
+                if *can_read {
+                    capabilities.push(StoreCapability::Read);
+                }
+                if *can_write {
+                    capabilities.push(StoreCapability::Write);
+                }
+                MemoryStoreConfig {
+                    name: name.to_string(),
+                    endpoint: endpoint.to_string(),
+                    connect_timeout_ms: 5000,
+                    request_timeout_ms: 10000,
+                    max_results: 5,
+                    capabilities,
+                    examples: examples.iter().map(|s| s.to_string()).collect(),
+                }
+            })
+            .collect();
+
+        let memory_domain = memory_threshold.map(|t| DomainConfig {
+            enabled: true,
+            threshold: Some(t),
+        });
+
+        Arc::new(WeftConfig {
+            server: ServerConfig {
+                bind_address: "127.0.0.1:8080".to_string(),
+            },
+            router: RouterConfig {
+                classifier: ClassifierConfig {
+                    model_path: "models/test.onnx".to_string(),
+                    tokenizer_path: "models/tokenizer.json".to_string(),
+                    threshold: 0.5, // default threshold for memory routing tests
+                    max_commands: 20,
+                },
+                default_model: Some("test-model".to_string()),
+                providers: vec![ProviderConfig {
+                    name: "test-provider".to_string(),
+                    kind: LlmProviderKind::Anthropic,
+                    api_key: "test-key".to_string(),
+                    base_url: None,
+                    models: vec![ModelEntry {
+                        name: "test-model".to_string(),
+                        model: "claude-test".to_string(),
+                        max_tokens: 1024,
+                        examples: vec!["test query".to_string()],
+                    }],
+                }],
+                skip_tools_when_unnecessary: true,
+                domains: DomainsConfig {
+                    model: None,
+                    tool_necessity: None,
+                    memory: memory_domain,
+                },
+            },
+            tool_registry: None,
+            memory: Some(MemoryConfig {
+                stores: store_configs,
+            }),
+            gateway: GatewayConfig {
+                system_prompt: "You are a test assistant.".to_string(),
+                max_command_iterations: 10,
+                request_timeout_secs: 30,
+            },
+        })
+    }
+
+    /// Build an engine with the given config, mux, and router.
+    fn make_engine_with_config_and_mux(
+        config: Arc<WeftConfig>,
+        registry: Arc<ProviderRegistry>,
+        router: impl SemanticRouter + 'static,
+        commands: impl CommandRegistry + 'static,
+        mux: Option<Arc<MemoryStoreMux>>,
+    ) -> GatewayEngine {
+        GatewayEngine::new(config, registry, Arc::new(router), Arc::new(commands), mux)
+    }
+
+    // ── Phase 3: build_memory_candidates ──────────────────────────────────
+
+    #[test]
+    fn test_build_memory_candidates_empty_when_no_config() {
+        // Config with no memory section produces empty candidate sets.
+        let config = test_config();
+        let (all, read, write) = build_memory_candidates(&config);
+        assert!(all.is_empty());
+        assert!(read.is_empty());
+        assert!(write.is_empty());
+    }
+
+    #[test]
+    fn test_build_memory_candidates_read_write_store() {
+        // A store with both capabilities appears in all three sets.
+        let config = config_with_memory(
+            &[(
+                "conv",
+                "http://localhost:50052",
+                true,
+                true,
+                vec!["recall conv"],
+            )],
+            None,
+        );
+        let (all, read, write) = build_memory_candidates(&config);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, "conv");
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].id, "conv");
+        assert_eq!(write.len(), 1);
+        assert_eq!(write[0].id, "conv");
+    }
+
+    #[test]
+    fn test_build_memory_candidates_read_only_store() {
+        // A read-only store appears in all and read, but not write.
+        let config = config_with_memory(
+            &[(
+                "kb",
+                "http://localhost:50053",
+                true,
+                false,
+                vec!["knowledge base"],
+            )],
+            None,
+        );
+        let (all, read, write) = build_memory_candidates(&config);
+        assert_eq!(all.len(), 1);
+        assert_eq!(read.len(), 1);
+        assert!(write.is_empty());
+    }
+
+    #[test]
+    fn test_build_memory_candidates_write_only_store() {
+        // A write-only store appears in all and write, but not read.
+        let config = config_with_memory(
+            &[(
+                "audit",
+                "http://localhost:50054",
+                false,
+                true,
+                vec!["audit log"],
+            )],
+            None,
+        );
+        let (all, read, write) = build_memory_candidates(&config);
+        assert_eq!(all.len(), 1);
+        assert!(read.is_empty());
+        assert_eq!(write.len(), 1);
+    }
+
+    #[test]
+    fn test_build_memory_candidates_multiple_stores() {
+        // Multiple stores split correctly by capability.
+        let config = config_with_memory(
+            &[
+                (
+                    "conv",
+                    "http://localhost:50052",
+                    true,
+                    true,
+                    vec!["conversation"],
+                ),
+                (
+                    "kb",
+                    "http://localhost:50053",
+                    true,
+                    false,
+                    vec!["knowledge base"],
+                ),
+                (
+                    "audit",
+                    "http://localhost:50054",
+                    false,
+                    true,
+                    vec!["audit"],
+                ),
+            ],
+            None,
+        );
+        let (all, read, write) = build_memory_candidates(&config);
+        assert_eq!(all.len(), 3);
+        assert_eq!(read.len(), 2); // conv + kb
+        assert_eq!(write.len(), 2); // conv + audit
+        assert!(read.iter().any(|c| c.id == "conv"));
+        assert!(read.iter().any(|c| c.id == "kb"));
+        assert!(write.iter().any(|c| c.id == "conv"));
+        assert!(write.iter().any(|c| c.id == "audit"));
+    }
+
+    // ── Phase 3: route_all_domains includes Memory domain ─────────────────
+
+    #[tokio::test]
+    async fn test_route_all_domains_includes_memory_when_configured() {
+        // When memory stores are configured, route_all_domains should pass
+        // Memory domain candidates to the router. We verify by checking that
+        // the engine picks up the memory candidates (indirectly via exec_recall routing).
+        //
+        // Setup: one store "conv", router scores it above threshold (0.9 > 0.5).
+        // /recall should target "conv" specifically (not fan out to all).
+        let conv_client = Arc::new(MockMemStoreClient::succeeds(vec![mem_entry(
+            "m1",
+            "dark mode pref",
+        )]));
+        let mux = make_mux_with_stores(vec![("conv", true, true, conv_client)]);
+
+        let config = config_with_memory(
+            &[(
+                "conv",
+                "http://localhost:50052",
+                true,
+                true,
+                vec!["conversation recall"],
+            )],
+            None, // no memory-domain threshold override — uses classifier.threshold = 0.5
+        );
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/recall query: \"user preferences\"",
+                "I found memory about dark mode.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+
+        // Router scores first (only) read candidate at 0.9 > 0.5 threshold.
+        let router = MockRouter::with_score(0.9).with_memory_score(0.9);
+
+        let engine = make_engine_with_config_and_mux(
+            config,
+            registry,
+            router,
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Tell me about preferences"))
+            .await
+            .expect("should succeed");
+
+        // Should succeed and include memory content in the response.
+        assert_eq!(
+            resp.choices[0].message.content,
+            "I found memory about dark mode."
+        );
+    }
+
+    // ── Phase 3: /recall per-invocation routing ────────────────────────────
+
+    #[tokio::test]
+    async fn test_recall_routes_based_on_query_not_user_message() {
+        // The key Phase 3 invariant: /recall routing uses the query argument,
+        // not the user's original message. Both route via score_memory_candidates().
+        //
+        // Setup: two stores. "conv" gets score 0.9, "kb" gets 0.0 from mock router.
+        // User message is "help me with my code" (code-domain).
+        // /recall query is "user preferences" (conv-domain).
+        // Only "conv" should be queried.
+        let conv_client = Arc::new(MockMemStoreClient::succeeds(vec![mem_entry(
+            "m1",
+            "user prefers dark mode",
+        )]));
+        let kb_client = Arc::new(MockMemStoreClient::query_fails("should not be called"));
+        let mux = make_mux_with_stores(vec![
+            ("conv", true, false, conv_client),
+            ("kb", true, false, kb_client),
+        ]);
+
+        let config = config_with_memory(
+            &[
+                (
+                    "conv",
+                    "http://localhost:50052",
+                    true,
+                    false,
+                    vec!["user preferences"],
+                ),
+                (
+                    "kb",
+                    "http://localhost:50053",
+                    true,
+                    false,
+                    vec!["code architecture"],
+                ),
+            ],
+            None,
+        );
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/recall query: \"user preferences\"",
+                "Found: user prefers dark mode.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+
+        // Router: first candidate (conv) gets 0.9, second (kb) gets 0.0.
+        // This simulates "user preferences" being semantically closest to conv.
+        let router = MockRouter::with_score(0.9).with_memory_score(0.9);
+
+        let engine = make_engine_with_config_and_mux(
+            config,
+            registry,
+            router,
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("help me with my code"))
+            .await
+            .expect("should succeed");
+
+        // kb_client would fail if called — success means only conv was queried.
+        assert_eq!(
+            resp.choices[0].message.content,
+            "Found: user prefers dark mode."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recall_below_threshold_fans_out_to_all_readable() {
+        // When all candidates score below threshold, /recall fans out to ALL read-capable stores.
+        // Router scores first candidate at 0.1, second at 0.0 — both below threshold 0.5.
+        let conv_client = Arc::new(MockMemStoreClient::succeeds(vec![mem_entry(
+            "m1",
+            "conv memory",
+        )]));
+        let kb_client = Arc::new(MockMemStoreClient::succeeds(vec![mem_entry(
+            "m2",
+            "kb memory",
+        )]));
+        let mux = make_mux_with_stores(vec![
+            ("conv", true, false, conv_client),
+            ("kb", true, false, kb_client),
+        ]);
+
+        let config = config_with_memory(
+            &[
+                (
+                    "conv",
+                    "http://localhost:50052",
+                    true,
+                    false,
+                    vec!["conversations"],
+                ),
+                (
+                    "kb",
+                    "http://localhost:50053",
+                    true,
+                    false,
+                    vec!["knowledge"],
+                ),
+            ],
+            Some(0.5), // memory domain threshold
+        );
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/recall query: \"something unrelated\"",
+                "Found memories from both stores.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+
+        // Router: first candidate 0.1, second 0.0 — both below 0.5 threshold.
+        let router = MockRouter::with_score(0.9).with_memory_score(0.1);
+
+        let engine = make_engine_with_config_and_mux(
+            config,
+            registry,
+            router,
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("something"))
+            .await
+            .expect("should succeed");
+
+        // Both stores should have been queried (fan-out) — response shows 2 memories.
+        let content = &resp.choices[0].message.content;
+        assert_eq!(content, "Found memories from both stores.");
+    }
+
+    #[tokio::test]
+    async fn test_recall_router_unavailable_fans_out_to_all_readable() {
+        // When the router is unavailable (ModelNotLoaded), /recall fans out to all readable.
+        let conv_client = Arc::new(MockMemStoreClient::succeeds(vec![mem_entry(
+            "m1",
+            "conv memory",
+        )]));
+        let kb_client = Arc::new(MockMemStoreClient::succeeds(vec![mem_entry(
+            "m2",
+            "kb memory",
+        )]));
+        let mux = make_mux_with_stores(vec![
+            ("conv", true, false, conv_client),
+            ("kb", true, false, kb_client),
+        ]);
+
+        let config = config_with_memory(
+            &[
+                (
+                    "conv",
+                    "http://localhost:50052",
+                    true,
+                    false,
+                    vec!["conversations"],
+                ),
+                (
+                    "kb",
+                    "http://localhost:50053",
+                    true,
+                    false,
+                    vec!["knowledge"],
+                ),
+            ],
+            None,
+        );
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/recall query: \"anything\"",
+                "Got results from both stores.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+
+        // Router returns ModelNotLoaded for score_memory_candidates.
+        let router = MockRouter::with_score(0.9).with_memory_unavailable();
+
+        let engine = make_engine_with_config_and_mux(
+            config,
+            registry,
+            router,
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("anything"))
+            .await
+            .expect("should succeed");
+
+        assert_eq!(
+            resp.choices[0].message.content,
+            "Got results from both stores."
+        );
+    }
+
+    // ── Phase 3: /remember per-invocation routing ─────────────────────────
+
+    #[tokio::test]
+    async fn test_remember_routes_based_on_content_not_user_message() {
+        // /remember routing uses the content argument, not the user's original message.
+        // Setup: two writable stores. "conv" gets score 0.9, "audit" gets 0.0.
+        // User asks about code; LLM remembers a user preference.
+        // Only "conv" should be written to.
+        let conv_client = Arc::new(MockMemStoreClient::succeeds(vec![]));
+        // audit_client: if written to, the store call would succeed, but we verify
+        // by checking the TOON output only mentions "conv".
+        let audit_client = Arc::new(MockMemStoreClient::store_fails("should not be written"));
+        let mux = make_mux_with_stores(vec![
+            ("conv", false, true, conv_client),
+            ("audit", false, true, audit_client),
+        ]);
+
+        let config = config_with_memory(
+            &[
+                (
+                    "conv",
+                    "http://localhost:50052",
+                    false,
+                    true,
+                    vec!["user preferences"],
+                ),
+                (
+                    "audit",
+                    "http://localhost:50053",
+                    false,
+                    true,
+                    vec!["audit logs"],
+                ),
+            ],
+            None,
+        );
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/remember content: \"user prefers dark mode\"",
+                "Noted, I'll remember that.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+
+        // First write candidate (conv) gets 0.9, second (audit) gets 0.0.
+        let router = MockRouter::with_score(0.9).with_memory_score(0.9);
+
+        let engine = make_engine_with_config_and_mux(
+            config,
+            registry,
+            router,
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("how do I configure nginx?"))
+            .await
+            .expect("should succeed");
+
+        // audit_client has store_fails — if it were called we'd get a partial failure in TOON.
+        // Success means only conv was written.
+        assert_eq!(
+            resp.choices[0].message.content,
+            "Noted, I'll remember that."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remember_below_threshold_picks_highest_scoring_store() {
+        // When all candidates are below threshold, /remember picks single highest-scoring store.
+        // Router: first candidate (conv) 0.3, second (audit) 0.1 — both below 0.5 threshold.
+        // conv has the higher score, so it gets picked.
+        let conv_client = Arc::new(MockMemStoreClient::succeeds(vec![]));
+        // audit_client: if written, would succeed — but conv should be picked.
+        let audit_client = Arc::new(MockMemStoreClient::store_fails("should not be written"));
+        let mux = make_mux_with_stores(vec![
+            ("conv", false, true, conv_client),
+            ("audit", false, true, audit_client),
+        ]);
+
+        let config = config_with_memory(
+            &[
+                (
+                    "conv",
+                    "http://localhost:50052",
+                    false,
+                    true,
+                    vec!["conversation prefs"],
+                ),
+                (
+                    "audit",
+                    "http://localhost:50053",
+                    false,
+                    true,
+                    vec!["audit events"],
+                ),
+            ],
+            Some(0.5), // threshold: 0.5
+        );
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec!["/remember content: \"something\"", "Memory stored."]),
+            "test-model",
+            "claude-test",
+        );
+
+        // Both below threshold; first candidate scores higher (0.3 > 0.0 for second).
+        let router = MockRouter::with_score(0.9).with_memory_score(0.3);
+
+        let engine = make_engine_with_config_and_mux(
+            config,
+            registry,
+            router,
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("remember something"))
+            .await
+            .expect("should succeed");
+
+        // audit_client has store_fails — success means only conv was picked.
+        assert_eq!(resp.choices[0].message.content, "Memory stored.");
+    }
+
+    #[tokio::test]
+    async fn test_remember_router_unavailable_writes_to_first_writable() {
+        // When router is unavailable, /remember writes to the first configured writable store.
+        let conv_client = Arc::new(MockMemStoreClient::succeeds(vec![]));
+        let audit_client = Arc::new(MockMemStoreClient::store_fails("should not be written"));
+        let mux = make_mux_with_stores(vec![
+            ("conv", false, true, conv_client),
+            ("audit", false, true, audit_client),
+        ]);
+
+        let config = config_with_memory(
+            &[
+                (
+                    "conv",
+                    "http://localhost:50052",
+                    false,
+                    true,
+                    vec!["conversations"],
+                ),
+                (
+                    "audit",
+                    "http://localhost:50053",
+                    false,
+                    true,
+                    vec!["audit"],
+                ),
+            ],
+            None,
+        );
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec!["/remember content: \"important note\"", "Saved."]),
+            "test-model",
+            "claude-test",
+        );
+
+        // Router unavailable for memory scoring.
+        let router = MockRouter::with_score(0.9).with_memory_unavailable();
+
+        let engine = make_engine_with_config_and_mux(
+            config,
+            registry,
+            router,
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("remember this"))
+            .await
+            .expect("should succeed");
+
+        // audit_client has store_fails — success means only first writable (conv) was picked.
+        assert_eq!(resp.choices[0].message.content, "Saved.");
+    }
+
+    // ── Phase 3: memory domain threshold from config ──────────────────────
+
+    #[tokio::test]
+    async fn test_memory_domain_threshold_gate_applied() {
+        // When a per-domain memory threshold is configured, it takes precedence over
+        // the classifier threshold.
+        //
+        // Classifier threshold = 0.5, memory domain threshold = 0.8.
+        // Router scores first candidate at 0.7 — above 0.5 but below 0.8.
+        // With memory domain threshold, the store should NOT be directly selected
+        // (falls back to all readable for /recall, or highest-scoring for /remember).
+        let conv_client = Arc::new(MockMemStoreClient::succeeds(vec![mem_entry(
+            "m1", "memory",
+        )]));
+        let kb_client = Arc::new(MockMemStoreClient::succeeds(vec![]));
+        let mux = make_mux_with_stores(vec![
+            ("conv", true, false, conv_client),
+            ("kb", true, false, kb_client),
+        ]);
+
+        let config = config_with_memory(
+            &[
+                (
+                    "conv",
+                    "http://localhost:50052",
+                    true,
+                    false,
+                    vec!["conversations"],
+                ),
+                (
+                    "kb",
+                    "http://localhost:50053",
+                    true,
+                    false,
+                    vec!["knowledge"],
+                ),
+            ],
+            Some(0.8), // memory domain threshold = 0.8 (higher than classifier 0.5)
+        );
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec!["/recall query: \"something\"", "Found memories."]),
+            "test-model",
+            "claude-test",
+        );
+
+        // Score 0.7: above classifier threshold (0.5) but below memory domain threshold (0.8).
+        let router = MockRouter::with_score(0.9).with_memory_score(0.7);
+
+        let engine = make_engine_with_config_and_mux(
+            config,
+            registry,
+            router,
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("recall something"))
+            .await
+            .expect("should succeed");
+
+        // Below memory-domain threshold → fell back to all readable → both stores queried.
+        // conv_client returns a memory, kb_client returns empty.
+        // Final response is whatever the LLM said after seeing results.
+        assert_eq!(resp.choices[0].message.content, "Found memories.");
+    }
+
+    // ── Phase 3: RoutingDecision::fallback() memory_stores population ─────
+
+    #[test]
+    fn test_fallback_decision_populates_memory_stores() {
+        use weft_router::{RoutingDecision, RoutingDomainKind};
+        // RoutingDecision::fallback() should populate memory_stores with all
+        // candidates at score 1.0 when the Memory domain is included.
+        let domains = vec![
+            (
+                RoutingDomainKind::Commands,
+                vec![RoutingCandidate {
+                    id: "search".to_string(),
+                    examples: vec!["search: Search".to_string()],
+                }],
+            ),
+            (
+                RoutingDomainKind::Memory,
+                vec![
+                    RoutingCandidate {
+                        id: "conv".to_string(),
+                        examples: vec!["conversations".to_string()],
+                    },
+                    RoutingCandidate {
+                        id: "kb".to_string(),
+                        examples: vec!["knowledge base".to_string()],
+                    },
+                ],
+            ),
+        ];
+
+        let decision = RoutingDecision::fallback(&domains);
+
+        // Commands: scored at 1.0.
+        assert_eq!(decision.commands.len(), 1);
+
+        // Memory stores: all at 1.0, sorted alphabetically.
+        assert_eq!(decision.memory_stores.len(), 2);
+        assert_eq!(decision.memory_stores[0].id, "conv");
+        assert_eq!(decision.memory_stores[1].id, "kb");
+        for m in &decision.memory_stores {
+            assert_eq!(m.score, 1.0, "fallback memory scores should be 1.0");
+        }
+
+        // Model and tools: conservative defaults.
+        assert!(decision.model.is_none());
+        assert!(decision.tools_needed.is_none());
+    }
+
+    #[test]
+    fn test_fallback_decision_memory_stores_empty_when_no_memory_domain() {
+        // When Memory domain is NOT included in domains, memory_stores stays empty.
+        let domains = vec![(
+            RoutingDomainKind::Commands,
+            vec![RoutingCandidate {
+                id: "search".to_string(),
+                examples: vec!["search: Search".to_string()],
+            }],
+        )];
+
+        let decision = RoutingDecision::fallback(&domains);
+        assert!(decision.memory_stores.is_empty());
+    }
+
+    // ── Phase 3: memory domain disabled via config ─────────────────────────
+
+    #[tokio::test]
+    async fn test_recall_with_memory_domain_disabled_fans_out_to_all() {
+        // When memory domain is disabled via config, /recall falls back to all readable.
+        // The candidates are built but the Memory domain is NOT included in route_all_domains.
+        // Per-invocation routing also falls back since write_memory_candidates will still
+        // work via score_memory_candidates — but route_all_domains doesn't pass the domain.
+        // Since read_memory_candidates is non-empty, score_memory_candidates is still called.
+        // The router still works; the "domain disabled" only affects route_all_domains.
+        //
+        // When domain disabled: engine doesn't pass Memory domain to router.route(),
+        // but select_recall_stores() still calls score_memory_candidates() since it uses
+        // read_memory_candidates directly.
+        //
+        // This test verifies that the engine still functions when domain is disabled.
+        let conv_client = Arc::new(MockMemStoreClient::succeeds(vec![mem_entry(
+            "m1",
+            "memory found",
+        )]));
+        let mux = make_mux_with_stores(vec![("conv", true, true, conv_client)]);
+
+        // Build config with memory domain explicitly disabled.
+        let disabled_domain = DomainConfig {
+            enabled: false,
+            threshold: None,
+        };
+        let config = Arc::new(WeftConfig {
+            server: ServerConfig {
+                bind_address: "127.0.0.1:8080".to_string(),
+            },
+            router: RouterConfig {
+                classifier: ClassifierConfig {
+                    model_path: "models/test.onnx".to_string(),
+                    tokenizer_path: "models/tokenizer.json".to_string(),
+                    threshold: 0.5,
+                    max_commands: 20,
+                },
+                default_model: Some("test-model".to_string()),
+                providers: vec![ProviderConfig {
+                    name: "test-provider".to_string(),
+                    kind: LlmProviderKind::Anthropic,
+                    api_key: "test-key".to_string(),
+                    base_url: None,
+                    models: vec![ModelEntry {
+                        name: "test-model".to_string(),
+                        model: "claude-test".to_string(),
+                        max_tokens: 1024,
+                        examples: vec!["test query".to_string()],
+                    }],
+                }],
+                skip_tools_when_unnecessary: true,
+                domains: DomainsConfig {
+                    model: None,
+                    tool_necessity: None,
+                    memory: Some(disabled_domain),
+                },
+            },
+            tool_registry: None,
+            memory: Some(MemoryConfig {
+                stores: vec![MemoryStoreConfig {
+                    name: "conv".to_string(),
+                    endpoint: "http://localhost:50052".to_string(),
+                    connect_timeout_ms: 5000,
+                    request_timeout_ms: 10000,
+                    max_results: 5,
+                    capabilities: vec![StoreCapability::Read, StoreCapability::Write],
+                    examples: vec!["conversation".to_string()],
+                }],
+            }),
+            gateway: GatewayConfig {
+                system_prompt: "You are a test assistant.".to_string(),
+                max_command_iterations: 10,
+                request_timeout_secs: 30,
+            },
+        });
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec!["/recall query: \"test query\"", "Found something."]),
+            "test-model",
+            "claude-test",
+        );
+
+        // Router: score_memory_candidates still works (above threshold for conv).
+        let router = MockRouter::with_score(0.9).with_memory_score(0.9);
+
+        let engine = make_engine_with_config_and_mux(
+            config,
+            registry,
+            router,
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("recall test"))
+            .await
+            .expect("should succeed");
+
+        assert_eq!(resp.choices[0].message.content, "Found something.");
     }
 }

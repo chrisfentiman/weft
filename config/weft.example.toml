@@ -99,6 +99,58 @@ connect_timeout_ms = 5000
 # Per-request timeout in milliseconds.
 request_timeout_ms = 30000
 
+# ── Optional: Memory Stores ───────────────────────────────────────────────
+#
+# Memory stores give the LLM the ability to recall context from previous
+# conversations and remember important information for future use.
+#
+# Multiple stores can be configured — each handles a different semantic domain.
+# The semantic router selects which store(s) to use for each /recall and /remember
+# command based on the content of the query or memory being stored.
+#
+# The `examples` field determines which queries route to this store. The router
+# computes a centroid embedding from the examples; at runtime, it scores
+# the query/content against each store's centroid to pick the best match.
+# Use at least 3 examples per store for a meaningful centroid.
+#
+# The `capabilities` field controls which operations the gateway routes to this
+# store. A read-only knowledge base, a write-only audit log, or a full read-write
+# conversation store are all the same gRPC service — capabilities declare how each
+# store participates in this deployment. Defaults to ["read", "write"] if omitted.
+
+[[memory.stores]]
+# Unique name for this store (used in routing and logging).
+name = "conversations"
+# gRPC endpoint for the MemoryStore service.
+endpoint = "http://localhost:50052"
+# Maximum memories to retrieve per /recall query. Default: 5.
+max_results = 5
+# Connection timeout in milliseconds. Default: 5000.
+connect_timeout_ms = 5000
+# Whether this store supports reading, writing, or both. Default: ["read", "write"].
+capabilities = ["read", "write"]
+# Example queries this store is best suited for.
+# The router uses these to build a centroid — more/better examples = better routing.
+examples = [
+  "What did we discuss yesterday?",
+  "Recall our previous conversation about auth",
+  "What was the conclusion on the database migration?",
+]
+
+# A second store — read-only knowledge base.
+# The router routes recall queries about code/architecture here,
+# but never writes to it (read-only replica or static knowledge base).
+[[memory.stores]]
+name = "code_knowledge"
+endpoint = "http://localhost:50053"
+max_results = 3
+capabilities = ["read"]  # read-only: knowledge base, not for storing new memories
+examples = [
+  "How does the parser work?",
+  "What's the architecture of the gateway?",
+  "Explain the routing domain design",
+]
+
 # ── Multi-Provider Example (commented out) ────────────────────────────────
 #
 # Uncomment and adapt for multi-provider / multi-model routing.

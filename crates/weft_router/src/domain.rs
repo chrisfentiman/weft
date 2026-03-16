@@ -81,18 +81,36 @@ impl RoutingDecision {
     pub fn fallback(domains: &[(RoutingDomainKind, Vec<RoutingCandidate>)]) -> Self {
         let mut decision = Self::empty();
         for (kind, candidates) in domains {
-            if let RoutingDomainKind::Commands = kind {
-                let mut scored: Vec<ScoredCandidate> = candidates
-                    .iter()
-                    .map(|c| ScoredCandidate {
-                        id: c.id.clone(),
-                        score: 1.0,
-                    })
-                    .collect();
-                scored.sort_by(|a, b| a.id.cmp(&b.id));
-                decision.commands = scored;
+            match kind {
+                RoutingDomainKind::Commands => {
+                    let mut scored: Vec<ScoredCandidate> = candidates
+                        .iter()
+                        .map(|c| ScoredCandidate {
+                            id: c.id.clone(),
+                            score: 1.0,
+                        })
+                        .collect();
+                    scored.sort_by(|a, b| a.id.cmp(&b.id));
+                    decision.commands = scored;
+                }
+                RoutingDomainKind::Memory => {
+                    // Populate with all candidates at score 1.0.
+                    // Used for the "should we inject memory stubs" signal — not for
+                    // store selection (both /recall and /remember perform per-invocation
+                    // routing via score_memory_candidates()).
+                    let mut scored: Vec<ScoredCandidate> = candidates
+                        .iter()
+                        .map(|c| ScoredCandidate {
+                            id: c.id.clone(),
+                            score: 1.0,
+                        })
+                        .collect();
+                    scored.sort_by(|a, b| a.id.cmp(&b.id));
+                    decision.memory_stores = scored;
+                }
+                // Model: None (use default), ToolNecessity: None
+                RoutingDomainKind::Model | RoutingDomainKind::ToolNecessity => {}
             }
-            // Model: None (use default), ToolNecessity: None, Memory: empty
         }
         decision
     }
