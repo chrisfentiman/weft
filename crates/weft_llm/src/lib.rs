@@ -14,6 +14,7 @@
 pub mod anthropic;
 pub mod openai;
 pub mod provider;
+pub mod provider_service;
 pub mod registry;
 pub mod rhai_provider;
 
@@ -22,6 +23,7 @@ pub use openai::OpenAIProvider;
 pub use provider::{
     Capability, ProviderError, ProviderRequest, ProviderResponse, TokenUsage, extract_text_messages,
 };
+pub use provider_service::ProviderService;
 pub use registry::ProviderRegistry;
 pub use rhai_provider::RhaiProvider;
 

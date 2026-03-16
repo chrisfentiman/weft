@@ -1,0 +1,17 @@
+[package]
+name = "weft_engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+weft_core = { path = "../weft_core" }
+weft_hooks = { path = "../weft_hooks" }
+weft_llm = { path = "../weft_llm" }
+weft_router = { path = "../weft_router" }
+weft_commands = { path = "../weft_commands" }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
