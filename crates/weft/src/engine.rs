@@ -30,7 +30,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 use weft_commands::{CommandRegistry, MemoryStoreMux, parse_response};
@@ -236,21 +236,26 @@ impl GatewayEngine {
         // Clone the request_id for RequestEnd (fire-and-forget after response).
         let request_model = request.model.clone();
 
+        // Record start time for duration_ms in RequestEnd payload.
+        let request_start = Instant::now();
+
         // Wrap the entire gateway loop in a timeout.
         let result = tokio::time::timeout(timeout, self.run_loop(request))
             .await
             .map_err(|_| WeftError::RequestTimeout { timeout_secs })?;
 
+        let duration_ms = request_start.elapsed().as_millis() as u64;
+
         // ── [HOOK: RequestEnd] ───────────────────────────────────────────────
         // Fire-and-forget after the response is returned. Gated by semaphore.
         // We fire it regardless of success/failure.
-        let (status, duration_ms) = match &result {
-            Ok(_) => (200u16, 0u64), // Duration tracked per-request in future
-            Err(WeftError::HookBlocked { .. }) => (403u16, 0u64),
-            Err(WeftError::HookBlockedAfterRetries { .. }) => (422u16, 0u64),
-            Err(WeftError::RateLimited { .. }) => (429u16, 0u64),
-            Err(WeftError::RequestTimeout { .. }) => (504u16, 0u64),
-            Err(_) => (500u16, 0u64),
+        let (status, commands_executed) = match &result {
+            Ok((_, count)) => (200u16, *count),
+            Err(WeftError::HookBlocked { .. }) => (403u16, 0u32),
+            Err(WeftError::HookBlockedAfterRetries { .. }) => (422u16, 0u32),
+            Err(WeftError::RateLimited { .. }) => (429u16, 0u32),
+            Err(WeftError::RequestTimeout { .. }) => (504u16, 0u32),
+            Err(_) => (500u16, 0u32),
         };
 
         let end_payload = serde_json::json!({
@@ -258,7 +263,7 @@ impl GatewayEngine {
             "duration_ms": duration_ms,
             "model": request_model,
             "status": status,
-            "commands_executed": 0u32,
+            "commands_executed": commands_executed,
         });
 
         let hook_registry = Arc::clone(&self.hook_registry);
@@ -278,14 +283,17 @@ impl GatewayEngine {
             }
         }
 
-        result
+        // Strip the commands_executed count from the result before returning.
+        result.map(|(response, _)| response)
     }
 
     /// Inner gateway loop (no timeout wrapping — caller handles that).
+    ///
+    /// Returns the response and the total number of commands executed during this request.
     async fn run_loop(
         &self,
         request: ChatCompletionRequest,
-    ) -> Result<ChatCompletionResponse, WeftError> {
+    ) -> Result<(ChatCompletionResponse, u32), WeftError> {
         // Get all available commands from the registry.
         let all_commands = self
             .command_registry
@@ -380,6 +388,8 @@ impl GatewayEngine {
         let max_retries = self.config.effective_max_pre_response_retries();
         let mut iterations = 0u32;
         let mut pre_response_retries = 0u32;
+        // Count every command execution (builtin + external) for RequestEnd telemetry.
+        let mut commands_executed: u32 = 0;
 
         loop {
             if iterations >= max_iterations {
@@ -433,7 +443,9 @@ impl GatewayEngine {
                                 max_retries,
                                 "PreResponse hook blocked response — injecting reason and regenerating"
                             );
-                            // Inject block reason as a system message so LLM can reconsider.
+                            // Inject the blocked assistant response, then a User-role
+                            // directive so the LLM receives the feedback as an external
+                            // instruction rather than its own prior output.
                             let injection = format!(
                                 "[Hook {hook_name} blocked your response: {reason}. Please reconsider and generate a new response.]"
                             );
@@ -442,7 +454,7 @@ impl GatewayEngine {
                                 content: completion.text.clone(),
                             });
                             messages.push(Message {
-                                role: Role::Assistant,
+                                role: Role::User,
                                 content: injection,
                             });
                             iterations += 1;
@@ -463,10 +475,9 @@ impl GatewayEngine {
                             .and_then(|v| v.as_str())
                             .unwrap_or(&parsed.text)
                             .to_string();
-                        return Ok(build_response(
-                            &final_text,
-                            &request.model,
-                            completion.usage,
+                        return Ok((
+                            build_response(&final_text, &request.model, completion.usage),
+                            commands_executed,
                         ));
                     }
                 }
@@ -488,6 +499,7 @@ impl GatewayEngine {
                 let result = self
                     .handle_builtin_with_hooks(invocation, user_message)
                     .await;
+                commands_executed += 1;
                 results.push(result);
             }
 
@@ -566,6 +578,7 @@ impl GatewayEngine {
                         output: String::new(),
                         error: Some(e.to_string()),
                     });
+                commands_executed += 1;
 
                 // ── [HOOK: PostToolUse] ──────────────────────────────────────
                 let post_tool_payload = serde_json::json!({
@@ -1290,14 +1303,51 @@ impl GatewayEngine {
             }
         };
 
-        // If describe action, return early after PreToolUse (no routing hooks for describe).
+        // If describe action, return after PreToolUse + PostToolUse (no routing hooks for describe).
+        // PostToolUse fires for both execute and describe actions per spec.
         if matches!(effective_invocation.action, CommandAction::Describe) {
-            return CommandResult {
+            let mut cmd_result = CommandResult {
                 command_name: effective_invocation.name.clone(),
                 success: true,
                 output: builtin_describe_text(&effective_invocation.name),
                 error: None,
             };
+
+            let post_tool_payload = serde_json::json!({
+                "command": effective_invocation.name,
+                "action": "describe",
+                "success": cmd_result.success,
+                "output": cmd_result.output,
+                "error": cmd_result.error,
+            });
+
+            match self
+                .hook_registry
+                .run_chain(
+                    HookEvent::PostToolUse,
+                    post_tool_payload,
+                    Some(&effective_invocation.name),
+                )
+                .await
+            {
+                HookChainResult::Allowed { payload, .. } => {
+                    if let Some(output) = payload.get("output").and_then(|v| v.as_str()) {
+                        cmd_result.output = output.to_string();
+                    }
+                    if let Some(success) = payload.get("success").and_then(|v| v.as_bool()) {
+                        cmd_result.success = success;
+                    }
+                }
+                HookChainResult::Blocked { hook_name, reason } => {
+                    warn!(
+                        hook = %hook_name,
+                        reason = %reason,
+                        "PostToolUse hook returned Block (non-blocking event) — ignoring"
+                    );
+                }
+            }
+
+            return cmd_result;
         }
 
         let _ = pre_tool_blocked; // Always false at this point (we returned early on block).
@@ -5600,5 +5650,457 @@ mod tests {
             .expect("should succeed");
 
         assert_eq!(resp.choices[0].message.content, "Found something.");
+    }
+
+    // ── Phase 4: memory command hook integration ───────────────────────────
+
+    /// Build a `GatewayEngine` with a custom hook registry AND a memory mux.
+    fn make_engine_with_hooks_and_mux(
+        registry: Arc<ProviderRegistry>,
+        router: impl SemanticRouter + 'static,
+        commands: impl CommandRegistry + 'static,
+        hook_registry: crate::hooks::HookRegistry,
+        mux: Option<Arc<MemoryStoreMux>>,
+    ) -> GatewayEngine {
+        GatewayEngine::new(
+            test_config(),
+            registry,
+            Arc::new(router),
+            Arc::new(commands),
+            mux,
+            Arc::new(hook_registry),
+        )
+    }
+
+    /// Build a minimal single-store memory mux with both read and write capability.
+    fn make_single_rw_mux(name: &str, client: Arc<dyn MemoryStoreClient>) -> Arc<MemoryStoreMux> {
+        make_mux_with_stores(vec![(name, true, true, client)])
+    }
+
+    #[tokio::test]
+    async fn test_pre_tool_use_blocks_recall_routing_hooks_not_fired() {
+        // PreToolUse blocks /recall -> failed CommandResult returned, routing hooks
+        // (PreRoute/PostRoute on memory domain) are NOT fired.
+        //
+        // Verified by: a PreRoute hook that panics if ever called. If routing hooks
+        // were fired after the PreToolUse block, the test would panic.
+        let mux = make_single_rw_mux(
+            "conv",
+            Arc::new(MockMemStoreClient::succeeds(vec![mem_entry("m1", "data")])),
+        );
+
+        struct PanicExecutor;
+        #[async_trait]
+        impl crate::hooks::executor::HookExecutor for PanicExecutor {
+            async fn execute(
+                &self,
+                _payload: &serde_json::Value,
+            ) -> crate::hooks::types::HookResponse {
+                panic!("PreRoute should not fire after PreToolUse block");
+            }
+        }
+
+        let hook_reg = hook_registry_multi(vec![
+            // PreToolUse blocks /recall.
+            (
+                HookEvent::PreToolUse,
+                Box::new(FixedHookExecutor(crate::hooks::types::HookResponse::block(
+                    "recall blocked by policy",
+                ))),
+                Some("recall"),
+                100,
+            ),
+            // PreRoute on memory domain — must NOT fire.
+            (
+                HookEvent::PreRoute,
+                Box::new(PanicExecutor),
+                Some("memory"),
+                100,
+            ),
+        ]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec!["/recall query: \"test\"", "No memory needed."]),
+            "test-model",
+            "claude-test",
+        );
+
+        let engine = make_engine_with_hooks_and_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            hook_reg,
+            Some(mux),
+        );
+
+        // The /recall should be blocked, but the engine should not panic and should
+        // eventually return a response (after LLM sees the failed recall result).
+        let resp = engine
+            .handle_request(make_user_request("What do you know about me?"))
+            .await
+            .expect("engine should not error — blocked command is a failed CommandResult");
+
+        assert_eq!(resp.choices[0].message.content, "No memory needed.");
+    }
+
+    #[tokio::test]
+    async fn test_pre_tool_use_modifies_recall_arguments_used_in_routing() {
+        // PreToolUse modifies /recall arguments -> the modified query is what reaches
+        // the routing phase (and thus the memory store).
+        //
+        // Verified by: the mock mux client records which query text it receives.
+        // We assert it matches the MODIFIED argument, not the original.
+        let query_seen = Arc::new(std::sync::Mutex::new(String::new()));
+        let query_seen_clone = Arc::clone(&query_seen);
+
+        struct RecordingMemStoreClient {
+            query_seen: Arc<std::sync::Mutex<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl MemoryStoreClient for RecordingMemStoreClient {
+            async fn query(
+                &self,
+                query: &str,
+                _max_results: u32,
+                _min_score: f32,
+            ) -> Result<Vec<MemoryEntry>, MemoryStoreError> {
+                *self.query_seen.lock().unwrap() = query.to_string();
+                Ok(vec![])
+            }
+
+            async fn store(
+                &self,
+                _content: &str,
+                _metadata: Option<&serde_json::Value>,
+            ) -> Result<MemoryStoreResult, MemoryStoreError> {
+                Ok(MemoryStoreResult {
+                    id: "mock".to_string(),
+                })
+            }
+        }
+
+        let mux = make_single_rw_mux(
+            "conv",
+            Arc::new(RecordingMemStoreClient {
+                query_seen: query_seen_clone,
+            }),
+        );
+
+        // PreToolUse hook: replace the "query" argument with a different value.
+        let hook_reg = hook_registry_with(
+            HookEvent::PreToolUse,
+            Box::new(ModifyHookExecutor(serde_json::json!({
+                "arguments": {"query": "modified query text"}
+            }))),
+            Some("recall"),
+            100,
+        );
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/recall query: \"original query\"",
+                "Got the recall results.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+
+        let engine = make_engine_with_hooks_and_mux(
+            registry,
+            MockRouter::with_score(0.9).with_memory_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            hook_reg,
+            Some(mux),
+        );
+
+        engine
+            .handle_request(make_user_request("recall test"))
+            .await
+            .expect("should succeed");
+
+        let seen = query_seen.lock().unwrap().clone();
+        assert_eq!(
+            seen, "modified query text",
+            "routing should use the modified argument, not the original"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pre_route_memory_blocks_recall_returns_failed_command_result() {
+        // PreRoute hook with matcher "memory" blocks the recall routing phase ->
+        // a failed CommandResult is returned to the LLM (feedback block).
+        let mux = make_single_rw_mux(
+            "conv",
+            Arc::new(MockMemStoreClient::succeeds(vec![])),
+        );
+
+        let hook_reg = hook_registry_with(
+            HookEvent::PreRoute,
+            Box::new(FixedHookExecutor(crate::hooks::types::HookResponse::block(
+                "memory access denied",
+            ))),
+            Some("memory"),
+            100,
+        );
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/recall query: \"preferences\"",
+                "Memory was blocked.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+
+        let engine = make_engine_with_hooks_and_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            hook_reg,
+            Some(mux),
+        );
+
+        // The PreRoute block on memory results in a failed CommandResult, then
+        // the LLM produces a final response after seeing the blocked recall.
+        let resp = engine
+            .handle_request(make_user_request("What do you know about me?"))
+            .await
+            .expect("engine should not error — blocked recall is a failed CommandResult");
+
+        assert_eq!(resp.choices[0].message.content, "Memory was blocked.");
+    }
+
+    #[tokio::test]
+    async fn test_post_route_memory_overrides_selected_stores_for_remember() {
+        // PostRoute hook with matcher "memory" overrides selected stores for /remember.
+        // There are two write-capable stores: "store-a" and "store-b".
+        // Router would normally select "store-a" (score 0.9).
+        // PostRoute overrides selected to ["store-b"].
+        // Verified by: only "store-b"'s client records a store() call.
+        let store_a_stored = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let store_b_stored = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let store_a_clone = Arc::clone(&store_a_stored);
+        let store_b_clone = Arc::clone(&store_b_stored);
+
+        struct TrackingMemStoreClient(Arc<std::sync::atomic::AtomicBool>);
+
+        #[async_trait::async_trait]
+        impl MemoryStoreClient for TrackingMemStoreClient {
+            async fn query(
+                &self,
+                _query: &str,
+                _max_results: u32,
+                _min_score: f32,
+            ) -> Result<Vec<MemoryEntry>, MemoryStoreError> {
+                Ok(vec![])
+            }
+
+            async fn store(
+                &self,
+                _content: &str,
+                _metadata: Option<&serde_json::Value>,
+            ) -> Result<MemoryStoreResult, MemoryStoreError> {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+                Ok(MemoryStoreResult {
+                    id: "tracked".to_string(),
+                })
+            }
+        }
+
+        let mux = make_mux_with_stores(vec![
+            ("store-a", true, true, Arc::new(TrackingMemStoreClient(store_a_clone))),
+            ("store-b", true, true, Arc::new(TrackingMemStoreClient(store_b_clone))),
+        ]);
+
+        // PostRoute on memory domain: override selected to ["store-b"].
+        let hook_reg = hook_registry_with(
+            HookEvent::PostRoute,
+            Box::new(ModifyHookExecutor(serde_json::json!({
+                "selected": ["store-b"]
+            }))),
+            Some("memory"),
+            100,
+        );
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/remember content: \"user prefers dark mode\"",
+                "Stored the preference.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+
+        // Router selects store-a (first candidate, score 0.9) — hook should override to store-b.
+        let engine = make_engine_with_hooks_and_mux(
+            registry,
+            MockRouter::with_score(0.9).with_memory_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            hook_reg,
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Remember that I prefer dark mode"))
+            .await
+            .expect("should succeed");
+
+        assert_eq!(resp.choices[0].message.content, "Stored the preference.");
+
+        // Only store-b should have been written to.
+        assert!(
+            store_b_stored.load(std::sync::atomic::Ordering::Acquire),
+            "store-b should have been written to after PostRoute override"
+        );
+        assert!(
+            !store_a_stored.load(std::sync::atomic::Ordering::Acquire),
+            "store-a should NOT have been written to (PostRoute overrode selection)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multiple_recall_invocations_each_fires_independent_hook_lifecycle() {
+        // Multiple /recall invocations in the same LLM turn each fire their own
+        // independent PreToolUse + PreRoute(memory) + PostRoute(memory) + PostToolUse.
+        //
+        // Verified by counting how many times PreToolUse is fired for "recall".
+        let pre_tool_call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = Arc::clone(&pre_tool_call_count);
+
+        struct CountingExecutor(Arc<std::sync::atomic::AtomicU32>);
+        #[async_trait]
+        impl crate::hooks::executor::HookExecutor for CountingExecutor {
+            async fn execute(
+                &self,
+                _payload: &serde_json::Value,
+            ) -> crate::hooks::types::HookResponse {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                crate::hooks::types::HookResponse::allow()
+            }
+        }
+
+        let mux = make_single_rw_mux(
+            "conv",
+            Arc::new(MockMemStoreClient::succeeds(vec![mem_entry("m1", "data")])),
+        );
+
+        use crate::hooks::types::HookMatcher;
+        use crate::hooks::{HookRegistry, RegisteredHook};
+        let matcher = HookMatcher::new(Some("recall"), 0).expect("valid matcher");
+        let hook = RegisteredHook {
+            event: HookEvent::PreToolUse,
+            matcher,
+            executor: Box::new(CountingExecutor(count_clone)),
+            name: "counting-hook".to_string(),
+            priority: 100,
+        };
+        let mut map = std::collections::HashMap::new();
+        map.insert(HookEvent::PreToolUse, vec![hook]);
+        let hook_reg = HookRegistry::from_registered(map);
+
+        // LLM emits TWO /recall invocations in one turn.
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/recall query: \"query one\"\n/recall query: \"query two\"",
+                "Done with both recalls.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+
+        let engine = make_engine_with_hooks_and_mux(
+            registry,
+            MockRouter::with_score(0.9).with_memory_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            hook_reg,
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Recall twice"))
+            .await
+            .expect("should succeed");
+
+        assert_eq!(resp.choices[0].message.content, "Done with both recalls.");
+
+        // PreToolUse must have fired once per /recall invocation = 2 times.
+        assert_eq!(
+            pre_tool_call_count.load(std::sync::atomic::Ordering::Acquire),
+            2,
+            "PreToolUse should fire independently for each /recall invocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_post_route_modifies_scores_visible_to_subsequent_hooks() {
+        // PostRoute hook modifies "scores" in the payload. A second PostRoute hook
+        // that fires after the first should see the modified scores.
+        //
+        // Verified by: the second hook records what it received; we check that the
+        // scores field reflects the first hook's modifications.
+        let second_hook_payload = Arc::new(std::sync::Mutex::new(None::<serde_json::Value>));
+        let capture_clone = Arc::clone(&second_hook_payload);
+
+        struct CapturePayloadExecutor(Arc<std::sync::Mutex<Option<serde_json::Value>>>);
+        #[async_trait]
+        impl crate::hooks::executor::HookExecutor for CapturePayloadExecutor {
+            async fn execute(
+                &self,
+                payload: &serde_json::Value,
+            ) -> crate::hooks::types::HookResponse {
+                *self.0.lock().unwrap() = Some(payload.clone());
+                crate::hooks::types::HookResponse::allow()
+            }
+        }
+
+        // First hook: modify scores to set all scores to 0.5.
+        // Second hook: capture the payload after modification.
+        let hook_reg = hook_registry_multi(vec![
+            (
+                HookEvent::PostRoute,
+                Box::new(ModifyHookExecutor(serde_json::json!({
+                    "scores": [{"id": "test-model", "score": 0.5}]
+                }))),
+                Some("model"),
+                50, // fires first
+            ),
+            (
+                HookEvent::PostRoute,
+                Box::new(CapturePayloadExecutor(capture_clone)),
+                Some("model"),
+                100, // fires second
+            ),
+        ]);
+
+        let engine = GatewayEngine::new(
+            multi_model_config(),
+            two_model_registry(
+                MockLlmProvider::single("Response"),
+                MockLlmProvider::single("Response"),
+            ),
+            Arc::new(MockRouter::with_model("default-model")),
+            Arc::new(MockCommandRegistry::new(vec![])),
+            None,
+            Arc::new(hook_reg),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Hello"))
+            .await
+            .expect("should succeed");
+
+        assert_eq!(resp.choices[0].message.content, "Response");
+
+        // The second PostRoute hook should have seen the scores modified by the first hook.
+        let captured = second_hook_payload.lock().unwrap().clone();
+        let captured = captured.expect("second hook should have been called");
+        let scores = captured.get("scores").expect("scores field must exist");
+        // The first hook set scores to [{"id": "test-model", "score": 0.5}].
+        assert_eq!(
+            scores,
+            &serde_json::json!([{"id": "test-model", "score": 0.5}]),
+            "second PostRoute hook should see scores modified by first hook"
+        );
     }
 }
