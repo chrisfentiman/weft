@@ -783,6 +783,56 @@ mod tests {
         assert_eq!(t, "hi");
     }
 
+    // ── Priority ordering ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_hooks_sorted_by_priority_ascending() {
+        // Register hooks with priorities 200, 50, 100 (in that order) via from_config.
+        // After sorting, the hooks should appear in ascending priority order: 50, 100, 200.
+        let configs = vec![
+            HookConfig {
+                event: HookEvent::RequestStart,
+                matcher: None,
+                hook_type: HookType::Http,
+                script: None,
+                url: Some("http://example.com/hook-200".to_string()),
+                agent: None,
+                timeout_ms: None,
+                secret: None,
+                priority: 200,
+            },
+            HookConfig {
+                event: HookEvent::RequestStart,
+                matcher: None,
+                hook_type: HookType::Http,
+                script: None,
+                url: Some("http://example.com/hook-50".to_string()),
+                agent: None,
+                timeout_ms: None,
+                secret: None,
+                priority: 50,
+            },
+            HookConfig {
+                event: HookEvent::RequestStart,
+                matcher: None,
+                hook_type: HookType::Http,
+                script: None,
+                url: Some("http://example.com/hook-100".to_string()),
+                agent: None,
+                timeout_ms: None,
+                secret: None,
+                priority: 100,
+            },
+        ];
+
+        let registry = HookRegistry::from_config(&configs, test_http_client()).unwrap();
+
+        // The hooks for RequestStart should be sorted ascending: 50, 100, 200.
+        let hooks_for_event = registry.hooks.get(&HookEvent::RequestStart).unwrap();
+        let priorities: Vec<u32> = hooks_for_event.iter().map(|h| h.priority).collect();
+        assert_eq!(priorities, vec![50, 100, 200]);
+    }
+
     #[tokio::test]
     async fn test_total_context_capped_at_4096() {
         // Create a context string that would exceed 4096 bytes when combined.

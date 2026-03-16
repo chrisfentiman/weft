@@ -93,4 +93,31 @@ mod tests {
             "rate limited by provider, retry after 2000ms"
         );
     }
+
+    #[test]
+    fn test_hook_blocked_display_formatting() {
+        let err = WeftError::HookBlocked {
+            event: "request_start".to_string(),
+            reason: "blocked by policy".to_string(),
+            hook_name: "auth-hook".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "hook blocked at request_start: blocked by policy (hook: auth-hook)"
+        );
+    }
+
+    #[test]
+    fn test_hook_blocked_after_retries_display_formatting() {
+        let err = WeftError::HookBlockedAfterRetries {
+            event: "pre_response".to_string(),
+            reason: "content policy violation".to_string(),
+            hook_name: "content-filter".to_string(),
+            retries: 2,
+        };
+        assert_eq!(
+            err.to_string(),
+            "hook blocked after 2 retries at pre_response: content policy violation (hook: content-filter)"
+        );
+    }
 }

@@ -77,11 +77,26 @@ impl WeftConfig {
         Ok(())
     }
 
+    /// Returns the effective `max_pre_response_retries` value, clamped to 5.
+    ///
+    /// Values above 5 are silently clamped here. The warning is emitted by
+    /// `validate_hooks` at config validation time.
+    pub fn effective_max_pre_response_retries(&self) -> u32 {
+        self.max_pre_response_retries.min(5)
+    }
+
     fn validate_hooks(&self) -> Result<(), String> {
-        // Clamp max_pre_response_retries to 5 (warning only — clamp is done at runtime).
         // Enforce request_end_concurrency > 0.
         if self.request_end_concurrency == 0 {
             return Err("request_end_concurrency must be > 0".to_string());
+        }
+
+        // Clamp max_pre_response_retries to 5. Values above 5 are clamped with a warning.
+        if self.max_pre_response_retries > 5 {
+            tracing::warn!(
+                value = self.max_pre_response_retries,
+                "max_pre_response_retries exceeds maximum of 5 — clamping to 5"
+            );
         }
 
         for (i, hook) in self.hooks.iter().enumerate() {
@@ -1723,5 +1738,248 @@ examples = ["example 2"]
         };
         assert!(!wo_store.can_read());
         assert!(wo_store.can_write());
+    }
+
+    // ── HookEvent tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_hook_event_can_block_all_variants() {
+        // Blocking events: RequestStart, PreRoute, PostRoute, PreToolUse, PreResponse.
+        assert!(HookEvent::RequestStart.can_block());
+        assert!(HookEvent::PreRoute.can_block());
+        assert!(HookEvent::PostRoute.can_block());
+        assert!(HookEvent::PreToolUse.can_block());
+        assert!(HookEvent::PreResponse.can_block());
+        // Non-blocking events: PostToolUse, RequestEnd.
+        assert!(!HookEvent::PostToolUse.can_block());
+        assert!(!HookEvent::RequestEnd.can_block());
+    }
+
+    #[test]
+    fn test_hook_event_is_feedback_block_all_variants() {
+        // Feedback-block events (reason fed back to LLM): PreToolUse, PreResponse.
+        assert!(HookEvent::PreToolUse.is_feedback_block());
+        assert!(HookEvent::PreResponse.is_feedback_block());
+        // Hard-block events (immediate HTTP error): RequestStart, PreRoute, PostRoute.
+        assert!(!HookEvent::RequestStart.is_feedback_block());
+        assert!(!HookEvent::PreRoute.is_feedback_block());
+        assert!(!HookEvent::PostRoute.is_feedback_block());
+        // Non-blocking events do not feedback-block either.
+        assert!(!HookEvent::PostToolUse.is_feedback_block());
+        assert!(!HookEvent::RequestEnd.is_feedback_block());
+    }
+
+    // ── HookRoutingDomain tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_hook_routing_domain_serde_round_trip() {
+        for (domain, expected_json) in [
+            (HookRoutingDomain::Model, r#""model""#),
+            (HookRoutingDomain::Commands, r#""commands""#),
+            (HookRoutingDomain::ToolNecessity, r#""tool_necessity""#),
+            (HookRoutingDomain::Memory, r#""memory""#),
+        ] {
+            let json = serde_json::to_string(&domain).unwrap();
+            assert_eq!(json, expected_json, "serialize {domain:?}");
+            let back: HookRoutingDomain = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, domain, "deserialize {domain:?}");
+        }
+    }
+
+    #[test]
+    fn test_hook_routing_domain_as_matcher_target() {
+        assert_eq!(HookRoutingDomain::Model.as_matcher_target(), "model");
+        assert_eq!(HookRoutingDomain::Commands.as_matcher_target(), "commands");
+        assert_eq!(
+            HookRoutingDomain::ToolNecessity.as_matcher_target(),
+            "tool_necessity"
+        );
+        assert_eq!(HookRoutingDomain::Memory.as_matcher_target(), "memory");
+    }
+
+    // ── RoutingTrigger tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_routing_trigger_serde_round_trip() {
+        for (trigger, expected_json) in [
+            (RoutingTrigger::RequestStart, r#""request_start""#),
+            (RoutingTrigger::RecallCommand, r#""recall_command""#),
+            (RoutingTrigger::RememberCommand, r#""remember_command""#),
+        ] {
+            let json = serde_json::to_string(&trigger).unwrap();
+            assert_eq!(json, expected_json, "serialize {trigger:?}");
+            let back: RoutingTrigger = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, trigger, "deserialize {trigger:?}");
+        }
+    }
+
+    #[test]
+    fn test_routing_trigger_is_hard_block() {
+        // RequestStart: hard block (403).
+        assert!(RoutingTrigger::RequestStart.is_hard_block());
+        // RecallCommand and RememberCommand: feedback block (failed CommandResult).
+        assert!(!RoutingTrigger::RecallCommand.is_hard_block());
+        assert!(!RoutingTrigger::RememberCommand.is_hard_block());
+    }
+
+    // ── TOML parsing with [[hooks]] ───────────────────────────────────────────
+
+    #[test]
+    fn test_hooks_toml_parses_rhai_and_http() {
+        let toml = format!(
+            r#"{}
+[[hooks]]
+event = "request_start"
+type = "rhai"
+script = "/etc/hooks/auth.rhai"
+
+[[hooks]]
+event = "pre_tool_use"
+type = "http"
+url = "https://example.com/hook"
+matcher = "web_search"
+priority = 50
+"#,
+            minimal_router_toml_str()
+        );
+        let config: WeftConfig = toml::from_str(&toml).unwrap();
+        assert_eq!(config.hooks.len(), 2);
+
+        let rhai_hook = &config.hooks[0];
+        assert_eq!(rhai_hook.event, HookEvent::RequestStart);
+        assert_eq!(rhai_hook.hook_type, HookType::Rhai);
+        assert_eq!(rhai_hook.script.as_deref(), Some("/etc/hooks/auth.rhai"));
+        // priority defaults to 100 when absent.
+        assert_eq!(rhai_hook.priority, 100);
+
+        let http_hook = &config.hooks[1];
+        assert_eq!(http_hook.event, HookEvent::PreToolUse);
+        assert_eq!(http_hook.hook_type, HookType::Http);
+        assert_eq!(http_hook.url.as_deref(), Some("https://example.com/hook"));
+        assert_eq!(http_hook.matcher.as_deref(), Some("web_search"));
+        assert_eq!(http_hook.priority, 50);
+    }
+
+    #[test]
+    fn test_hooks_priority_defaults_to_100() {
+        let toml = format!(
+            r#"{}
+[[hooks]]
+event = "request_start"
+type = "http"
+url = "https://example.com/hook"
+"#,
+            minimal_router_toml_str()
+        );
+        let config: WeftConfig = toml::from_str(&toml).unwrap();
+        assert_eq!(config.hooks[0].priority, 100);
+    }
+
+    #[test]
+    fn test_hooks_secret_with_env_prefix_parsed() {
+        // SAFETY: test-only, single-threaded context.
+        unsafe { std::env::set_var("WEFT_TEST_HOOK_SECRET_789", "my-shared-secret") };
+
+        let toml = format!(
+            r#"{}
+[[hooks]]
+event = "request_start"
+type = "http"
+url = "https://example.com/hook"
+secret = "env:WEFT_TEST_HOOK_SECRET_789"
+"#,
+            minimal_router_toml_str()
+        );
+        let mut config: WeftConfig = toml::from_str(&toml).unwrap();
+        // Before resolve: raw env: reference is stored.
+        assert_eq!(
+            config.hooks[0].secret.as_deref(),
+            Some("env:WEFT_TEST_HOOK_SECRET_789")
+        );
+        // After resolve: the env var value is substituted.
+        config.resolve().unwrap();
+        assert_eq!(config.hooks[0].secret.as_deref(), Some("my-shared-secret"));
+
+        // SAFETY: test-only cleanup.
+        unsafe { std::env::remove_var("WEFT_TEST_HOOK_SECRET_789") };
+    }
+
+    #[test]
+    fn test_max_pre_response_retries_defaults_to_2() {
+        let config: WeftConfig = toml::from_str(minimal_router_toml_str()).unwrap();
+        assert_eq!(config.max_pre_response_retries, 2);
+    }
+
+    #[test]
+    fn test_request_end_concurrency_defaults_to_64() {
+        let config: WeftConfig = toml::from_str(minimal_router_toml_str()).unwrap();
+        assert_eq!(config.request_end_concurrency, 64);
+    }
+
+    #[test]
+    fn test_max_pre_response_retries_clamped_at_5() {
+        // Top-level fields must appear before section headers in TOML.
+        let toml = r#"
+max_pre_response_retries = 100
+
+[server]
+bind_address = "0.0.0.0:8080"
+
+[gateway]
+system_prompt = "You are helpful."
+
+[router]
+
+[router.classifier]
+model_path = "m.onnx"
+tokenizer_path = "t.json"
+
+[[router.providers]]
+name = "anthropic"
+kind = "anthropic"
+api_key = "sk-test"
+
+  [[router.providers.models]]
+  name = "main"
+  model = "claude-1"
+  examples = ["example"]
+"#;
+        let config: WeftConfig = toml::from_str(toml).unwrap();
+        // Raw field stores the configured value.
+        assert_eq!(config.max_pre_response_retries, 100);
+        // Effective accessor returns clamped value.
+        assert_eq!(config.effective_max_pre_response_retries(), 5);
+    }
+
+    #[test]
+    fn test_max_pre_response_retries_within_limit_unchanged() {
+        let toml = r#"
+max_pre_response_retries = 3
+
+[server]
+bind_address = "0.0.0.0:8080"
+
+[gateway]
+system_prompt = "You are helpful."
+
+[router]
+
+[router.classifier]
+model_path = "m.onnx"
+tokenizer_path = "t.json"
+
+[[router.providers]]
+name = "anthropic"
+kind = "anthropic"
+api_key = "sk-test"
+
+  [[router.providers.models]]
+  name = "main"
+  model = "claude-1"
+  examples = ["example"]
+"#;
+        let config: WeftConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.max_pre_response_retries, 3);
+        assert_eq!(config.effective_max_pre_response_retries(), 3);
     }
 }

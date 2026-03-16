@@ -685,4 +685,29 @@ mod tests {
         // code is present (may be null)
         assert!(resp["error"].get("code").is_some());
     }
+
+    // ── ApiError status code mapping tests ─────────────────────────────────
+
+    #[test]
+    fn test_hook_blocked_maps_to_403() {
+        let err = WeftError::HookBlocked {
+            event: "request_start".to_string(),
+            reason: "policy violation".to_string(),
+            hook_name: "auth-hook".to_string(),
+        };
+        let api_error = ApiError::from_weft_error(err);
+        assert_eq!(api_error.status, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_hook_blocked_after_retries_maps_to_422() {
+        let err = WeftError::HookBlockedAfterRetries {
+            event: "pre_response".to_string(),
+            reason: "content violation".to_string(),
+            hook_name: "content-filter".to_string(),
+            retries: 2,
+        };
+        let api_error = ApiError::from_weft_error(err);
+        assert_eq!(api_error.status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
 }
