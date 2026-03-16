@@ -17,28 +17,31 @@
 //!
 //! # Sandboxing
 //!
-//! The Rhai engine is constructed with `Engine::new()` (standard library, no `eval`).
-//! Additional hard limits prevent resource abuse:
-//! - `set_max_operations(10_000)` — prevents infinite loops
-//! - `set_max_string_size(1_048_576)` — 1 MB max string (response bodies can be large)
-//! - `set_max_array_size(4_096)` — reasonable limit for message arrays
-//! - `set_max_map_size(512)` — reasonable limit for header maps
+//! The Rhai engine is constructed via `weft_rhai::EngineBuilder` with
+//! `SandboxLimits::relaxed()`. Relaxed limits are appropriate because wire format
+//! scripts process full request/response bodies:
+//! - `max_operations: 10_000` — prevents infinite loops
+//! - `max_string_size: 1_048_576` — 1 MB max string (response bodies can be large)
+//! - `max_array_size: 4_096` — reasonable limit for message arrays
+//! - `max_map_size: 512` — reasonable limit for header maps
 //!
 //! Scripts have no file I/O, no network access, and no system calls. The HTTP call
 //! is made by `RhaiProvider` itself — the script only transforms data.
 //!
 //! # Execution Model
 //!
-//! Rhai is CPU-bound and synchronous. All Rhai calls are wrapped in
-//! `tokio::task::spawn_blocking()` to avoid blocking tokio worker threads. A fresh
-//! `Scope` is created per call so there is no shared mutable state between concurrent
-//! requests.
+//! Rhai is CPU-bound and synchronous. All Rhai calls go through
+//! `weft_rhai::safe_call_fn`, which wraps `tokio::task::spawn_blocking` and
+//! `std::panic::catch_unwind` to prevent blocking tokio workers and to provide
+//! structured error messages on Rhai-internal panics. A fresh `Scope` is created
+//! per call so there is no shared mutable state between concurrent requests.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rhai::{Dynamic, Engine, Scope};
+use rhai::Dynamic;
 use tracing::{debug, info, warn};
+use weft_rhai::{CompiledScript, EngineBuilder, SandboxLimits, ScriptError, safe_call_fn};
 
 use crate::{
     Provider, ProviderError, ProviderRequest, ProviderResponse,
@@ -52,31 +55,30 @@ use weft_core::Role;
 /// deserialization (HTTP response → Weft response). The actual HTTP call
 /// is made by `RhaiProvider` — the script cannot make network calls.
 ///
-/// `Engine` and `AST` are wrapped in `Arc` so they can be moved into
-/// `spawn_blocking` closures. Both are `Send + Sync` with the `rhai/sync` feature.
+/// `Engine` is wrapped in `Arc` so it can be shared into `spawn_blocking`
+/// closures. `CompiledScript` owns an `Arc<AST>` internally.
 pub struct RhaiProvider {
     /// Display name for this provider instance (from config), for logging.
     provider_name: String,
-    /// Compiled Rhai AST (compiled once at startup, reused for every request).
-    ast: Arc<rhai::AST>,
+    /// Compiled Rhai script with metadata (compiled once at startup).
+    script: CompiledScript,
     /// Rhai engine with registered API surface (no file/network access).
-    engine: Arc<Engine>,
+    engine: Arc<weft_rhai::Engine>,
     /// HTTP client for making provider API calls.
     client: reqwest::Client,
     /// API key (already resolved from `env:` prefix).
     api_key: String,
     /// Base URL for the provider API (e.g. `https://api.banana.ai/v1`).
     base_url: String,
-    /// Path to the Rhai script (stored for error messages).
-    script_path: String,
 }
 
 impl RhaiProvider {
     /// Construct a new `RhaiProvider`.
     ///
-    /// Reads the script from disk, configures a sandboxed Rhai engine, compiles the
-    /// script into an AST, and validates that both `format_request` and `parse_response`
-    /// functions are defined. Fails fast at startup rather than silently at request time.
+    /// Reads the script from disk, configures a sandboxed Rhai engine via
+    /// `weft_rhai::EngineBuilder`, compiles the script, and validates that both
+    /// `format_request` and `parse_response` functions are defined. Fails fast at
+    /// startup rather than silently at request time.
     ///
     /// # Arguments
     ///
@@ -97,24 +99,18 @@ impl RhaiProvider {
         base_url: String,
         provider_name: String,
     ) -> Result<Self, ProviderError> {
-        let script_content =
-            std::fs::read_to_string(script_path).map_err(|e| ProviderError::WireScriptError {
-                script: script_path.to_string(),
-                message: format!("failed to read script: {e}"),
-            })?;
+        let engine = EngineBuilder::new(SandboxLimits::relaxed())
+            .log_source("rhai_wire")
+            .with_base64_helpers(true)
+            .build();
+        let engine = Arc::new(engine);
 
-        let engine = build_engine();
+        let script = CompiledScript::load(script_path, &engine)
+            .map_err(|e| script_error_to_provider(e, script_path))?;
 
-        let ast = engine
-            .compile(&script_content)
-            .map_err(|e| ProviderError::WireScriptError {
-                script: script_path.to_string(),
-                message: format!("compilation failed: {e}"),
-            })?;
-
-        // Validate that both required functions exist (arity-1).
-        // `ast.iter_functions()` exposes function metadata without executing the script.
-        validate_required_functions(&ast, script_path)?;
+        script
+            .validate_functions(&["format_request", "parse_response"])
+            .map_err(|e| script_error_to_provider(e, script_path))?;
 
         info!(
             script = %script_path,
@@ -124,179 +120,50 @@ impl RhaiProvider {
 
         Ok(Self {
             provider_name,
-            ast: Arc::new(ast),
-            engine: Arc::new(engine),
+            script,
+            engine,
             client: reqwest::Client::new(),
             api_key,
             base_url,
-            script_path: script_path.to_string(),
         })
     }
 }
 
-/// Build a sandboxed Rhai engine with the wire format API registered.
+/// Convert a `ScriptError` from `weft_rhai` into a `ProviderError::WireScriptError`.
 ///
-/// Uses `Engine::new()` (standard library, no `eval`). No file I/O, no network,
-/// no system access. Limits are set per spec section 4.3.2.
-fn build_engine() -> Engine {
-    let mut engine = Engine::new();
-
-    // Hard limits per spec §4.3.2.
-    engine.set_max_operations(10_000);
-    engine.set_max_string_size(1_048_576); // 1 MB
-    engine.set_max_array_size(4_096);
-    engine.set_max_map_size(512);
-
-    register_wire_api(&mut engine);
-
-    engine
-}
-
-/// Register the wire format API functions into the engine.
-///
-/// Only JSON helpers, logging, and base64 encoding are exposed. Scripts cannot
-/// perform file I/O, network calls, or system commands.
-fn register_wire_api(engine: &mut Engine) {
-    // json_encode(value) -> String — serialize a Rhai Dynamic to a JSON string.
-    engine.register_fn("json_encode", |value: Dynamic| -> String {
-        match rhai::serde::from_dynamic::<serde_json::Value>(&value) {
-            Ok(json_val) => serde_json::to_string(&json_val).unwrap_or_else(|_| "null".to_string()),
-            Err(_) => "null".to_string(),
-        }
-    });
-
-    // json_decode(s) -> Dynamic — deserialize a JSON string to a Rhai Dynamic.
-    engine.register_fn("json_decode", |s: &str| -> Dynamic {
-        match serde_json::from_str::<serde_json::Value>(s) {
-            Ok(json_val) => rhai::serde::to_dynamic(&json_val).unwrap_or(Dynamic::UNIT),
-            Err(_) => Dynamic::UNIT,
-        }
-    });
-
-    // log_info(msg) — emit a tracing::info! log from the wire script.
-    engine.register_fn("log_info", |msg: &str| {
-        info!(source = "rhai_wire", "{}", msg);
-    });
-
-    // log_warn(msg) — emit a tracing::warn! log from the wire script.
-    engine.register_fn("log_warn", |msg: &str| {
-        warn!(source = "rhai_wire", "{}", msg);
-    });
-
-    // base64_encode(s) -> String — base64 encode a string (standard alphabet).
-    engine.register_fn("base64_encode", |s: &str| -> String {
-        // Inline base64 encoder — standard alphabet, no line breaks.
-        // Avoids adding a dependency just for this helper.
-        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let bytes = s.as_bytes();
-        let mut buf = String::with_capacity(bytes.len().div_ceil(3) * 4);
-        let mut i = 0;
-        while i < bytes.len() {
-            let b0 = bytes[i] as u32;
-            let b1 = if i + 1 < bytes.len() {
-                bytes[i + 1] as u32
-            } else {
-                0
-            };
-            let b2 = if i + 2 < bytes.len() {
-                bytes[i + 2] as u32
-            } else {
-                0
-            };
-
-            buf.push(ALPHABET[((b0 >> 2) & 0x3F) as usize] as char);
-            buf.push(ALPHABET[(((b0 << 4) | (b1 >> 4)) & 0x3F) as usize] as char);
-            if i + 1 < bytes.len() {
-                buf.push(ALPHABET[(((b1 << 2) | (b2 >> 6)) & 0x3F) as usize] as char);
-            } else {
-                buf.push('=');
-            }
-            if i + 2 < bytes.len() {
-                buf.push(ALPHABET[(b2 & 0x3F) as usize] as char);
-            } else {
-                buf.push('=');
-            }
-            i += 3;
-        }
-        buf
-    });
-
-    // base64_decode(s) -> String — base64 decode a string (returns empty on error).
-    engine.register_fn("base64_decode", |s: &str| -> String {
-        // Simple base64 decoder (standard alphabet, no line breaks).
-        const DECODE_TABLE: [i8; 256] = {
-            let mut t = [-1i8; 256];
-            let mut i = 0usize;
-            while i < 26 {
-                t[b'A' as usize + i] = i as i8;
-                t[b'a' as usize + i] = (i + 26) as i8;
-                i += 1;
-            }
-            let mut i = 0usize;
-            while i < 10 {
-                t[b'0' as usize + i] = (i + 52) as i8;
-                i += 1;
-            }
-            t[b'+' as usize] = 62;
-            t[b'/' as usize] = 63;
-            t
-        };
-
-        let input: Vec<u8> = s
-            .bytes()
-            .filter(|&b| b != b'=')
-            .filter(|&b| DECODE_TABLE[b as usize] >= 0)
-            .collect();
-
-        let mut out = Vec::with_capacity(input.len() * 3 / 4);
-        let mut i = 0;
-        while i + 3 < input.len() {
-            let v0 = DECODE_TABLE[input[i] as usize] as u32;
-            let v1 = DECODE_TABLE[input[i + 1] as usize] as u32;
-            let v2 = DECODE_TABLE[input[i + 2] as usize] as u32;
-            let v3 = DECODE_TABLE[input[i + 3] as usize] as u32;
-            out.push(((v0 << 2) | (v1 >> 4)) as u8);
-            out.push(((v1 << 4) | (v2 >> 2)) as u8);
-            out.push(((v2 << 6) | v3) as u8);
-            i += 4;
-        }
-        if i + 2 < input.len() {
-            let v0 = DECODE_TABLE[input[i] as usize] as u32;
-            let v1 = DECODE_TABLE[input[i + 1] as usize] as u32;
-            let v2 = DECODE_TABLE[input[i + 2] as usize] as u32;
-            out.push(((v0 << 2) | (v1 >> 4)) as u8);
-            out.push(((v1 << 4) | (v2 >> 2)) as u8);
-        } else if i + 1 < input.len() {
-            let v0 = DECODE_TABLE[input[i] as usize] as u32;
-            let v1 = DECODE_TABLE[input[i + 1] as usize] as u32;
-            out.push(((v0 << 2) | (v1 >> 4)) as u8);
-        }
-
-        String::from_utf8(out).unwrap_or_default()
-    });
-}
-
-/// Validate that the compiled AST defines both required wire format functions.
-///
-/// Checks via `ast.iter_functions()` which exposes function metadata without
-/// executing the script. Checks for arity-1 variants of each function name.
-fn validate_required_functions(ast: &rhai::AST, script_path: &str) -> Result<(), ProviderError> {
-    let fn_names: Vec<String> = ast.iter_functions().map(|f| f.name.to_string()).collect();
-
-    if !fn_names.iter().any(|n| n == "format_request") {
-        return Err(ProviderError::WireScriptError {
+/// This maps the shared infrastructure error into the domain error type for
+/// `weft_llm`, preserving the script path and message for diagnostics.
+fn script_error_to_provider(e: ScriptError, script_path: &str) -> ProviderError {
+    match &e {
+        ScriptError::FileNotFound { path, source } => ProviderError::WireScriptError {
+            script: path.clone(),
+            message: format!("failed to read script: {source}"),
+        },
+        ScriptError::CompilationFailed { path, message } => ProviderError::WireScriptError {
+            script: path.clone(),
+            message: format!("compilation failed: {message}"),
+        },
+        ScriptError::ExecutionError { path, message } => ProviderError::WireScriptError {
+            script: path.clone(),
+            message: format!("execution error: {message}"),
+        },
+        ScriptError::Panic { path, message } => ProviderError::WireScriptError {
+            script: path.clone(),
+            message: format!("script panicked: {message}"),
+        },
+        ScriptError::TaskJoinError { path, message } => ProviderError::WireScriptError {
+            script: path.clone(),
+            message: format!("task join error: {message}"),
+        },
+        ScriptError::MissingFunction { path, function } => ProviderError::WireScriptError {
+            script: path.clone(),
+            message: format!("script must define fn {function}(request)"),
+        },
+        ScriptError::ConversionError { message } => ProviderError::WireScriptError {
             script: script_path.to_string(),
-            message: "script must define fn format_request(request)".to_string(),
-        });
+            message: format!("conversion error: {message}"),
+        },
     }
-    if !fn_names.iter().any(|n| n == "parse_response") {
-        return Err(ProviderError::WireScriptError {
-            script: script_path.to_string(),
-            message: "script must define fn parse_response(response)".to_string(),
-        });
-    }
-
-    Ok(())
 }
 
 /// Convert a `ProviderRequest` into a Rhai `Dynamic` object map.
@@ -365,8 +232,8 @@ struct RequestSpec {
 /// Returns a `RequestSpec` or a `WireScriptError`.
 fn extract_request_spec(dynamic: Dynamic, script_path: &str) -> Result<RequestSpec, ProviderError> {
     // Convert Dynamic -> serde_json::Value for easier field access.
-    let json: serde_json::Value =
-        rhai::serde::from_dynamic(&dynamic).map_err(|e| ProviderError::WireScriptError {
+    let json =
+        weft_rhai::dynamic_to_json(&dynamic).map_err(|e| ProviderError::WireScriptError {
             script: script_path.to_string(),
             message: format!("format_request returned non-map value: {e}"),
         })?;
@@ -429,8 +296,8 @@ fn dynamic_to_provider_result(
     dynamic: Dynamic,
     script_path: &str,
 ) -> Result<ProviderResponse, ProviderError> {
-    let json: serde_json::Value =
-        rhai::serde::from_dynamic(&dynamic).map_err(|e| ProviderError::WireScriptError {
+    let json =
+        weft_rhai::dynamic_to_json(&dynamic).map_err(|e| ProviderError::WireScriptError {
             script: script_path.to_string(),
             message: format!("parse_response returned non-map value: {e}"),
         })?;
@@ -489,29 +356,29 @@ fn dynamic_to_provider_result(
 #[async_trait]
 impl Provider for RhaiProvider {
     async fn execute(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
-        let engine = Arc::clone(&self.engine);
-        let ast = Arc::clone(&self.ast);
-        let script_path = self.script_path.clone();
+        let script_path = self.script.path().to_string();
 
         // Step 1: Convert the ProviderRequest to a Rhai Dynamic.
         let request_dynamic = request_to_dynamic(&request);
 
-        // Step 2: Call format_request(request_map) via spawn_blocking (CPU-bound).
-        let script_path_clone = script_path.clone();
-        let format_result = tokio::task::spawn_blocking(move || {
-            let mut scope = Scope::new();
-            engine
-                .call_fn::<Dynamic>(&mut scope, &ast, "format_request", (request_dynamic,))
-                .map_err(|e| ProviderError::WireScriptError {
-                    script: script_path_clone.clone(),
-                    message: format!("format_request failed: {e}"),
-                })
-        })
+        // Step 2: Call format_request(request_map) via safe_call_fn (CPU-bound,
+        // wrapped in spawn_blocking + catch_unwind).
+        let format_result = safe_call_fn(
+            Arc::clone(&self.engine),
+            &self.script,
+            "format_request",
+            (request_dynamic,),
+        )
         .await
-        .map_err(|e| ProviderError::WireScriptError {
-            script: script_path.clone(),
-            message: format!("format_request task join error: {e}"),
-        })??;
+        .map_err(|e| {
+            warn!(
+                script = %script_path,
+                provider = %self.provider_name,
+                error = %e,
+                "format_request failed"
+            );
+            script_error_to_provider(e, &script_path)
+        })?;
 
         // Step 3: Extract method, path, headers, body from the returned map.
         let spec = extract_request_spec(format_result, &script_path)?;
@@ -588,24 +455,23 @@ impl Provider for RhaiProvider {
         resp_map.insert("headers".into(), Dynamic::from_map(headers_map));
         let response_dynamic = Dynamic::from_map(resp_map);
 
-        // Step 7: Call parse_response(response_map) via spawn_blocking.
-        let engine2 = Arc::clone(&self.engine);
-        let ast2 = Arc::clone(&self.ast);
-        let script_path_clone2 = script_path.clone();
-        let parse_result = tokio::task::spawn_blocking(move || {
-            let mut scope = Scope::new();
-            engine2
-                .call_fn::<Dynamic>(&mut scope, &ast2, "parse_response", (response_dynamic,))
-                .map_err(|e| ProviderError::WireScriptError {
-                    script: script_path_clone2.clone(),
-                    message: format!("parse_response failed: {e}"),
-                })
-        })
+        // Step 7: Call parse_response(response_map) via safe_call_fn.
+        let parse_result = safe_call_fn(
+            Arc::clone(&self.engine),
+            &self.script,
+            "parse_response",
+            (response_dynamic,),
+        )
         .await
-        .map_err(|e| ProviderError::WireScriptError {
-            script: script_path.clone(),
-            message: format!("parse_response task join error: {e}"),
-        })??;
+        .map_err(|e| {
+            warn!(
+                script = %script_path,
+                provider = %self.provider_name,
+                error = %e,
+                "parse_response failed"
+            );
+            script_error_to_provider(e, &script_path)
+        })?;
 
         // Step 8: Convert the returned map to ProviderResponse or ProviderError.
         dynamic_to_provider_result(parse_result, &script_path)
@@ -620,7 +486,7 @@ impl std::fmt::Debug for RhaiProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RhaiProvider")
             .field("provider_name", &self.provider_name)
-            .field("script_path", &self.script_path)
+            .field("script_path", &self.script.path())
             .field("base_url", &self.base_url)
             .finish()
     }
@@ -631,6 +497,7 @@ mod tests {
     use super::*;
     use std::io::Write;
     use weft_core::{Message, Role};
+    use weft_rhai::{EngineBuilder, SandboxLimits};
 
     /// Write a Rhai script to a temporary file and return the file handle.
     /// The file is deleted when the handle is dropped.
@@ -787,7 +654,7 @@ fn parse_response(response) {
         let dynamic = request_to_dynamic(&req);
 
         // Convert back to JSON for assertion.
-        let json: serde_json::Value = rhai::serde::from_dynamic(&dynamic).unwrap();
+        let json = weft_rhai::dynamic_to_json(&dynamic).unwrap();
         assert_eq!(json["type"], "chat_completion");
         assert_eq!(json["model"], "test-model");
         assert_eq!(json["system_prompt"], "You are helpful.");
@@ -810,7 +677,7 @@ fn parse_response(response) {
             temperature: None,
         });
         let dynamic = request_to_dynamic(&req);
-        let json: serde_json::Value = rhai::serde::from_dynamic(&dynamic).unwrap();
+        let json = weft_rhai::dynamic_to_json(&dynamic).unwrap();
         // temperature should be null/absent when None
         assert!(
             json["temperature"].is_null()
@@ -842,7 +709,7 @@ fn parse_response(response) {
             temperature: None,
         });
         let dynamic = request_to_dynamic(&req);
-        let json: serde_json::Value = rhai::serde::from_dynamic(&dynamic).unwrap();
+        let json = weft_rhai::dynamic_to_json(&dynamic).unwrap();
         let msgs = json["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"], "user");
         assert_eq!(msgs[1]["role"], "assistant");
@@ -853,7 +720,7 @@ fn parse_response(response) {
 
     #[test]
     fn test_extract_request_spec_valid() {
-        let engine = Engine::new();
+        let engine = EngineBuilder::new(SandboxLimits::default()).build();
         let dynamic: Dynamic = engine
             .eval(r#"#{ method: "POST", path: "/v1/chat", headers: #{}, body: "{}" }"#)
             .unwrap();
@@ -868,7 +735,7 @@ fn parse_response(response) {
 
     #[test]
     fn test_extract_request_spec_with_headers() {
-        let engine = Engine::new();
+        let engine = EngineBuilder::new(SandboxLimits::default()).build();
         let dynamic: Dynamic = engine
             .eval(r#"#{ method: "POST", path: "/v1", headers: #{ "X-Custom": "value" }, body: "{}" }"#)
             .unwrap();
@@ -884,7 +751,7 @@ fn parse_response(response) {
 
     #[test]
     fn test_extract_request_spec_missing_method_fails() {
-        let engine = Engine::new();
+        let engine = EngineBuilder::new(SandboxLimits::default()).build();
         let dynamic: Dynamic = engine
             .eval(r#"#{ path: "/v1", headers: #{}, body: "{}" }"#)
             .unwrap();
@@ -897,7 +764,7 @@ fn parse_response(response) {
 
     #[test]
     fn test_extract_request_spec_missing_body_fails() {
-        let engine = Engine::new();
+        let engine = EngineBuilder::new(SandboxLimits::default()).build();
         let dynamic: Dynamic = engine
             .eval(r#"#{ method: "POST", path: "/v1", headers: #{} }"#)
             .unwrap();
@@ -919,7 +786,7 @@ fn parse_response(response) {
 
     #[test]
     fn test_dynamic_to_provider_result_chat_completion_success() {
-        let engine = Engine::new();
+        let engine = EngineBuilder::new(SandboxLimits::default()).build();
         let dynamic: Dynamic = engine
             .eval(
                 r#"
@@ -942,7 +809,7 @@ fn parse_response(response) {
 
     #[test]
     fn test_dynamic_to_provider_result_no_usage() {
-        let engine = Engine::new();
+        let engine = EngineBuilder::new(SandboxLimits::default()).build();
         let dynamic: Dynamic = engine
             .eval(
                 r#"
@@ -959,7 +826,7 @@ fn parse_response(response) {
 
     #[test]
     fn test_dynamic_to_provider_result_error_response() {
-        let engine = Engine::new();
+        let engine = EngineBuilder::new(SandboxLimits::default()).build();
         let dynamic: Dynamic = engine
             .eval(
                 r#"
@@ -977,7 +844,7 @@ fn parse_response(response) {
 
     #[test]
     fn test_dynamic_to_provider_result_rate_limited() {
-        let engine = Engine::new();
+        let engine = EngineBuilder::new(SandboxLimits::default()).build();
         let dynamic: Dynamic = engine
             .eval(
                 r#"
@@ -997,7 +864,7 @@ fn parse_response(response) {
 
     #[test]
     fn test_dynamic_to_provider_result_unknown_type_fails() {
-        let engine = Engine::new();
+        let engine = EngineBuilder::new(SandboxLimits::default()).build();
         let dynamic: Dynamic = engine
             .eval(
                 r#"
@@ -1023,7 +890,7 @@ fn parse_response(response) {
 
     #[test]
     fn test_dynamic_to_provider_result_missing_text_fails() {
-        let engine = Engine::new();
+        let engine = EngineBuilder::new(SandboxLimits::default()).build();
         let dynamic: Dynamic = engine
             .eval(
                 r#"
@@ -1042,11 +909,11 @@ fn parse_response(response) {
 
     #[test]
     fn test_json_encode_decode_roundtrip() {
-        let engine = {
-            let mut e = Engine::new();
-            register_wire_api(&mut e);
-            e
-        };
+        // Use the weft_rhai builder (same as RhaiProvider::new would use).
+        let engine = EngineBuilder::new(SandboxLimits::relaxed())
+            .log_source("rhai_wire")
+            .with_base64_helpers(true)
+            .build();
         let result: Dynamic = engine
             .eval(
                 r#"
@@ -1056,29 +923,27 @@ fn parse_response(response) {
             "#,
             )
             .unwrap();
-        let json: serde_json::Value = rhai::serde::from_dynamic(&result).unwrap();
+        let json = weft_rhai::dynamic_to_json(&result).unwrap();
         assert_eq!(json["key"], "value");
         assert_eq!(json["num"], 42);
     }
 
     #[test]
     fn test_base64_encode_accessible_in_script() {
-        let engine = {
-            let mut e = Engine::new();
-            register_wire_api(&mut e);
-            e
-        };
+        let engine = EngineBuilder::new(SandboxLimits::relaxed())
+            .log_source("rhai_wire")
+            .with_base64_helpers(true)
+            .build();
         let result: String = engine.eval(r#"base64_encode("hello")"#).unwrap();
         assert_eq!(result, "aGVsbG8=");
     }
 
     #[test]
     fn test_base64_decode_accessible_in_script() {
-        let engine = {
-            let mut e = Engine::new();
-            register_wire_api(&mut e);
-            e
-        };
+        let engine = EngineBuilder::new(SandboxLimits::relaxed())
+            .log_source("rhai_wire")
+            .with_base64_helpers(true)
+            .build();
         let result: String = engine.eval(r#"base64_decode("aGVsbG8=")"#).unwrap();
         assert_eq!(result, "hello");
     }
@@ -1087,12 +952,15 @@ fn parse_response(response) {
 
     #[test]
     fn test_operation_limit_prevents_infinite_loop() {
-        // Verify the engine's max_operations is applied.
-        let engine = build_engine();
+        // Verify the engine's max_operations is applied via weft_rhai builder.
+        let engine = EngineBuilder::new(SandboxLimits::relaxed())
+            .log_source("rhai_wire")
+            .with_base64_helpers(true)
+            .build();
         let ast = engine
             .compile("fn format_request(r) { let i = 0; loop { i += 1; } }")
             .unwrap();
-        let mut scope = Scope::new();
+        let mut scope = rhai::Scope::new();
         let result =
             engine.call_fn::<Dynamic>(&mut scope, &ast, "format_request", (Dynamic::UNIT,));
         // Should fail with an operation limit error, not hang.
