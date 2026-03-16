@@ -83,6 +83,16 @@ struct OpenAiUsage {
 ///
 /// All messages are assigned `Source::Client` since this is the OpenAI compat
 /// layer and there is no source attribution in the OpenAI format.
+///
+/// # Spec deviation note
+///
+/// The spec (Section 10.1) declares this as `fn openai_to_weft(...) -> Result<WeftRequest, WeftError>`.
+/// This implementation is intentionally infallible: every field in `OpenAiChatRequest` maps
+/// cleanly to `WeftRequest` without conditions that can fail at translation time. Validation
+/// (empty messages, missing user role, streaming) is performed by the axum handler before this
+/// function is called, so returning `Ok(...)` unconditionally would add noise without safety.
+/// If future translation logic introduces fallible steps, the signature should be updated to
+/// match the spec.
 fn openai_to_weft(req: OpenAiChatRequest) -> WeftRequest {
     let messages: Vec<WeftMessage> = req
         .messages
@@ -1026,6 +1036,53 @@ mod tests {
         let openai_resp = weft_to_openai(resp);
         // No assistant message → empty content, not a panic
         assert_eq!(openai_resp.choices[0].message.content, "");
+    }
+
+    // ── Dual-listener test ─────────────────────────────────────────────────
+
+    /// Verify that the combined `build_router()` routes gRPC-content-type requests
+    /// to the tonic handler, not the axum HTTP handler.
+    ///
+    /// Real gRPC requires HTTP/2 framing and prost-encoded bodies. A unit test using
+    /// `tower::ServiceExt::oneshot` sends HTTP/1.1, so the tonic handler will reject
+    /// the request with a gRPC status error — but the key observable is that the
+    /// response carries `content-type: application/grpc` (set by tonic), which proves
+    /// the request was dispatched to the tonic router and NOT handled by the axum
+    /// JSON handlers (which would return `application/json` or a 404/405).
+    ///
+    /// A true end-to-end dual-listener integration test (binding a real port and
+    /// connecting a tonic client) lives in the integration test suite and requires
+    /// a running tokio runtime with a real TCP listener. See `tests/grpc_integration.rs`
+    /// (placeholder) for that path.
+    #[tokio::test]
+    async fn test_grpc_content_type_routes_to_tonic_handler() {
+        let router = make_router(MockLlmProvider::ok("irrelevant"));
+
+        // Send a request with the gRPC content-type header.
+        // The URI matches the tonic-generated service path: /weft.v1.Weft/Chat
+        let req = Request::builder()
+            .method("POST")
+            .uri("/weft.v1.Weft/Chat")
+            .header("content-type", "application/grpc+proto")
+            // te: trailers is required by gRPC spec; tonic checks for it
+            .header("te", "trailers")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+
+        // Tonic sets content-type: application/grpc on ALL responses it handles,
+        // including error responses. If routing had fallen through to axum, we would
+        // receive application/json (error body) or a 404, not application/grpc.
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.starts_with("application/grpc"),
+            "expected gRPC content-type from tonic handler, got: {content_type:?}"
+        );
     }
 
     // ── Single code path test ───────────────────────────────────────────────
