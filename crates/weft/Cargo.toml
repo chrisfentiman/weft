@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 weft_core = { path = "../weft_core" }
+weft_hooks = { path = "../weft_hooks" }
 weft_llm = { path = "../weft_llm" }
 weft_rhai = { path = "../weft_rhai" }
 weft_router = { path = "../weft_router" }
@@ -33,6 +34,7 @@ rhai = { workspace = true }
 reqwest = { workspace = true }
 
 [dev-dependencies]
+weft_hooks = { path = "../weft_hooks", features = ["test-support"] }
 tower = { version = "0.5", features = ["util"] }
 mockito = { workspace = true }
 tempfile = { version = "3" }

@@ -32,9 +32,9 @@ use tracing::{debug, info, warn};
 use weft_core::HookEvent;
 use weft_rhai::{CompiledScript, Engine, EngineBuilder, SandboxLimits, safe_call_fn};
 
-use crate::hooks::HookError;
-use crate::hooks::executor::HookExecutor;
-use crate::hooks::types::{HookDecision, HookResponse};
+use crate::HookError;
+use crate::executor::HookExecutor;
+use crate::types::{HookDecision, HookResponse};
 
 /// Rhai-based hook executor.
 ///
@@ -447,9 +447,6 @@ mod tests {
                 .unwrap();
         let payload = serde_json::json!({});
         let response = exec.execute(&payload).await;
-        // If log_info was not registered, this would return Allow due to runtime error.
-        // Either way we get Allow, but the script-path matters for coverage.
-        // We verify by ensuring the script path is in the executor (i.e., it compiled).
         assert_eq!(response.decision, HookDecision::Allow);
     }
 

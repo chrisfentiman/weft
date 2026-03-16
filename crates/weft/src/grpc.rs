@@ -867,7 +867,7 @@ mod tests {
             Arc::new(MockRouter),
             Arc::new(MockCommandRegistry),
             None,
-            Arc::new(crate::hooks::HookRegistry::empty()),
+            Arc::new(weft_hooks::HookRegistry::empty()),
         )
     }
 

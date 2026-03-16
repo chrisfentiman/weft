@@ -29,9 +29,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 use weft_core::HookEvent;
 
-use crate::hooks::HookError;
-use crate::hooks::executor::HookExecutor;
-use crate::hooks::types::{HookDecision, HookResponse};
+use crate::HookError;
+use crate::executor::HookExecutor;
+use crate::types::{HookDecision, HookResponse};
 
 /// HTTP webhook hook executor.
 ///
@@ -753,10 +753,6 @@ mod tests {
     #[test]
     fn test_format_rfc3339_utc_leap_year() {
         // 2000-02-29T00:00:00Z — leap year day.
-        // 2000-02-29 = 1970 + 30 years + leap day.
-        // Days from 1970-01-01 to 2000-02-29:
-        // 1970..1999 = 30 years. Count leap years: 1972,1976,...,1996 = 8 leap years.
-        // So 22*365 + 8*366 = 8030 + 2928 = 10958... let me just check the format.
         let ts = UNIX_EPOCH + Duration::from_secs(951_782_400); // 2000-02-29T00:00:00Z
         let formatted = format_rfc3339_utc(ts);
         assert_eq!(formatted, "2000-02-29T00:00:00Z");

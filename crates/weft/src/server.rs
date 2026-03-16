@@ -692,7 +692,7 @@ mod tests {
             Arc::new(MockRouter),
             Arc::new(MockRegistry),
             None,
-            std::sync::Arc::new(crate::hooks::HookRegistry::empty()),
+            std::sync::Arc::new(weft_hooks::HookRegistry::empty()),
         );
         Arc::new(WeftService::new(engine))
     }

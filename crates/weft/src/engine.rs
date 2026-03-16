@@ -59,8 +59,8 @@ use weft_router::{
 use crate::context::{
     assemble_system_prompt, assemble_system_prompt_no_tools, format_command_results_toon,
 };
-use crate::hooks::HookChainResult;
 use weft_core::HookEvent;
+use weft_hooks::{HookChainResult, HookRunner};
 
 /// Built-in command names intercepted by the engine before the command registry.
 const BUILTIN_COMMANDS: &[&str] = &["recall", "remember"];
@@ -169,7 +169,7 @@ pub struct GatewayEngine {
     write_memory_candidates: Vec<RoutingCandidate>,
     /// Hook registry. Shared immutably across all request handlers.
     /// Contains all registered hooks, sorted by priority per event.
-    hook_registry: Arc<crate::hooks::HookRegistry>,
+    hook_registry: Arc<weft_hooks::HookRegistry>,
     /// Semaphore limiting concurrent RequestEnd hook tasks.
     /// Prevents unbounded task accumulation under burst load.
     request_end_semaphore: Arc<tokio::sync::Semaphore>,
@@ -194,7 +194,7 @@ impl GatewayEngine {
         router: Arc<dyn SemanticRouter>,
         command_registry: Arc<dyn CommandRegistry>,
         memory_mux: Option<Arc<MemoryStoreMux>>,
-        hook_registry: Arc<crate::hooks::HookRegistry>,
+        hook_registry: Arc<weft_hooks::HookRegistry>,
     ) -> Self {
         // Build per-capability candidate sets from config memory stores.
         // These are derived from the same config used to build the mux, so they
@@ -2095,6 +2095,8 @@ mod tests {
         SamplingOptions, ServerConfig, Source, StoreCapability, WeftConfig, WeftMessage,
         WeftRequest, WireFormat,
     };
+    use weft_hooks::types::HookMatcher;
+    use weft_hooks::{HookRegistry, RegisteredHook};
     use weft_llm::{
         Capability, Provider, ProviderError, ProviderRegistry, ProviderRequest, ProviderResponse,
         TokenUsage,
@@ -2683,7 +2685,7 @@ mod tests {
             Arc::new(router),
             Arc::new(commands),
             None,
-            Arc::new(crate::hooks::HookRegistry::empty()),
+            Arc::new(weft_hooks::HookRegistry::empty()),
         )
     }
 
@@ -2699,7 +2701,7 @@ mod tests {
             Arc::new(router),
             Arc::new(commands),
             None,
-            Arc::new(crate::hooks::HookRegistry::empty()),
+            Arc::new(weft_hooks::HookRegistry::empty()),
         )
     }
 
@@ -3835,7 +3837,7 @@ mod tests {
             Arc::new(router),
             Arc::new(commands),
             mux,
-            Arc::new(crate::hooks::HookRegistry::empty()),
+            Arc::new(weft_hooks::HookRegistry::empty()),
         )
     }
 
@@ -4363,7 +4365,7 @@ mod tests {
             Arc::new(router),
             Arc::new(commands),
             mux,
-            Arc::new(crate::hooks::HookRegistry::empty()),
+            Arc::new(weft_hooks::HookRegistry::empty()),
         )
     }
 
@@ -5057,7 +5059,7 @@ mod tests {
         registry: Arc<ProviderRegistry>,
         router: impl SemanticRouter + 'static,
         commands: impl CommandRegistry + 'static,
-        hook_registry: crate::hooks::HookRegistry,
+        hook_registry: weft_hooks::HookRegistry,
     ) -> GatewayEngine {
         GatewayEngine::new(
             test_config(),
@@ -5072,12 +5074,10 @@ mod tests {
     /// Build a `HookRegistry` with a single hook executor for one event.
     fn hook_registry_with(
         event: HookEvent,
-        executor: Box<dyn crate::hooks::executor::HookExecutor>,
+        executor: Box<dyn weft_hooks::executor::HookExecutor>,
         matcher: Option<&str>,
         priority: u32,
-    ) -> crate::hooks::HookRegistry {
-        use crate::hooks::types::HookMatcher;
-        use crate::hooks::{HookRegistry, RegisteredHook};
+    ) -> weft_hooks::HookRegistry {
         let matcher = HookMatcher::new(matcher, 0).expect("valid matcher in test");
         let hook = RegisteredHook {
             event,
@@ -5094,11 +5094,11 @@ mod tests {
     // ── Phase 4: inline hook executor helpers ─────────────────────────────
 
     /// A hook executor that always returns a fixed response.
-    struct FixedHookExecutor(crate::hooks::types::HookResponse);
+    struct FixedHookExecutor(weft_hooks::types::HookResponse);
 
     #[async_trait]
-    impl crate::hooks::executor::HookExecutor for FixedHookExecutor {
-        async fn execute(&self, _payload: &serde_json::Value) -> crate::hooks::types::HookResponse {
+    impl weft_hooks::executor::HookExecutor for FixedHookExecutor {
+        async fn execute(&self, _payload: &serde_json::Value) -> weft_hooks::types::HookResponse {
             self.0.clone()
         }
     }
@@ -5121,10 +5121,10 @@ mod tests {
     }
 
     #[async_trait]
-    impl crate::hooks::executor::HookExecutor for RecordingHookExecutor {
-        async fn execute(&self, payload: &serde_json::Value) -> crate::hooks::types::HookResponse {
+    impl weft_hooks::executor::HookExecutor for RecordingHookExecutor {
+        async fn execute(&self, payload: &serde_json::Value) -> weft_hooks::types::HookResponse {
             self.recorded.lock().unwrap().push(payload.clone());
-            crate::hooks::types::HookResponse::allow()
+            weft_hooks::types::HookResponse::allow()
         }
     }
 
@@ -5132,8 +5132,8 @@ mod tests {
     struct ModifyHookExecutor(serde_json::Value);
 
     #[async_trait]
-    impl crate::hooks::executor::HookExecutor for ModifyHookExecutor {
-        async fn execute(&self, payload: &serde_json::Value) -> crate::hooks::types::HookResponse {
+    impl weft_hooks::executor::HookExecutor for ModifyHookExecutor {
+        async fn execute(&self, payload: &serde_json::Value) -> weft_hooks::types::HookResponse {
             // Merge self.0 fields into current payload.
             let mut merged = payload.clone();
             if let (Some(obj), Some(extra)) = (merged.as_object_mut(), self.0.as_object()) {
@@ -5141,8 +5141,8 @@ mod tests {
                     obj.insert(k.clone(), v.clone());
                 }
             }
-            crate::hooks::types::HookResponse {
-                decision: crate::hooks::types::HookDecision::Modify,
+            weft_hooks::types::HookResponse {
+                decision: weft_hooks::types::HookDecision::Modify,
                 reason: None,
                 modified: Some(merged),
                 context: None,
@@ -5154,13 +5154,11 @@ mod tests {
     fn hook_registry_multi(
         hooks: Vec<(
             HookEvent,
-            Box<dyn crate::hooks::executor::HookExecutor>,
+            Box<dyn weft_hooks::executor::HookExecutor>,
             Option<&'static str>,
             u32,
         )>,
-    ) -> crate::hooks::HookRegistry {
-        use crate::hooks::types::HookMatcher;
-        use crate::hooks::{HookRegistry, RegisteredHook};
+    ) -> weft_hooks::HookRegistry {
         let mut map: std::collections::HashMap<HookEvent, Vec<RegisteredHook>> =
             std::collections::HashMap::new();
         for (i, (event, executor, matcher_pat, priority)) in hooks.into_iter().enumerate() {
@@ -5189,7 +5187,7 @@ mod tests {
         );
         let hook_reg = hook_registry_with(
             HookEvent::RequestStart,
-            Box::new(FixedHookExecutor(crate::hooks::types::HookResponse::block(
+            Box::new(FixedHookExecutor(weft_hooks::types::HookResponse::block(
                 "auth failed",
             ))),
             None,
@@ -5223,7 +5221,7 @@ mod tests {
         );
         let hook_reg = hook_registry_with(
             HookEvent::RequestStart,
-            Box::new(FixedHookExecutor(crate::hooks::types::HookResponse::allow())),
+            Box::new(FixedHookExecutor(weft_hooks::types::HookResponse::allow())),
             None,
             100,
         );
@@ -5248,7 +5246,7 @@ mod tests {
         // PreRoute block on model domain → hard block (403).
         let hook_reg = hook_registry_with(
             HookEvent::PreRoute,
-            Box::new(FixedHookExecutor(crate::hooks::types::HookResponse::block(
+            Box::new(FixedHookExecutor(weft_hooks::types::HookResponse::block(
                 "model blocked",
             ))),
             Some("model"),
@@ -5287,13 +5285,13 @@ mod tests {
 
         struct ArcRecording(Arc<RecordingHookExecutor>);
         #[async_trait]
-        impl crate::hooks::executor::HookExecutor for ArcRecording {
+        impl weft_hooks::executor::HookExecutor for ArcRecording {
             async fn execute(
                 &self,
                 payload: &serde_json::Value,
-            ) -> crate::hooks::types::HookResponse {
+            ) -> weft_hooks::types::HookResponse {
                 self.0.recorded.lock().unwrap().push(payload.clone());
-                crate::hooks::types::HookResponse::allow()
+                weft_hooks::types::HookResponse::allow()
             }
         }
 
@@ -5421,7 +5419,7 @@ mod tests {
 
         let hook_reg = hook_registry_with(
             HookEvent::PreToolUse,
-            Box::new(FixedHookExecutor(crate::hooks::types::HookResponse::block(
+            Box::new(FixedHookExecutor(weft_hooks::types::HookResponse::block(
                 "permission denied",
             ))),
             Some("web_search"),
@@ -5457,7 +5455,7 @@ mod tests {
 
         let hook_reg = hook_registry_with(
             HookEvent::PreToolUse,
-            Box::new(FixedHookExecutor(crate::hooks::types::HookResponse::block(
+            Box::new(FixedHookExecutor(weft_hooks::types::HookResponse::block(
                 "blocked",
             ))),
             Some("web_search"), // only blocks web_search
@@ -5546,17 +5544,17 @@ mod tests {
             count: std::sync::Mutex<u32>,
         }
         #[async_trait]
-        impl crate::hooks::executor::HookExecutor for BlockOnceExecutor {
+        impl weft_hooks::executor::HookExecutor for BlockOnceExecutor {
             async fn execute(
                 &self,
                 _payload: &serde_json::Value,
-            ) -> crate::hooks::types::HookResponse {
+            ) -> weft_hooks::types::HookResponse {
                 let mut count = self.count.lock().unwrap();
                 *count += 1;
                 if *count == 1 {
-                    crate::hooks::types::HookResponse::block("content policy")
+                    weft_hooks::types::HookResponse::block("content policy")
                 } else {
-                    crate::hooks::types::HookResponse::allow()
+                    weft_hooks::types::HookResponse::allow()
                 }
             }
         }
@@ -5598,7 +5596,7 @@ mod tests {
 
         let hook_reg = hook_registry_with(
             HookEvent::PreResponse,
-            Box::new(FixedHookExecutor(crate::hooks::types::HookResponse::block(
+            Box::new(FixedHookExecutor(weft_hooks::types::HookResponse::block(
                 "always blocked",
             ))),
             None,
@@ -5665,13 +5663,13 @@ mod tests {
 
         struct FireFlagExecutor(Arc<std::sync::atomic::AtomicBool>);
         #[async_trait]
-        impl crate::hooks::executor::HookExecutor for FireFlagExecutor {
+        impl weft_hooks::executor::HookExecutor for FireFlagExecutor {
             async fn execute(
                 &self,
                 _payload: &serde_json::Value,
-            ) -> crate::hooks::types::HookResponse {
+            ) -> weft_hooks::types::HookResponse {
                 self.0.store(true, std::sync::atomic::Ordering::Release);
-                crate::hooks::types::HookResponse::allow()
+                weft_hooks::types::HookResponse::allow()
             }
         }
 
@@ -5721,13 +5719,13 @@ mod tests {
 
         struct FireFlagExecutor(Arc<std::sync::atomic::AtomicBool>);
         #[async_trait]
-        impl crate::hooks::executor::HookExecutor for FireFlagExecutor {
+        impl weft_hooks::executor::HookExecutor for FireFlagExecutor {
             async fn execute(
                 &self,
                 _payload: &serde_json::Value,
-            ) -> crate::hooks::types::HookResponse {
+            ) -> weft_hooks::types::HookResponse {
                 self.0.store(true, std::sync::atomic::Ordering::Release);
-                crate::hooks::types::HookResponse::allow()
+                weft_hooks::types::HookResponse::allow()
             }
         }
 
@@ -5818,7 +5816,7 @@ mod tests {
         let hook_reg = hook_registry_multi(vec![
             (
                 HookEvent::RequestStart,
-                Box::new(FixedHookExecutor(crate::hooks::types::HookResponse::block(
+                Box::new(FixedHookExecutor(weft_hooks::types::HookResponse::block(
                     "low priority block",
                 ))),
                 None,
@@ -5826,7 +5824,7 @@ mod tests {
             ),
             (
                 HookEvent::RequestStart,
-                Box::new(FixedHookExecutor(crate::hooks::types::HookResponse::allow())),
+                Box::new(FixedHookExecutor(weft_hooks::types::HookResponse::allow())),
                 None,
                 200, // fires second (but chain already blocked)
             ),
@@ -5949,7 +5947,7 @@ mod tests {
         registry: Arc<ProviderRegistry>,
         router: impl SemanticRouter + 'static,
         commands: impl CommandRegistry + 'static,
-        hook_registry: crate::hooks::HookRegistry,
+        hook_registry: weft_hooks::HookRegistry,
         mux: Option<Arc<MemoryStoreMux>>,
     ) -> GatewayEngine {
         GatewayEngine::new(
@@ -5981,11 +5979,11 @@ mod tests {
 
         struct PanicExecutor;
         #[async_trait]
-        impl crate::hooks::executor::HookExecutor for PanicExecutor {
+        impl weft_hooks::executor::HookExecutor for PanicExecutor {
             async fn execute(
                 &self,
                 _payload: &serde_json::Value,
-            ) -> crate::hooks::types::HookResponse {
+            ) -> weft_hooks::types::HookResponse {
                 panic!("PreRoute should not fire after PreToolUse block");
             }
         }
@@ -5994,7 +5992,7 @@ mod tests {
             // PreToolUse blocks /recall.
             (
                 HookEvent::PreToolUse,
-                Box::new(FixedHookExecutor(crate::hooks::types::HookResponse::block(
+                Box::new(FixedHookExecutor(weft_hooks::types::HookResponse::block(
                     "recall blocked by policy",
                 ))),
                 Some("recall"),
@@ -6124,7 +6122,7 @@ mod tests {
 
         let hook_reg = hook_registry_with(
             HookEvent::PreRoute,
-            Box::new(FixedHookExecutor(crate::hooks::types::HookResponse::block(
+            Box::new(FixedHookExecutor(weft_hooks::types::HookResponse::block(
                 "memory access denied",
             ))),
             Some("memory"),
@@ -6267,13 +6265,13 @@ mod tests {
 
         struct CountingExecutor(Arc<std::sync::atomic::AtomicU32>);
         #[async_trait]
-        impl crate::hooks::executor::HookExecutor for CountingExecutor {
+        impl weft_hooks::executor::HookExecutor for CountingExecutor {
             async fn execute(
                 &self,
                 _payload: &serde_json::Value,
-            ) -> crate::hooks::types::HookResponse {
+            ) -> weft_hooks::types::HookResponse {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                crate::hooks::types::HookResponse::allow()
+                weft_hooks::types::HookResponse::allow()
             }
         }
 
@@ -6282,8 +6280,6 @@ mod tests {
             Arc::new(MockMemStoreClient::succeeds(vec![mem_entry("m1", "data")])),
         );
 
-        use crate::hooks::types::HookMatcher;
-        use crate::hooks::{HookRegistry, RegisteredHook};
         let matcher = HookMatcher::new(Some("recall"), 0).expect("valid matcher");
         let hook = RegisteredHook {
             event: HookEvent::PreToolUse,
@@ -6341,13 +6337,13 @@ mod tests {
 
         struct CapturePayloadExecutor(Arc<std::sync::Mutex<Option<serde_json::Value>>>);
         #[async_trait]
-        impl crate::hooks::executor::HookExecutor for CapturePayloadExecutor {
+        impl weft_hooks::executor::HookExecutor for CapturePayloadExecutor {
             async fn execute(
                 &self,
                 payload: &serde_json::Value,
-            ) -> crate::hooks::types::HookResponse {
+            ) -> weft_hooks::types::HookResponse {
                 *self.0.lock().unwrap() = Some(payload.clone());
-                crate::hooks::types::HookResponse::allow()
+                weft_hooks::types::HookResponse::allow()
             }
         }
 

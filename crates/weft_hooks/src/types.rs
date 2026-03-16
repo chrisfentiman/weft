@@ -5,8 +5,6 @@
 //! `weft_core::config` alongside `HookConfig`, to avoid circular dependencies.
 
 /// The decision a hook makes about a lifecycle event.
-// Used by HookResponse (returned from executors) and run_chain (Phase 4 wiring).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HookDecision {
@@ -23,8 +21,6 @@ pub enum HookDecision {
 ///
 /// Rhai scripts return this directly (via registered type).
 /// HTTP hooks return this as JSON.
-// Used by HookExecutor::execute implementations (Phase 2/3 wiring).
-#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HookResponse {
     /// The decision: allow, block, or modify.
@@ -40,8 +36,6 @@ pub struct HookResponse {
     pub context: Option<String>,
 }
 
-// allow() and block() are used by executor implementations (Phase 2/3) and tests.
-#[allow(dead_code)]
 impl HookResponse {
     /// Convenience constructor for an Allow response with no modifications.
     pub fn allow() -> Self {
@@ -67,8 +61,6 @@ impl HookResponse {
 /// Compiled matcher for a hook. Determines whether a hook fires for a given event instance.
 pub struct HookMatcher {
     /// Compiled regex. `None` means the hook fires for all events of its type.
-    // Used by HookRegistry::run_chain (Phase 4 wiring).
-    #[allow(dead_code)]
     regex: Option<regex::Regex>,
     /// Original pattern string, for error messages and debug output.
     pattern: Option<String>,
@@ -79,7 +71,7 @@ impl HookMatcher {
     ///
     /// Returns an error if the pattern is provided but invalid.
     /// The error message includes the hook index for operator diagnostics.
-    pub fn new(pattern: Option<&str>, hook_index: usize) -> Result<Self, crate::hooks::HookError> {
+    pub fn new(pattern: Option<&str>, hook_index: usize) -> Result<Self, crate::HookError> {
         match pattern {
             None => Ok(Self {
                 regex: None,
@@ -89,7 +81,7 @@ impl HookMatcher {
                 // Anchor the pattern: full-string match semantics (^pattern$).
                 let anchored = format!("^(?:{p})$");
                 let regex = regex::Regex::new(&anchored).map_err(|e| {
-                    crate::hooks::HookError::RegistryError(format!(
+                    crate::HookError::RegistryError(format!(
                         "hooks[{hook_index}]: invalid matcher regex '{p}': {e}"
                     ))
                 })?;
@@ -106,8 +98,6 @@ impl HookMatcher {
     /// A `None` regex always matches (the hook fires for all events of its type).
     /// `target` is event-specific: the routing domain name, command name, etc.
     /// Pass `None` for events where matchers are ignored (RequestStart, PreResponse, RequestEnd).
-    // Used by HookRegistry::run_chain and tests.
-    #[allow(dead_code)]
     pub fn matches(&self, target: Option<&str>) -> bool {
         match (&self.regex, target) {
             // No regex: always fires.
@@ -124,8 +114,6 @@ impl HookMatcher {
     }
 
     /// Returns the original pattern string, if any.
-    // Used for diagnostics and debug output.
-    #[allow(dead_code)]
     pub fn pattern(&self) -> Option<&str> {
         self.pattern.as_deref()
     }

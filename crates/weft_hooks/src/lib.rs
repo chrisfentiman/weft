@@ -12,7 +12,7 @@
 //!   live in `types.rs`.
 //! - The `HookExecutor` trait lives in `executor.rs`.
 //! - Executor implementations live in `rhai_executor.rs` and `http_executor.rs`.
-//! - `HookRegistry` and chain execution logic live in this file (`mod.rs`).
+//! - `HookRegistry` and chain execution logic live in this file (`lib.rs`).
 //!
 //! # Fail-open semantics
 //!
@@ -20,8 +20,8 @@
 //! Hooks are optional evaluation gates; the gateway's primary job is routing to LLMs.
 
 pub mod executor;
-pub mod http_executor;
-pub mod rhai_executor;
+pub(crate) mod http_executor;
+pub(crate) mod rhai_executor;
 pub mod types;
 
 use std::collections::HashMap;
@@ -30,10 +30,10 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 use weft_core::{HookConfig, HookEvent, HookType};
 
-use crate::hooks::executor::HookExecutor;
-use crate::hooks::http_executor::HttpHookExecutor;
-use crate::hooks::rhai_executor::RhaiHookExecutor;
-use crate::hooks::types::{HookDecision, HookMatcher};
+use crate::executor::HookExecutor;
+use crate::http_executor::HttpHookExecutor;
+use crate::rhai_executor::RhaiHookExecutor;
+use crate::types::{HookDecision, HookMatcher};
 
 /// Error type for hook registry construction.
 ///
@@ -48,7 +48,6 @@ pub enum HookError {
     #[error("http hook error: {url}: {message}")]
     HttpError { url: String, message: String },
     /// Returned when a hook returns a response that violates validation rules.
-    /// Defined here for completeness; used in Phase 2/3 executor implementations.
     #[allow(dead_code)]
     #[error("hook response validation error: {hook_name}: {message}")]
     ValidationError { hook_name: String, message: String },
@@ -57,7 +56,7 @@ pub enum HookError {
 }
 
 /// A registered hook with its configuration and compiled execution state.
-pub(crate) struct RegisteredHook {
+pub struct RegisteredHook {
     /// Which lifecycle event this hook fires on.
     pub event: HookEvent,
     /// Optional compiled matcher.
@@ -86,7 +85,7 @@ impl std::fmt::Debug for RegisteredHook {
 /// Consumed by the engine to determine whether to block or
 /// pass the modified payload to the next stage.
 #[derive(Debug)]
-pub(crate) enum HookChainResult {
+pub enum HookChainResult {
     /// All hooks allowed (or no hooks registered for this event).
     /// Contains the final payload (possibly modified by Modify hooks)
     /// and any accumulated context strings.
@@ -98,11 +97,59 @@ pub(crate) enum HookChainResult {
     Blocked { reason: String, hook_name: String },
 }
 
+impl HookChainResult {
+    /// Convenience constructor for an Allowed result with unmodified payload and no context.
+    pub fn allow(payload: serde_json::Value) -> Self {
+        Self::Allowed {
+            payload,
+            context: None,
+        }
+    }
+}
+
+/// Trait for hook chain execution.
+///
+/// The engine calls this; implementations determine how hooks are resolved and run.
+///
+/// `Send + Sync + 'static` because the engine holds `Arc<H>` and calls
+/// from async context.
+#[async_trait::async_trait]
+pub trait HookRunner: Send + Sync + 'static {
+    /// Run all hooks for the given event, in priority order.
+    async fn run_chain(
+        &self,
+        event: HookEvent,
+        payload: serde_json::Value,
+        matcher_target: Option<&str>,
+    ) -> HookChainResult;
+}
+
+/// Null implementation. Always returns Allowed with unmodified payload.
+///
+/// Used in tests that do not exercise hook behavior and in contexts where
+/// no hook runner is needed.
+pub struct NullHookRunner;
+
+#[async_trait::async_trait]
+impl HookRunner for NullHookRunner {
+    async fn run_chain(
+        &self,
+        _event: HookEvent,
+        payload: serde_json::Value,
+        _matcher_target: Option<&str>,
+    ) -> HookChainResult {
+        HookChainResult::Allowed {
+            payload,
+            context: None,
+        }
+    }
+}
+
 /// The hook registry: owns all registered hooks, grouped by event.
 ///
 /// Constructed at startup from config. Immutable after construction.
 /// Shared via `Arc` (all fields are `Send + Sync`).
-pub(crate) struct HookRegistry {
+pub struct HookRegistry {
     /// Hooks indexed by event type, in priority-sorted order.
     /// Read by `run_chain` during the engine request loop.
     hooks: HashMap<HookEvent, Vec<RegisteredHook>>,
@@ -119,7 +166,7 @@ impl HookRegistry {
     /// 2. Constructs the executor (validates file/URL existence).
     /// 3. Weft-type hooks are skipped with a warning log.
     /// 4. Hooks are sorted by priority (ascending, stable for equal priorities).
-    pub(crate) fn from_config(
+    pub fn from_config(
         hooks_config: &[HookConfig],
         http_client: Arc<reqwest::Client>,
     ) -> Result<Self, HookError> {
@@ -189,10 +236,10 @@ impl HookRegistry {
 
     /// Construct an empty registry (no hooks configured).
     ///
-    /// Used in tests where no hook behavior is needed. No allocations at request
-    /// time — `run_chain` returns `Allowed` immediately when no hooks are registered.
-    #[cfg(test)]
-    pub(crate) fn empty() -> Self {
+    /// Intended for test use. No allocations at request time — `run_chain` returns
+    /// `Allowed` immediately when no hooks are registered.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn empty() -> Self {
         Self {
             hooks: HashMap::new(),
         }
@@ -200,13 +247,23 @@ impl HookRegistry {
 
     /// Construct a registry from a pre-built event-to-hooks map.
     ///
-    /// Used in tests to build registries with inline executor implementations
+    /// Intended for test use to build registries with inline executor implementations
     /// without going through `from_config` (which requires real Rhai scripts or URLs).
-    #[cfg(test)]
-    pub(crate) fn from_registered(hooks: HashMap<HookEvent, Vec<RegisteredHook>>) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_registered(hooks: HashMap<HookEvent, Vec<RegisteredHook>>) -> Self {
         Self { hooks }
     }
 
+    /// Returns the number of registered hooks for a given event.
+    /// Intended for diagnostics and testing.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hook_count(&self, event: HookEvent) -> usize {
+        self.hooks.get(&event).map(|v| v.len()).unwrap_or(0)
+    }
+}
+
+#[async_trait::async_trait]
+impl HookRunner for HookRegistry {
     /// Run all hooks for the given event, in priority order.
     ///
     /// Returns the final payload (possibly modified) and whether the chain was blocked.
@@ -219,7 +276,7 @@ impl HookRegistry {
     /// - `PreRoute`/`PostRoute`: routing domain name ("model", "commands", "memory", "tool_necessity")
     /// - `PreToolUse`/`PostToolUse`: command name
     /// - Other events: `None` (matcher ignored — hook always fires)
-    pub(crate) async fn run_chain(
+    async fn run_chain(
         &self,
         event: HookEvent,
         payload: serde_json::Value,
@@ -322,13 +379,6 @@ impl HookRegistry {
             context,
         }
     }
-
-    /// Returns the number of registered hooks for a given event.
-    /// Used for diagnostics and testing.
-    #[cfg(test)]
-    pub(crate) fn hook_count(&self, event: HookEvent) -> usize {
-        self.hooks.get(&event).map(|v| v.len()).unwrap_or(0)
-    }
 }
 
 /// Truncate a string to at most `max_bytes` bytes, preserving UTF-8 boundaries.
@@ -361,7 +411,7 @@ fn truncate_bytes_with_suffix(s: &str, max_bytes: usize, suffix: &str) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hooks::types::{HookDecision, HookResponse};
+    use crate::types::{HookDecision, HookResponse};
 
     fn test_http_client() -> Arc<reqwest::Client> {
         Arc::new(reqwest::Client::new())
@@ -396,6 +446,40 @@ mod tests {
             .run_chain(HookEvent::PreToolUse, payload.clone(), Some("web_search"))
             .await;
         assert!(matches!(result, HookChainResult::Allowed { .. }));
+    }
+
+    // ── NullHookRunner ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_null_hook_runner_always_allows() {
+        let runner = NullHookRunner;
+        let payload = serde_json::json!({"command": "test"});
+        let result = runner
+            .run_chain(HookEvent::RequestStart, payload.clone(), None)
+            .await;
+        assert!(matches!(result, HookChainResult::Allowed { .. }));
+        if let HookChainResult::Allowed {
+            payload: p,
+            context,
+        } = result
+        {
+            assert_eq!(p, payload);
+            assert!(context.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_null_hook_runner_preserves_payload() {
+        let runner = NullHookRunner;
+        let payload = serde_json::json!({"messages": [{"role": "user", "content": "hello"}]});
+        let result = runner
+            .run_chain(HookEvent::PreToolUse, payload.clone(), Some("web_search"))
+            .await;
+        if let HookChainResult::Allowed { payload: p, .. } = result {
+            assert_eq!(p, payload);
+        } else {
+            panic!("expected Allowed");
+        }
     }
 
     // ── from_config ───────────────────────────────────────────────────────────

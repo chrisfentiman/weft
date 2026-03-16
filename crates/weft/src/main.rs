@@ -6,7 +6,6 @@
 mod context;
 mod engine;
 mod grpc;
-mod hooks;
 mod server;
 
 use std::collections::{HashMap, HashSet};
@@ -424,8 +423,8 @@ async fn main() {
     let http_client = std::sync::Arc::new(reqwest::Client::new());
 
     let hook_registry = {
-        let registry =
-            hooks::HookRegistry::from_config(&config.hooks, http_client).unwrap_or_else(|e| {
+        let registry = weft_hooks::HookRegistry::from_config(&config.hooks, http_client)
+            .unwrap_or_else(|e| {
                 eprintln!("error: hook configuration error: {e}");
                 std::process::exit(1);
             });
