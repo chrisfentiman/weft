@@ -5,6 +5,7 @@
 
 mod context;
 mod engine;
+mod hooks;
 mod server;
 
 use std::collections::{HashMap, HashSet};
@@ -375,6 +376,24 @@ async fn main() {
         None
     };
 
+    // ── Construct hook registry ────────────────────────────────────────────
+    //
+    // One shared reqwest::Client for all HTTP hooks (connection pooling).
+    // HookRegistry::from_config validates all hook configs and compiles matchers.
+    // Startup fails fast if any hook is misconfigured.
+
+    let http_client = std::sync::Arc::new(reqwest::Client::new());
+
+    let hook_registry = {
+        let registry =
+            hooks::HookRegistry::from_config(&config.hooks, http_client).unwrap_or_else(|e| {
+                eprintln!("error: hook configuration error: {e}");
+                std::process::exit(1);
+            });
+        info!(hooks = config.hooks.len(), "hook registry initialized");
+        std::sync::Arc::new(registry)
+    };
+
     // ── Wire the gateway engine ────────────────────────────────────────────
 
     let engine = GatewayEngine::new(
@@ -383,6 +402,7 @@ async fn main() {
         router,
         command_registry,
         memory_mux,
+        hook_registry,
     );
 
     // ── Start the HTTP server ──────────────────────────────────────────────

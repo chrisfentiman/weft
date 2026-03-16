@@ -217,6 +217,18 @@ impl ApiError {
                 message: e.to_string(),
                 retry_after_ms: None,
             },
+            // Hard block: hook terminated the request before LLM involvement.
+            WeftError::HookBlocked { .. } => Self {
+                status: StatusCode::FORBIDDEN,
+                message: e.to_string(),
+                retry_after_ms: None,
+            },
+            // Feedback block exhausted retries (PreResponse only).
+            WeftError::HookBlockedAfterRetries { .. } => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                message: e.to_string(),
+                retry_after_ms: None,
+            },
         }
     }
 }
@@ -434,6 +446,9 @@ mod tests {
             },
             tool_registry: None,
             memory: None,
+            hooks: vec![],
+            max_pre_response_retries: 2,
+            request_end_concurrency: 64,
             gateway: GatewayConfig {
                 system_prompt: "You are a test assistant.".to_string(),
                 max_command_iterations: 10,
@@ -467,6 +482,7 @@ mod tests {
             Arc::new(MockRouter),
             Arc::new(MockRegistry),
             None,
+            std::sync::Arc::new(crate::hooks::HookRegistry::empty()),
         );
         build_router(engine)
     }
@@ -620,6 +636,7 @@ mod tests {
             Arc::new(MockRouter),
             Arc::new(MockRegistry),
             None,
+            std::sync::Arc::new(crate::hooks::HookRegistry::empty()),
         );
         let router = build_router(engine);
 

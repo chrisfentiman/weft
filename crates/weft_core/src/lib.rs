@@ -15,9 +15,10 @@ pub use command::{
     CommandAction, CommandDescription, CommandInvocation, CommandResult, CommandStub,
 };
 pub use config::{
-    ClassifierConfig, DomainConfig, DomainsConfig, GatewayConfig, LlmProviderKind, MemoryConfig,
-    MemoryStoreConfig, ModelEntry, ProviderConfig, ResolvedModel, RouterConfig, ServerConfig,
-    StoreCapability, ToolRegistryConfig, WeftConfig,
+    ClassifierConfig, DomainConfig, DomainsConfig, GatewayConfig, HookConfig, HookEvent,
+    HookRoutingDomain, HookType, LlmProviderKind, MemoryConfig, MemoryStoreConfig, ModelEntry,
+    ProviderConfig, ResolvedModel, RouterConfig, RoutingTrigger, ServerConfig, StoreCapability,
+    ToolRegistryConfig, WeftConfig,
 };
 pub use error::WeftError;
 pub use message::{ChatCompletionRequest, ChatCompletionResponse, Choice, Message, Role, Usage};

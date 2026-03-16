@@ -31,6 +31,21 @@ pub enum WeftError {
     ModelNotFound { name: String },
     #[error("memory store error: {0}")]
     MemoryStore(String),
+    /// Hard block — request terminated immediately (RequestStart, PreRoute, PostRoute).
+    #[error("hook blocked at {event}: {reason} (hook: {hook_name})")]
+    HookBlocked {
+        event: String,
+        reason: String,
+        hook_name: String,
+    },
+    /// Feedback block exhausted retries (PreResponse only).
+    #[error("hook blocked after {retries} retries at {event}: {reason} (hook: {hook_name})")]
+    HookBlockedAfterRetries {
+        event: String,
+        reason: String,
+        hook_name: String,
+        retries: u32,
+    },
 }
 
 #[cfg(test)]

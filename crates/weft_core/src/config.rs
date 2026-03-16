@@ -14,6 +14,25 @@ pub struct WeftConfig {
     pub router: RouterConfig,
     /// Memory store configuration. Optional -- absent means no memory stores.
     pub memory: Option<MemoryConfig>,
+    /// Hook configuration. Empty vec means no hooks.
+    #[serde(default)]
+    pub hooks: Vec<HookConfig>,
+    /// Maximum number of LLM regeneration attempts when a PreResponse hook blocks.
+    /// Default: 2. Max: 5.
+    #[serde(default = "default_max_pre_response_retries")]
+    pub max_pre_response_retries: u32,
+    /// Maximum concurrent RequestEnd hook tasks. Excess tasks are dropped with a warning.
+    /// Default: 64.
+    #[serde(default = "default_request_end_concurrency")]
+    pub request_end_concurrency: usize,
+}
+
+fn default_max_pre_response_retries() -> u32 {
+    2
+}
+
+fn default_request_end_concurrency() -> usize {
+    64
 }
 
 impl WeftConfig {
@@ -28,6 +47,20 @@ impl WeftConfig {
             provider.api_key = resolve_env_var(&provider.api_key)
                 .map_err(|e| format!("router.providers[{}].api_key: {e}", provider.name))?;
         }
+        // Resolve env: references in hook secrets.
+        for (i, hook) in self.hooks.iter_mut().enumerate() {
+            if let Some(ref secret) = hook.secret.clone()
+                && secret.starts_with("env:")
+            {
+                let resolved = resolve_env_var(secret).map_err(|e| {
+                    let var_name = secret.strip_prefix("env:").unwrap_or(secret);
+                    format!(
+                        "hooks[{i}]: secret references env var '{var_name}' which is not set: {e}"
+                    )
+                })?;
+                hook.secret = Some(resolved);
+            }
+        }
         Ok(())
     }
 
@@ -40,6 +73,53 @@ impl WeftConfig {
         if let Some(ref memory) = self.memory {
             memory.validate()?;
         }
+        self.validate_hooks()?;
+        Ok(())
+    }
+
+    fn validate_hooks(&self) -> Result<(), String> {
+        // Clamp max_pre_response_retries to 5 (warning only — clamp is done at runtime).
+        // Enforce request_end_concurrency > 0.
+        if self.request_end_concurrency == 0 {
+            return Err("request_end_concurrency must be > 0".to_string());
+        }
+
+        for (i, hook) in self.hooks.iter().enumerate() {
+            match hook.hook_type {
+                HookType::Rhai => {
+                    if hook.script.is_none() {
+                        return Err(format!("hooks[{i}]: rhai hook requires 'script' field"));
+                    }
+                    // Clamp Rhai timeout to 5000ms (no hard error, just cap).
+                    // Capping is applied at registry construction time.
+                }
+                HookType::Http => {
+                    let url = hook.url.as_deref().ok_or_else(|| {
+                        format!("hooks[{i}]: http hook requires valid 'url' field")
+                    })?;
+                    // Validate URL starts with a valid scheme (http:// or https://).
+                    // Full URL parsing is done by the reqwest client at registry construction time.
+                    if !url.starts_with("http://") && !url.starts_with("https://") {
+                        return Err(format!(
+                            "hooks[{i}]: http hook requires valid 'url' field (must start with http:// or https://)"
+                        ));
+                    }
+                    // Clamp HTTP timeout to 30000ms (applied at registry construction).
+                }
+                HookType::Weft => {
+                    // agent field validated but hook is skipped at registry time.
+                    if hook.agent.is_none() {
+                        tracing::warn!(
+                            "hooks[{i}]: weft hook missing 'agent' field — hook will be skipped"
+                        );
+                    }
+                    tracing::warn!(
+                        "hooks[{i}]: weft-type hooks are reserved for future implementation"
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -492,6 +572,155 @@ fn default_max_results() -> u32 {
 
 fn default_capabilities() -> Vec<StoreCapability> {
     vec![StoreCapability::Read, StoreCapability::Write]
+}
+
+// ── Hook configuration ────────────────────────────────────────────────────────
+
+/// Lifecycle events that hooks can attach to.
+///
+/// Lives in `weft_core::config` so `HookConfig` can reference it for
+/// deserialization. Placing it in the `weft` binary crate would create a
+/// circular dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookEvent {
+    /// Request arrives at gateway, before any processing.
+    RequestStart,
+    /// Before each routing decision (fires per domain).
+    PreRoute,
+    /// After each routing decision (fires per domain).
+    PostRoute,
+    /// Before executing a single command invocation.
+    PreToolUse,
+    /// After command returns, before result injection. Cannot block.
+    PostToolUse,
+    /// Before building the final HTTP response.
+    PreResponse,
+    /// After response sent to client. Cannot block. Fire-and-forget.
+    RequestEnd,
+}
+
+impl HookEvent {
+    /// Whether this event supports blocking decisions.
+    pub fn can_block(&self) -> bool {
+        matches!(
+            self,
+            Self::RequestStart
+                | Self::PreRoute
+                | Self::PostRoute
+                | Self::PreToolUse
+                | Self::PreResponse
+        )
+    }
+
+    /// Whether this event uses feedback-loop blocking (reason fed back to LLM)
+    /// as opposed to hard blocking (HTTP error to client).
+    ///
+    /// For PreRoute/PostRoute, the blocking behavior depends on the trigger:
+    /// - `request_start` trigger: hard block (403)
+    /// - `recall_command` or `remember_command` trigger: feedback block (failed CommandResult)
+    ///
+    /// This method returns the DEFAULT behavior. The engine overrides for
+    /// PreRoute/PostRoute based on the trigger at call time.
+    pub fn is_feedback_block(&self) -> bool {
+        matches!(self, Self::PreToolUse | Self::PreResponse)
+    }
+}
+
+/// The routing domain for PreRoute/PostRoute events.
+///
+/// Mirrors `RoutingDomainKind` from `weft_router` but lives in `weft_core::config`
+/// to avoid a dependency on `weft_router` from config types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookRoutingDomain {
+    /// Which model handles this request.
+    Model,
+    /// Which commands are relevant for this turn.
+    Commands,
+    /// Whether tools are needed at all.
+    ToolNecessity,
+    /// Which memory stores to query or write to.
+    Memory,
+}
+
+impl HookRoutingDomain {
+    /// String representation for matcher evaluation.
+    pub fn as_matcher_target(&self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Commands => "commands",
+            Self::ToolNecessity => "tool_necessity",
+            Self::Memory => "memory",
+        }
+    }
+}
+
+/// What triggered this routing decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingTrigger {
+    /// Initial routing at request start (model, commands, tool_necessity domains).
+    RequestStart,
+    /// Per-invocation routing for a `/recall` command.
+    RecallCommand,
+    /// Per-invocation routing for a `/remember` command.
+    RememberCommand,
+}
+
+impl RoutingTrigger {
+    /// Whether a block on this trigger should be a hard block (403) or a feedback block.
+    ///
+    /// Hard block: request terminated immediately.
+    /// Feedback block: block reason fed back to LLM as failed CommandResult.
+    pub fn is_hard_block(&self) -> bool {
+        matches!(self, Self::RequestStart)
+    }
+}
+
+/// Hook type: which execution engine handles this hook.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HookType {
+    /// Rhai embedded scripting language hook.
+    Rhai,
+    /// HTTP webhook hook.
+    Http,
+    /// Weft-type hook (reserved for future implementation).
+    Weft,
+}
+
+/// A single hook configuration entry.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct HookConfig {
+    /// Which lifecycle event this hook fires on.
+    pub event: HookEvent,
+    /// Optional regex matcher. Absence means "fire on all events of this type."
+    pub matcher: Option<String>,
+    /// Hook type: "rhai", "http", or "weft".
+    #[serde(rename = "type")]
+    pub hook_type: HookType,
+    /// Path to Rhai script file. Required when `hook_type` is `rhai`.
+    pub script: Option<String>,
+    /// URL for HTTP webhook. Required when `hook_type` is `http`.
+    pub url: Option<String>,
+    /// Agent name for Weft hook. Required when `hook_type` is `weft`.
+    pub agent: Option<String>,
+    /// Execution timeout in milliseconds.
+    /// Default: 100 for Rhai, 5000 for HTTP. Max: 5000 for Rhai, 30000 for HTTP.
+    pub timeout_ms: Option<u64>,
+    /// Optional shared secret for HTTP hook authentication.
+    /// Sent as `Authorization: Bearer <secret>` header.
+    /// Supports `env:VAR_NAME` syntax for environment variable resolution.
+    /// Only applicable to HTTP hooks; ignored for other types.
+    pub secret: Option<String>,
+    /// Execution priority. Lower values run first. Default: 100.
+    #[serde(default = "default_hook_priority")]
+    pub priority: u32,
+}
+
+fn default_hook_priority() -> u32 {
+    100
 }
 
 #[cfg(test)]

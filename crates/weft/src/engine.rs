@@ -97,6 +97,16 @@ pub struct GatewayEngine {
     /// Memory candidates filtered to write-capable stores only. Used by `/remember`
     /// for per-invocation routing via `score_memory_candidates()`.
     write_memory_candidates: Vec<RoutingCandidate>,
+    /// Hook registry. Shared immutably across all request handlers.
+    /// Contains all registered hooks, sorted by priority per event.
+    /// Wired into the request loop in Phase 4.
+    #[allow(dead_code)]
+    hook_registry: Arc<crate::hooks::HookRegistry>,
+    /// Semaphore limiting concurrent RequestEnd hook tasks.
+    /// Prevents unbounded task accumulation under burst load.
+    /// Used in Phase 4 for fire-and-forget RequestEnd hook dispatch.
+    #[allow(dead_code)]
+    request_end_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl GatewayEngine {
@@ -118,12 +128,16 @@ impl GatewayEngine {
         router: Arc<dyn SemanticRouter>,
         command_registry: Arc<dyn CommandRegistry>,
         memory_mux: Option<Arc<MemoryStoreMux>>,
+        hook_registry: Arc<crate::hooks::HookRegistry>,
     ) -> Self {
         // Build per-capability candidate sets from config memory stores.
         // These are derived from the same config used to build the mux, so they
         // will always be consistent with the mux's readable/writable sets.
         let (memory_candidates, read_memory_candidates, write_memory_candidates) =
             build_memory_candidates(&config);
+
+        let request_end_concurrency = config.request_end_concurrency;
+        let request_end_semaphore = Arc::new(tokio::sync::Semaphore::new(request_end_concurrency));
 
         Self {
             config,
@@ -134,6 +148,8 @@ impl GatewayEngine {
             memory_candidates,
             read_memory_candidates,
             write_memory_candidates,
+            hook_registry,
+            request_end_semaphore,
         }
     }
 
@@ -1412,6 +1428,9 @@ mod tests {
             },
             tool_registry: None,
             memory: None,
+            hooks: vec![],
+            max_pre_response_retries: 2,
+            request_end_concurrency: 64,
             gateway: GatewayConfig {
                 system_prompt: "You are a test assistant.".to_string(),
                 max_command_iterations: 10,
@@ -1459,6 +1478,9 @@ mod tests {
             },
             tool_registry: None,
             memory: None,
+            hooks: vec![],
+            max_pre_response_retries: 2,
+            request_end_concurrency: 64,
             gateway: GatewayConfig {
                 system_prompt: "You are a test assistant.".to_string(),
                 max_command_iterations: 10,
@@ -1542,6 +1564,7 @@ mod tests {
             Arc::new(router),
             Arc::new(commands),
             None,
+            Arc::new(crate::hooks::HookRegistry::empty()),
         )
     }
 
@@ -1551,7 +1574,14 @@ mod tests {
         router: impl SemanticRouter + 'static,
         commands: impl CommandRegistry + 'static,
     ) -> GatewayEngine {
-        GatewayEngine::new(config, registry, Arc::new(router), Arc::new(commands), None)
+        GatewayEngine::new(
+            config,
+            registry,
+            Arc::new(router),
+            Arc::new(commands),
+            None,
+            Arc::new(crate::hooks::HookRegistry::empty()),
+        )
     }
 
     // ── Test: no-command response (single pass) ────────────────────────────
@@ -2587,6 +2617,7 @@ mod tests {
             Arc::new(router),
             Arc::new(commands),
             mux,
+            Arc::new(crate::hooks::HookRegistry::empty()),
         )
     }
 
@@ -3105,6 +3136,9 @@ mod tests {
             memory: Some(MemoryConfig {
                 stores: store_configs,
             }),
+            hooks: vec![],
+            max_pre_response_retries: 2,
+            request_end_concurrency: 64,
             gateway: GatewayConfig {
                 system_prompt: "You are a test assistant.".to_string(),
                 max_command_iterations: 10,
@@ -3121,7 +3155,14 @@ mod tests {
         commands: impl CommandRegistry + 'static,
         mux: Option<Arc<MemoryStoreMux>>,
     ) -> GatewayEngine {
-        GatewayEngine::new(config, registry, Arc::new(router), Arc::new(commands), mux)
+        GatewayEngine::new(
+            config,
+            registry,
+            Arc::new(router),
+            Arc::new(commands),
+            mux,
+            Arc::new(crate::hooks::HookRegistry::empty()),
+        )
     }
 
     // ── Phase 3: build_memory_candidates ──────────────────────────────────
@@ -3888,6 +3929,9 @@ mod tests {
                     examples: vec!["conversation".to_string()],
                 }],
             }),
+            hooks: vec![],
+            max_pre_response_retries: 2,
+            request_end_concurrency: 64,
             gateway: GatewayConfig {
                 system_prompt: "You are a test assistant.".to_string(),
                 max_command_iterations: 10,
