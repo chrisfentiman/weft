@@ -61,8 +61,11 @@ max_commands = 20
 [[router.providers]]
 # Unique name for this provider (used in logging).
 name = "anthropic"
-# Provider type: "anthropic" or "openai"
-kind = "anthropic"
+# Wire format: "anthropic", "openai", or "custom"
+# - "anthropic": Anthropic Messages API (claude-* models)
+# - "openai": OpenAI Chat Completions API (OpenAI, Ollama, vLLM, and OpenAI-compatible providers)
+# - "custom": Rhai script defines the wire protocol (requires wire_script field)
+wire_format = "anthropic"
 # API key. Use "env:VAR_NAME" to load from an environment variable.
 api_key = "env:ANTHROPIC_API_KEY"
 # base_url is optional — defaults to the official Anthropic API endpoint.
@@ -76,6 +79,9 @@ api_key = "env:ANTHROPIC_API_KEY"
   model = "claude-sonnet-4-20250514"
   # Maximum tokens in the response.
   max_tokens = 4096
+  # Capabilities this model supports. Default: ["chat_completions"].
+  # Omit this field for standard chat models — the default covers the common case.
+  # capabilities = ["chat_completions", "vision", "tool_calling"]
   # Example queries this model is best suited for.
   # The router embeds all examples, averages them into a centroid vector,
   # and routes requests based on semantic similarity to the centroid.
@@ -176,13 +182,14 @@ examples = [
 #
 # [[router.providers]]
 # name = "anthropic"
-# kind = "anthropic"
+# wire_format = "anthropic"
 # api_key = "env:ANTHROPIC_API_KEY"
 #
 #   [[router.providers.models]]
 #   name = "complex"
 #   model = "claude-sonnet-4-20250514"
 #   max_tokens = 8192
+#   capabilities = ["chat_completions", "vision", "tool_calling"]
 #   examples = [
 #     "Design a distributed system with fault tolerance",
 #     "Analyze this algorithm's time complexity",
@@ -194,6 +201,7 @@ examples = [
 #   name = "fast"
 #   model = "claude-haiku-4-5-20251001"
 #   max_tokens = 2048
+#   capabilities = ["chat_completions", "vision"]
 #   examples = [
 #     "Hi, how are you?",
 #     "What time is it in Tokyo?",
@@ -203,7 +211,7 @@ examples = [
 #
 # [[router.providers]]
 # name = "local"
-# kind = "openai"
+# wire_format = "openai"
 # api_key = "unused"                                    # Local providers ignore auth headers
 # base_url = "http://localhost:11434/v1/chat/completions"
 #
@@ -211,8 +219,32 @@ examples = [
 #   name = "general"
 #   model = "llama3.2"
 #   max_tokens = 4096
+#   # capabilities defaults to ["chat_completions"] when omitted
 #   examples = [
 #     "Draft an internal memo about project status",
 #     "Review this confidential contract",
 #     "Analyze our proprietary data",
+#   ]
+#
+# # ── Custom Wire Format Provider ─────────────────────────────────────────
+# #
+# # Use wire_format = "custom" for providers with a non-standard API.
+# # The wire_script field points to a Rhai script that handles serialization
+# # and deserialization. See providers/example.rhai for the script interface.
+#
+# [[router.providers]]
+# name = "banana-ai"
+# wire_format = "custom"
+# wire_script = "providers/banana.rhai"
+# api_key = "env:BANANA_KEY"
+# base_url = "https://api.banana.ai/v1"
+#
+#   [[router.providers.models]]
+#   name = "banana-gen"
+#   model = "banana-image-v2"
+#   max_tokens = 1024
+#   capabilities = ["image_generations"]
+#   examples = [
+#     "Generate an image of a sunset",
+#     "Create a logo for my company",
 #   ]

@@ -237,6 +237,40 @@ impl RouterConfig {
             }
         }
 
+        // 7. wire_format = custom requires wire_script; non-custom must not have wire_script.
+        for provider in &self.providers {
+            match &provider.wire_format {
+                WireFormat::Custom => {
+                    if provider.wire_script.is_none() {
+                        return Err(format!(
+                            "provider '{}': custom wire_format requires 'wire_script' field",
+                            provider.name
+                        ));
+                    }
+                }
+                WireFormat::OpenAI | WireFormat::Anthropic => {
+                    if provider.wire_script.is_some() {
+                        return Err(format!(
+                            "provider '{}': wire_script is only valid with wire_format = 'custom'",
+                            provider.name
+                        ));
+                    }
+                }
+            }
+        }
+
+        // 8. Each model's capabilities must have at least one entry.
+        for provider in &self.providers {
+            for model in &provider.models {
+                if model.capabilities.is_empty() {
+                    return Err(format!(
+                        "model '{}': capabilities must have at least one entry",
+                        model.name
+                    ));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -267,10 +301,12 @@ impl RouterConfig {
                     model: model.model.clone(),
                     max_tokens: model.max_tokens,
                     examples: model.examples.clone(),
-                    provider_kind: provider.kind.clone(),
+                    wire_format: provider.wire_format.clone(),
                     api_key: provider.api_key.clone(),
                     base_url: provider.base_url.clone(),
                     provider_name: provider.name.clone(),
+                    wire_script: provider.wire_script.clone(),
+                    capabilities: model.capabilities.clone(),
                 });
             }
         }
@@ -309,10 +345,10 @@ fn default_enabled() -> bool {
 /// An LLM provider -- an API endpoint that serves one or more models.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ProviderConfig {
-    /// Unique name for this provider (e.g., "anthropic", "local").
+    /// Unique name for this provider (e.g., "anthropic", "local-ollama").
     pub name: String,
-    /// Provider type -- determines the API protocol used.
-    pub kind: LlmProviderKind,
+    /// Wire format -- determines the API protocol used.
+    pub wire_format: WireFormat,
     /// API key for this provider. Supports `env:VAR_NAME` prefix.
     /// For local providers (e.g., Ollama) that don't require authentication,
     /// use a literal string like `"unused"`. The value is passed through to the
@@ -322,13 +358,16 @@ pub struct ProviderConfig {
     pub api_key: String,
     /// Optional base URL override. Required for local/custom endpoints (e.g., Ollama).
     pub base_url: Option<String>,
+    /// Path to Rhai wire format script. Required when `wire_format` is `custom`.
+    /// Relative paths are resolved from the current working directory at startup.
+    pub wire_script: Option<String>,
     /// Models served by this provider. Must have at least one.
     pub models: Vec<ModelEntry>,
 }
 
 /// A model available for routing, nested under a provider.
 ///
-/// The model inherits the provider's API endpoint (kind, api_key, base_url).
+/// The model inherits the provider's API endpoint (wire_format, api_key, base_url).
 /// The `model` field is sent to the provider API to select which model to use.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ModelEntry {
@@ -346,10 +385,19 @@ pub struct ModelEntry {
     /// and routes based on distance to the centroid.
     /// Must contain at least one example.
     pub examples: Vec<String>,
+    /// Capabilities this model supports.
+    /// Default: `["chat_completions"]` -- a model that doesn't declare capabilities
+    /// is assumed to support chat completions only.
+    #[serde(default = "default_model_capabilities")]
+    pub capabilities: Vec<String>,
 }
 
 fn default_max_tokens() -> u32 {
     4096
+}
+
+fn default_model_capabilities() -> Vec<String> {
+    vec!["chat_completions".to_string()]
 }
 
 /// A fully-resolved model combining provider endpoint info with model-specific config.
@@ -365,22 +413,33 @@ pub struct ResolvedModel {
     pub max_tokens: u32,
     /// Routing examples (from ModelEntry.examples).
     pub examples: Vec<String>,
-    /// Provider kind (from ProviderConfig.kind).
-    pub provider_kind: LlmProviderKind,
+    /// Wire format (from ProviderConfig.wire_format).
+    pub wire_format: WireFormat,
     /// Resolved API key (from ProviderConfig.api_key, after env resolution).
     pub api_key: String,
     /// Base URL (from ProviderConfig.base_url).
     pub base_url: Option<String>,
     /// Provider name (from ProviderConfig.name) -- for logging/diagnostics.
     pub provider_name: String,
+    /// Path to Rhai wire script (only for Custom wire format).
+    pub wire_script: Option<String>,
+    /// Capabilities this model supports, as strings.
+    pub capabilities: Vec<String>,
 }
 
+/// Wire format -- determines how requests are serialized and responses are parsed
+/// for a provider's API.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum LlmProviderKind {
-    Anthropic,
+pub enum WireFormat {
+    /// OpenAI Chat Completions API format.
+    /// Used by OpenAI, Azure OpenAI, Ollama, vLLM, and most OpenAI-compatible providers.
     #[serde(rename = "openai")]
     OpenAI,
+    /// Anthropic Messages API format.
+    Anthropic,
+    /// Custom wire format defined by a Rhai script.
+    Custom,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -764,7 +823,7 @@ max_commands = 20
 
 [[router.providers]]
 name = "anthropic"
-kind = "anthropic"
+wire_format = "anthropic"
 api_key = "sk-ant-test-key"
 
   [[router.providers.models]]
@@ -811,7 +870,7 @@ max_commands = 20
 
 [[router.providers]]
 name = "anthropic"
-kind = "anthropic"
+wire_format = "anthropic"
 api_key = "sk-ant-test"
 
   [[router.providers.models]]
@@ -828,7 +887,7 @@ api_key = "sk-ant-test"
 
 [[router.providers]]
 name = "local"
-kind = "openai"
+wire_format = "openai"
 api_key = "unused"
 base_url = "http://localhost:11434/v1/chat/completions"
 
@@ -887,7 +946,7 @@ tokenizer_path = "models/tokenizer.json"
 
 [[router.providers]]
 name = "anthropic"
-kind = "anthropic"
+wire_format = "anthropic"
 api_key = "sk-test"
 
   [[router.providers.models]]
@@ -947,7 +1006,7 @@ tokenizer_path = "t.json"
 
 [[router.providers]]
 name = "anthropic"
-kind = "anthropic"
+wire_format = "anthropic"
 api_key = "sk-test"
 models = []
 "#;
@@ -974,7 +1033,7 @@ tokenizer_path = "t.json"
 
 [[router.providers]]
 name = "anthropic"
-kind = "anthropic"
+wire_format = "anthropic"
 api_key = "sk-test"
 
   [[router.providers.models]]
@@ -984,7 +1043,7 @@ api_key = "sk-test"
 
 [[router.providers]]
 name = "openai"
-kind = "openai"
+wire_format = "openai"
 api_key = "sk-test2"
 
   [[router.providers.models]]
@@ -1015,7 +1074,7 @@ tokenizer_path = "t.json"
 
 [[router.providers]]
 name = "anthropic"
-kind = "anthropic"
+wire_format = "anthropic"
 api_key = "sk-test"
 
   [[router.providers.models]]
@@ -1025,7 +1084,7 @@ api_key = "sk-test"
 
 [[router.providers]]
 name = "anthropic"
-kind = "openai"
+wire_format = "openai"
 api_key = "sk-test2"
 
   [[router.providers.models]]
@@ -1057,7 +1116,7 @@ tokenizer_path = "t.json"
 
 [[router.providers]]
 name = "anthropic"
-kind = "anthropic"
+wire_format = "anthropic"
 api_key = "sk-test"
 
   [[router.providers.models]]
@@ -1088,7 +1147,7 @@ tokenizer_path = "t.json"
 
 [[router.providers]]
 name = "anthropic"
-kind = "anthropic"
+wire_format = "anthropic"
 api_key = "sk-test"
 
   [[router.providers.models]]
@@ -1127,7 +1186,7 @@ tokenizer_path = "t.json"
 
 [[router.providers]]
 name = "anthropic"
-kind = "anthropic"
+wire_format = "anthropic"
 api_key = "sk-ant-literal-key"
 
   [[router.providers.models]]
@@ -1159,7 +1218,7 @@ tokenizer_path = "t.json"
 
 [[router.providers]]
 name = "anthropic"
-kind = "anthropic"
+wire_format = "anthropic"
 api_key = "env:WEFT_TEST_ROUTER_API_KEY_456"
 
   [[router.providers.models]]
@@ -1194,7 +1253,7 @@ tokenizer_path = "t.json"
 
 [[router.providers]]
 name = "anthropic"
-kind = "anthropic"
+wire_format = "anthropic"
 api_key = "env:WEFT_TEST_MISSING_ROUTER_VAR_XYZ"
 
   [[router.providers.models]]
@@ -1213,7 +1272,7 @@ api_key = "env:WEFT_TEST_MISSING_ROUTER_VAR_XYZ"
     }
 
     #[test]
-    fn test_llm_provider_kind_openai() {
+    fn test_wire_format_openai_parses() {
         let toml = r#"
 [server]
 bind_address = "0.0.0.0:8080"
@@ -1229,7 +1288,7 @@ tokenizer_path = "t.json"
 
 [[router.providers]]
 name = "openai"
-kind = "openai"
+wire_format = "openai"
 api_key = "sk-test"
 
   [[router.providers.models]]
@@ -1239,8 +1298,8 @@ api_key = "sk-test"
 "#;
         let config: WeftConfig = toml::from_str(toml).unwrap();
         assert!(matches!(
-            config.router.providers[0].kind,
-            LlmProviderKind::OpenAI
+            config.router.providers[0].wire_format,
+            WireFormat::OpenAI
         ));
     }
 
@@ -1264,7 +1323,7 @@ tokenizer_path = "t.json"
 
 [[router.providers]]
 name = "anthropic"
-kind = "anthropic"
+wire_format = "anthropic"
 api_key = "sk-ant-key"
 
   [[router.providers.models]]
@@ -1281,7 +1340,7 @@ api_key = "sk-ant-key"
 
 [[router.providers]]
 name = "local"
-kind = "openai"
+wire_format = "openai"
 api_key = "unused"
 base_url = "http://localhost:11434/v1"
 
@@ -1303,6 +1362,7 @@ base_url = "http://localhost:11434/v1"
         assert_eq!(complex.api_key, "sk-ant-key");
         assert!(complex.base_url.is_none());
         assert_eq!(complex.examples.len(), 1);
+        assert!(matches!(complex.wire_format, WireFormat::Anthropic));
 
         let fast = resolved.iter().find(|m| m.name == "fast").unwrap();
         assert_eq!(fast.model, "claude-haiku-4-5-20251001");
@@ -1342,7 +1402,7 @@ tokenizer_path = "t.json"
 
 [[router.providers]]
 name = "anthropic"
-kind = "anthropic"
+wire_format = "anthropic"
 api_key = "sk-test"
 
   [[router.providers.models]]
@@ -1372,7 +1432,7 @@ tokenizer_path = "t.json"
 
 [[router.providers]]
 name = "anthropic"
-kind = "anthropic"
+wire_format = "anthropic"
 api_key = "sk-test"
 
   [[router.providers.models]]
@@ -1403,7 +1463,7 @@ tokenizer_path = "t.json"
 
 [[router.providers]]
 name = "anthropic"
-kind = "anthropic"
+wire_format = "anthropic"
 api_key = "sk-test"
 
   [[router.providers.models]]
@@ -1441,7 +1501,7 @@ enabled = false
 
 [[router.providers]]
 name = "anthropic"
-kind = "anthropic"
+wire_format = "anthropic"
 api_key = "sk-test"
 
   [[router.providers.models]]
@@ -1480,7 +1540,7 @@ tokenizer_path = "t.json"
 
 [[router.providers]]
 name = "anthropic"
-kind = "anthropic"
+wire_format = "anthropic"
 api_key = "sk-test"
 
   [[router.providers.models]]
@@ -1936,7 +1996,7 @@ tokenizer_path = "t.json"
 
 [[router.providers]]
 name = "anthropic"
-kind = "anthropic"
+wire_format = "anthropic"
 api_key = "sk-test"
 
   [[router.providers.models]]
@@ -1970,7 +2030,7 @@ tokenizer_path = "t.json"
 
 [[router.providers]]
 name = "anthropic"
-kind = "anthropic"
+wire_format = "anthropic"
 api_key = "sk-test"
 
   [[router.providers.models]]
@@ -1981,5 +2041,307 @@ api_key = "sk-test"
         let config: WeftConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.max_pre_response_retries, 3);
         assert_eq!(config.effective_max_pre_response_retries(), 3);
+    }
+
+    // ── Phase 2: WireFormat, capabilities, wire_script tests ─────────────────
+
+    #[test]
+    fn test_wire_format_anthropic_parses() {
+        let toml = r#"
+[server]
+bind_address = "0.0.0.0:8080"
+[gateway]
+system_prompt = "test"
+[router]
+[router.classifier]
+model_path = "m.onnx"
+tokenizer_path = "t.json"
+[[router.providers]]
+name = "anthropic"
+wire_format = "anthropic"
+api_key = "sk-test"
+  [[router.providers.models]]
+  name = "main"
+  model = "claude-1"
+  examples = ["example"]
+"#;
+        let config: WeftConfig = toml::from_str(toml).unwrap();
+        assert!(matches!(
+            config.router.providers[0].wire_format,
+            WireFormat::Anthropic
+        ));
+    }
+
+    #[test]
+    fn test_wire_format_custom_parses() {
+        let toml = r#"
+[server]
+bind_address = "0.0.0.0:8080"
+[gateway]
+system_prompt = "test"
+[router]
+[router.classifier]
+model_path = "m.onnx"
+tokenizer_path = "t.json"
+[[router.providers]]
+name = "custom-provider"
+wire_format = "custom"
+wire_script = "providers/custom.rhai"
+api_key = "sk-test"
+base_url = "https://api.custom.ai/v1"
+  [[router.providers.models]]
+  name = "main"
+  model = "custom-model"
+  examples = ["example"]
+"#;
+        let config: WeftConfig = toml::from_str(toml).unwrap();
+        assert!(matches!(
+            config.router.providers[0].wire_format,
+            WireFormat::Custom
+        ));
+        assert_eq!(
+            config.router.providers[0].wire_script.as_deref(),
+            Some("providers/custom.rhai")
+        );
+    }
+
+    #[test]
+    fn test_model_capabilities_default_to_chat_completions() {
+        // A model without a 'capabilities' field should default to ["chat_completions"].
+        let toml = r#"
+[server]
+bind_address = "0.0.0.0:8080"
+[gateway]
+system_prompt = "test"
+[router]
+[router.classifier]
+model_path = "m.onnx"
+tokenizer_path = "t.json"
+[[router.providers]]
+name = "anthropic"
+wire_format = "anthropic"
+api_key = "sk-test"
+  [[router.providers.models]]
+  name = "main"
+  model = "claude-1"
+  examples = ["example"]
+"#;
+        let config: WeftConfig = toml::from_str(toml).unwrap();
+        let caps = &config.router.providers[0].models[0].capabilities;
+        assert_eq!(caps, &vec!["chat_completions".to_string()]);
+    }
+
+    #[test]
+    fn test_model_explicit_capabilities_parsed() {
+        let toml = r#"
+[server]
+bind_address = "0.0.0.0:8080"
+[gateway]
+system_prompt = "test"
+[router]
+[router.classifier]
+model_path = "m.onnx"
+tokenizer_path = "t.json"
+[[router.providers]]
+name = "anthropic"
+wire_format = "anthropic"
+api_key = "sk-test"
+  [[router.providers.models]]
+  name = "main"
+  model = "claude-1"
+  capabilities = ["chat_completions", "vision", "tool_calling"]
+  examples = ["example"]
+"#;
+        let config: WeftConfig = toml::from_str(toml).unwrap();
+        let caps = &config.router.providers[0].models[0].capabilities;
+        assert_eq!(
+            caps,
+            &vec![
+                "chat_completions".to_string(),
+                "vision".to_string(),
+                "tool_calling".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_validation_custom_wire_format_without_wire_script_fails() {
+        let toml = r#"
+[server]
+bind_address = "0.0.0.0:8080"
+[gateway]
+system_prompt = "test"
+[router]
+[router.classifier]
+model_path = "m.onnx"
+tokenizer_path = "t.json"
+[[router.providers]]
+name = "custom-provider"
+wire_format = "custom"
+api_key = "sk-test"
+base_url = "https://api.custom.ai/v1"
+  [[router.providers.models]]
+  name = "main"
+  model = "custom-model"
+  examples = ["example"]
+"#;
+        let config: WeftConfig = toml::from_str(toml).unwrap();
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("custom wire_format requires 'wire_script'"),
+            "expected wire_script required error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validation_wire_script_with_non_custom_wire_format_fails() {
+        let toml = r#"
+[server]
+bind_address = "0.0.0.0:8080"
+[gateway]
+system_prompt = "test"
+[router]
+[router.classifier]
+model_path = "m.onnx"
+tokenizer_path = "t.json"
+[[router.providers]]
+name = "openai-provider"
+wire_format = "openai"
+wire_script = "providers/extra.rhai"
+api_key = "sk-test"
+  [[router.providers.models]]
+  name = "main"
+  model = "gpt-4"
+  examples = ["example"]
+"#;
+        let config: WeftConfig = toml::from_str(toml).unwrap();
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("wire_script is only valid with wire_format = 'custom'"),
+            "expected wire_script only for custom error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validation_empty_capabilities_fails() {
+        let toml = r#"
+[server]
+bind_address = "0.0.0.0:8080"
+[gateway]
+system_prompt = "test"
+[router]
+[router.classifier]
+model_path = "m.onnx"
+tokenizer_path = "t.json"
+[[router.providers]]
+name = "anthropic"
+wire_format = "anthropic"
+api_key = "sk-test"
+  [[router.providers.models]]
+  name = "main"
+  model = "claude-1"
+  capabilities = []
+  examples = ["example"]
+"#;
+        let config: WeftConfig = toml::from_str(toml).unwrap();
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("capabilities must have at least one entry"),
+            "expected empty capabilities error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_models_includes_wire_format_and_capabilities() {
+        let toml = r#"
+[server]
+bind_address = "0.0.0.0:8080"
+[gateway]
+system_prompt = "test"
+[router]
+default_model = "chat-model"
+[router.classifier]
+model_path = "m.onnx"
+tokenizer_path = "t.json"
+[[router.providers]]
+name = "anthropic"
+wire_format = "anthropic"
+api_key = "sk-ant-key"
+  [[router.providers.models]]
+  name = "chat-model"
+  model = "claude-sonnet"
+  max_tokens = 8192
+  capabilities = ["chat_completions", "vision"]
+  examples = ["example query"]
+
+[[router.providers]]
+name = "custom-provider"
+wire_format = "custom"
+wire_script = "providers/custom.rhai"
+api_key = "sk-custom"
+base_url = "https://api.custom.ai/v1"
+  [[router.providers.models]]
+  name = "image-model"
+  model = "custom-image-v1"
+  max_tokens = 1024
+  capabilities = ["image_generations"]
+  examples = ["generate an image"]
+"#;
+        let config: WeftConfig = toml::from_str(toml).unwrap();
+        let resolved = config.router.resolve_models();
+        assert_eq!(resolved.len(), 2);
+
+        let chat = resolved.iter().find(|m| m.name == "chat-model").unwrap();
+        assert!(matches!(chat.wire_format, WireFormat::Anthropic));
+        assert!(chat.wire_script.is_none());
+        assert_eq!(
+            chat.capabilities,
+            vec!["chat_completions".to_string(), "vision".to_string()]
+        );
+
+        let image = resolved.iter().find(|m| m.name == "image-model").unwrap();
+        assert!(matches!(image.wire_format, WireFormat::Custom));
+        assert_eq!(image.wire_script.as_deref(), Some("providers/custom.rhai"));
+        assert_eq!(image.capabilities, vec!["image_generations".to_string()]);
+    }
+
+    #[test]
+    fn test_validation_custom_with_wire_script_passes() {
+        // Custom wire_format with wire_script present should pass validation.
+        let toml = r#"
+[server]
+bind_address = "0.0.0.0:8080"
+[gateway]
+system_prompt = "test"
+[router]
+[router.classifier]
+model_path = "m.onnx"
+tokenizer_path = "t.json"
+[[router.providers]]
+name = "custom-provider"
+wire_format = "custom"
+wire_script = "providers/custom.rhai"
+api_key = "sk-test"
+base_url = "https://api.custom.ai/v1"
+  [[router.providers.models]]
+  name = "main"
+  model = "custom-model"
+  examples = ["example"]
+"#;
+        let config: WeftConfig = toml::from_str(toml).unwrap();
+        // Wire script validation (file existence) is deferred to startup, not config parse time.
+        // The config-level validation only checks that wire_script is present for custom.
+        let result = config.validate();
+        assert!(
+            result.is_ok(),
+            "custom with wire_script should pass config validation: {:?}",
+            result
+        );
     }
 }

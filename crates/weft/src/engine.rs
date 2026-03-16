@@ -1058,9 +1058,9 @@ mod tests {
     use weft_commands::{CommandError, CommandRegistry};
     use weft_core::{
         ClassifierConfig, CommandAction, CommandDescription, CommandInvocation, CommandResult,
-        CommandStub, DomainConfig, DomainsConfig, GatewayConfig, LlmProviderKind, MemoryConfig,
-        MemoryStoreConfig, Message, ModelEntry, ProviderConfig, Role, RouterConfig, ServerConfig,
-        StoreCapability, WeftConfig,
+        CommandStub, DomainConfig, DomainsConfig, GatewayConfig, MemoryConfig, MemoryStoreConfig,
+        Message, ModelEntry, ProviderConfig, Role, RouterConfig, ServerConfig, StoreCapability,
+        WeftConfig, WireFormat,
     };
     use weft_llm::{
         ChatCompletionOutput, Provider, ProviderError, ProviderRegistry, ProviderRequest,
@@ -1450,14 +1450,16 @@ mod tests {
                 default_model: Some("test-model".to_string()),
                 providers: vec![ProviderConfig {
                     name: "test-provider".to_string(),
-                    kind: LlmProviderKind::Anthropic,
+                    wire_format: WireFormat::Anthropic,
                     api_key: "test-key".to_string(),
                     base_url: None,
+                    wire_script: None,
                     models: vec![ModelEntry {
                         name: "test-model".to_string(),
                         model: "claude-test".to_string(),
                         max_tokens: 1024,
                         examples: vec!["test query".to_string()],
+                        capabilities: vec!["chat_completions".to_string()],
                     }],
                 }],
                 skip_tools_when_unnecessary: true,
@@ -1492,21 +1494,24 @@ mod tests {
                 default_model: Some("default-model".to_string()),
                 providers: vec![ProviderConfig {
                     name: "test-provider".to_string(),
-                    kind: LlmProviderKind::Anthropic,
+                    wire_format: WireFormat::Anthropic,
                     api_key: "test-key".to_string(),
                     base_url: None,
+                    wire_script: None,
                     models: vec![
                         ModelEntry {
                             name: "default-model".to_string(),
                             model: "claude-default".to_string(),
                             max_tokens: 1024,
                             examples: vec!["general question".to_string()],
+                            capabilities: vec!["chat_completions".to_string()],
                         },
                         ModelEntry {
                             name: "complex-model".to_string(),
                             model: "claude-complex".to_string(),
                             max_tokens: 4096,
                             examples: vec!["complex reasoning task".to_string()],
+                            capabilities: vec!["chat_completions".to_string()],
                         },
                     ],
                 }],
@@ -3180,14 +3185,16 @@ mod tests {
                 default_model: Some("test-model".to_string()),
                 providers: vec![ProviderConfig {
                     name: "test-provider".to_string(),
-                    kind: LlmProviderKind::Anthropic,
+                    wire_format: WireFormat::Anthropic,
                     api_key: "test-key".to_string(),
                     base_url: None,
+                    wire_script: None,
                     models: vec![ModelEntry {
                         name: "test-model".to_string(),
                         model: "claude-test".to_string(),
                         max_tokens: 1024,
                         examples: vec!["test query".to_string()],
+                        capabilities: vec!["chat_completions".to_string()],
                     }],
                 }],
                 skip_tools_when_unnecessary: true,
@@ -3965,14 +3972,16 @@ mod tests {
                 default_model: Some("test-model".to_string()),
                 providers: vec![ProviderConfig {
                     name: "test-provider".to_string(),
-                    kind: LlmProviderKind::Anthropic,
+                    wire_format: WireFormat::Anthropic,
                     api_key: "test-key".to_string(),
                     base_url: None,
+                    wire_script: None,
                     models: vec![ModelEntry {
                         name: "test-model".to_string(),
                         model: "claude-test".to_string(),
                         max_tokens: 1024,
                         examples: vec!["test query".to_string()],
+                        capabilities: vec!["chat_completions".to_string()],
                     }],
                 }],
                 skip_tools_when_unnecessary: true,

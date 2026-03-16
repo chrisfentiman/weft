@@ -284,8 +284,8 @@ mod tests {
     use weft_commands::{CommandError, CommandRegistry};
     use weft_core::{
         ClassifierConfig, CommandDescription, CommandInvocation, CommandResult, CommandStub,
-        DomainsConfig, GatewayConfig, LlmProviderKind, ModelEntry, ProviderConfig, RouterConfig,
-        ServerConfig, WeftConfig,
+        DomainsConfig, GatewayConfig, ModelEntry, ProviderConfig, RouterConfig, ServerConfig,
+        WeftConfig, WireFormat,
     };
     use weft_llm::{
         ChatCompletionOutput, Provider, ProviderError, ProviderRegistry, ProviderRequest,
@@ -438,14 +438,16 @@ mod tests {
                 default_model: Some("test-model".to_string()),
                 providers: vec![ProviderConfig {
                     name: "test-provider".to_string(),
-                    kind: LlmProviderKind::Anthropic,
+                    wire_format: WireFormat::Anthropic,
                     api_key: "test-key".to_string(),
                     base_url: None,
+                    wire_script: None,
                     models: vec![ModelEntry {
                         name: "test-model".to_string(),
                         model: "claude-test".to_string(),
                         max_tokens: 1024,
                         examples: vec!["test query".to_string()],
+                        capabilities: vec!["chat_completions".to_string()],
                     }],
                 }],
                 skip_tools_when_unnecessary: true,
