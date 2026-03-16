@@ -35,8 +35,9 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use weft_commands::{CommandRegistry, MemoryStoreMux, parse_response};
 use weft_core::{
-    ChatCompletionRequest, ChatCompletionResponse, Choice, CommandAction, CommandResult,
-    CommandStub, HookRoutingDomain, Message, Role, RoutingTrigger, Usage, WeftConfig, WeftError,
+    CommandAction, CommandResult, CommandStub, ContentPart, HookRoutingDomain, Role,
+    RoutingTrigger, Source, WeftConfig, WeftError, WeftMessage, WeftRequest, WeftResponse,
+    WeftTiming, WeftUsage,
     toon::{fenced_toon, serialize_table},
 };
 use weft_llm::{
@@ -178,25 +179,18 @@ impl GatewayEngine {
     /// Handle a single chat completion request.
     ///
     /// This is the main gateway loop: route → assemble → LLM → parse → execute → loop.
-    pub async fn handle_request(
-        &self,
-        mut request: ChatCompletionRequest,
-    ) -> Result<ChatCompletionResponse, WeftError> {
-        // Reject streaming early — no ambiguity.
-        if request.stream == Some(true) {
-            return Err(WeftError::StreamingNotSupported);
-        }
-
+    pub async fn handle_request(&self, request: WeftRequest) -> Result<WeftResponse, WeftError> {
         // ── [HOOK: RequestStart] ─────────────────────────────────────────────
         // Hard block — fires before any routing or LLM involvement.
-        // A Modify can alter the request (e.g., strip fields, inject messages).
-        // ChatCompletionRequest doesn't derive Serialize so we build the payload manually.
+        // WeftRequest does not derive Serialize, so the payload is built manually.
+        // Hook modifications to the payload are logged but not applied back to the
+        // WeftRequest (the hook may inspect/block the request, but full deserialization
+        // back to WeftRequest is deferred to a future phase when serde support is added).
         let request_payload = serde_json::json!({
-            "model": request.model,
-            "messages": request.messages,
-            "max_tokens": request.max_tokens,
-            "temperature": request.temperature,
-            "stream": request.stream,
+            "model": request.routing.raw,
+            "message_count": request.messages.len(),
+            "temperature": request.options.temperature,
+            "max_tokens": request.options.max_tokens,
         });
         match self
             .hook_registry
@@ -215,26 +209,20 @@ impl GatewayEngine {
                     hook_name,
                 });
             }
-            HookChainResult::Allowed { payload, context } => {
-                // If modified, attempt to deserialize back to ChatCompletionRequest.
-                match serde_json::from_value::<ChatCompletionRequest>(payload) {
-                    Ok(modified_req) => {
-                        request = modified_req;
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "RequestStart hook returned payload that could not be deserialized to ChatCompletionRequest — using original");
-                    }
-                }
+            HookChainResult::Allowed {
+                payload: _,
+                context: _,
+            } => {
                 // Context from RequestStart is accumulated along with routing context.
-                let _ = context;
+                // Full WeftRequest modification via hook payload deferred to future phase.
             }
         }
 
         let timeout_secs = self.config.gateway.request_timeout_secs;
         let timeout = Duration::from_secs(timeout_secs);
 
-        // Clone the request_id for RequestEnd (fire-and-forget after response).
-        let request_model = request.model.clone();
+        // Clone the routing raw string for RequestEnd telemetry.
+        let request_model = request.routing.raw.clone();
 
         // Record start time for duration_ms in RequestEnd payload.
         let request_start = Instant::now();
@@ -290,10 +278,7 @@ impl GatewayEngine {
     /// Inner gateway loop (no timeout wrapping — caller handles that).
     ///
     /// Returns the response and the total number of commands executed during this request.
-    async fn run_loop(
-        &self,
-        request: ChatCompletionRequest,
-    ) -> Result<(ChatCompletionResponse, u32), WeftError> {
+    async fn run_loop(&self, request: WeftRequest) -> Result<(WeftResponse, u32), WeftError> {
         // Verify that at least one model supports the required capability before routing.
         // For chat completions (the only implemented endpoint), the required capability is
         // always chat_completions. If no model supports this, fail fast with 400.
@@ -314,12 +299,16 @@ impl GatewayEngine {
             .await
             .map_err(|e| WeftError::Command(e.to_string()))?;
 
-        // Extract the latest user message for semantic routing.
-        let user_message = extract_latest_user_message(&request.messages)?;
+        // Extract the latest user message text for semantic routing.
+        let user_text = extract_latest_user_text(&request.messages).ok_or_else(|| {
+            WeftError::Config(
+                "request must contain at least one user message with text content".to_string(),
+            )
+        })?;
 
         // Build all routing domains and call the router once — with per-domain PreRoute/PostRoute hooks.
         let routing_result = self
-            .route_all_domains_with_hooks(user_message, &all_commands)
+            .route_all_domains_with_hooks(&user_text, &all_commands)
             .await?;
 
         // Unpack the routing result.
@@ -341,7 +330,7 @@ impl GatewayEngine {
         let max_tokens = self
             .provider_registry
             .max_tokens_for(&selected_model_name)
-            .or(request.max_tokens);
+            .or(request.options.max_tokens);
 
         // Build memory stubs to append when memory stores are configured.
         // These appear regardless of semantic routing — memory commands are always available.
@@ -417,7 +406,14 @@ impl GatewayEngine {
                 messages: messages.clone(),
                 model: model_id.clone().unwrap_or_default(),
                 max_tokens: max_tokens.unwrap_or(4096),
-                temperature: request.temperature,
+                temperature: request.options.temperature,
+                top_p: request.options.top_p,
+                top_k: request.options.top_k,
+                stop: request.options.stop.clone(),
+                frequency_penalty: request.options.frequency_penalty,
+                presence_penalty: request.options.presence_penalty,
+                seed: request.options.seed,
+                response_format: request.options.response_format.clone(),
             });
 
             // Call the selected provider, with fallback to default on non-rate-limit error.
@@ -426,7 +422,7 @@ impl GatewayEngine {
                     provider.clone(),
                     &selected_model_name,
                     provider_request,
-                    request.temperature,
+                    request.options.temperature,
                 )
                 .await?;
 
@@ -462,13 +458,21 @@ impl GatewayEngine {
                             let injection = format!(
                                 "[Hook {hook_name} blocked your response: {reason}. Please reconsider and generate a new response.]"
                             );
-                            messages.push(Message {
+                            messages.push(WeftMessage {
                                 role: Role::Assistant,
-                                content: completion.text.clone(),
+                                source: Source::Provider,
+                                model: Some(selected_model_name.clone()),
+                                content: vec![ContentPart::Text(completion.text.clone())],
+                                delta: false,
+                                message_index: 0,
                             });
-                            messages.push(Message {
+                            messages.push(WeftMessage {
                                 role: Role::User,
-                                content: injection,
+                                source: Source::Client,
+                                model: None,
+                                content: vec![ContentPart::Text(injection)],
+                                delta: false,
+                                message_index: 0,
                             });
                             iterations += 1;
                             continue;
@@ -489,7 +493,12 @@ impl GatewayEngine {
                             .unwrap_or(&parsed.text)
                             .to_string();
                         return Ok((
-                            build_response(&final_text, &request.model, completion.usage),
+                            assemble_response(
+                                &request.routing.raw,
+                                final_text,
+                                &selected_model_name,
+                                completion.usage,
+                            ),
                             commands_executed,
                         ));
                     }
@@ -509,9 +518,7 @@ impl GatewayEngine {
 
             // Execute built-in memory commands first (results available in same turn).
             for invocation in &builtin_invocations {
-                let result = self
-                    .handle_builtin_with_hooks(invocation, user_message)
-                    .await;
+                let result = self.handle_builtin_with_hooks(invocation, &user_text).await;
                 commands_executed += 1;
                 results.push(result);
             }
@@ -637,16 +644,24 @@ impl GatewayEngine {
             }
 
             // Append the full assistant response (with command lines) to message history.
-            messages.push(Message {
+            messages.push(WeftMessage {
                 role: Role::Assistant,
-                content: completion.text.clone(),
+                source: Source::Provider,
+                model: Some(selected_model_name.clone()),
+                content: vec![ContentPart::Text(completion.text.clone())],
+                delta: false,
+                message_index: 0,
             });
 
             // Inject command results as an assistant message in TOON format.
             // The assistant called the commands; results are part of its workflow.
-            messages.push(Message {
+            messages.push(WeftMessage {
                 role: Role::Assistant,
-                content: format_command_results_toon(&results),
+                source: Source::Tool,
+                model: None,
+                content: vec![ContentPart::Text(format_command_results_toon(&results))],
+                delta: false,
+                message_index: 0,
             });
 
             iterations += 1;
@@ -1868,52 +1883,62 @@ pub fn tool_necessity_candidates() -> Vec<RoutingCandidate> {
 
 /// Extract the text of the last user message from the conversation.
 ///
-/// Returns an error if there are no messages or no user message.
-fn extract_latest_user_message(messages: &[Message]) -> Result<&str, WeftError> {
+/// Concatenates all Text content parts from the last user message.
+/// Returns None if there is no user message or no text content in the last user message.
+fn extract_latest_user_text(messages: &[WeftMessage]) -> Option<String> {
     messages
         .iter()
         .rev()
         .find(|m| m.role == Role::User)
-        .map(|m| m.content.as_str())
-        .ok_or_else(|| {
-            WeftError::Config("request must contain at least one user message".to_string())
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
         })
+        .filter(|s| !s.is_empty())
 }
 
-/// Build the final `ChatCompletionResponse` from clean text + usage info.
-fn build_response(
-    clean_text: &str,
-    model: &str,
+/// Assemble the final `WeftResponse` from the LLM output.
+///
+/// This is the simple (no-activity) path used in Phase 3 — activity assembly
+/// is extended in Phase 4 when `options.activity` is wired in.
+fn assemble_response(
+    model_instruction: &str,
+    llm_text: String,
+    model_name: &str,
     usage: Option<TokenUsage>,
-) -> ChatCompletionResponse {
+) -> WeftResponse {
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
-    let created = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
 
     let (prompt_tokens, completion_tokens) = usage
         .map(|u| (u.prompt_tokens, u.completion_tokens))
         .unwrap_or((0, 0));
 
-    ChatCompletionResponse {
+    let total_tokens = prompt_tokens + completion_tokens;
+
+    WeftResponse {
         id,
-        object: "chat.completion".to_string(),
-        created,
-        model: model.to_string(),
-        choices: vec![Choice {
-            index: 0,
-            message: Message {
-                role: Role::Assistant,
-                content: clean_text.to_string(),
-            },
-            finish_reason: "stop".to_string(),
+        model: model_instruction.to_string(),
+        messages: vec![WeftMessage {
+            role: Role::Assistant,
+            source: Source::Provider,
+            model: Some(model_name.to_string()),
+            content: vec![ContentPart::Text(llm_text)],
+            delta: false,
+            message_index: 0,
         }],
-        usage: Usage {
+        usage: WeftUsage {
             prompt_tokens,
             completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
+            total_tokens,
+            llm_calls: 1,
         },
+        timing: WeftTiming::default(),
     }
 }
 
@@ -1926,9 +1951,10 @@ mod tests {
     use weft_commands::{CommandError, CommandRegistry};
     use weft_core::{
         ClassifierConfig, CommandAction, CommandDescription, CommandInvocation, CommandResult,
-        CommandStub, DomainConfig, DomainsConfig, GatewayConfig, MemoryConfig, MemoryStoreConfig,
-        Message, ModelEntry, ProviderConfig, Role, RouterConfig, ServerConfig, StoreCapability,
-        WeftConfig, WireFormat,
+        CommandStub, ContentPart, DomainConfig, DomainsConfig, GatewayConfig, MemoryConfig,
+        MemoryStoreConfig, ModelEntry, ModelRoutingInstruction, ProviderConfig, Role, RouterConfig,
+        SamplingOptions, ServerConfig, Source, StoreCapability, WeftConfig, WeftMessage,
+        WeftRequest, WireFormat,
     };
     use weft_llm::{
         Capability, ChatCompletionOutput, Provider, ProviderError, ProviderRegistry,
@@ -2399,16 +2425,18 @@ mod tests {
         })
     }
 
-    fn make_user_request(content: &str) -> ChatCompletionRequest {
-        ChatCompletionRequest {
-            model: "test-model".to_string(),
-            messages: vec![Message {
+    fn make_user_request(content: &str) -> WeftRequest {
+        WeftRequest {
+            messages: vec![WeftMessage {
                 role: Role::User,
-                content: content.to_string(),
+                source: Source::Client,
+                model: None,
+                content: vec![ContentPart::Text(content.to_string())],
+                delta: false,
+                message_index: 0,
             }],
-            max_tokens: None,
-            temperature: None,
-            stream: None,
+            routing: ModelRoutingInstruction::parse("test-model"),
+            options: SamplingOptions::default(),
         }
     }
 
@@ -2522,6 +2550,25 @@ mod tests {
         )
     }
 
+    // ── Response extraction helpers ────────────────────────────────────────
+
+    /// Extract the assistant response text from a `WeftResponse`.
+    ///
+    /// Returns the text from the first assistant message with source Provider.
+    /// Panics if no such message is found (indicates a test setup error).
+    fn resp_text(resp: &crate::engine::WeftResponse) -> &str {
+        resp.messages
+            .iter()
+            .find(|m| m.role == Role::Assistant && m.source == Source::Provider)
+            .and_then(|m| {
+                m.content.iter().find_map(|p| match p {
+                    ContentPart::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+            })
+            .expect("WeftResponse should contain an assistant text message")
+    }
+
     // ── Test: no-command response (single pass) ────────────────────────────
 
     #[tokio::test]
@@ -2542,12 +2589,7 @@ mod tests {
             .await
             .expect("should succeed");
 
-        assert_eq!(
-            resp.choices[0].message.content,
-            "Hello, I can help you with that!"
-        );
-        assert_eq!(resp.choices[0].message.role, Role::Assistant);
-        assert_eq!(resp.object, "chat.completion");
+        assert_eq!(resp_text(&resp), "Hello, I can help you with that!");
         assert!(resp.id.starts_with("chatcmpl-"));
     }
 
@@ -2581,10 +2623,7 @@ mod tests {
             .await
             .expect("should succeed");
 
-        assert_eq!(
-            resp.choices[0].message.content,
-            "Here are the results I found."
-        );
+        assert_eq!(resp_text(&resp), "Here are the results I found.");
     }
 
     // ── Test: multiple commands ────────────────────────────────────────────
@@ -2619,7 +2658,7 @@ mod tests {
             .await
             .expect("should succeed");
 
-        assert_eq!(resp.choices[0].message.content, "Done with both commands.");
+        assert_eq!(resp_text(&resp), "Done with both commands.");
     }
 
     // ── Test: max iterations exceeded ─────────────────────────────────────
@@ -2697,7 +2736,7 @@ mod tests {
             .expect("should succeed despite command failure");
 
         assert_eq!(
-            resp.choices[0].message.content,
+            resp_text(&resp),
             "The search failed, but I can still answer."
         );
     }
@@ -2726,7 +2765,7 @@ mod tests {
             .await
             .expect("router fallback must not fail the request");
 
-        assert!(!resp.choices[0].message.content.is_empty());
+        assert!(!resp_text(&resp).is_empty());
     }
 
     // ── Test: --describe flag ──────────────────────────────────────────────
@@ -2759,35 +2798,7 @@ mod tests {
             .await
             .expect("should succeed");
 
-        assert_eq!(
-            resp.choices[0].message.content,
-            "Now I understand the command."
-        );
-    }
-
-    // ── Test: streaming rejection ──────────────────────────────────────────
-
-    #[tokio::test]
-    async fn test_streaming_rejected() {
-        let registry = single_model_registry(
-            MockLlmProvider::single("irrelevant"),
-            "test-model",
-            "claude-test",
-        );
-        let engine = make_engine(
-            registry,
-            MockRouter::with_score(0.9),
-            MockCommandRegistry::new(vec![]),
-        );
-
-        let mut req = make_user_request("Hello");
-        req.stream = Some(true);
-
-        let result = engine.handle_request(req).await;
-        assert!(
-            matches!(result, Err(WeftError::StreamingNotSupported)),
-            "expected StreamingNotSupported"
-        );
+        assert_eq!(resp_text(&resp), "Now I understand the command.");
     }
 
     // ── Test: request timeout ──────────────────────────────────────────────
@@ -2864,19 +2875,18 @@ mod tests {
             resp.id.starts_with("chatcmpl-"),
             "id must start with chatcmpl-"
         );
-        assert_eq!(resp.object, "chat.completion");
-        assert!(
-            resp.created > 0,
-            "created must be a positive unix timestamp"
-        );
+        // model echoes the routing instruction from the request
         assert_eq!(
             resp.model, "test-model",
             "model must be preserved from request"
         );
-        assert_eq!(resp.choices.len(), 1);
-        assert_eq!(resp.choices[0].index, 0);
-        assert_eq!(resp.choices[0].finish_reason, "stop");
-        assert_eq!(resp.choices[0].message.role, Role::Assistant);
+        // Response messages contain exactly one assistant message from Provider
+        let assistant_msg = resp
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Assistant && m.source == Source::Provider)
+            .expect("response must contain an assistant Provider message");
+        assert_eq!(assistant_msg.role, Role::Assistant);
         assert_eq!(
             resp.usage.total_tokens,
             resp.usage.prompt_tokens + resp.usage.completion_tokens
@@ -2898,15 +2908,18 @@ mod tests {
             MockCommandRegistry::new(vec![]),
         );
 
-        let req = ChatCompletionRequest {
-            model: "test-model".to_string(),
-            messages: vec![Message {
+        // A request with only a system message (no user message) should fail.
+        let req = WeftRequest {
+            messages: vec![WeftMessage {
                 role: Role::System,
-                content: "system only".to_string(),
+                source: Source::Client,
+                model: None,
+                content: vec![ContentPart::Text("system only".to_string())],
+                delta: false,
+                message_index: 0,
             }],
-            max_tokens: None,
-            temperature: None,
-            stream: None,
+            routing: ModelRoutingInstruction::parse("test-model"),
+            options: SamplingOptions::default(),
         };
 
         let result = engine.handle_request(req).await;
@@ -2997,7 +3010,7 @@ mod tests {
             .await
             .expect("empty LLM response must be valid");
 
-        assert_eq!(resp.choices[0].message.content, "");
+        assert_eq!(resp_text(&resp), "");
     }
 
     // ── Test: usage propagated from last LLM call ──────────────────────────
@@ -3358,7 +3371,7 @@ mod tests {
             .await
             .expect("fallback to default must succeed");
 
-        assert_eq!(resp.choices[0].message.content, "fallback response");
+        assert_eq!(resp_text(&resp), "fallback response");
     }
 
     // ── Test: rate limit does NOT trigger fallback ─────────────────────────
@@ -3641,10 +3654,7 @@ mod tests {
             .await
             .expect("should succeed");
 
-        assert_eq!(
-            resp.choices[0].message.content,
-            "I found some memories about preferences."
-        );
+        assert_eq!(resp_text(&resp), "I found some memories about preferences.");
     }
 
     #[tokio::test]
@@ -3679,7 +3689,7 @@ mod tests {
             .await
             .expect("should succeed");
 
-        assert_eq!(resp.choices[0].message.content, "Thanks for the context.");
+        assert_eq!(resp_text(&resp), "Thanks for the context.");
     }
 
     #[tokio::test]
@@ -3709,7 +3719,7 @@ mod tests {
             .await
             .expect("should succeed without panicking");
 
-        assert_eq!(resp.choices[0].message.content, "Nothing found in memory.");
+        assert_eq!(resp_text(&resp), "Nothing found in memory.");
     }
 
     #[tokio::test]
@@ -3742,10 +3752,7 @@ mod tests {
             .await
             .expect("should succeed even when stores fail");
 
-        assert_eq!(
-            resp.choices[0].message.content,
-            "Understood, no memories available."
-        );
+        assert_eq!(resp_text(&resp), "Understood, no memories available.");
     }
 
     #[tokio::test]
@@ -3782,10 +3789,7 @@ mod tests {
         // The LLM response includes "/recall query: something" but it's treated as prose
         // because recall is not in known_commands when mux is None.
         // The first LLM response is returned directly since no commands are parsed.
-        assert_eq!(
-            resp.choices[0].message.content,
-            "/recall query: \"something\""
-        );
+        assert_eq!(resp_text(&resp), "/recall query: \"something\"");
     }
 
     // ── /remember tests ───────────────────────────────────────────────────
@@ -3819,7 +3823,7 @@ mod tests {
             .await
             .expect("should succeed");
 
-        assert_eq!(resp.choices[0].message.content, "Memory stored.");
+        assert_eq!(resp_text(&resp), "Memory stored.");
     }
 
     #[tokio::test]
@@ -3852,10 +3856,7 @@ mod tests {
             .await
             .expect("should succeed overall");
 
-        assert_eq!(
-            resp.choices[0].message.content,
-            "Got an error about missing argument."
-        );
+        assert_eq!(resp_text(&resp), "Got an error about missing argument.");
     }
 
     #[tokio::test]
@@ -3888,7 +3889,7 @@ mod tests {
             .await
             .expect("should not fail");
 
-        assert_eq!(resp.choices[0].message.content, "Attempted to remember.");
+        assert_eq!(resp_text(&resp), "Attempted to remember.");
     }
 
     // ── --describe tests ──────────────────────────────────────────────────
@@ -3919,7 +3920,7 @@ mod tests {
             .await
             .expect("should succeed");
 
-        assert_eq!(resp.choices[0].message.content, "I see how recall works.");
+        assert_eq!(resp_text(&resp), "I see how recall works.");
     }
 
     #[tokio::test]
@@ -3954,10 +3955,7 @@ mod tests {
             .await
             .expect("should succeed");
 
-        assert_eq!(
-            resp.choices[0].message.content,
-            "Now I know how to use remember."
-        );
+        assert_eq!(resp_text(&resp), "Now I know how to use remember.");
     }
 
     // ── mixed built-in + external commands ────────────────────────────────
@@ -4003,10 +4001,7 @@ mod tests {
             .await
             .expect("should succeed");
 
-        assert_eq!(
-            resp.choices[0].message.content,
-            "Found memories and web results."
-        );
+        assert_eq!(resp_text(&resp), "Found memories and web results.");
     }
 
     #[tokio::test]
@@ -4043,7 +4038,7 @@ mod tests {
             .await
             .expect("should succeed");
 
-        assert_eq!(resp.choices[0].message.content, "Here are the results.");
+        assert_eq!(resp_text(&resp), "Here are the results.");
     }
 
     // ── Phase 3: Semantic Router Integration tests ─────────────────────────
@@ -4313,10 +4308,7 @@ mod tests {
             .expect("should succeed");
 
         // Should succeed and include memory content in the response.
-        assert_eq!(
-            resp.choices[0].message.content,
-            "I found memory about dark mode."
-        );
+        assert_eq!(resp_text(&resp), "I found memory about dark mode.");
     }
 
     // ── Phase 3: /recall per-invocation routing ────────────────────────────
@@ -4387,10 +4379,7 @@ mod tests {
             .expect("should succeed");
 
         // kb_client would fail if called — success means only conv was queried.
-        assert_eq!(
-            resp.choices[0].message.content,
-            "Found: user prefers dark mode."
-        );
+        assert_eq!(resp_text(&resp), "Found: user prefers dark mode.");
     }
 
     #[tokio::test]
@@ -4456,8 +4445,7 @@ mod tests {
             .expect("should succeed");
 
         // Both stores should have been queried (fan-out) — response shows 2 memories.
-        let content = &resp.choices[0].message.content;
-        assert_eq!(content, "Found memories from both stores.");
+        assert_eq!(resp_text(&resp), "Found memories from both stores.");
     }
 
     #[tokio::test]
@@ -4521,10 +4509,7 @@ mod tests {
             .await
             .expect("should succeed");
 
-        assert_eq!(
-            resp.choices[0].message.content,
-            "Got results from both stores."
-        );
+        assert_eq!(resp_text(&resp), "Got results from both stores.");
     }
 
     // ── Phase 3: /remember per-invocation routing ─────────────────────────
@@ -4591,10 +4576,7 @@ mod tests {
 
         // audit_client has store_fails — if it were called we'd get a partial failure in TOON.
         // Success means only conv was written.
-        assert_eq!(
-            resp.choices[0].message.content,
-            "Noted, I'll remember that."
-        );
+        assert_eq!(resp_text(&resp), "Noted, I'll remember that.");
     }
 
     #[tokio::test]
@@ -4653,7 +4635,7 @@ mod tests {
             .expect("should succeed");
 
         // audit_client has store_fails — success means only conv was picked.
-        assert_eq!(resp.choices[0].message.content, "Memory stored.");
+        assert_eq!(resp_text(&resp), "Memory stored.");
     }
 
     #[tokio::test]
@@ -4709,7 +4691,7 @@ mod tests {
             .expect("should succeed");
 
         // audit_client has store_fails — success means only first writable (conv) was picked.
-        assert_eq!(resp.choices[0].message.content, "Saved.");
+        assert_eq!(resp_text(&resp), "Saved.");
     }
 
     // ── Phase 3: memory domain threshold from config ──────────────────────
@@ -4777,7 +4759,7 @@ mod tests {
         // Below memory-domain threshold → fell back to all readable → both stores queried.
         // conv_client returns a memory, kb_client returns empty.
         // Final response is whatever the LLM said after seeing results.
-        assert_eq!(resp.choices[0].message.content, "Found memories.");
+        assert_eq!(resp_text(&resp), "Found memories.");
     }
 
     // ── Phase 3: RoutingDecision::fallback() memory_stores population ─────
@@ -5033,7 +5015,7 @@ mod tests {
             .handle_request(make_user_request("Hello"))
             .await
             .expect("should succeed when RequestStart hook allows");
-        assert_eq!(resp.choices[0].message.content, "Response text");
+        assert_eq!(resp_text(&resp), "Response text");
     }
 
     // ── Phase 4: PreRoute hook integration ─────────────────────────────────
@@ -5163,7 +5145,7 @@ mod tests {
             .handle_request(make_user_request("Hello"))
             .await
             .expect("should succeed with PostRoute model override to default-model");
-        assert_eq!(resp.choices[0].message.content, "final response");
+        assert_eq!(resp_text(&resp), "final response");
     }
 
     #[tokio::test]
@@ -5196,7 +5178,7 @@ mod tests {
             .handle_request(make_user_request("Hello"))
             .await
             .expect("should fall back to default model on invalid PostRoute override");
-        assert_eq!(resp.choices[0].message.content, "fallback response");
+        assert_eq!(resp_text(&resp), "fallback response");
     }
 
     // ── Phase 4: PreToolUse hook integration ───────────────────────────────
@@ -5234,10 +5216,7 @@ mod tests {
             .handle_request(make_user_request("Search for Rust"))
             .await
             .expect("should succeed — block returns error result not 403");
-        assert_eq!(
-            resp.choices[0].message.content,
-            "Search blocked, answering from memory."
-        );
+        assert_eq!(resp_text(&resp), "Search blocked, answering from memory.");
     }
 
     #[tokio::test]
@@ -5279,7 +5258,7 @@ mod tests {
             .handle_request(make_user_request("Do both"))
             .await
             .expect("should succeed");
-        assert_eq!(resp.choices[0].message.content, "Done.");
+        assert_eq!(resp_text(&resp), "Done.");
     }
 
     // ── Phase 4: PostToolUse hook integration ──────────────────────────────
@@ -5323,10 +5302,7 @@ mod tests {
             .handle_request(make_user_request("Search for Rust"))
             .await
             .expect("should succeed");
-        assert_eq!(
-            resp.choices[0].message.content,
-            "Search result was: hooked output"
-        );
+        assert_eq!(resp_text(&resp), "Search result was: hooked output");
     }
 
     // ── Phase 4: PreResponse hook integration ──────────────────────────────
@@ -5383,7 +5359,7 @@ mod tests {
             .await
             .expect("should succeed after regeneration");
         // Second response should be returned (first was blocked and regenerated).
-        assert_eq!(resp.choices[0].message.content, "second response");
+        assert_eq!(resp_text(&resp), "second response");
     }
 
     #[tokio::test]
@@ -5453,7 +5429,7 @@ mod tests {
             .handle_request(make_user_request("Hello"))
             .await
             .expect("should succeed");
-        assert_eq!(resp.choices[0].message.content, "modified text");
+        assert_eq!(resp_text(&resp), "modified text");
     }
 
     // ── Phase 4: RequestEnd hook integration ───────────────────────────────
@@ -5498,7 +5474,7 @@ mod tests {
             .handle_request(make_user_request("Hello"))
             .await
             .expect("should succeed");
-        assert_eq!(resp.choices[0].message.content, "Hello");
+        assert_eq!(resp_text(&resp), "Hello");
 
         // Give the spawned RequestEnd task a moment to execute.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -5556,7 +5532,7 @@ mod tests {
             .handle_request(make_user_request("Hello"))
             .await
             .expect("should succeed even with exhausted semaphore");
-        assert_eq!(resp.choices[0].message.content, "Hello");
+        assert_eq!(resp_text(&resp), "Hello");
 
         // Give time for any possible task scheduling.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -5595,7 +5571,7 @@ mod tests {
             .handle_request(make_user_request("Search for Rust"))
             .await
             .expect("should succeed with no hooks");
-        assert_eq!(resp.choices[0].message.content, "Results found.");
+        assert_eq!(resp_text(&resp), "Results found.");
     }
 
     // ── Phase 4: hook priority ordering ────────────────────────────────────
@@ -5740,7 +5716,7 @@ mod tests {
             .await
             .expect("should succeed");
 
-        assert_eq!(resp.choices[0].message.content, "Found something.");
+        assert_eq!(resp_text(&resp), "Found something.");
     }
 
     // ── Phase 4: memory command hook integration ───────────────────────────
@@ -5831,7 +5807,7 @@ mod tests {
             .await
             .expect("engine should not error — blocked command is a failed CommandResult");
 
-        assert_eq!(resp.choices[0].message.content, "No memory needed.");
+        assert_eq!(resp_text(&resp), "No memory needed.");
     }
 
     #[tokio::test]
@@ -5956,7 +5932,7 @@ mod tests {
             .await
             .expect("engine should not error — blocked recall is a failed CommandResult");
 
-        assert_eq!(resp.choices[0].message.content, "Memory was blocked.");
+        assert_eq!(resp_text(&resp), "Memory was blocked.");
     }
 
     #[tokio::test]
@@ -6044,7 +6020,7 @@ mod tests {
             .await
             .expect("should succeed");
 
-        assert_eq!(resp.choices[0].message.content, "Stored the preference.");
+        assert_eq!(resp_text(&resp), "Stored the preference.");
 
         // Only store-b should have been written to.
         assert!(
@@ -6120,7 +6096,7 @@ mod tests {
             .await
             .expect("should succeed");
 
-        assert_eq!(resp.choices[0].message.content, "Done with both recalls.");
+        assert_eq!(resp_text(&resp), "Done with both recalls.");
 
         // PreToolUse must have fired once per /recall invocation = 2 times.
         assert_eq!(
@@ -6188,7 +6164,7 @@ mod tests {
             .await
             .expect("should succeed");
 
-        assert_eq!(resp.choices[0].message.content, "Response");
+        assert_eq!(resp_text(&resp), "Response");
 
         // The second PostRoute hook should have seen the scores modified by the first hook.
         let captured = second_hook_payload.lock().unwrap().clone();
@@ -6604,7 +6580,8 @@ mod tests {
             .await
             .expect("fallback should succeed");
         assert_eq!(
-            result.choices[0].message.content, "fallback response",
+            resp_text(&result),
+            "fallback response",
             "response should come from fallback default model"
         );
     }
@@ -6629,11 +6606,10 @@ mod tests {
             .expect("end-to-end should succeed");
 
         assert_eq!(
-            resp.choices[0].message.content, "Hello from provider",
+            resp_text(&resp),
+            "Hello from provider",
             "response text must come from provider.execute()"
         );
-        assert_eq!(resp.choices[0].finish_reason, "stop");
-        assert_eq!(resp.object, "chat.completion");
         // Usage should be populated from the mock provider.
         assert_eq!(resp.usage.prompt_tokens, 10);
         assert_eq!(resp.usage.completion_tokens, 5);

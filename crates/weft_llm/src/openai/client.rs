@@ -1,9 +1,9 @@
 use tracing::{debug, warn};
-use weft_core::Role;
 
 use super::wire::{OpenAIMessage, OpenAIRequest, OpenAIResponse};
 use crate::{
     ChatCompletionOutput, Provider, ProviderError, ProviderRequest, ProviderResponse, TokenUsage,
+    provider::weft_messages_to_text,
 };
 
 const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
@@ -36,8 +36,13 @@ impl OpenAIProvider {
         &self,
         input: crate::ChatCompletionInput,
     ) -> Result<ChatCompletionOutput, ProviderError> {
+        use weft_core::Role;
+
         // System prompt goes as first message with role "system".
-        // Any Role::System messages in the messages slice are also mapped to role "system".
+        // Extract text from WeftMessage content parts. weft_messages_to_text
+        // filters out gateway activity (source: Gateway, role: System).
+        let role_text_pairs = weft_messages_to_text(&input.messages);
+
         let mut wire_messages = Vec::new();
 
         // Prepend the system_prompt as a system role message
@@ -48,15 +53,15 @@ impl OpenAIProvider {
             });
         }
 
-        for m in &input.messages {
-            let role = match m.role {
+        for (role, text) in role_text_pairs {
+            let role_str = match role {
                 Role::System => "system",
                 Role::User => "user",
                 Role::Assistant => "assistant",
             };
             wire_messages.push(OpenAIMessage {
-                role: role.to_string(),
-                content: m.content.clone(),
+                role: role_str.to_string(),
+                content: text,
             });
         }
 
@@ -149,16 +154,20 @@ impl Provider for OpenAIProvider {
 mod tests {
     use super::*;
     use serde_json::json;
-    use weft_core::{Message, Role};
+    use weft_core::{ContentPart, Role, Source, WeftMessage};
 
     fn make_provider(base_url: &str) -> OpenAIProvider {
         OpenAIProvider::new("test-key".to_string(), Some(base_url.to_string()))
     }
 
-    fn make_messages() -> Vec<Message> {
-        vec![Message {
+    fn make_messages() -> Vec<WeftMessage> {
+        vec![WeftMessage {
             role: Role::User,
-            content: "Hello".to_string(),
+            source: Source::Client,
+            model: None,
+            content: vec![ContentPart::Text("Hello".to_string())],
+            delta: false,
+            message_index: 0,
         }]
     }
 
@@ -169,6 +178,13 @@ mod tests {
             model: model.to_string(),
             max_tokens: 4096,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            response_format: None,
         })
     }
 
@@ -286,6 +302,13 @@ mod tests {
             model: "gpt-test".to_string(),
             max_tokens: 4096,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            response_format: None,
         });
         let result = provider.execute(request).await;
 
@@ -324,6 +347,13 @@ mod tests {
             model: "gpt-test".to_string(),
             max_tokens: 256,
             temperature: Some(0.5),
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            response_format: None,
         });
         let result = provider.execute(request).await;
         assert!(result.is_ok());
@@ -354,6 +384,13 @@ mod tests {
             model: "gpt-test".to_string(),
             max_tokens: 4096,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            response_format: None,
         });
         let result = provider.execute(request).await;
         assert!(result.is_ok());

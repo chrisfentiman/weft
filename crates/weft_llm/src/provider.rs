@@ -3,7 +3,7 @@
 //! These types form the contract between the gateway engine and provider implementations.
 //! The `Provider` trait (defined in `lib.rs`) uses these types exclusively.
 
-use weft_core::Message;
+use weft_core::{ContentPart, ResponseFormat, WeftMessage};
 
 /// A capability that a model supports.
 ///
@@ -78,14 +78,59 @@ pub enum ProviderRequest {
 pub struct ChatCompletionInput {
     /// The assembled system prompt.
     pub system_prompt: String,
-    /// The conversation messages.
-    pub messages: Vec<Message>,
+    /// The conversation messages (domain type with source attribution).
+    pub messages: Vec<WeftMessage>,
     /// Model identifier to send to the provider API.
     pub model: String,
     /// Maximum tokens in response.
     pub max_tokens: u32,
     /// Sampling temperature. If None, use provider default.
     pub temperature: Option<f32>,
+    /// Nucleus sampling threshold. If None, use provider default.
+    pub top_p: Option<f32>,
+    /// Top-k sampling. If None, use provider default.
+    pub top_k: Option<u32>,
+    /// Stop sequences. Empty means none.
+    pub stop: Vec<String>,
+    /// Frequency penalty. If None, use provider default.
+    pub frequency_penalty: Option<f32>,
+    /// Presence penalty. If None, use provider default.
+    pub presence_penalty: Option<f32>,
+    /// Deterministic seed. If None, non-deterministic.
+    pub seed: Option<i64>,
+    /// Response format constraint.
+    pub response_format: Option<ResponseFormat>,
+}
+
+/// Extract text content from a slice of `WeftMessage` for text-only providers.
+///
+/// Filters out activity messages (source: Gateway, role: System) since those
+/// are for the client, not the LLM. Tool and memory results ARE included
+/// because the LLM needs to see them for multi-turn command loops.
+/// Returns `(role, text)` pairs where `text` is all Text parts joined with `\n`.
+/// Messages whose text content is empty after extraction are omitted.
+pub fn weft_messages_to_text(messages: &[WeftMessage]) -> Vec<(weft_core::Role, String)> {
+    use weft_core::{Role, Source};
+    messages
+        .iter()
+        .filter(|m| {
+            // Activity messages (source: Gateway, role: System) are for the client, not the LLM.
+            !(m.role == Role::System && m.source == Source::Gateway)
+        })
+        .map(|m| {
+            let text: String = m
+                .content
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            (m.role, text)
+        })
+        .filter(|(_, text)| !text.is_empty())
+        .collect()
 }
 
 /// A response from a provider.
@@ -214,16 +259,27 @@ mod tests {
 
     #[test]
     fn test_chat_completion_input_construction() {
-        use weft_core::{Message, Role};
+        use weft_core::{ContentPart, Role, Source, WeftMessage};
         let input = ChatCompletionInput {
             system_prompt: "You are helpful.".to_string(),
-            messages: vec![Message {
+            messages: vec![WeftMessage {
                 role: Role::User,
-                content: "Hello".to_string(),
+                source: Source::Client,
+                model: None,
+                content: vec![ContentPart::Text("Hello".to_string())],
+                delta: false,
+                message_index: 0,
             }],
             model: "gpt-4".to_string(),
             max_tokens: 1024,
             temperature: Some(0.7),
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            response_format: None,
         };
         assert_eq!(input.system_prompt, "You are helpful.");
         assert_eq!(input.messages.len(), 1);
@@ -234,16 +290,27 @@ mod tests {
 
     #[test]
     fn test_provider_request_chat_completion_construction() {
-        use weft_core::{Message, Role};
+        use weft_core::{ContentPart, Role, Source, WeftMessage};
         let request = ProviderRequest::ChatCompletion(ChatCompletionInput {
             system_prompt: "sys".to_string(),
-            messages: vec![Message {
+            messages: vec![WeftMessage {
                 role: Role::User,
-                content: "hi".to_string(),
+                source: Source::Client,
+                model: None,
+                content: vec![ContentPart::Text("hi".to_string())],
+                delta: false,
+                message_index: 0,
             }],
             model: "claude-test".to_string(),
             max_tokens: 2048,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            response_format: None,
         });
         assert!(matches!(request, ProviderRequest::ChatCompletion(_)));
     }

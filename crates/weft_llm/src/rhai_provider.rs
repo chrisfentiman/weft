@@ -45,9 +45,8 @@ use weft_rhai::{CompiledScript, EngineBuilder, SandboxLimits, ScriptError, safe_
 
 use crate::{
     Provider, ProviderError, ProviderRequest, ProviderResponse,
-    provider::{ChatCompletionOutput, TokenUsage},
+    provider::{ChatCompletionOutput, TokenUsage, weft_messages_to_text},
 };
-use weft_core::Role;
 
 /// A provider that uses a Rhai script for wire format transformation.
 ///
@@ -187,18 +186,22 @@ fn request_to_dynamic(request: &ProviderRequest) -> Dynamic {
                 Dynamic::from(input.system_prompt.clone()),
             );
 
-            let messages: rhai::Array = input
-                .messages
-                .iter()
-                .map(|msg| {
+            // Extract text from WeftMessage content parts for the Rhai script interface.
+            // weft_messages_to_text filters gateway activity and concatenates Text parts.
+            let role_text_pairs = weft_messages_to_text(&input.messages);
+
+            let messages: rhai::Array = role_text_pairs
+                .into_iter()
+                .map(|(role, text)| {
+                    use weft_core::Role;
                     let mut msg_map = rhai::Map::new();
-                    let role_str = match msg.role {
+                    let role_str = match role {
                         Role::User => "user",
                         Role::Assistant => "assistant",
                         Role::System => "system",
                     };
                     msg_map.insert("role".into(), Dynamic::from(role_str.to_string()));
-                    msg_map.insert("content".into(), Dynamic::from(msg.content.clone()));
+                    msg_map.insert("content".into(), Dynamic::from(text));
                     Dynamic::from_map(msg_map)
                 })
                 .collect();
@@ -496,7 +499,7 @@ impl std::fmt::Debug for RhaiProvider {
 mod tests {
     use super::*;
     use std::io::Write;
-    use weft_core::{Message, Role};
+    use weft_core::{ContentPart, Role, Source, WeftMessage};
     use weft_rhai::{EngineBuilder, SandboxLimits};
 
     /// Write a Rhai script to a temporary file and return the file handle.
@@ -549,13 +552,24 @@ fn parse_response(response) {
     fn sample_chat_request() -> ProviderRequest {
         ProviderRequest::ChatCompletion(crate::provider::ChatCompletionInput {
             system_prompt: "You are helpful.".to_string(),
-            messages: vec![Message {
+            messages: vec![WeftMessage {
                 role: Role::User,
-                content: "Hello".to_string(),
+                source: Source::Client,
+                model: None,
+                content: vec![ContentPart::Text("Hello".to_string())],
+                delta: false,
+                message_index: 0,
             }],
             model: "test-model".to_string(),
             max_tokens: 1024,
             temperature: Some(0.7),
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            response_format: None,
         })
     }
 
@@ -675,6 +689,13 @@ fn parse_response(response) {
             model: "m".to_string(),
             max_tokens: 100,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            response_format: None,
         });
         let dynamic = request_to_dynamic(&req);
         let json = weft_rhai::dynamic_to_json(&dynamic).unwrap();
@@ -691,22 +712,42 @@ fn parse_response(response) {
         let req = ProviderRequest::ChatCompletion(crate::provider::ChatCompletionInput {
             system_prompt: "sys".to_string(),
             messages: vec![
-                Message {
+                WeftMessage {
                     role: Role::User,
-                    content: "user msg".to_string(),
+                    source: Source::Client,
+                    model: None,
+                    content: vec![ContentPart::Text("user msg".to_string())],
+                    delta: false,
+                    message_index: 0,
                 },
-                Message {
+                WeftMessage {
                     role: Role::Assistant,
-                    content: "assistant msg".to_string(),
+                    source: Source::Provider,
+                    model: None,
+                    content: vec![ContentPart::Text("assistant msg".to_string())],
+                    delta: false,
+                    message_index: 0,
                 },
-                Message {
+                // Client-provided system message (not gateway activity)
+                WeftMessage {
                     role: Role::System,
-                    content: "system msg".to_string(),
+                    source: Source::Client,
+                    model: None,
+                    content: vec![ContentPart::Text("system msg".to_string())],
+                    delta: false,
+                    message_index: 0,
                 },
             ],
             model: "m".to_string(),
             max_tokens: 100,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            response_format: None,
         });
         let dynamic = request_to_dynamic(&req);
         let json = weft_rhai::dynamic_to_json(&dynamic).unwrap();

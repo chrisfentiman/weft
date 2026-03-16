@@ -13,9 +13,150 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tracing::{info, info_span, warn};
-use weft_core::{ChatCompletionRequest, ChatCompletionResponse, WeftError};
+use weft_core::{
+    ContentPart, ModelRoutingInstruction, Role, SamplingOptions, Source, WeftError, WeftMessage,
+    WeftRequest,
+};
 
 use crate::engine::GatewayEngine;
+
+// ── OpenAI compat types (local to this module) ─────────────────────────────
+//
+// These are wire-format types for the /v1/chat/completions translation layer.
+// They are NOT domain types. The domain types are WeftRequest/WeftResponse in weft_core.
+
+/// OpenAI-format chat completion request body.
+#[derive(Debug, Deserialize)]
+struct OpenAiChatRequest {
+    model: String,
+    messages: Vec<OpenAiMessage>,
+    #[serde(default)]
+    stream: Option<bool>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+}
+
+/// An OpenAI-format message with role and string content.
+#[derive(Debug, Serialize, Deserialize)]
+struct OpenAiMessage {
+    role: Role,
+    content: String,
+}
+
+/// OpenAI-format chat completion response body.
+#[derive(Debug, Serialize)]
+struct OpenAiChatResponse {
+    id: String,
+    object: String,
+    created: u64,
+    model: String,
+    choices: Vec<OpenAiChoice>,
+    usage: OpenAiUsage,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiChoice {
+    index: u32,
+    message: OpenAiMessage,
+    finish_reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiUsage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
+}
+
+// ── Translation functions ───────────────────────────────────────────────────
+
+/// Translate an OpenAI-format request into a domain `WeftRequest`.
+///
+/// All messages are assigned `Source::Client` since this is the OpenAI compat
+/// layer and there is no source attribution in the OpenAI format.
+fn openai_to_weft(req: OpenAiChatRequest) -> WeftRequest {
+    let messages: Vec<WeftMessage> = req
+        .messages
+        .into_iter()
+        .map(|m| WeftMessage {
+            source: match m.role {
+                Role::User => Source::Client,
+                Role::Assistant => Source::Provider,
+                Role::System => Source::Gateway,
+            },
+            role: m.role,
+            model: None,
+            content: vec![ContentPart::Text(m.content)],
+            delta: false,
+            message_index: 0,
+        })
+        .collect();
+
+    let routing = ModelRoutingInstruction::parse(&req.model);
+
+    let options = SamplingOptions {
+        temperature: req.temperature,
+        max_tokens: req.max_tokens,
+        ..Default::default()
+    };
+
+    WeftRequest {
+        messages,
+        routing,
+        options,
+    }
+}
+
+/// Translate a domain `WeftResponse` into an OpenAI-format response.
+///
+/// Extracts the last assistant text message from the response.
+fn weft_to_openai(resp: weft_core::WeftResponse) -> OpenAiChatResponse {
+    // Extract the last assistant/provider text message.
+    let assistant_text = resp
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Assistant && m.source == Source::Provider)
+        .and_then(|m| {
+            m.content.iter().find_map(|part| match part {
+                ContentPart::Text(text) => Some(text.clone()),
+                _ => None,
+            })
+        })
+        .unwrap_or_default();
+
+    OpenAiChatResponse {
+        id: resp.id,
+        object: "chat.completion".to_string(),
+        created: unix_timestamp(),
+        model: resp.model,
+        choices: vec![OpenAiChoice {
+            index: 0,
+            message: OpenAiMessage {
+                role: Role::Assistant,
+                content: assistant_text,
+            },
+            finish_reason: "stop".to_string(),
+        }],
+        usage: OpenAiUsage {
+            prompt_tokens: resp.usage.prompt_tokens,
+            completion_tokens: resp.usage.completion_tokens,
+            total_tokens: resp.usage.total_tokens,
+        },
+    }
+}
+
+/// Return the current Unix timestamp in seconds.
+fn unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+// ── Router ──────────────────────────────────────────────────────────────────
 
 /// Build the axum `Router` with all routes attached.
 pub fn build_router(engine: GatewayEngine) -> Router {
@@ -79,42 +220,40 @@ async fn shutdown_signal() {
 /// chat completion response. Streaming is not supported in v1.
 async fn chat_completions_handler(
     State(engine): State<GatewayEngine>,
-    Json(request): Json<ChatCompletionRequest>,
-) -> Result<Json<ChatCompletionResponse>, ApiError> {
+    Json(openai_req): Json<OpenAiChatRequest>,
+) -> Result<Json<OpenAiChatResponse>, ApiError> {
     // Generate a request-scoped tracing span for observability.
     let request_id = uuid::Uuid::new_v4().to_string();
     let span = info_span!("chat_completion", request_id = %request_id);
     let _guard = span.enter();
 
     // Validate: must have at least one message.
-    if request.messages.is_empty() {
+    if openai_req.messages.is_empty() {
         return Err(ApiError::bad_request("messages array must not be empty"));
     }
 
     // Validate: must have at least one user message.
-    if !request
-        .messages
-        .iter()
-        .any(|m| m.role == weft_core::Role::User)
-    {
+    if !openai_req.messages.iter().any(|m| m.role == Role::User) {
         return Err(ApiError::bad_request(
             "messages must contain at least one user message",
         ));
     }
 
     // Reject streaming explicitly.
-    if request.stream == Some(true) {
+    if openai_req.stream == Some(true) {
         return Err(ApiError::bad_request("streaming is not supported in v1"));
     }
 
     info!(
-        model = %request.model,
-        message_count = request.messages.len(),
+        model = %openai_req.model,
+        message_count = openai_req.messages.len(),
         "handling chat completion request"
     );
 
-    match engine.handle_request(request).await {
-        Ok(response) => Ok(Json(response)),
+    let weft_req = openai_to_weft(openai_req);
+
+    match engine.handle_request(weft_req).await {
+        Ok(weft_resp) => Ok(Json(weft_to_openai(weft_resp))),
         Err(e) => Err(ApiError::from_weft_error(e)),
     }
 }
@@ -190,6 +329,8 @@ impl ApiError {
 
     fn from_weft_error(e: WeftError) -> Self {
         match e {
+            WeftError::InvalidRequest(_) => Self::bad_request(e.to_string()),
+            WeftError::ProtoConversion(_) => Self::internal(e.to_string()),
             WeftError::StreamingNotSupported => Self::bad_request(e.to_string()),
             WeftError::Config(_) => Self::internal(e.to_string()),
             WeftError::RateLimited { retry_after_ms } => Self {
@@ -725,5 +866,129 @@ mod tests {
         };
         let api_error = ApiError::from_weft_error(err);
         assert_eq!(api_error.status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn test_invalid_request_maps_to_400() {
+        let err = WeftError::InvalidRequest("bad input".to_string());
+        let api_error = ApiError::from_weft_error(err);
+        assert_eq!(api_error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_proto_conversion_maps_to_500() {
+        let err = WeftError::ProtoConversion("missing role".to_string());
+        let api_error = ApiError::from_weft_error(err);
+        assert_eq!(api_error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ── Translation unit tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_openai_to_weft_assigns_sources() {
+        use weft_core::Source;
+        let req = OpenAiChatRequest {
+            model: "gpt-4".to_string(),
+            messages: vec![
+                OpenAiMessage {
+                    role: Role::System,
+                    content: "sys prompt".to_string(),
+                },
+                OpenAiMessage {
+                    role: Role::User,
+                    content: "hello".to_string(),
+                },
+                OpenAiMessage {
+                    role: Role::Assistant,
+                    content: "hi there".to_string(),
+                },
+            ],
+            stream: None,
+            temperature: None,
+            max_tokens: None,
+        };
+        let weft_req = openai_to_weft(req);
+        assert_eq!(weft_req.messages[0].source, Source::Gateway);
+        assert_eq!(weft_req.messages[1].source, Source::Client);
+        assert_eq!(weft_req.messages[2].source, Source::Provider);
+    }
+
+    #[test]
+    fn test_openai_to_weft_routing_parsed() {
+        use weft_core::RoutingMode;
+        let req = OpenAiChatRequest {
+            model: "auto".to_string(),
+            messages: vec![OpenAiMessage {
+                role: Role::User,
+                content: "hi".to_string(),
+            }],
+            stream: None,
+            temperature: None,
+            max_tokens: None,
+        };
+        let weft_req = openai_to_weft(req);
+        assert_eq!(weft_req.routing.mode, RoutingMode::Auto);
+    }
+
+    #[test]
+    fn test_openai_to_weft_sampling_options() {
+        let req = OpenAiChatRequest {
+            model: "gpt-4".to_string(),
+            messages: vec![OpenAiMessage {
+                role: Role::User,
+                content: "hi".to_string(),
+            }],
+            stream: None,
+            temperature: Some(0.5),
+            max_tokens: Some(256),
+        };
+        let weft_req = openai_to_weft(req);
+        assert_eq!(weft_req.options.temperature, Some(0.5));
+        assert_eq!(weft_req.options.max_tokens, Some(256));
+    }
+
+    #[test]
+    fn test_weft_to_openai_extracts_assistant_text() {
+        use weft_core::{WeftResponse, WeftTiming, WeftUsage};
+        let resp = WeftResponse {
+            id: "chatcmpl-test".to_string(),
+            model: "gpt-4".to_string(),
+            messages: vec![WeftMessage {
+                role: Role::Assistant,
+                source: Source::Provider,
+                model: Some("gpt-4".to_string()),
+                content: vec![ContentPart::Text("Hello!".to_string())],
+                delta: false,
+                message_index: 0,
+            }],
+            usage: WeftUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                llm_calls: 1,
+            },
+            timing: WeftTiming::default(),
+        };
+        let openai_resp = weft_to_openai(resp);
+        assert_eq!(openai_resp.choices[0].message.content, "Hello!");
+        assert_eq!(openai_resp.usage.prompt_tokens, 10);
+        assert_eq!(openai_resp.usage.completion_tokens, 5);
+        assert_eq!(openai_resp.usage.total_tokens, 15);
+        assert_eq!(openai_resp.object, "chat.completion");
+    }
+
+    #[test]
+    fn test_weft_to_openai_empty_messages_returns_empty_content() {
+        use weft_core::{WeftResponse, WeftTiming, WeftUsage};
+        let resp = WeftResponse {
+            id: "chatcmpl-test".to_string(),
+            model: "auto".to_string(),
+            messages: vec![],
+            usage: WeftUsage::default(),
+            timing: WeftTiming::default(),
+        };
+        let openai_resp = weft_to_openai(resp);
+        // No assistant message → empty content, not a panic
+        assert_eq!(openai_resp.choices[0].message.content, "");
     }
 }

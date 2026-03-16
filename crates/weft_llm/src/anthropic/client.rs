@@ -1,9 +1,9 @@
 use tracing::{debug, warn};
-use weft_core::Role;
 
 use super::wire::{AnthropicMessage, AnthropicRequest, AnthropicResponse};
 use crate::{
     ChatCompletionOutput, Provider, ProviderError, ProviderRequest, ProviderResponse, TokenUsage,
+    provider::weft_messages_to_text,
 };
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -37,24 +37,30 @@ impl AnthropicProvider {
         &self,
         input: crate::ChatCompletionInput,
     ) -> Result<ChatCompletionOutput, ProviderError> {
-        // Build the system string: the provided system_prompt plus any System-role messages
-        // concatenated in order.
+        use weft_core::Role;
+
+        // Extract text from WeftMessage content parts.
+        // weft_messages_to_text filters out gateway activity (source: Gateway, role: System)
+        // and extracts only Text content parts, skipping non-text content.
+        let role_text_pairs = weft_messages_to_text(&input.messages);
+
+        // Build the system string: the provided system_prompt plus any client-provided
+        // System-role messages concatenated in order.
         let mut system_parts = vec![input.system_prompt.clone()];
-        let wire_messages: Vec<AnthropicMessage> = input
-            .messages
-            .iter()
-            .filter_map(|m| match m.role {
+        let wire_messages: Vec<AnthropicMessage> = role_text_pairs
+            .into_iter()
+            .filter_map(|(role, text)| match role {
                 Role::System => {
-                    system_parts.push(m.content.clone());
+                    system_parts.push(text);
                     None
                 }
                 Role::User => Some(AnthropicMessage {
                     role: "user".to_string(),
-                    content: m.content.clone(),
+                    content: text,
                 }),
                 Role::Assistant => Some(AnthropicMessage {
                     role: "assistant".to_string(),
-                    content: m.content.clone(),
+                    content: text,
                 }),
             })
             .collect();
@@ -155,16 +161,20 @@ impl Provider for AnthropicProvider {
 mod tests {
     use super::*;
     use serde_json::json;
-    use weft_core::{Message, Role};
+    use weft_core::{ContentPart, Role, Source, WeftMessage};
 
     fn make_provider(base_url: &str) -> AnthropicProvider {
         AnthropicProvider::new("test-key".to_string(), Some(base_url.to_string()))
     }
 
-    fn make_messages() -> Vec<Message> {
-        vec![Message {
+    fn make_messages() -> Vec<WeftMessage> {
+        vec![WeftMessage {
             role: Role::User,
-            content: "Hello".to_string(),
+            source: Source::Client,
+            model: None,
+            content: vec![ContentPart::Text("Hello".to_string())],
+            delta: false,
+            message_index: 0,
         }]
     }
 
@@ -175,6 +185,13 @@ mod tests {
             model: model.to_string(),
             max_tokens: 4096,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            response_format: None,
         })
     }
 
@@ -281,14 +298,25 @@ mod tests {
             .create_async()
             .await;
 
+        // System messages with source Client are included and concatenated.
         let messages = vec![
-            Message {
+            WeftMessage {
                 role: Role::System,
-                content: "You are a helpful assistant.".to_string(),
+                source: Source::Client,
+                model: None,
+                content: vec![ContentPart::Text(
+                    "You are a helpful assistant.".to_string(),
+                )],
+                delta: false,
+                message_index: 0,
             },
-            Message {
+            WeftMessage {
                 role: Role::User,
-                content: "Hello".to_string(),
+                source: Source::Client,
+                model: None,
+                content: vec![ContentPart::Text("Hello".to_string())],
+                delta: false,
+                message_index: 0,
             },
         ];
 
@@ -299,6 +327,13 @@ mod tests {
             model: "claude-test".to_string(),
             max_tokens: 4096,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            response_format: None,
         });
         let result = provider.execute(request).await;
 
@@ -336,6 +371,13 @@ mod tests {
             model: "claude-test".to_string(),
             max_tokens: 512,
             temperature: Some(0.7),
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            response_format: None,
         });
         let result = provider.execute(request).await;
         assert!(result.is_ok());

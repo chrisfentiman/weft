@@ -5,6 +5,7 @@
 
 mod context;
 mod engine;
+mod grpc;
 mod hooks;
 mod server;
 
