@@ -114,6 +114,7 @@ async fn main() {
             &config.router.classifier.model_path,
             &config.router.classifier.tokenizer_path,
             &[], // No pre-embedding at startup — candidates are embedded lazily per-request
+            std::collections::HashMap::new(), // Phase 4 wires domain thresholds from config
         )
         .await;
         info!(
