@@ -25,6 +25,11 @@ use weft_core::{
 };
 use weft_proto::weft::v1 as proto;
 
+use weft_commands::CommandRegistry;
+use weft_hooks::HookRunner;
+use weft_llm::ProviderService;
+use weft_router::SemanticRouter;
+
 use crate::grpc::WeftService;
 
 // ── OpenAI compat types (local to this module) ─────────────────────────────
@@ -184,7 +189,13 @@ fn unix_timestamp() -> u64 {
 /// Uses `tonic::service::Routes::into_axum_router()` to compose the gRPC server
 /// with axum on a single port. The tonic router handles `content-type: application/grpc`;
 /// axum handles everything else.
-pub fn build_router(weft_service: Arc<WeftService>) -> Router {
+pub fn build_router<H, R, P, C>(weft_service: Arc<WeftService<H, R, P, C>>) -> Router
+where
+    H: HookRunner + Send + Sync + 'static,
+    R: SemanticRouter + Send + Sync + 'static,
+    P: ProviderService + Send + Sync + 'static,
+    C: CommandRegistry + Send + Sync + 'static,
+{
     // Build the gRPC router via tonic's axum integration.
     // tonic::service::Routes::new() wraps a NamedService + tower::Service.
     // into_axum_router() returns an axum Router that handles gRPC content-type requests.
@@ -195,8 +206,11 @@ pub fn build_router(weft_service: Arc<WeftService>) -> Router {
 
     // Build the HTTP axum router for OpenAI compat + health.
     let http_router = Router::new()
-        .route("/v1/chat/completions", post(chat_completions_handler))
-        .route("/health", get(health_handler))
+        .route(
+            "/v1/chat/completions",
+            post(chat_completions_handler::<H, R, P, C>),
+        )
+        .route("/health", get(health_handler::<H, R, P, C>))
         .with_state(Arc::clone(&weft_service));
 
     // Merge: gRPC router handles application/grpc requests; HTTP router handles the rest.
@@ -258,10 +272,16 @@ async fn shutdown_signal() {
 /// chat completion response. Translates to/from `WeftRequest`/`WeftResponse`
 /// and calls `WeftService::handle_weft_request()` — the same code path as gRPC.
 /// Streaming is not supported in v1.
-async fn chat_completions_handler(
-    State(weft_service): State<Arc<WeftService>>,
+async fn chat_completions_handler<H, R, P, C>(
+    State(weft_service): State<Arc<WeftService<H, R, P, C>>>,
     Json(openai_req): Json<OpenAiChatRequest>,
-) -> Result<Json<OpenAiChatResponse>, ApiError> {
+) -> Result<Json<OpenAiChatResponse>, ApiError>
+where
+    H: HookRunner + Send + Sync + 'static,
+    R: SemanticRouter + Send + Sync + 'static,
+    P: ProviderService + Send + Sync + 'static,
+    C: CommandRegistry + Send + Sync + 'static,
+{
     // Generate a request-scoped tracing span for observability.
     let request_id = uuid::Uuid::new_v4().to_string();
     let span = info_span!("chat_completion", request_id = %request_id);
@@ -303,7 +323,15 @@ async fn chat_completions_handler(
 /// `GET /health`
 ///
 /// Returns gateway health status. Always 200 if the process is up.
-async fn health_handler(State(weft_service): State<Arc<WeftService>>) -> Json<HealthResponse> {
+async fn health_handler<H, R, P, C>(
+    State(weft_service): State<Arc<WeftService<H, R, P, C>>>,
+) -> Json<HealthResponse>
+where
+    H: HookRunner + Send + Sync + 'static,
+    R: SemanticRouter + Send + Sync + 'static,
+    P: ProviderService + Send + Sync + 'static,
+    C: CommandRegistry + Send + Sync + 'static,
+{
     let config = weft_service.engine_config();
 
     // Classifier is considered loaded if it doesn't immediately fail a trivial classify.
@@ -685,7 +713,10 @@ mod tests {
         ))
     }
 
-    fn make_weft_service(llm: impl Provider + 'static) -> Arc<WeftService> {
+    fn make_weft_service(
+        llm: impl Provider + 'static,
+    ) -> Arc<WeftService<weft_hooks::HookRegistry, MockRouter, ProviderRegistry, MockRegistry>>
+    {
         let engine = crate::engine::GatewayEngine::new(
             test_config(),
             make_registry(llm),

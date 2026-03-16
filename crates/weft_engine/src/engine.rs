@@ -48,7 +48,7 @@ use weft_core::{
     toon::{fenced_toon, serialize_table},
 };
 use weft_llm::{
-    Capability, Provider, ProviderError, ProviderRegistry, ProviderRequest, ProviderResponse,
+    Capability, Provider, ProviderError, ProviderRequest, ProviderResponse, ProviderService,
     TokenUsage,
 };
 use weft_router::{
@@ -147,14 +147,20 @@ fn builtin_describe_text(name: &str) -> String {
 
 /// The gateway engine: holds shared components and drives the request loop.
 ///
-/// All fields are `Arc` so `GatewayEngine` is cheaply `Clone`able — axum clones
-/// it into each request handler.
-#[derive(Clone)]
-pub struct GatewayEngine {
+/// Generic parameters:
+/// - `H`: hook runner (e.g. `weft_hooks::HookRegistry` or `NullHookRunner`)
+/// - `R`: semantic router (e.g. `weft_router::ModernBertClassifier`)
+/// - `P`: provider service (e.g. `weft_llm::ProviderRegistry`)
+/// - `C`: command registry (e.g. `weft_commands::ToolRegistryCommandAdapter`)
+///
+/// All fields are `Arc` so `GatewayEngine` is cheaply cloneable — axum clones
+/// it into each request handler. A manual `Clone` impl avoids requiring the
+/// type params themselves to be `Clone` (they are behind `Arc`).
+pub struct GatewayEngine<H, R, P, C> {
     config: Arc<WeftConfig>,
-    provider_registry: Arc<ProviderRegistry>,
-    router: Arc<dyn SemanticRouter>,
-    command_registry: Arc<dyn CommandRegistry>,
+    providers: Arc<P>,
+    router: Arc<R>,
+    commands: Arc<C>,
     /// Optional memory store multiplexer. `None` when no memory stores are configured.
     memory_mux: Option<Arc<MemoryStoreMux>>,
     /// All memory store routing candidates (from config). Used for the Memory domain
@@ -167,15 +173,37 @@ pub struct GatewayEngine {
     /// Memory candidates filtered to write-capable stores only. Used by `/remember`
     /// for per-invocation routing via `score_memory_candidates()`.
     write_memory_candidates: Vec<RoutingCandidate>,
-    /// Hook registry. Shared immutably across all request handlers.
-    /// Contains all registered hooks, sorted by priority per event.
-    hook_registry: Arc<weft_hooks::HookRegistry>,
+    /// Hook runner. Shared immutably across all request handlers.
+    hooks: Arc<H>,
     /// Semaphore limiting concurrent RequestEnd hook tasks.
     /// Prevents unbounded task accumulation under burst load.
     request_end_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
-impl GatewayEngine {
+impl<H, R, P, C> Clone for GatewayEngine<H, R, P, C> {
+    fn clone(&self) -> Self {
+        Self {
+            config: Arc::clone(&self.config),
+            providers: Arc::clone(&self.providers),
+            router: Arc::clone(&self.router),
+            commands: Arc::clone(&self.commands),
+            memory_mux: self.memory_mux.clone(),
+            memory_candidates: self.memory_candidates.clone(),
+            read_memory_candidates: self.read_memory_candidates.clone(),
+            write_memory_candidates: self.write_memory_candidates.clone(),
+            hooks: Arc::clone(&self.hooks),
+            request_end_semaphore: Arc::clone(&self.request_end_semaphore),
+        }
+    }
+}
+
+impl<H, R, P, C> GatewayEngine<H, R, P, C>
+where
+    H: HookRunner + Send + Sync + 'static,
+    R: SemanticRouter + Send + Sync + 'static,
+    P: ProviderService + Send + Sync + 'static,
+    C: CommandRegistry + Send + Sync + 'static,
+{
     /// Expose the config for use by the health handler and other modules.
     pub fn config(&self) -> &WeftConfig {
         &self.config
@@ -183,18 +211,14 @@ impl GatewayEngine {
 
     /// Construct a new gateway engine.
     ///
-    /// `memory_candidates`: All memory store routing candidates (pre-built from config,
-    ///   same structure as model candidates). Used for the Memory domain in routing and
-    ///   for per-invocation `score_memory_candidates()` calls during command execution.
-    /// `read_memory_candidates`: Subset with read capability (for `/recall` routing).
-    /// `write_memory_candidates`: Subset with write capability (for `/remember` routing).
+    /// `memory_mux`: Optional memory store multiplexer. `None` when no memory stores configured.
     pub fn new(
         config: Arc<WeftConfig>,
-        provider_registry: Arc<ProviderRegistry>,
-        router: Arc<dyn SemanticRouter>,
-        command_registry: Arc<dyn CommandRegistry>,
+        providers: Arc<P>,
+        router: Arc<R>,
+        commands: Arc<C>,
         memory_mux: Option<Arc<MemoryStoreMux>>,
-        hook_registry: Arc<weft_hooks::HookRegistry>,
+        hooks: Arc<H>,
     ) -> Self {
         // Build per-capability candidate sets from config memory stores.
         // These are derived from the same config used to build the mux, so they
@@ -207,14 +231,14 @@ impl GatewayEngine {
 
         Self {
             config,
-            provider_registry,
+            providers,
             router,
-            command_registry,
+            commands,
             memory_mux,
             memory_candidates,
             read_memory_candidates,
             write_memory_candidates,
-            hook_registry,
+            hooks,
             request_end_semaphore,
         }
     }
@@ -236,7 +260,7 @@ impl GatewayEngine {
             "max_tokens": request.options.max_tokens,
         });
         match self
-            .hook_registry
+            .hooks
             .run_chain(HookEvent::RequestStart, request_payload, None)
             .await
         {
@@ -297,14 +321,14 @@ impl GatewayEngine {
             "commands_executed": commands_executed,
         });
 
-        let hook_registry = Arc::clone(&self.hook_registry);
+        let hooks_clone = Arc::clone(&self.hooks);
         let semaphore = Arc::clone(&self.request_end_semaphore);
 
         match semaphore.clone().try_acquire_owned() {
             Ok(permit) => {
                 tokio::spawn(async move {
                     let _permit = permit; // Dropped when task completes.
-                    hook_registry
+                    hooks_clone
                         .run_chain(HookEvent::RequestEnd, end_payload, None)
                         .await;
                 });
@@ -326,9 +350,7 @@ impl GatewayEngine {
         // For chat completions (the only implemented endpoint), the required capability is
         // always chat_completions. If no model supports this, fail fast with 400.
         let required_capability = Capability::new(Capability::CHAT_COMPLETIONS);
-        let eligible_models = self
-            .provider_registry
-            .models_with_capability(&required_capability);
+        let eligible_models = self.providers.models_with_capability(&required_capability);
         if eligible_models.is_empty() {
             return Err(WeftError::NoEligibleModels {
                 capability: Capability::CHAT_COMPLETIONS.to_string(),
@@ -337,7 +359,7 @@ impl GatewayEngine {
 
         // Get all available commands from the registry.
         let all_commands = self
-            .command_registry
+            .commands
             .list_commands()
             .await
             .map_err(|e| WeftError::Command(e.to_string()))?;
@@ -376,13 +398,13 @@ impl GatewayEngine {
         );
 
         // Look up the provider and model_id for the selected model.
-        let provider = self.provider_registry.get(&selected_model_name);
+        let provider = self.providers.get(&selected_model_name);
         let model_id = self
-            .provider_registry
+            .providers
             .model_id(&selected_model_name)
             .map(String::from);
         let max_tokens = self
-            .provider_registry
+            .providers
             .max_tokens_for(&selected_model_name)
             .or(request.options.max_tokens);
 
@@ -518,7 +540,7 @@ impl GatewayEngine {
                 });
 
                 match self
-                    .hook_registry
+                    .hooks
                     .run_chain(HookEvent::PreResponse, pre_response_payload, None)
                     .await
                 {
@@ -619,7 +641,7 @@ impl GatewayEngine {
                 });
 
                 let (effective_invocation, pre_tool_blocked) = match self
-                    .hook_registry
+                    .hooks
                     .run_chain(HookEvent::PreToolUse, tool_payload, Some(&invocation.name))
                     .await
                 {
@@ -672,7 +694,7 @@ impl GatewayEngine {
 
                 // Execute the command.
                 let mut cmd_result = self
-                    .command_registry
+                    .commands
                     .execute_command(&effective_invocation)
                     .await
                     .unwrap_or_else(|e| CommandResult {
@@ -696,7 +718,7 @@ impl GatewayEngine {
                 });
 
                 match self
-                    .hook_registry
+                    .hooks
                     .run_chain(
                         HookEvent::PostToolUse,
                         post_tool_payload,
@@ -778,12 +800,12 @@ impl GatewayEngine {
                 // Rate limit: propagate immediately, no fallback.
                 Err(WeftError::RateLimited { retry_after_ms })
             }
-            Err(e) if selected_model_name != self.provider_registry.default_name() => {
+            Err(e) if selected_model_name != self.providers.default_name() => {
                 // Non-default model failed with a non-rate-limit error: try the default,
                 // but only if the default model supports the required capability.
-                let default_name = self.provider_registry.default_name();
+                let default_name = self.providers.default_name();
                 if !self
-                    .provider_registry
+                    .providers
                     .model_has_capability(default_name, &required_capability)
                 {
                     warn!(
@@ -800,7 +822,7 @@ impl GatewayEngine {
                     error = %e,
                     "model failed, falling back to default"
                 );
-                let default_provider = self.provider_registry.default_provider();
+                let default_provider = self.providers.default_provider();
 
                 // Build a new request with the default model's identifiers.
                 let fallback_request = match request {
@@ -810,14 +832,12 @@ impl GatewayEngine {
                         options,
                     } => {
                         let fallback_model_id = self
-                            .provider_registry
+                            .providers
                             .model_id(default_name)
                             .map(String::from)
                             .unwrap_or_default();
-                        let fallback_max_tokens = self
-                            .provider_registry
-                            .max_tokens_for(default_name)
-                            .unwrap_or(4096);
+                        let fallback_max_tokens =
+                            self.providers.max_tokens_for(default_name).unwrap_or(4096);
                         ProviderRequest::ChatCompletion {
                             messages,
                             model: fallback_model_id,
@@ -881,7 +901,7 @@ impl GatewayEngine {
         let threshold = self.config.router.classifier.threshold;
         let max_commands = self.config.router.classifier.max_commands;
         let skip_tools_when_unnecessary = self.config.router.skip_tools_when_unnecessary;
-        let default_model = self.provider_registry.default_name().to_string();
+        let default_model = self.providers.default_name().to_string();
 
         // Build the Commands domain candidates: each command as "{name}: {description}".
         let command_candidates: Vec<RoutingCandidate> = all_commands
@@ -907,9 +927,7 @@ impl GatewayEngine {
             .map(|p| p.models.len())
             .sum();
         if total_models > 1 {
-            let eligible_models = self
-                .provider_registry
-                .models_with_capability(&required_capability);
+            let eligible_models = self.providers.models_with_capability(&required_capability);
             let model_candidates: Vec<RoutingCandidate> = build_model_candidates(&self.config)
                 .into_iter()
                 .filter(|c| eligible_models.contains(&c.id))
@@ -972,7 +990,7 @@ impl GatewayEngine {
             });
 
             match self
-                .hook_registry
+                .hooks
                 .run_chain(
                     HookEvent::PreRoute,
                     pre_payload,
@@ -1104,7 +1122,7 @@ impl GatewayEngine {
                 });
 
                 let final_cmd_ids = match self
-                    .hook_registry
+                    .hooks
                     .run_chain(
                         HookEvent::PostRoute,
                         post_commands_payload,
@@ -1189,7 +1207,7 @@ impl GatewayEngine {
                     });
 
                     match self
-                        .hook_registry
+                        .hooks
                         .run_chain(
                             HookEvent::PostRoute,
                             post_tn_payload,
@@ -1262,7 +1280,7 @@ impl GatewayEngine {
                     });
 
                     match self
-                        .hook_registry
+                        .hooks
                         .run_chain(
                             HookEvent::PostRoute,
                             post_model_payload,
@@ -1291,7 +1309,7 @@ impl GatewayEngine {
 
                             if let Some(model) = override_model {
                                 // Validate that the model exists in the provider registry.
-                                if self.provider_registry.model_id(&model).is_some() {
+                                if self.providers.model_id(&model).is_some() {
                                     model
                                 } else {
                                     warn!(
@@ -1425,7 +1443,13 @@ fn format_memory_store_results(
     }
 }
 
-impl GatewayEngine {
+impl<H, R, P, C> GatewayEngine<H, R, P, C>
+where
+    H: HookRunner + Send + Sync + 'static,
+    R: SemanticRouter + Send + Sync + 'static,
+    P: ProviderService + Send + Sync + 'static,
+    C: CommandRegistry + Send + Sync + 'static,
+{
     /// Handle a built-in memory command (`/recall` or `/remember`) with full hook lifecycle.
     ///
     /// Hook firing order for memory commands:
@@ -1451,7 +1475,7 @@ impl GatewayEngine {
         });
 
         let (effective_invocation, pre_tool_blocked) = match self
-            .hook_registry
+            .hooks
             .run_chain(HookEvent::PreToolUse, tool_payload, Some(&invocation.name))
             .await
         {
@@ -1500,7 +1524,7 @@ impl GatewayEngine {
             });
 
             match self
-                .hook_registry
+                .hooks
                 .run_chain(
                     HookEvent::PostToolUse,
                     post_tool_payload,
@@ -1576,7 +1600,7 @@ impl GatewayEngine {
         });
 
         let (effective_candidates, effective_routing_text) = match self
-            .hook_registry
+            .hooks
             .run_chain(
                 HookEvent::PreRoute,
                 pre_route_payload,
@@ -1663,7 +1687,7 @@ impl GatewayEngine {
         });
 
         let final_store_ids = match self
-            .hook_registry
+            .hooks
             .run_chain(
                 HookEvent::PostRoute,
                 post_route_payload,
@@ -1769,7 +1793,7 @@ impl GatewayEngine {
         });
 
         match self
-            .hook_registry
+            .hooks
             .run_chain(
                 HookEvent::PostToolUse,
                 post_tool_payload,
@@ -2674,11 +2698,15 @@ mod tests {
         ))
     }
 
-    fn make_engine(
+    fn make_engine<R, C>(
         registry: Arc<ProviderRegistry>,
-        router: impl SemanticRouter + 'static,
-        commands: impl CommandRegistry + 'static,
-    ) -> GatewayEngine {
+        router: R,
+        commands: C,
+    ) -> GatewayEngine<weft_hooks::HookRegistry, R, ProviderRegistry, C>
+    where
+        R: SemanticRouter + Send + Sync + 'static,
+        C: CommandRegistry + Send + Sync + 'static,
+    {
         GatewayEngine::new(
             test_config(),
             registry,
@@ -2689,12 +2717,16 @@ mod tests {
         )
     }
 
-    fn make_engine_with_config(
+    fn make_engine_with_config<R, C>(
         config: Arc<WeftConfig>,
         registry: Arc<ProviderRegistry>,
-        router: impl SemanticRouter + 'static,
-        commands: impl CommandRegistry + 'static,
-    ) -> GatewayEngine {
+        router: R,
+        commands: C,
+    ) -> GatewayEngine<weft_hooks::HookRegistry, R, ProviderRegistry, C>
+    where
+        R: SemanticRouter + Send + Sync + 'static,
+        C: CommandRegistry + Send + Sync + 'static,
+    {
         GatewayEngine::new(
             config,
             registry,
@@ -3825,12 +3857,16 @@ mod tests {
         ))
     }
 
-    fn make_engine_with_mux(
+    fn make_engine_with_mux<R, C>(
         registry: Arc<ProviderRegistry>,
-        router: impl SemanticRouter + 'static,
-        commands: impl CommandRegistry + 'static,
+        router: R,
+        commands: C,
         mux: Option<Arc<MemoryStoreMux>>,
-    ) -> GatewayEngine {
+    ) -> GatewayEngine<weft_hooks::HookRegistry, R, ProviderRegistry, C>
+    where
+        R: SemanticRouter + Send + Sync + 'static,
+        C: CommandRegistry + Send + Sync + 'static,
+    {
         GatewayEngine::new(
             test_config(),
             registry,
@@ -4352,13 +4388,17 @@ mod tests {
     }
 
     /// Build an engine with the given config, mux, and router.
-    fn make_engine_with_config_and_mux(
+    fn make_engine_with_config_and_mux<R, C>(
         config: Arc<WeftConfig>,
         registry: Arc<ProviderRegistry>,
-        router: impl SemanticRouter + 'static,
-        commands: impl CommandRegistry + 'static,
+        router: R,
+        commands: C,
         mux: Option<Arc<MemoryStoreMux>>,
-    ) -> GatewayEngine {
+    ) -> GatewayEngine<weft_hooks::HookRegistry, R, ProviderRegistry, C>
+    where
+        R: SemanticRouter + Send + Sync + 'static,
+        C: CommandRegistry + Send + Sync + 'static,
+    {
         GatewayEngine::new(
             config,
             registry,
@@ -5055,12 +5095,16 @@ mod tests {
     // ── Phase 4: hook integration helpers ─────────────────────────────────
 
     /// Build a `GatewayEngine` with a custom hook registry (Phase 4 tests).
-    fn make_engine_with_hooks(
+    fn make_engine_with_hooks<R, C>(
         registry: Arc<ProviderRegistry>,
-        router: impl SemanticRouter + 'static,
-        commands: impl CommandRegistry + 'static,
+        router: R,
+        commands: C,
         hook_registry: weft_hooks::HookRegistry,
-    ) -> GatewayEngine {
+    ) -> GatewayEngine<weft_hooks::HookRegistry, R, ProviderRegistry, C>
+    where
+        R: SemanticRouter + Send + Sync + 'static,
+        C: CommandRegistry + Send + Sync + 'static,
+    {
         GatewayEngine::new(
             test_config(),
             registry,
@@ -5943,13 +5987,17 @@ mod tests {
     // ── Phase 4: memory command hook integration ───────────────────────────
 
     /// Build a `GatewayEngine` with a custom hook registry AND a memory mux.
-    fn make_engine_with_hooks_and_mux(
+    fn make_engine_with_hooks_and_mux<R, C>(
         registry: Arc<ProviderRegistry>,
-        router: impl SemanticRouter + 'static,
-        commands: impl CommandRegistry + 'static,
+        router: R,
+        commands: C,
         hook_registry: weft_hooks::HookRegistry,
         mux: Option<Arc<MemoryStoreMux>>,
-    ) -> GatewayEngine {
+    ) -> GatewayEngine<weft_hooks::HookRegistry, R, ProviderRegistry, C>
+    where
+        R: SemanticRouter + Send + Sync + 'static,
+        C: CommandRegistry + Send + Sync + 'static,
+    {
         GatewayEngine::new(
             test_config(),
             registry,

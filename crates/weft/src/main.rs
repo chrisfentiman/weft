@@ -6,6 +6,7 @@
 mod engine;
 mod grpc;
 mod server;
+mod types;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -20,9 +21,10 @@ use weft_core::{WeftConfig, WireFormat};
 use weft_llm::{AnthropicProvider, Capability, OpenAIProvider, ProviderRegistry, RhaiProvider};
 use weft_router::{ModernBertRouter, RoutingCandidate, RoutingDomainKind};
 
-use crate::engine::{GatewayEngine, tool_necessity_candidates};
+use crate::engine::tool_necessity_candidates;
 use crate::grpc::WeftService;
 use crate::server::build_router;
+use crate::types::{BinaryCommandRegistry, WeftEngine};
 
 /// Weft — AI orchestration gateway
 #[derive(Debug, Parser)]
@@ -313,7 +315,7 @@ async fn main() {
     // `ModernBertRouter::new` is infallible — falls back to passthrough mode
     // if the model or tokenizer can't be loaded, logging a warning internally.
 
-    let router: Arc<dyn weft_router::SemanticRouter> = {
+    let router = {
         let r = ModernBertRouter::new(
             &config.router.classifier.model_path,
             &config.router.classifier.tokenizer_path,
@@ -332,7 +334,7 @@ async fn main() {
 
     // ── Construct command registry ─────────────────────────────────────────
 
-    let command_registry: Arc<dyn weft_commands::CommandRegistry> =
+    let command_registry: Arc<BinaryCommandRegistry> =
         if let Some(tr_config) = &config.tool_registry {
             info!(
                 endpoint = %tr_config.endpoint,
@@ -343,10 +345,12 @@ async fn main() {
                 tr_config.connect_timeout_ms,
                 tr_config.request_timeout_ms,
             );
-            Arc::new(ToolRegistryCommandAdapter::new(Arc::new(grpc_client)))
+            Arc::new(BinaryCommandRegistry::Tool(
+                ToolRegistryCommandAdapter::new(Arc::new(grpc_client)),
+            ))
         } else {
             info!("no tool registry configured, using empty registry");
-            Arc::new(EmptyCommandRegistry)
+            Arc::new(BinaryCommandRegistry::Empty)
         };
 
     // ── Build memory store multiplexer (optional) ─────────────────────────
@@ -433,7 +437,7 @@ async fn main() {
 
     // ── Wire the gateway engine ────────────────────────────────────────────
 
-    let engine = GatewayEngine::new(
+    let engine: WeftEngine = WeftEngine::new(
         Arc::clone(&config),
         provider_registry,
         router,
@@ -458,35 +462,5 @@ async fn main() {
     if let Err(e) = server::serve(router, bind_address).await {
         eprintln!("error: server failed: {e}");
         std::process::exit(1);
-    }
-}
-
-// ── Empty command registry ─────────────────────────────────────────────────
-
-/// A command registry with no commands. Used when no tool registry is configured.
-struct EmptyCommandRegistry;
-
-#[async_trait::async_trait]
-impl weft_commands::CommandRegistry for EmptyCommandRegistry {
-    async fn list_commands(
-        &self,
-    ) -> Result<Vec<weft_core::CommandStub>, weft_commands::CommandError> {
-        Ok(vec![])
-    }
-
-    async fn describe_command(
-        &self,
-        name: &str,
-    ) -> Result<weft_core::CommandDescription, weft_commands::CommandError> {
-        Err(weft_commands::CommandError::NotFound(name.to_string()))
-    }
-
-    async fn execute_command(
-        &self,
-        invocation: &weft_core::CommandInvocation,
-    ) -> Result<weft_core::CommandResult, weft_commands::CommandError> {
-        Err(weft_commands::CommandError::NotFound(
-            invocation.name.clone(),
-        ))
     }
 }

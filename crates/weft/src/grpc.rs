@@ -18,7 +18,11 @@ use tonic::{Request, Response, Status};
 use weft_core::{WeftError, WeftRequest, WeftResponse, validate_request};
 use weft_proto::weft::v1 as proto;
 
-use crate::engine::GatewayEngine;
+use weft_commands::CommandRegistry;
+use weft_engine::GatewayEngine;
+use weft_hooks::HookRunner;
+use weft_llm::ProviderService;
+use weft_router::SemanticRouter;
 
 // ── Conversion types ────────────────────────────────────────────────────────
 //
@@ -36,16 +40,36 @@ use weft_core::{
 
 /// tonic gRPC service implementation.
 ///
+/// Generic over the engine type params so the binary can use concrete types.
 /// `GatewayEngine` is `Clone` (all `Arc` internals) — cloned into the service.
 /// `WeftService` can be cloned and shared across request handlers.
-#[derive(Clone)]
-pub struct WeftService {
-    engine: GatewayEngine,
+pub struct WeftService<H, R, P, C> {
+    engine: GatewayEngine<H, R, P, C>,
 }
 
-impl WeftService {
+impl<H, R, P, C> Clone for WeftService<H, R, P, C>
+where
+    H: HookRunner + Send + Sync + 'static,
+    R: SemanticRouter + Send + Sync + 'static,
+    P: ProviderService + Send + Sync + 'static,
+    C: CommandRegistry + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            engine: self.engine.clone(),
+        }
+    }
+}
+
+impl<H, R, P, C> WeftService<H, R, P, C>
+where
+    H: HookRunner + Send + Sync + 'static,
+    R: SemanticRouter + Send + Sync + 'static,
+    P: ProviderService + Send + Sync + 'static,
+    C: CommandRegistry + Send + Sync + 'static,
+{
     /// Create a new `WeftService` wrapping the given engine.
-    pub fn new(engine: GatewayEngine) -> Self {
+    pub fn new(engine: GatewayEngine<H, R, P, C>) -> Self {
         Self { engine }
     }
 
@@ -67,7 +91,13 @@ impl WeftService {
 // ── tonic trait implementation ───────────────────────────────────────────────
 
 #[tonic::async_trait]
-impl proto::weft_server::Weft for WeftService {
+impl<H, R, P, C> proto::weft_server::Weft for WeftService<H, R, P, C>
+where
+    H: HookRunner + Send + Sync + 'static,
+    R: SemanticRouter + Send + Sync + 'static,
+    P: ProviderService + Send + Sync + 'static,
+    C: CommandRegistry + Send + Sync + 'static,
+{
     /// Unary chat RPC: single request → single response.
     async fn chat(
         &self,
@@ -836,7 +866,10 @@ mod tests {
         })
     }
 
-    fn make_engine(provider: impl Provider + 'static) -> GatewayEngine {
+    fn make_engine(
+        provider: impl Provider + 'static,
+    ) -> GatewayEngine<weft_hooks::HookRegistry, MockRouter, ProviderRegistry, MockCommandRegistry>
+    {
         let mut providers = HashMap::new();
         providers.insert(
             "test-model".to_string(),
