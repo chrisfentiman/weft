@@ -30,7 +30,7 @@ commit_type="${BASH_REMATCH[1]}"
   exit 1
 }
 
-body_count=$(tail -n +3 "$commit_msg_file" | grep -cv '^$' 2>/dev/null || echo 0)
+body_count=$(awk 'NR>2 && /[^[:space:]]/{c++} END{print c+0}' "$commit_msg_file")
 (( body_count <= 20 )) || {
   echo "ERROR: Body $body_count lines (max 20)."
   exit 1
@@ -57,10 +57,17 @@ done < "$commit_msg_file"
 
 # ─── FILE CLASSIFICATION ────────────────────────────────────────
 # Classify every staged file into exactly one category using a
-# precedence-based system. Categories are tracked as counts in
-# an associative array.
+# precedence-based system. Categories are tracked as individual
+# integer variables for bash 3.x compatibility.
 
-declare -A cats=( [src]=0 [test]=0 [docs]=0 [ci]=0 [build]=0 [infra]=0 [config]=0 [proto]=0 )
+cat_src=0
+cat_test=0
+cat_docs=0
+cat_ci=0
+cat_build=0
+cat_infra=0
+cat_config=0
+cat_proto=0
 
 staged=$(git diff --cached --name-only 2>/dev/null || true)
 [[ -z "$staged" ]] && exit 0
@@ -69,61 +76,59 @@ while IFS= read -r f; do
   case "$f" in
     # CI/CD — most specific first
     .github/*|.gitlab-ci*|Dockerfile*|docker-compose*|*.dockerfile)
-      (( cats[ci]++ )) ;;
+      (( cat_ci++ )) ;;
 
     # Infrastructure / dev tooling
     .githooks/*|.claude/*|.gitignore|.editorconfig|.rustfmt.toml|clippy.toml|deny.toml|rustfmt.toml)
-      (( cats[infra]++ )) ;;
+      (( cat_infra++ )) ;;
 
     # Documentation
     *.md|docs/*|LICENSE*|CHANGELOG*|CONTRIBUTING*)
-      (( cats[docs]++ )) ;;
+      (( cat_docs++ )) ;;
 
     # Test files (Rust convention: _test.rs, tests/ dir)
     *_test.rs|*/tests/*|tests/*)
-      (( cats[test]++ )) ;;
+      (( cat_test++ )) ;;
 
     # Proto files — these generate source, count as src
     *.proto|*/proto/*)
-      (( cats[proto]++ )) ;;
+      (( cat_proto++ )) ;;
 
     # Build system
     */build.rs|build.rs)
-      (( cats[build]++ )) ;;
+      (( cat_build++ )) ;;
 
     # Cargo manifests — context-dependent
     # Root Cargo.toml with src changes = build, alone = build
     Cargo.toml|*/Cargo.toml|Cargo.lock)
-      (( cats[build]++ )) ;;
+      (( cat_build++ )) ;;
 
     # Config files
     config/*|*.toml|*.yaml|*.yml)
-      (( cats[config]++ )) ;;
+      (( cat_config++ )) ;;
 
     # Rust source
     *.rs)
-      (( cats[src]++ )) ;;
+      (( cat_src++ )) ;;
 
     # Model files, assets, gitkeep
     models/*|*.gitkeep)
-      (( cats[infra]++ )) ;;
+      (( cat_infra++ )) ;;
 
     # Catch-all: treat as source
     *)
-      (( cats[src]++ )) ;;
+      (( cat_src++ )) ;;
   esac
 done <<< "$staged"
 
 # Derived booleans for readability
-has_src=$(( cats[src] + cats[proto] > 0 ? 1 : 0 ))
-has_test=$(( cats[test] > 0 ? 1 : 0 ))
-has_docs=$(( cats[docs] > 0 ? 1 : 0 ))
-has_ci=$(( cats[ci] > 0 ? 1 : 0 ))
-has_build=$(( cats[build] > 0 ? 1 : 0 ))
-has_infra=$(( cats[infra] > 0 ? 1 : 0 ))
-has_config=$(( cats[config] > 0 ? 1 : 0 ))
-total_cats=0
-for v in "${cats[@]}"; do (( v > 0 )) && (( total_cats++ )); done
+has_src=$(( cat_src + cat_proto > 0 ? 1 : 0 ))
+has_test=$(( cat_test > 0 ? 1 : 0 ))
+has_docs=$(( cat_docs > 0 ? 1 : 0 ))
+has_ci=$(( cat_ci > 0 ? 1 : 0 ))
+has_build=$(( cat_build > 0 ? 1 : 0 ))
+has_infra=$(( cat_infra > 0 ? 1 : 0 ))
+has_config=$(( cat_config > 0 ? 1 : 0 ))
 
 # ─── TYPE VALIDATION ────────────────────────────────────────────
 # Matrix of allowed combinations per commit type.
@@ -149,7 +154,7 @@ case "$commit_type" in
   feat|fix|perf)
     (( has_src || has_build )) || \
       err "Type '$commit_type' requires source or build changes." \
-          "Only found: $(for k in "${!cats[@]}"; do (( cats[$k] > 0 )) && printf '%s ' "$k"; done)"
+          "Check staged files include .rs or Cargo.toml changes."
     (( has_ci )) && \
       err "Type '$commit_type' includes CI files." \
           "Split CI changes into a separate 'ci' commit."
