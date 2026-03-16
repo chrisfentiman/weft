@@ -2,15 +2,18 @@
 //!
 //! Assembles the system prompt from three parts (in order):
 //! 1. Weft foundational prompt (slash command format tutorial)
-//! 2. Command stubs section (filtered commands in TOON format)
+//! 2. Command stubs section (filtered commands in TOON fenced block)
 //! 3. Agent system prompt (from gateway config)
 
-use weft_core::{CommandStub, toon::serialize_table};
+use weft_core::{
+    CommandStub,
+    toon::{fenced_toon, serialize_table},
+};
 
 /// The foundational system prompt that teaches the LLM the slash command format.
 ///
-/// `{command_stubs_toon}` is a placeholder replaced at runtime with the TOON
-/// table of semantically-selected command stubs.
+/// `{command_stubs_toon}` is a placeholder replaced at runtime with a fenced TOON
+/// block containing the semantically-selected command stubs.
 const FOUNDATIONAL_PROMPT_TEMPLATE: &str = r#"You have access to commands. To use a command, write it as a slash command with TOON arguments:
 
 /command_name key: value, key2: "value with spaces"
@@ -38,7 +41,7 @@ Rules:
 
 /// Assemble the full system prompt.
 ///
-/// Order: foundational prompt (with command stubs TOON) + agent system prompt from config.
+/// Order: foundational prompt (with fenced TOON command stubs) + agent system prompt.
 ///
 /// # Arguments
 /// - `selected_commands`: The semantically-filtered list of command stubs to inject.
@@ -53,8 +56,8 @@ pub fn assemble_system_prompt(
         .map(|cmd| vec![cmd.name.clone(), cmd.description.clone()])
         .collect();
 
-    let command_stubs_toon =
-        serialize_table("Available commands:", &["name", "description"], &rows);
+    let table = serialize_table("commands", &["name", "description"], &rows);
+    let command_stubs_toon = fenced_toon(&table);
 
     // Replace the placeholder in the foundational prompt
     let foundational =
@@ -70,7 +73,7 @@ pub fn assemble_system_prompt(
 
 /// Format command results as TOON for injection back into the conversation.
 ///
-/// Produces a user-role message containing the results of all executed commands.
+/// Produces a fenced TOON block containing the results of all executed commands.
 pub fn format_command_results_toon(results: &[weft_core::CommandResult]) -> String {
     let rows: Vec<Vec<String>> = results
         .iter()
@@ -90,7 +93,8 @@ pub fn format_command_results_toon(results: &[weft_core::CommandResult]) -> Stri
         })
         .collect();
 
-    serialize_table("[Command Results]", &["command", "status", "output"], &rows)
+    let table = serialize_table("results", &["command", "status", "output"], &rows);
+    fenced_toon(&table)
 }
 
 #[cfg(test)]
@@ -121,8 +125,8 @@ mod tests {
         assert!(prompt.contains("/command_name key: value"));
         assert!(prompt.contains("--describe"));
 
-        // Contains TOON command stubs
-        assert!(prompt.contains("Available commands:"));
+        // Contains fenced TOON block
+        assert!(prompt.contains("```toon"));
         assert!(prompt.contains("web_search"));
 
         // Contains agent prompt after foundational
@@ -145,20 +149,22 @@ mod tests {
         ];
         let prompt = assemble_system_prompt(&stubs, "");
 
-        // TOON table format: label, headers, rows
-        assert!(prompt.contains("Available commands:"));
-        assert!(prompt.contains("name, description"));
+        // TOON array format: label[N]{fields}:
+        assert!(prompt.contains("commands[2]{name, description}:"));
         assert!(prompt.contains("web_search"));
         assert!(prompt.contains("code_review"));
+        // Wrapped in fenced block
+        assert!(prompt.contains("```toon"));
     }
 
     #[test]
     fn test_system_prompt_no_commands_shows_empty_toon() {
         let prompt = assemble_system_prompt(&[], "Do something.");
 
-        // Even with no commands, the table headers should appear (TOON format)
-        assert!(prompt.contains("Available commands:"));
-        assert!(prompt.contains("name, description"));
+        // Empty table still has the array header
+        assert!(prompt.contains("commands[0]{name, description}:"));
+        // Still in a fenced block
+        assert!(prompt.contains("```toon"));
     }
 
     #[test]
@@ -192,6 +198,23 @@ mod tests {
         assert!(prompt.contains("Text outside of slash commands is your response to the user"));
     }
 
+    #[test]
+    fn test_system_prompt_fenced_block_format() {
+        let stubs = vec![make_stub("web_search", "Search the web")];
+        let prompt = assemble_system_prompt(&stubs, "");
+        // Fenced block must open and close correctly
+        assert!(prompt.contains("```toon\n"));
+        assert!(prompt.contains("\n```"));
+    }
+
+    #[test]
+    fn test_system_prompt_command_rows_indented() {
+        let stubs = vec![make_stub("web_search", "Search the web")];
+        let prompt = assemble_system_prompt(&stubs, "");
+        // Rows in TOON array syntax are 2-space indented
+        assert!(prompt.contains("  web_search, Search the web"));
+    }
+
     // ── format_command_results_toon ────────────────────────────────────────
 
     #[test]
@@ -204,8 +227,10 @@ mod tests {
         }];
         let toon = format_command_results_toon(&results);
 
-        assert!(toon.contains("[Command Results]"));
-        assert!(toon.contains("command, status, output"));
+        // Wrapped in fenced block
+        assert!(toon.contains("```toon"));
+        // TOON array format
+        assert!(toon.contains("results[1]{command, status, output}:"));
         assert!(toon.contains("web_search"));
         assert!(toon.contains("success"));
         assert!(toon.contains("Found 3 results"));
@@ -248,13 +273,28 @@ mod tests {
         assert!(toon.contains("docs_search"));
         assert!(toon.contains("success"));
         assert!(toon.contains("error"));
+        // Two results
+        assert!(toon.contains("results[2]{command, status, output}:"));
     }
 
     #[test]
     fn test_format_results_empty() {
         let toon = format_command_results_toon(&[]);
-        // Should still produce the TOON headers
-        assert!(toon.contains("[Command Results]"));
-        assert!(toon.contains("command, status, output"));
+        // Still produces a fenced block with the array header
+        assert!(toon.contains("```toon"));
+        assert!(toon.contains("results[0]{command, status, output}:"));
+    }
+
+    #[test]
+    fn test_format_results_fenced_block() {
+        let results = vec![CommandResult {
+            command_name: "cmd".to_string(),
+            success: true,
+            output: "ok".to_string(),
+            error: None,
+        }];
+        let toon = format_command_results_toon(&results);
+        assert!(toon.starts_with("```toon\n"));
+        assert!(toon.ends_with("```"));
     }
 }
