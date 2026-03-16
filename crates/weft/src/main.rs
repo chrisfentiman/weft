@@ -95,8 +95,9 @@ async fn main() {
         let c = ModernBertClassifier::new(
             &config.classifier.model_path,
             &config.classifier.tokenizer_path,
-            &[], // No commands at startup — commands are fetched lazily per-request
-        );
+            &[], // No commands at startup — commands are embedded lazily per-request
+        )
+        .await;
         info!(
             model_path = %config.classifier.model_path,
             "semantic classifier initialized"
