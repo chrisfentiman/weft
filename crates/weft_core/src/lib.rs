@@ -8,7 +8,9 @@ pub mod command;
 pub mod config;
 pub mod error;
 pub mod message;
+pub mod routing;
 pub mod toon;
+pub mod wire;
 
 // Re-export everything at the crate root for convenience.
 pub use command::{
@@ -21,4 +23,13 @@ pub use config::{
     WeftConfig, WireFormat,
 };
 pub use error::WeftError;
-pub use message::{ChatCompletionRequest, ChatCompletionResponse, Choice, Message, Role, Usage};
+pub use message::{
+    CommandCallContent, CommandResultContent, ContentPart, CouncilStartActivity, DocumentContent,
+    HookActivity, MediaContent, MediaSource, MemoryResultContent, MemoryResultEntry,
+    MemoryStoredContent, Role, RoutingActivity, Source, WeftMessage,
+};
+pub use routing::{ModelInfo, ModelRoutingInstruction, RoutingMode};
+pub use wire::{
+    ConversionError, ResponseFormat, SamplingOptions, SourceValidationError, WeftRequest,
+    WeftResponse, WeftTiming, WeftUsage, validate_message_source, validate_request,
+};

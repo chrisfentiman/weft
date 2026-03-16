@@ -50,6 +50,10 @@ pub enum WeftError {
         hook_name: String,
         retries: u32,
     },
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+    #[error("proto conversion error: {0}")]
+    ProtoConversion(String),
 }
 
 #[cfg(test)]
@@ -76,6 +80,8 @@ mod tests {
         let _ = WeftError::NoEligibleModels {
             capability: "embeddings".to_string(),
         };
+        let _ = WeftError::InvalidRequest("bad request".to_string());
+        let _ = WeftError::ProtoConversion("missing role".to_string());
     }
 
     #[test]
@@ -111,6 +117,21 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "hook blocked at request_start: blocked by policy (hook: auth-hook)"
+        );
+    }
+
+    #[test]
+    fn test_invalid_request_display() {
+        let err = WeftError::InvalidRequest("messages must not be empty".to_string());
+        assert_eq!(err.to_string(), "invalid request: messages must not be empty");
+    }
+
+    #[test]
+    fn test_proto_conversion_display() {
+        let err = WeftError::ProtoConversion("message role is required".to_string());
+        assert_eq!(
+            err.to_string(),
+            "proto conversion error: message role is required"
         );
     }
 
