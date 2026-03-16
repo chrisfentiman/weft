@@ -284,11 +284,12 @@ mod tests {
     use weft_commands::{CommandError, CommandRegistry};
     use weft_core::{
         ClassifierConfig, CommandDescription, CommandInvocation, CommandResult, CommandStub,
-        DomainsConfig, GatewayConfig, LlmProviderKind, Message, ModelEntry, ProviderConfig,
-        RouterConfig, ServerConfig, WeftConfig,
+        DomainsConfig, GatewayConfig, LlmProviderKind, ModelEntry, ProviderConfig, RouterConfig,
+        ServerConfig, WeftConfig,
     };
     use weft_llm::{
-        CompletionOptions, CompletionResponse, LlmError, LlmProvider, ProviderRegistry,
+        ChatCompletionOutput, Provider, ProviderError, ProviderRegistry, ProviderRequest,
+        ProviderResponse, TokenUsage,
     };
     use weft_router::{
         RouterError, RoutingCandidate, RoutingDecision, RoutingDomainKind, SemanticRouter,
@@ -309,50 +310,56 @@ mod tests {
     }
 
     #[async_trait]
-    impl LlmProvider for MockLlmProvider {
-        async fn complete(
+    impl Provider for MockLlmProvider {
+        async fn execute(
             &self,
-            _: &str,
-            _: &[Message],
-            _: &CompletionOptions,
-        ) -> Result<CompletionResponse, LlmError> {
-            Ok(CompletionResponse {
+            _request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            Ok(ProviderResponse::ChatCompletion(ChatCompletionOutput {
                 text: self.response.clone(),
-                usage: Some(weft_llm::LlmUsage {
+                usage: Some(TokenUsage {
                     prompt_tokens: 5,
                     completion_tokens: 3,
                 }),
-            })
+            }))
+        }
+
+        fn name(&self) -> &str {
+            "mock"
         }
     }
 
     struct RateLimitedLlm;
 
     #[async_trait]
-    impl LlmProvider for RateLimitedLlm {
-        async fn complete(
+    impl Provider for RateLimitedLlm {
+        async fn execute(
             &self,
-            _: &str,
-            _: &[Message],
-            _: &CompletionOptions,
-        ) -> Result<CompletionResponse, LlmError> {
-            Err(LlmError::RateLimited {
+            _request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            Err(ProviderError::RateLimited {
                 retry_after_ms: 2000,
             })
+        }
+
+        fn name(&self) -> &str {
+            "rate-limited"
         }
     }
 
     struct FailingLlm;
 
     #[async_trait]
-    impl LlmProvider for FailingLlm {
-        async fn complete(
+    impl Provider for FailingLlm {
+        async fn execute(
             &self,
-            _: &str,
-            _: &[Message],
-            _: &CompletionOptions,
-        ) -> Result<CompletionResponse, LlmError> {
-            Err(LlmError::RequestFailed("internal".to_string()))
+            _request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            Err(ProviderError::RequestFailed("internal".to_string()))
+        }
+
+        fn name(&self) -> &str {
+            "failing"
         }
     }
 
@@ -457,12 +464,9 @@ mod tests {
         })
     }
 
-    fn make_registry(llm: impl LlmProvider + 'static) -> Arc<ProviderRegistry> {
+    fn make_registry(llm: impl Provider + 'static) -> Arc<ProviderRegistry> {
         let mut providers = HashMap::new();
-        providers.insert(
-            "test-model".to_string(),
-            Arc::new(llm) as Arc<dyn LlmProvider>,
-        );
+        providers.insert("test-model".to_string(), Arc::new(llm) as Arc<dyn Provider>);
         let mut model_ids = HashMap::new();
         model_ids.insert("test-model".to_string(), "claude-test".to_string());
         let mut max_tokens = HashMap::new();
@@ -475,7 +479,7 @@ mod tests {
         ))
     }
 
-    fn make_router(llm: impl LlmProvider + 'static) -> Router {
+    fn make_router(llm: impl Provider + 'static) -> Router {
         let engine = GatewayEngine::new(
             test_config(),
             make_registry(llm),

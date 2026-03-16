@@ -1,11 +1,11 @@
-//! Provider registry: maps model routing names to LLM provider instances.
+//! Provider registry: maps model routing names to provider instances.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::LlmProvider;
+use crate::Provider;
 
-/// Registry of named LLM providers. The gateway selects a provider
+/// Registry of named providers. The gateway selects a provider
 /// by model name based on the semantic router's model decision.
 ///
 /// Thread-safe: providers are Arc'd and the HashMap is immutable after construction.
@@ -15,7 +15,7 @@ use crate::LlmProvider;
 /// (once per model it serves), but each Arc is cheap.
 pub struct ProviderRegistry {
     /// Named providers. Key is the model routing name (e.g., "complex", "fast").
-    providers: HashMap<String, Arc<dyn LlmProvider>>,
+    providers: HashMap<String, Arc<dyn Provider>>,
     /// Name of the default model.
     default_name: String,
     /// Model identifier for each routing name. Used to set the model field on API requests.
@@ -41,7 +41,7 @@ impl ProviderRegistry {
     /// going through the validated config path. This is a startup-time check,
     /// not a runtime condition.
     pub fn new(
-        providers: HashMap<String, Arc<dyn LlmProvider>>,
+        providers: HashMap<String, Arc<dyn Provider>>,
         model_ids: HashMap<String, String>,
         max_tokens: HashMap<String, u32>,
         default_name: String,
@@ -64,7 +64,7 @@ impl ProviderRegistry {
     }
 
     /// Get a provider by model routing name. Returns the default if name is not found.
-    pub fn get(&self, name: &str) -> &Arc<dyn LlmProvider> {
+    pub fn get(&self, name: &str) -> &Arc<dyn Provider> {
         self.providers
             .get(name)
             .unwrap_or_else(|| self.providers.get(&self.default_name).unwrap())
@@ -81,7 +81,7 @@ impl ProviderRegistry {
     }
 
     /// Get the default provider.
-    pub fn default_provider(&self) -> &Arc<dyn LlmProvider> {
+    pub fn default_provider(&self) -> &Arc<dyn Provider> {
         self.providers.get(&self.default_name).unwrap()
     }
 
@@ -94,30 +94,31 @@ impl ProviderRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CompletionOptions, CompletionResponse, LlmError};
+    use crate::{ProviderError, ProviderRequest, ProviderResponse};
     use async_trait::async_trait;
-    use weft_core::Message;
 
     struct StubProvider {
         name: String,
     }
 
     #[async_trait]
-    impl LlmProvider for StubProvider {
-        async fn complete(
+    impl Provider for StubProvider {
+        async fn execute(
             &self,
-            _system_prompt: &str,
-            _messages: &[Message],
-            _options: &CompletionOptions,
-        ) -> Result<CompletionResponse, LlmError> {
-            Ok(CompletionResponse {
-                text: format!("response from {}", self.name),
-                usage: None,
-            })
+            _request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            Err(ProviderError::Unsupported(format!(
+                "stub provider '{}' does not handle requests",
+                self.name
+            )))
+        }
+
+        fn name(&self) -> &str {
+            &self.name
         }
     }
 
-    fn stub(name: &str) -> Arc<dyn LlmProvider> {
+    fn stub(name: &str) -> Arc<dyn Provider> {
         Arc::new(StubProvider {
             name: name.to_string(),
         })
@@ -179,7 +180,7 @@ mod tests {
     #[test]
     fn test_get_named_provider() {
         let registry = build_registry();
-        // Just verify get returns something (can't compare Arc<dyn LlmProvider> by value)
+        // Just verify get returns something (can't compare Arc<dyn Provider> by value)
         let _ = registry.get("fast");
         let _ = registry.get("complex");
     }
