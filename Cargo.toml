@@ -22,6 +22,9 @@ tonic = { version = "0.13" }
 tonic-build = { version = "0.13" }
 prost = { version = "0.13" }
 
+# Internal
+weft_proto = { path = "crates/weft_proto" }
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
