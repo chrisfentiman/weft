@@ -1,5 +1,5 @@
 use tracing::{debug, warn};
-use weft_core::{LlmConfig, Message, Role};
+use weft_core::{Message, Role};
 
 use super::wire::{OpenAIMessage, OpenAIRequest, OpenAIResponse};
 use crate::{CompletionOptions, CompletionResponse, LlmError, LlmProvider, LlmUsage};
@@ -7,29 +7,25 @@ use crate::{CompletionOptions, CompletionResponse, LlmError, LlmProvider, LlmUsa
 const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
 
 /// OpenAI Chat Completions API provider.
+///
+/// One provider instance corresponds to one API endpoint (credentials + base_url).
+/// The model identifier is passed per-request via `CompletionOptions.model`.
 pub struct OpenAIProvider {
     client: reqwest::Client,
     api_key: String,
-    model: String,
-    default_max_tokens: u32,
     base_url: String,
 }
 
 impl OpenAIProvider {
-    /// Create a new `OpenAIProvider` from config.
+    /// Create a new `OpenAIProvider` from connection info.
     ///
     /// `api_key` must already be resolved (env: prefix expanded).
-    pub fn new(config: &LlmConfig) -> Self {
-        let base_url = config
-            .base_url
-            .clone()
-            .unwrap_or_else(|| OPENAI_API_URL.to_string());
-
+    /// `base_url` overrides the default OpenAI API URL if provided.
+    pub fn new(api_key: String, base_url: Option<String>) -> Self {
+        let base_url = base_url.unwrap_or_else(|| OPENAI_API_URL.to_string());
         Self {
             client: reqwest::Client::new(),
-            api_key: config.api_key.clone(),
-            model: config.model.clone(),
-            default_max_tokens: config.max_tokens,
+            api_key,
             base_url,
         }
     }
@@ -43,6 +39,13 @@ impl LlmProvider for OpenAIProvider {
         messages: &[Message],
         options: &CompletionOptions,
     ) -> Result<CompletionResponse, LlmError> {
+        // Providers MUST return an error if model is None (defensive check).
+        let model = options.model.as_deref().ok_or_else(|| {
+            LlmError::RequestFailed(
+                "CompletionOptions.model is None -- engine misconfiguration".to_string(),
+            )
+        })?;
+
         // System prompt goes as first message with role "system".
         // Any Role::System messages in the messages slice are also mapped to role "system".
         let mut wire_messages = Vec::new();
@@ -67,16 +70,16 @@ impl LlmProvider for OpenAIProvider {
             });
         }
 
-        let max_tokens = options.max_tokens.unwrap_or(self.default_max_tokens);
+        let max_tokens = options.max_tokens.unwrap_or(4096);
 
         let request = OpenAIRequest {
-            model: self.model.clone(),
+            model: model.to_string(),
             messages: wire_messages,
             max_tokens: Some(max_tokens),
             temperature: options.temperature,
         };
 
-        debug!(model = %self.model, max_tokens, "sending OpenAI request");
+        debug!(model = %model, max_tokens, "sending OpenAI request");
 
         let response = self
             .client
@@ -137,16 +140,9 @@ impl LlmProvider for OpenAIProvider {
 mod tests {
     use super::*;
     use serde_json::json;
-    use weft_core::LlmProviderKind;
 
-    fn make_config(base_url: &str) -> LlmConfig {
-        LlmConfig {
-            provider: LlmProviderKind::OpenAI,
-            api_key: "test-key".to_string(),
-            model: "gpt-test".to_string(),
-            max_tokens: 1024,
-            base_url: Some(base_url.to_string()),
-        }
+    fn make_provider(base_url: &str) -> OpenAIProvider {
+        OpenAIProvider::new("test-key".to_string(), Some(base_url.to_string()))
     }
 
     fn make_messages() -> Vec<Message> {
@@ -154,6 +150,14 @@ mod tests {
             role: Role::User,
             content: "Hello".to_string(),
         }]
+    }
+
+    fn options_with_model(model: &str) -> CompletionOptions {
+        CompletionOptions {
+            max_tokens: None,
+            temperature: None,
+            model: Some(model.to_string()),
+        }
     }
 
     #[tokio::test]
@@ -178,9 +182,9 @@ mod tests {
             .create_async()
             .await;
 
-        let provider = OpenAIProvider::new(&make_config(&server.url()));
+        let provider = make_provider(&server.url());
         let result = provider
-            .complete("system", &make_messages(), &CompletionOptions::default())
+            .complete("system", &make_messages(), &options_with_model("gpt-test"))
             .await
             .expect("should succeed");
 
@@ -189,6 +193,27 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 12);
         assert_eq!(usage.completion_tokens, 9);
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_model_none_returns_error() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/")
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let provider = make_provider(&server.url());
+        let options = CompletionOptions::default(); // model is None
+        let result = provider
+            .complete("system", &make_messages(), &options)
+            .await;
+
+        assert!(
+            matches!(result, Err(LlmError::RequestFailed(_))),
+            "None model should return RequestFailed"
+        );
     }
 
     #[tokio::test]
@@ -201,9 +226,9 @@ mod tests {
             .create_async()
             .await;
 
-        let provider = OpenAIProvider::new(&make_config(&server.url()));
+        let provider = make_provider(&server.url());
         let result = provider
-            .complete("system", &make_messages(), &CompletionOptions::default())
+            .complete("system", &make_messages(), &options_with_model("gpt-test"))
             .await;
 
         assert!(matches!(
@@ -223,9 +248,9 @@ mod tests {
             .create_async()
             .await;
 
-        let provider = OpenAIProvider::new(&make_config(&server.url()));
+        let provider = make_provider(&server.url());
         let result = provider
-            .complete("system", &make_messages(), &CompletionOptions::default())
+            .complete("system", &make_messages(), &options_with_model("gpt-test"))
             .await;
 
         assert!(matches!(
@@ -239,8 +264,6 @@ mod tests {
     #[tokio::test]
     async fn test_system_prompt_prepended_as_system_message() {
         let mut server = mockito::Server::new_async().await;
-        // Verify that the system prompt appears as the first message with role "system"
-        // in the serialized request body.
         let mock = server
             .mock("POST", "/")
             .with_status(200)
@@ -264,12 +287,12 @@ mod tests {
             .create_async()
             .await;
 
-        let provider = OpenAIProvider::new(&make_config(&server.url()));
+        let provider = make_provider(&server.url());
         let result = provider
             .complete(
                 "You are a helpful assistant.",
                 &make_messages(),
-                &CompletionOptions::default(),
+                &options_with_model("gpt-test"),
             )
             .await;
 
@@ -280,8 +303,6 @@ mod tests {
     #[tokio::test]
     async fn test_options_forwarded() {
         let mut server = mockito::Server::new_async().await;
-        // Verify that max_tokens and temperature from CompletionOptions appear in the
-        // serialized request body sent to OpenAI.
         let mock = server
             .mock("POST", "/")
             .with_status(200)
@@ -303,10 +324,11 @@ mod tests {
             .create_async()
             .await;
 
-        let provider = OpenAIProvider::new(&make_config(&server.url()));
+        let provider = make_provider(&server.url());
         let options = CompletionOptions {
             max_tokens: Some(256),
             temperature: Some(0.5),
+            model: Some("gpt-test".to_string()),
         };
         let result = provider
             .complete("system", &make_messages(), &options)
@@ -332,10 +354,10 @@ mod tests {
             .create_async()
             .await;
 
-        let provider = OpenAIProvider::new(&make_config(&server.url()));
+        let provider = make_provider(&server.url());
         // Empty system prompt should not add a system message
         let result = provider
-            .complete("", &make_messages(), &CompletionOptions::default())
+            .complete("", &make_messages(), &options_with_model("gpt-test"))
             .await;
         assert!(result.is_ok());
     }
@@ -351,9 +373,9 @@ mod tests {
             .create_async()
             .await;
 
-        let provider = OpenAIProvider::new(&make_config(&server.url()));
+        let provider = make_provider(&server.url());
         let result = provider
-            .complete("system", &make_messages(), &CompletionOptions::default())
+            .complete("system", &make_messages(), &options_with_model("gpt-test"))
             .await;
 
         assert!(matches!(result, Err(LlmError::DeserializationError(_))));

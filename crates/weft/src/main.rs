@@ -12,10 +12,10 @@ use std::sync::Arc;
 use clap::Parser;
 use std::path::PathBuf;
 use tracing::info;
-use weft_classifier::ModernBertClassifier;
 use weft_commands::{GrpcToolRegistryClient, ToolRegistryCommandAdapter};
 use weft_core::{LlmProviderKind, WeftConfig};
 use weft_llm::{AnthropicProvider, OpenAIProvider};
+use weft_router::ModernBertRouter;
 
 use crate::engine::GatewayEngine;
 use crate::server::build_router;
@@ -68,41 +68,59 @@ async fn main() {
         std::process::exit(1);
     });
 
+    config.validate().unwrap_or_else(|e| {
+        eprintln!("error: configuration validation error: {e}");
+        std::process::exit(1);
+    });
+
     info!(path = %cli.config.display(), "configuration loaded");
+
+    let default_model = config.router.effective_default_model();
+    let provider_count = config.router.providers.len();
+    let model_count: usize = config.router.providers.iter().map(|p| p.models.len()).sum();
     info!(
-        provider = ?config.llm.provider,
-        model = %config.llm.model,
-        "LLM provider configured"
+        providers = provider_count,
+        models = model_count,
+        default_model = %default_model,
+        "router configured"
     );
 
     let config = Arc::new(config);
 
     // ── Construct LLM provider ─────────────────────────────────────────────
+    //
+    // Phase 1: single provider from the first provider entry.
+    // Phase 4 replaces this with ProviderRegistry.
 
-    let llm_provider: Arc<dyn weft_llm::LlmProvider> = match &config.llm.provider {
-        LlmProviderKind::Anthropic => Arc::new(AnthropicProvider::new(&config.llm)),
-        LlmProviderKind::OpenAI => Arc::new(OpenAIProvider::new(&config.llm)),
+    let first_provider = &config.router.providers[0];
+    let llm_provider: Arc<dyn weft_llm::LlmProvider> = match &first_provider.kind {
+        LlmProviderKind::Anthropic => Arc::new(AnthropicProvider::new(
+            first_provider.api_key.clone(),
+            first_provider.base_url.clone(),
+        )),
+        LlmProviderKind::OpenAI => Arc::new(OpenAIProvider::new(
+            first_provider.api_key.clone(),
+            first_provider.base_url.clone(),
+        )),
     };
 
-    // ── Construct semantic classifier ──────────────────────────────────────
+    // ── Construct semantic router ──────────────────────────────────────────
     //
-    // `ModernBertClassifier::new` is infallible — it falls back to passthrough mode
+    // `ModernBertRouter::new` is infallible — it falls back to passthrough mode
     // if the model or tokenizer can't be loaded, logging a warning internally.
-    // We use FallbackClassifier only when the model path doesn't exist at all,
-    // to ensure the gateway starts cleanly even without model files.
 
-    let classifier: Arc<dyn weft_classifier::SemanticClassifier> = {
-        let c = ModernBertClassifier::new(
-            &config.classifier.model_path,
-            &config.classifier.tokenizer_path,
-            &[], // No commands at startup — commands are embedded lazily per-request
+    let router: Arc<dyn weft_router::SemanticRouter> = {
+        let r = ModernBertRouter::new(
+            &config.router.classifier.model_path,
+            &config.router.classifier.tokenizer_path,
+            &[], // No pre-embedding at startup — candidates are embedded lazily per-request
         )
         .await;
         info!(
-            model_path = %config.classifier.model_path,
-            "semantic classifier initialized"
+            model_path = %config.router.classifier.model_path,
+            "semantic router initialized"
         );
-        Arc::new(c)
+        Arc::new(r)
     };
 
     // ── Construct command registry ─────────────────────────────────────────
@@ -126,12 +144,7 @@ async fn main() {
 
     // ── Wire the gateway engine ────────────────────────────────────────────
 
-    let engine = GatewayEngine::new(
-        Arc::clone(&config),
-        llm_provider,
-        classifier,
-        command_registry,
-    );
+    let engine = GatewayEngine::new(Arc::clone(&config), llm_provider, router, command_registry);
 
     // ── Start the HTTP server ──────────────────────────────────────────────
 

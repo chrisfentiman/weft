@@ -1,5 +1,6 @@
 use tracing::{debug, warn};
-use weft_core::{LlmConfig, Message, Role};
+use weft_core::Message;
+use weft_core::Role;
 
 use super::wire::{AnthropicMessage, AnthropicRequest, AnthropicResponse};
 use crate::{CompletionOptions, CompletionResponse, LlmError, LlmProvider, LlmUsage};
@@ -8,29 +9,25 @@ const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Anthropic Messages API provider.
+///
+/// One provider instance corresponds to one API endpoint (credentials + base_url).
+/// The model identifier is passed per-request via `CompletionOptions.model`.
 pub struct AnthropicProvider {
     client: reqwest::Client,
     api_key: String,
-    model: String,
-    default_max_tokens: u32,
     base_url: String,
 }
 
 impl AnthropicProvider {
-    /// Create a new `AnthropicProvider` from config.
+    /// Create a new `AnthropicProvider` from connection info.
     ///
     /// `api_key` must already be resolved (env: prefix expanded).
-    pub fn new(config: &LlmConfig) -> Self {
-        let base_url = config
-            .base_url
-            .clone()
-            .unwrap_or_else(|| ANTHROPIC_API_URL.to_string());
-
+    /// `base_url` overrides the default Anthropic API URL if provided.
+    pub fn new(api_key: String, base_url: Option<String>) -> Self {
+        let base_url = base_url.unwrap_or_else(|| ANTHROPIC_API_URL.to_string());
         Self {
             client: reqwest::Client::new(),
-            api_key: config.api_key.clone(),
-            model: config.model.clone(),
-            default_max_tokens: config.max_tokens,
+            api_key,
             base_url,
         }
     }
@@ -44,6 +41,13 @@ impl LlmProvider for AnthropicProvider {
         messages: &[Message],
         options: &CompletionOptions,
     ) -> Result<CompletionResponse, LlmError> {
+        // Providers MUST return an error if model is None (defensive check).
+        let model = options.model.as_deref().ok_or_else(|| {
+            LlmError::RequestFailed(
+                "CompletionOptions.model is None -- engine misconfiguration".to_string(),
+            )
+        })?;
+
         // Build the system string: the provided system_prompt plus any System-role messages
         // concatenated in order.
         let mut system_parts = vec![system_prompt.to_string()];
@@ -66,17 +70,17 @@ impl LlmProvider for AnthropicProvider {
             .collect();
 
         let system = system_parts.join("\n\n");
-        let max_tokens = options.max_tokens.unwrap_or(self.default_max_tokens);
+        let max_tokens = options.max_tokens.unwrap_or(4096);
 
         let request = AnthropicRequest {
-            model: self.model.clone(),
+            model: model.to_string(),
             system,
             messages: wire_messages,
             max_tokens,
             temperature: options.temperature,
         };
 
-        debug!(model = %self.model, max_tokens, "sending Anthropic request");
+        debug!(model = %model, max_tokens, "sending Anthropic request");
 
         let response = self
             .client
@@ -141,16 +145,9 @@ impl LlmProvider for AnthropicProvider {
 mod tests {
     use super::*;
     use serde_json::json;
-    use weft_core::LlmProviderKind;
 
-    fn make_config(base_url: &str) -> LlmConfig {
-        LlmConfig {
-            provider: LlmProviderKind::Anthropic,
-            api_key: "test-key".to_string(),
-            model: "claude-test".to_string(),
-            max_tokens: 1024,
-            base_url: Some(base_url.to_string()),
-        }
+    fn make_provider(base_url: &str) -> AnthropicProvider {
+        AnthropicProvider::new("test-key".to_string(), Some(base_url.to_string()))
     }
 
     fn make_messages() -> Vec<Message> {
@@ -158,6 +155,14 @@ mod tests {
             role: Role::User,
             content: "Hello".to_string(),
         }]
+    }
+
+    fn options_with_model(model: &str) -> CompletionOptions {
+        CompletionOptions {
+            max_tokens: None,
+            temperature: None,
+            model: Some(model.to_string()),
+        }
     }
 
     #[tokio::test]
@@ -180,9 +185,13 @@ mod tests {
             .create_async()
             .await;
 
-        let provider = AnthropicProvider::new(&make_config(&server.url()));
+        let provider = make_provider(&server.url());
         let result = provider
-            .complete("system", &make_messages(), &CompletionOptions::default())
+            .complete(
+                "system",
+                &make_messages(),
+                &options_with_model("claude-test"),
+            )
             .await
             .expect("should succeed");
 
@@ -191,6 +200,28 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 8);
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_model_none_returns_error() {
+        let mut server = mockito::Server::new_async().await;
+        // No mock needed — should fail before hitting the server
+        let _mock = server
+            .mock("POST", "/")
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let provider = make_provider(&server.url());
+        let options = CompletionOptions::default(); // model is None
+        let result = provider
+            .complete("system", &make_messages(), &options)
+            .await;
+
+        assert!(
+            matches!(result, Err(LlmError::RequestFailed(_))),
+            "None model should return RequestFailed"
+        );
     }
 
     #[tokio::test]
@@ -203,9 +234,13 @@ mod tests {
             .create_async()
             .await;
 
-        let provider = AnthropicProvider::new(&make_config(&server.url()));
+        let provider = make_provider(&server.url());
         let result = provider
-            .complete("system", &make_messages(), &CompletionOptions::default())
+            .complete(
+                "system",
+                &make_messages(),
+                &options_with_model("claude-test"),
+            )
             .await;
 
         assert!(matches!(
@@ -225,9 +260,13 @@ mod tests {
             .create_async()
             .await;
 
-        let provider = AnthropicProvider::new(&make_config(&server.url()));
+        let provider = make_provider(&server.url());
         let result = provider
-            .complete("system", &make_messages(), &CompletionOptions::default())
+            .complete(
+                "system",
+                &make_messages(),
+                &options_with_model("claude-test"),
+            )
             .await;
 
         assert!(matches!(
@@ -241,8 +280,6 @@ mod tests {
     #[tokio::test]
     async fn test_system_role_messages_concatenated() {
         let mut server = mockito::Server::new_async().await;
-        // Verify that the `system` field in the request body contains the concatenated
-        // system prompt (base + Role::System messages joined with "\n\n").
         let mock = server
             .mock("POST", "/")
             .with_status(200)
@@ -275,9 +312,9 @@ mod tests {
             },
         ];
 
-        let provider = AnthropicProvider::new(&make_config(&server.url()));
+        let provider = make_provider(&server.url());
         let result = provider
-            .complete("base system", &messages, &CompletionOptions::default())
+            .complete("base system", &messages, &options_with_model("claude-test"))
             .await;
 
         assert!(result.is_ok());
@@ -287,8 +324,6 @@ mod tests {
     #[tokio::test]
     async fn test_options_forwarded() {
         let mut server = mockito::Server::new_async().await;
-        // Verify that max_tokens and temperature from CompletionOptions appear in the
-        // serialized request body sent to Anthropic.
         let mock = server
             .mock("POST", "/")
             .with_status(200)
@@ -300,20 +335,20 @@ mod tests {
                 })
                 .to_string(),
             )
-            // Verify max_tokens appears in the request body. Temperature is an f32 and its
-            // JSON representation can vary (e.g. 0.699...); we check it separately via regex.
+            // Verify max_tokens appears in the request body.
             .match_body(mockito::Matcher::AllOf(vec![
                 mockito::Matcher::PartialJsonString(json!({"max_tokens": 512}).to_string()),
-                // temperature field is present (value starts with "0.6" or "0.7")
+                // temperature field is present
                 mockito::Matcher::Regex(r#""temperature"\s*:"#.to_string()),
             ]))
             .create_async()
             .await;
 
-        let provider = AnthropicProvider::new(&make_config(&server.url()));
+        let provider = make_provider(&server.url());
         let options = CompletionOptions {
             max_tokens: Some(512),
             temperature: Some(0.7),
+            model: Some("claude-test".to_string()),
         };
         let result = provider
             .complete("system", &make_messages(), &options)
@@ -333,9 +368,13 @@ mod tests {
             .create_async()
             .await;
 
-        let provider = AnthropicProvider::new(&make_config(&server.url()));
+        let provider = make_provider(&server.url());
         let result = provider
-            .complete("system", &make_messages(), &CompletionOptions::default())
+            .complete(
+                "system",
+                &make_messages(),
+                &options_with_model("claude-test"),
+            )
             .await;
 
         assert!(matches!(result, Err(LlmError::DeserializationError(_))));

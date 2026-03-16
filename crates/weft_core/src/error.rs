@@ -4,7 +4,7 @@
 ///
 /// This aggregates domain errors via `String` payloads to avoid circular
 /// crate dependencies. Domain crates define their own error enums
-/// (`LlmError`, `ClassifierError`, `CommandError`, `ToolRegistryError`).
+/// (`LlmError`, `RouterError`, `CommandError`, `ToolRegistryError`).
 /// The binary crate converts domain errors to `WeftError` at the boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum WeftError {
@@ -12,8 +12,6 @@ pub enum WeftError {
     Config(String),
     #[error("llm provider error: {0}")]
     Llm(String),
-    #[error("classifier error: {0}")]
-    Classifier(String),
     #[error("command error: {0}")]
     Command(String),
     #[error("tool registry error: {0}")]
@@ -27,6 +25,10 @@ pub enum WeftError {
     /// Rate-limited by the LLM provider.
     #[error("rate limited by provider, retry after {retry_after_ms}ms")]
     RateLimited { retry_after_ms: u64 },
+    #[error("routing error: {0}")]
+    Routing(String),
+    #[error("model '{name}' not found in provider registry")]
+    ModelNotFound { name: String },
 }
 
 #[cfg(test)]
@@ -37,7 +39,6 @@ mod tests {
     fn test_all_variants_constructible() {
         let _ = WeftError::Config("bad config".to_string());
         let _ = WeftError::Llm("provider failed".to_string());
-        let _ = WeftError::Classifier("inference failed".to_string());
         let _ = WeftError::Command("command failed".to_string());
         let _ = WeftError::ToolRegistry("registry down".to_string());
         let _ = WeftError::CommandLoopExceeded { max: 10 };
@@ -45,6 +46,10 @@ mod tests {
         let _ = WeftError::StreamingNotSupported;
         let _ = WeftError::RateLimited {
             retry_after_ms: 1000,
+        };
+        let _ = WeftError::Routing("routing failed".to_string());
+        let _ = WeftError::ModelNotFound {
+            name: "fast".to_string(),
         };
     }
 

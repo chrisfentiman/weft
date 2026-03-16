@@ -7,12 +7,15 @@
 //! - `CompletionResponse` and `LlmUsage` for provider responses
 //! - `AnthropicProvider`: Anthropic Messages API implementation
 //! - `OpenAIProvider`: OpenAI Chat Completions API implementation
+//! - `ProviderRegistry`: Registry of named LLM providers keyed by model routing name
 
 pub mod anthropic;
 pub mod openai;
+pub mod registry;
 
 pub use anthropic::AnthropicProvider;
 pub use openai::OpenAIProvider;
+pub use registry::ProviderRegistry;
 
 use async_trait::async_trait;
 use weft_core::Message;
@@ -24,6 +27,17 @@ pub struct CompletionOptions {
     pub max_tokens: Option<u32>,
     /// Sampling temperature. If None, use provider default.
     pub temperature: Option<f32>,
+    /// Model identifier to use for this request.
+    ///
+    /// **Contract:** The engine guarantees this is always `Some` when calling providers.
+    /// The engine resolves the model from the routing decision and `ProviderRegistry::model_id()`
+    /// before constructing `CompletionOptions`. The `Option` exists only because
+    /// `CompletionOptions` derives `Default` (used in tests); production code paths
+    /// always set this field.
+    ///
+    /// **Provider behavior:** Providers MUST return `LlmError` if `model` is `None`.
+    /// This is a defensive check -- it should never fire if the engine is wired correctly.
+    pub model: Option<String>,
 }
 
 /// A backend LLM provider (Anthropic, OpenAI, etc.)
