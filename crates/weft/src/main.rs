@@ -3,7 +3,6 @@
 //! Loads configuration, constructs concrete implementations of all components,
 //! wires them into the GatewayEngine, and starts the axum HTTP server.
 
-mod context;
 mod engine;
 mod grpc;
 mod server;

@@ -56,7 +56,7 @@ use weft_router::{
     take_top,
 };
 
-use crate::context::{
+use weft_engine::context::{
     assemble_system_prompt, assemble_system_prompt_no_tools, format_command_results_toon,
 };
 use weft_core::HookEvent;
@@ -3677,7 +3677,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_context_assembly_uses_toon_fenced_blocks() {
-        use crate::context::assemble_system_prompt;
+        use weft_engine::context::assemble_system_prompt;
         use weft_core::CommandStub;
 
         let stubs = vec![CommandStub {
@@ -3706,7 +3706,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_fenced_blocks_when_tool_skipping() {
-        use crate::context::assemble_system_prompt_no_tools;
+        use weft_engine::context::assemble_system_prompt_no_tools;
 
         let prompt = assemble_system_prompt_no_tools("You are a helpful assistant.");
         assert!(

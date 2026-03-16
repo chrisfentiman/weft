@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 weft_core = { path = "../weft_core" }
+weft_engine = { path = "../weft_engine" }
 weft_hooks = { path = "../weft_hooks" }
 weft_llm = { path = "../weft_llm" }
 weft_rhai = { path = "../weft_rhai" }
