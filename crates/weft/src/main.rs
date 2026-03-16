@@ -17,7 +17,7 @@ use tracing::{info, warn};
 use weft_commands::{
     GrpcMemoryStoreClient, GrpcToolRegistryClient, MemoryStoreMux, ToolRegistryCommandAdapter,
 };
-use weft_core::{LlmProviderKind, WeftConfig};
+use weft_core::{WeftConfig, WireFormat};
 use weft_llm::{AnthropicProvider, OpenAIProvider, ProviderRegistry};
 use weft_router::{ModernBertRouter, RoutingCandidate, RoutingDomainKind};
 
@@ -169,15 +169,29 @@ async fn main() {
     // One provider instance per unique provider name.
     let mut provider_instances: HashMap<String, Arc<dyn weft_llm::Provider>> = HashMap::new();
     for provider_config in &config.router.providers {
-        let instance: Arc<dyn weft_llm::Provider> = match &provider_config.kind {
-            LlmProviderKind::Anthropic => Arc::new(AnthropicProvider::new(
+        let instance: Arc<dyn weft_llm::Provider> = match &provider_config.wire_format {
+            WireFormat::Anthropic => Arc::new(AnthropicProvider::new(
                 provider_config.api_key.clone(),
                 provider_config.base_url.clone(),
             )),
-            LlmProviderKind::OpenAI => Arc::new(OpenAIProvider::new(
+            WireFormat::OpenAI => Arc::new(OpenAIProvider::new(
                 provider_config.api_key.clone(),
                 provider_config.base_url.clone(),
             )),
+            WireFormat::Custom => {
+                // wire_script presence validated by config.validate() above.
+                // File existence check is deferred to Phase 4 (RhaiProvider construction).
+                // For now, use OpenAI provider as a placeholder until Phase 4 implements RhaiProvider.
+                // This branch should not be reached in production until Phase 4 is complete.
+                warn!(
+                    provider = %provider_config.name,
+                    "custom wire_format not yet fully implemented — using OpenAI provider as placeholder"
+                );
+                Arc::new(OpenAIProvider::new(
+                    provider_config.api_key.clone(),
+                    provider_config.base_url.clone(),
+                ))
+            }
         };
         provider_instances.insert(provider_config.name.clone(), instance);
     }
