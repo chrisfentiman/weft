@@ -1,13 +1,12 @@
 //! Rhai hook executor.
 //!
 //! Executes hook scripts using the Rhai embedded scripting engine.
-//! Each `RhaiHookExecutor` owns its own `rhai::Engine` and compiled `rhai::AST`.
+//! Each `RhaiHookExecutor` owns its own `rhai::Engine` and compiled `weft_rhai::CompiledScript`.
 //!
 //! # Sandboxing
 //!
-//! The Rhai engine is constructed with `Engine::new()` (not `new_raw()`), which
-//! provides the standard library (math, string ops) but does NOT include `eval` or
-//! dynamic code loading. Additional limits prevent unbounded resource usage:
+//! The engine is constructed via `weft_rhai::EngineBuilder` with `SandboxLimits::strict`,
+//! which uses `Engine::new()` (standard library, no `eval`) and applies the following limits:
 //! - `set_max_string_size(65536)` — prevents large string allocation
 //! - `set_max_array_size(1024)` — prevents large array allocation
 //! - `set_max_map_size(256)` — prevents large map allocation
@@ -15,10 +14,9 @@
 //!
 //! # Execution model
 //!
-//! Rhai is CPU-bound and synchronous. All execution is wrapped in
-//! `tokio::task::spawn_blocking()` to avoid blocking tokio worker threads.
-//! A `catch_unwind` inside the blocking closure provides defense-in-depth
-//! against panics in Rhai internals.
+//! Rhai is CPU-bound and synchronous. All execution is delegated to
+//! `weft_rhai::safe_call_fn`, which wraps `tokio::task::spawn_blocking()` and
+//! `catch_unwind` for defense-in-depth against panics in Rhai internals.
 //!
 //! # Fail-open semantics
 //!
@@ -29,24 +27,18 @@
 
 use std::sync::Arc;
 
-use rhai::{Dynamic, Engine, Scope};
 use serde_json::Value;
 use tracing::{debug, info, warn};
 use weft_core::HookEvent;
+use weft_rhai::{CompiledScript, Engine, EngineBuilder, SandboxLimits, safe_call_fn};
 
 use crate::hooks::HookError;
 use crate::hooks::executor::HookExecutor;
 use crate::hooks::types::{HookDecision, HookResponse};
 
-/// Operations per millisecond for Rhai execution timeout approximation.
-/// Rhai counts abstract "operations" (not wall-clock time). 1000 ops/ms
-/// is an approximate budget that prevents infinite loops without needing
-/// a real timer.
-const OPS_PER_MS: u64 = 1000;
-
 /// Rhai-based hook executor.
 ///
-/// Owns a compiled Rhai AST and a configured Rhai engine.
+/// Owns a compiled Rhai script and a configured Rhai engine, both from `weft_rhai`.
 /// Both are `Send + Sync` via the `rhai/sync` feature.
 ///
 /// Each hook gets its own engine instance so different hooks can have
@@ -62,17 +54,16 @@ pub(crate) struct RhaiHookExecutor {
     /// Wrapped in Arc so it can be moved into `spawn_blocking` closures.
     /// `Engine` is `Send + Sync` with the `rhai/sync` feature.
     engine: Arc<Engine>,
-    /// Compiled script AST. Immutable after construction.
-    /// Wrapped in Arc so it can be moved into `spawn_blocking` closures.
-    ast: Arc<rhai::AST>,
+    /// Compiled script (AST + path metadata) from `weft_rhai`.
+    script: CompiledScript,
 }
 
 impl RhaiHookExecutor {
     /// Construct a Rhai executor from the given script path.
     ///
-    /// Builds a sandboxed engine, registers the hook API, and compiles the
-    /// Rhai script into an AST. Compilation errors are fatal (fail fast at
-    /// startup rather than silently at request time).
+    /// Builds a sandboxed engine via `weft_rhai::EngineBuilder`, registers the
+    /// hook API, and compiles the Rhai script. Compilation errors are fatal
+    /// (fail fast at startup rather than silently at request time).
     ///
     /// # Errors
     ///
@@ -87,23 +78,32 @@ impl RhaiHookExecutor {
         // Cap timeout at 5000ms as per spec.
         let timeout_ms = timeout_ms.unwrap_or(100).min(5000);
 
-        // Build the sandboxed engine with the hook API registered.
-        let engine = build_engine(timeout_ms);
+        // Build the sandboxed engine. SandboxLimits::strict derives max_operations
+        // from the timeout (1000 ops/ms with a 1000-op floor). Enable time helpers
+        // so scripts can call now_unix_secs().
+        let engine = EngineBuilder::new(SandboxLimits::strict(timeout_ms))
+            .log_source("rhai_hook")
+            .with_time_helpers(true)
+            .build();
 
-        // Read the script source (validates file existence with a clear error).
-        let script_source =
-            std::fs::read_to_string(script_path).map_err(|e| HookError::RhaiError {
-                script: script_path.to_string(),
-                message: format!("script file not found or unreadable: {e}"),
-            })?;
-
-        // Compile the AST — fail startup on syntax errors.
-        let ast = engine
-            .compile(&script_source)
-            .map_err(|e| HookError::RhaiError {
-                script: script_path.to_string(),
-                message: format!("script compilation error: {e}"),
-            })?;
+        // Load and compile the script — fail startup on file or syntax errors.
+        let script = CompiledScript::load(script_path, &engine).map_err(|e| {
+            use weft_rhai::ScriptError;
+            match e {
+                ScriptError::FileNotFound { .. } => HookError::RhaiError {
+                    script: script_path.to_string(),
+                    message: format!("script file not found or unreadable: {e}"),
+                },
+                ScriptError::CompilationFailed { .. } => HookError::RhaiError {
+                    script: script_path.to_string(),
+                    message: format!("script compilation error: {e}"),
+                },
+                other => HookError::RhaiError {
+                    script: script_path.to_string(),
+                    message: other.to_string(),
+                },
+            }
+        })?;
 
         info!(
             script = %script_path,
@@ -117,85 +117,9 @@ impl RhaiHookExecutor {
             timeout_ms,
             event,
             engine: Arc::new(engine),
-            ast: Arc::new(ast),
+            script,
         })
     }
-}
-
-/// Build a sandboxed Rhai engine with the hook API registered.
-///
-/// Uses `Engine::new()` (not `new_raw()`) for the standard library.
-/// Does NOT include `eval` — `Engine::new()` simply does not register it.
-fn build_engine(timeout_ms: u64) -> Engine {
-    let mut engine = Engine::new();
-
-    // Memory limits to prevent unbounded resource usage by scripts.
-    engine.set_max_string_size(65_536);
-    engine.set_max_array_size(1_024);
-    engine.set_max_map_size(256);
-
-    // Operation limit proportional to timeout — prevents infinite loops.
-    // At 1000 ops/ms, a 100ms timeout ≈ 100_000 operations.
-    let max_ops = timeout_ms.saturating_mul(OPS_PER_MS);
-    // Rhai's set_max_operations takes a u64; 0 means unlimited, so ensure at least 1.
-    engine.set_max_operations(max_ops.max(1_000));
-
-    // Register hook API functions.
-    register_api(&mut engine);
-
-    engine
-}
-
-/// Register the hook API functions into the Rhai engine.
-///
-/// These are the only external capabilities scripts have:
-/// - Logging (log_info, log_warn)
-/// - JSON serialization (json_encode, json_decode)
-/// - Time (now_unix_secs)
-///
-/// Scripts cannot perform file I/O, network calls, or system commands.
-fn register_api(engine: &mut Engine) {
-    // log_info(msg) — emit a tracing::info! log from the hook script.
-    engine.register_fn("log_info", |msg: &str| {
-        info!(source = "rhai_hook", "{}", msg);
-    });
-
-    // log_warn(msg) — emit a tracing::warn! log from the hook script.
-    engine.register_fn("log_warn", |msg: &str| {
-        warn!(source = "rhai_hook", "{}", msg);
-    });
-
-    // json_encode(value) -> String — serialize a Rhai Dynamic to a JSON string.
-    engine.register_fn("json_encode", |value: Dynamic| -> String {
-        match rhai::serde::from_dynamic::<Value>(&value) {
-            Ok(json_val) => serde_json::to_string(&json_val).unwrap_or_else(|_| "null".to_string()),
-            Err(_) => "null".to_string(),
-        }
-    });
-
-    // json_decode(s) -> Dynamic — deserialize a JSON string to a Rhai Dynamic.
-    engine.register_fn("json_decode", |s: &str| -> Dynamic {
-        match serde_json::from_str::<Value>(s) {
-            Ok(json_val) => rhai::serde::to_dynamic(&json_val).unwrap_or(Dynamic::UNIT),
-            Err(_) => Dynamic::UNIT,
-        }
-    });
-
-    // now_unix_secs() -> i64 — current Unix timestamp in seconds.
-    engine.register_fn("now_unix_secs", || -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
-    });
-}
-
-/// Convert a `serde_json::Value` to a Rhai `Dynamic`.
-///
-/// Returns `Dynamic::UNIT` on conversion failure (should not happen for
-/// well-formed JSON, but we never panic).
-fn json_to_dynamic(value: &Value) -> Dynamic {
-    rhai::serde::to_dynamic(value).unwrap_or(Dynamic::UNIT)
 }
 
 /// Convert a Rhai `Dynamic` to a `HookResponse`.
@@ -204,12 +128,9 @@ fn json_to_dynamic(value: &Value) -> Dynamic {
 /// Optional fields: `reason`, `modified`, `context`.
 ///
 /// Returns `None` if the Dynamic cannot be coerced to a valid `HookResponse`.
-fn dynamic_to_hook_response(dynamic: Dynamic) -> Option<HookResponse> {
-    // Convert Dynamic -> serde_json::Value -> HookResponse via serde.
-    let json_val: Value = rhai::serde::from_dynamic(&dynamic).ok()?;
-
-    // The script may return an object map with just `decision` as a string.
-    // We extend it to a full HookResponse via serde deserialization.
+fn dynamic_to_hook_response(dynamic: weft_rhai::Dynamic) -> Option<HookResponse> {
+    // Convert Dynamic -> serde_json::Value via weft_rhai, then -> HookResponse via serde.
+    let json_val = weft_rhai::dynamic_to_json(&dynamic).ok()?;
     serde_json::from_value::<HookResponse>(json_val).ok()
 }
 
@@ -218,72 +139,37 @@ impl HookExecutor for RhaiHookExecutor {
     async fn execute(&self, payload: &Value) -> HookResponse {
         let script_path = self.script_path.clone();
         let event = self.event;
-        let engine = Arc::clone(&self.engine);
-        let ast = Arc::clone(&self.ast);
-        let payload_clone = payload.clone();
+        let payload_dynamic = weft_rhai::json_to_dynamic(payload);
 
         let start = std::time::Instant::now();
 
-        // Rhai is CPU-bound and synchronous — must not block tokio worker threads.
-        let result = tokio::task::spawn_blocking(move || {
-            // Defense-in-depth: catch any unwinding panics from Rhai internals.
-            // SAFETY: We only catch panics here; we do not access the engine
-            // after a panic since each invocation creates a fresh Scope and the
-            // engine's immutable config (registered functions, operation limits)
-            // survives. This is safe per Rhai's architecture with the `sync` feature.
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // Convert payload to Rhai Dynamic.
-                let payload_dynamic = json_to_dynamic(&payload_clone);
-
-                // Fresh scope per invocation — no state bleeds between calls.
-                let mut scope = Scope::new();
-
-                // Call the script's `hook` function with the payload.
-                engine.call_fn::<Dynamic>(&mut scope, &ast, "hook", (payload_dynamic,))
-            }))
-        })
+        // Delegate to weft_rhai::safe_call_fn which handles:
+        // - spawn_blocking (Rhai is CPU-bound, must not block tokio workers)
+        // - catch_unwind (defense-in-depth against Rhai internal panics)
+        // - fresh Scope per call (no state bleeds between invocations)
+        let result = safe_call_fn(
+            Arc::clone(&self.engine),
+            &self.script,
+            "hook",
+            (payload_dynamic,),
+        )
         .await;
 
         let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         match result {
-            Err(join_err) => {
-                // spawn_blocking task panicked at the task level (rare).
+            Err(e) => {
+                // safe_call_fn surfaces all failure modes (panic, runtime error,
+                // task join error) as structured ScriptError variants.
                 warn!(
                     script = %script_path,
                     event = ?event,
-                    error = %join_err,
-                    "rhai hook task join error — returning allow"
-                );
-                HookResponse::allow()
-            }
-            Ok(Err(panic_payload)) => {
-                // catch_unwind caught a panic inside the Rhai execution.
-                let panic_msg = panic_payload
-                    .downcast_ref::<&str>()
-                    .copied()
-                    .or_else(|| panic_payload.downcast_ref::<String>().map(|s| s.as_str()))
-                    .unwrap_or("unknown panic");
-                warn!(
-                    script = %script_path,
-                    event = ?event,
-                    panic = %panic_msg,
-                    "rhai hook panicked — returning allow"
-                );
-                HookResponse::allow()
-            }
-            Ok(Ok(Err(rhai_err))) => {
-                // Rhai returned an error (runtime error, operation limit exceeded, etc.)
-                warn!(
-                    script = %script_path,
-                    event = ?event,
-                    error = %rhai_err,
+                    error = %e,
                     "rhai hook execution error — returning allow"
                 );
                 HookResponse::allow()
             }
-            Ok(Ok(Ok(dynamic))) => {
-                // Script executed successfully. Convert the return value.
+            Ok(dynamic) => {
                 match dynamic_to_hook_response(dynamic) {
                     Some(response) => {
                         let decision_str = match response.decision {
@@ -339,6 +225,7 @@ impl std::fmt::Debug for RhaiHookExecutor {
 mod tests {
     use super::*;
     use std::io::Write;
+    use weft_rhai::Dynamic;
 
     fn write_temp_script(content: &str) -> tempfile::NamedTempFile {
         let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -648,7 +535,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_to_hook_response_allow() {
-        let engine = Engine::new();
+        let engine = weft_rhai::EngineBuilder::new(weft_rhai::SandboxLimits::default()).build();
         let dynamic: Dynamic = engine.eval(r#"#{ decision: "allow" }"#).unwrap();
         let response = dynamic_to_hook_response(dynamic).unwrap();
         assert_eq!(response.decision, HookDecision::Allow);
@@ -656,7 +543,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_to_hook_response_block() {
-        let engine = Engine::new();
+        let engine = weft_rhai::EngineBuilder::new(weft_rhai::SandboxLimits::default()).build();
         let dynamic: Dynamic = engine
             .eval(r#"#{ decision: "block", reason: "denied" }"#)
             .unwrap();
@@ -677,7 +564,7 @@ mod tests {
     #[test]
     fn test_json_to_dynamic_object() {
         let json = serde_json::json!({"command": "web_search", "arguments": {"q": "test"}});
-        let dynamic = json_to_dynamic(&json);
+        let dynamic = weft_rhai::json_to_dynamic(&json);
         // Verify it's a map (not unit).
         assert!(!dynamic.is_unit());
     }
@@ -685,7 +572,7 @@ mod tests {
     #[test]
     fn test_json_to_dynamic_null_gives_unit() {
         let json = Value::Null;
-        let dynamic = json_to_dynamic(&json);
+        let dynamic = weft_rhai::json_to_dynamic(&json);
         // Null maps to Dynamic::UNIT (or similar), not a crash.
         // We just verify no panic.
         let _ = dynamic;
