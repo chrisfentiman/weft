@@ -1833,7 +1833,7 @@ fn build_response(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use weft_commands::{CommandError, CommandRegistry};
     use weft_core::{
@@ -1843,8 +1843,8 @@ mod tests {
         WeftConfig, WireFormat,
     };
     use weft_llm::{
-        ChatCompletionOutput, Provider, ProviderError, ProviderRegistry, ProviderRequest,
-        ProviderResponse, TokenUsage,
+        Capability, ChatCompletionOutput, Provider, ProviderError, ProviderRegistry,
+        ProviderRequest, ProviderResponse, TokenUsage,
     };
     use weft_router::{
         RouterError, RoutingCandidate, RoutingDecision, RoutingDomainKind, ScoredCandidate,
@@ -2324,6 +2324,18 @@ mod tests {
         }
     }
 
+    /// Build a default-only capabilities map for a single model (chat_completions).
+    fn default_caps(model_name: &str) -> HashMap<String, HashSet<Capability>> {
+        let mut caps = HashMap::new();
+        caps.insert(
+            model_name.to_string(),
+            [Capability::new(Capability::CHAT_COMPLETIONS)]
+                .into_iter()
+                .collect(),
+        );
+        caps
+    }
+
     /// Build a single-model `ProviderRegistry` backed by the given provider.
     fn single_model_registry(
         provider: impl Provider + 'static,
@@ -2343,6 +2355,7 @@ mod tests {
             providers,
             model_ids,
             max_tokens,
+            default_caps(model_name),
             model_name.to_string(),
         ))
     }
@@ -2367,10 +2380,25 @@ mod tests {
         let mut max_tokens = HashMap::new();
         max_tokens.insert("default-model".to_string(), 1024u32);
         max_tokens.insert("complex-model".to_string(), 4096u32);
+        // Both models support chat_completions for testing purposes.
+        let mut caps: HashMap<String, HashSet<Capability>> = HashMap::new();
+        caps.insert(
+            "default-model".to_string(),
+            [Capability::new(Capability::CHAT_COMPLETIONS)]
+                .into_iter()
+                .collect(),
+        );
+        caps.insert(
+            "complex-model".to_string(),
+            [Capability::new(Capability::CHAT_COMPLETIONS)]
+                .into_iter()
+                .collect(),
+        );
         Arc::new(ProviderRegistry::new(
             providers,
             model_ids,
             max_tokens,
+            caps,
             "default-model".to_string(),
         ))
     }
@@ -2933,10 +2961,26 @@ mod tests {
         max_tokens_map.insert("default-model".to_string(), 1024u32);
         max_tokens_map.insert("complex-model".to_string(), 4096u32);
 
+        // Both models support chat_completions for this test.
+        let mut caps_map: HashMap<String, HashSet<Capability>> = HashMap::new();
+        caps_map.insert(
+            "default-model".to_string(),
+            [Capability::new(Capability::CHAT_COMPLETIONS)]
+                .into_iter()
+                .collect(),
+        );
+        caps_map.insert(
+            "complex-model".to_string(),
+            [Capability::new(Capability::CHAT_COMPLETIONS)]
+                .into_iter()
+                .collect(),
+        );
+
         let registry = Arc::new(ProviderRegistry::new(
             providers,
             model_ids,
             max_tokens_map,
+            caps_map,
             "default-model".to_string(),
         ));
 
