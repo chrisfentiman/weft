@@ -2,7 +2,7 @@
 //!
 //! Assembles the system prompt from three parts (in order):
 //! 1. Weft foundational prompt (slash command format tutorial)
-//! 2. Command stubs section (filtered commands in TOON fenced block)
+//! 2. Command stubs section (dash-list of commands with "Use when..." trigger conditions)
 //! 3. Agent system prompt (from gateway config)
 
 use weft_core::{
@@ -12,36 +12,33 @@ use weft_core::{
 
 /// The foundational system prompt that teaches the LLM the slash command format.
 ///
-/// `{command_stubs_toon}` is a placeholder replaced at runtime with a fenced TOON
-/// block containing the semantically-selected command stubs.
-const FOUNDATIONAL_PROMPT_TEMPLATE: &str = r#"You have access to commands. To use a command, write it as a slash command with TOON arguments:
+/// `{command_stubs}` is a placeholder replaced at runtime with a dash-list of
+/// available commands, each formatted as `- /name — Use when <description>`.
+const FOUNDATIONAL_PROMPT_TEMPLATE: &str = r#"You have commands available that provide specialized capabilities and actions.
 
-/command_name key: value, key2: "value with spaces"
+When users ask you to perform tasks, check if any of the available commands match. Commands provide capabilities beyond your training data.
 
-Arguments are key-value pairs. Quote values containing spaces or commas. Numbers and booleans are unquoted. Arrays use brackets: [a, b, c].
+When a command matches the user request, this is a BLOCKING REQUIREMENT: call the relevant command BEFORE generating any other response about the task. NEVER mention a command without actually calling it.
 
-For many arguments, use multiple lines (indent with spaces):
+How to call a command:
+- /command_name key: value, key2: "quoted value"
+- Examples:
+  - /some_command target: "example value"
+  - /another_command id: 42, verbose: true
+  - /third_command query: "multi word search"
 
-/command_name
-  key: value
-  key2: "long value here"
+How to learn about a command before using it:
+- /command_name --describe
 
-To learn more about a command before using it:
+Available commands:
 
-/command_name --describe
+{command_stubs}
 
-{command_stubs_toon}
+If no command matches the request, respond directly. Do not explain or apologize about commands."#;
 
-Rules:
-- Only use commands listed above.
-- Arguments use TOON format (key: value pairs), not JSON.
-- You may use multiple commands in a single response.
-- Text outside of slash commands is your response to the user.
-- Wait for command results before drawing conclusions from them."#;
-
-/// Assemble the full system prompt with command stubs injected as a TOON fenced block.
+/// Assemble the full system prompt with command stubs injected as a dash-list.
 ///
-/// Order: foundational prompt (with fenced TOON command stubs) + agent system prompt.
+/// Order: foundational prompt (with dash-list command stubs) + agent system prompt.
 ///
 /// # Arguments
 /// - `selected_commands`: The semantically-filtered list of command stubs to inject.
@@ -50,18 +47,15 @@ pub fn assemble_system_prompt(
     selected_commands: &[CommandStub],
     agent_system_prompt: &str,
 ) -> String {
-    // Build TOON command stubs section
-    let rows: Vec<Vec<String>> = selected_commands
+    // Build dash-list command stubs: `- /name — Use when <description>`
+    let command_stubs: String = selected_commands
         .iter()
-        .map(|cmd| vec![cmd.name.clone(), cmd.description.clone()])
-        .collect();
-
-    let table = serialize_table("commands", &["name", "description"], &rows);
-    let command_stubs_toon = fenced_toon(&table);
+        .map(|cmd| format!("- /{} \u{2014} Use when {}", cmd.name, cmd.description))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     // Replace the placeholder in the foundational prompt
-    let foundational =
-        FOUNDATIONAL_PROMPT_TEMPLATE.replace("{command_stubs_toon}", &command_stubs_toon);
+    let foundational = FOUNDATIONAL_PROMPT_TEMPLATE.replace("{command_stubs}", &command_stubs);
 
     // Concatenate foundational + agent prompt
     if agent_system_prompt.trim().is_empty() {
@@ -128,25 +122,24 @@ mod tests {
     fn test_system_prompt_contains_foundational_and_agent() {
         let stubs = vec![make_stub(
             "web_search",
-            "Search the web for current information",
+            "search the web for current information",
         )];
         let agent_prompt = "You are a helpful assistant.";
         let prompt = assemble_system_prompt(&stubs, agent_prompt);
 
         // Contains foundational preamble
-        assert!(prompt.contains("You have access to commands"));
-        assert!(prompt.contains("/command_name key: value"));
+        assert!(prompt.contains("You have commands available"));
+        assert!(prompt.contains("BLOCKING REQUIREMENT"));
         assert!(prompt.contains("--describe"));
 
-        // Contains fenced TOON block
-        assert!(prompt.contains("```toon"));
+        // Contains command in dash-list format
         assert!(prompt.contains("web_search"));
 
         // Contains agent prompt after foundational
         assert!(prompt.contains("You are a helpful assistant."));
 
         // Order: foundational before agent
-        let foundational_pos = prompt.find("You have access to commands").unwrap();
+        let foundational_pos = prompt.find("You have commands available").unwrap();
         let agent_pos = prompt.find("You are a helpful assistant.").unwrap();
         assert!(
             foundational_pos < agent_pos,
@@ -155,77 +148,81 @@ mod tests {
     }
 
     #[test]
-    fn test_system_prompt_toon_format_for_command_stubs() {
+    fn test_system_prompt_dash_list_format_for_command_stubs() {
         let stubs = vec![
-            make_stub("web_search", "Search the web for current information"),
-            make_stub("code_review", "Review code for issues and improvements"),
+            make_stub("web_search", "search the web for current information"),
+            make_stub("code_review", "review code for issues and improvements"),
         ];
         let prompt = assemble_system_prompt(&stubs, "");
 
-        // TOON array format: label[N]{fields}:
-        assert!(prompt.contains("commands[2]{name, description}:"));
-        assert!(prompt.contains("web_search"));
-        assert!(prompt.contains("code_review"));
-        // Wrapped in fenced block
-        assert!(prompt.contains("```toon"));
+        // Dash-list format: `- /name — Use when <description>`
+        assert!(
+            prompt
+                .contains("- /web_search \u{2014} Use when search the web for current information")
+        );
+        assert!(
+            prompt.contains(
+                "- /code_review \u{2014} Use when review code for issues and improvements"
+            )
+        );
+        // No TOON fenced blocks for command stubs
+        assert!(!prompt.contains("commands[2]{name, description}:"));
     }
 
     #[test]
-    fn test_system_prompt_no_commands_shows_empty_toon() {
+    fn test_system_prompt_no_commands_shows_empty_stubs() {
         let prompt = assemble_system_prompt(&[], "Do something.");
 
-        // Empty table still has the array header
-        assert!(prompt.contains("commands[0]{name, description}:"));
-        // Still in a fenced block
-        assert!(prompt.contains("```toon"));
+        // No TOON table — placeholder replaced with empty string
+        assert!(!prompt.contains("commands[0]{name, description}:"));
+        // Still contains the "Available commands:" header
+        assert!(prompt.contains("Available commands:"));
     }
 
     #[test]
     fn test_system_prompt_empty_agent_prompt() {
-        let stubs = vec![make_stub("recall", "Retrieve memory")];
+        let stubs = vec![make_stub("recall", "retrieve memory")];
         let prompt = assemble_system_prompt(&stubs, "");
 
         // Should still produce valid prompt with foundational content
-        assert!(prompt.contains("You have access to commands"));
+        assert!(prompt.contains("You have commands available"));
         assert!(!prompt.ends_with("\n\n")); // No double-newline at end
     }
 
     #[test]
-    fn test_system_prompt_contains_toon_argument_instructions() {
+    fn test_system_prompt_contains_call_syntax_examples() {
         let prompt = assemble_system_prompt(&[], "");
 
-        // The foundational prompt must teach TOON argument syntax
-        assert!(prompt.contains("key: value, key2:"));
-        assert!(prompt.contains("Numbers and booleans are unquoted"));
-        assert!(prompt.contains("Arrays use brackets"));
+        // The foundational prompt must show call syntax with key: value pairs
+        assert!(prompt.contains("key: value, key2: \"quoted value\""));
+        assert!(prompt.contains("NEVER mention a command without actually calling it"));
     }
 
     #[test]
-    fn test_system_prompt_contains_rules_section() {
+    fn test_system_prompt_contains_blocking_requirement() {
         let prompt = assemble_system_prompt(&[], "");
 
-        // Rules section must be present
-        assert!(prompt.contains("Rules:"));
-        assert!(prompt.contains("Only use commands listed above"));
-        assert!(prompt.contains("Arguments use TOON format"));
-        assert!(prompt.contains("Text outside of slash commands is your response to the user"));
+        // Must have BLOCKING REQUIREMENT language
+        assert!(prompt.contains("BLOCKING REQUIREMENT"));
+        assert!(prompt.contains("NEVER mention a command without actually calling it"));
     }
 
     #[test]
-    fn test_system_prompt_fenced_block_format() {
-        let stubs = vec![make_stub("web_search", "Search the web")];
+    fn test_system_prompt_no_toon_jargon_in_stubs() {
+        let stubs = vec![make_stub("web_search", "search the web")];
         let prompt = assemble_system_prompt(&stubs, "");
-        // Fenced block must open and close correctly
-        assert!(prompt.contains("```toon\n"));
-        assert!(prompt.contains("\n```"));
+        // Command stubs section must not use TOON fenced blocks
+        assert!(!prompt.contains("```toon"));
+        // But command stubs show in dash-list format
+        assert!(prompt.contains("- /web_search \u{2014} Use when search the web"));
     }
 
     #[test]
-    fn test_system_prompt_command_rows_indented() {
-        let stubs = vec![make_stub("web_search", "Search the web")];
+    fn test_system_prompt_use_when_trigger_conditions() {
+        let stubs = vec![make_stub("web_search", "search the web")];
         let prompt = assemble_system_prompt(&stubs, "");
-        // Rows in TOON array syntax are 2-space indented
-        assert!(prompt.contains("  web_search, Search the web"));
+        // "Use when" trigger condition must appear before each command description
+        assert!(prompt.contains("Use when search the web"));
     }
 
     // ── assemble_system_prompt_no_tools ───────────────────────────────────

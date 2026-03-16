@@ -1672,14 +1672,14 @@ mod tests {
             .expect("should succeed");
 
         let captured = capture.captured.lock().unwrap().clone().unwrap_or_default();
-        // Commands must be injected
+        // Commands must be injected in dash-list format with "Use when" trigger conditions
         assert!(
-            captured.contains("```toon"),
-            "system prompt must contain toon block when tools are needed"
+            captured.contains("- /web_search \u{2014} Use when Search the web"),
+            "system prompt must contain dash-list command stubs when tools are needed"
         );
         assert!(
-            captured.contains("web_search"),
-            "system prompt must contain command stubs when tools are needed"
+            captured.contains("BLOCKING REQUIREMENT"),
+            "system prompt must contain blocking requirement language when tools are needed"
         );
     }
 
@@ -1869,10 +1869,19 @@ mod tests {
         }];
         let prompt = assemble_system_prompt(&stubs, "You are a helpful assistant.");
 
-        assert!(prompt.contains("```toon"), "must use fenced TOON blocks");
+        // Command stubs use dash-list format with "Use when" trigger conditions,
+        // not TOON fenced blocks — TOON is reserved for results injection only.
         assert!(
-            prompt.contains("commands[1]{name, description}:"),
-            "must use TOON typed array syntax"
+            prompt.contains("- /web_search \u{2014} Use when Search the web"),
+            "must use dash-list format with Use when trigger condition"
+        );
+        assert!(
+            prompt.contains("BLOCKING REQUIREMENT"),
+            "must include blocking requirement language"
+        );
+        assert!(
+            !prompt.contains("commands[1]{name, description}:"),
+            "must not use TOON array syntax for command stubs"
         );
     }
 
