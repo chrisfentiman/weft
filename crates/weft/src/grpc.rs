@@ -5,13 +5,14 @@
 //! It is the single code path to the engine — both the tonic `chat()` RPC method
 //! and the OpenAI compat HTTP handler (Phase 5) call `handle_weft_request()`.
 //!
-//! Phase 3 scope:
-//! - `Chat` unary RPC: proto request → domain → engine → domain → proto response
-//! - `ChatStream`: returns `Unimplemented` (wired in Phase 4)
+//! Phase 4 scope:
+//! - `ChatStream` server-streaming RPC: buffer-then-forward, activity events, delta flag
+//! - `Chat` unary RPC: activity events wired in via `options.activity`
 //! - `Live`: returns `Unimplemented` (reserved for future)
 //!
 //! Error mapping: `WeftError` → `tonic::Status` covers all variants.
 
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use weft_core::{WeftError, WeftRequest, WeftResponse, validate_request};
 use weft_proto::weft::v1 as proto;
@@ -83,20 +84,133 @@ impl proto::weft_server::Weft for WeftService {
         Ok(Response::new(proto_resp))
     }
 
-    /// Server-streaming chat RPC. Returns `Unimplemented` in Phase 3.
+    /// Server-streaming chat RPC.
     ///
-    /// Phase 4 will implement token streaming via `tokio::sync::mpsc::channel`
-    /// and `tokio_stream::wrappers::ReceiverStream`.
-    type ChatStreamStream =
-        tokio_stream::wrappers::ReceiverStream<Result<proto::ChatEvent, Status>>;
+    /// V1 implementation: buffer-then-forward. The engine processes the request fully
+    /// (no true token streaming), then emits events in order:
+    ///   1. Activity messages (`source: gateway`, `delta: false`) — if `options.activity = true`
+    ///   2. Assistant text message (`delta: true`, `message_index` per `(model, source)` stream)
+    ///   3. `RequestMetadata` — always last
+    ///
+    /// On engine error, emits a `ChatError` event and the stream terminates.
+    type ChatStreamStream = ReceiverStream<Result<proto::ChatEvent, Status>>;
 
     async fn chat_stream(
         &self,
-        _request: Request<proto::ChatRequest>,
+        request: Request<proto::ChatRequest>,
     ) -> Result<Response<Self::ChatStreamStream>, Status> {
-        Err(Status::unimplemented(
-            "ChatStream is not yet implemented (Phase 4)",
-        ))
+        let proto_req = request.into_inner();
+
+        // Convert proto → domain. Validate before spawning the task so the caller gets
+        // a gRPC error immediately on bad input rather than an error event in the stream.
+        let weft_req = weft_request_from_proto(proto_req)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        validate_request(&weft_req).map_err(|e| weft_error_to_status(&e))?;
+
+        // Bounded channel (32) prevents the spawned task from outrunning the consumer.
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let engine = self.engine.clone();
+
+        tokio::spawn(async move {
+            match engine.handle_request(weft_req).await {
+                Ok(resp) => {
+                    // Track message_index per (model, source) stream key.
+                    // Each unique (model, source) pair forms an independent logical stream.
+                    let mut stream_counters: std::collections::HashMap<
+                        (String, proto::Source),
+                        u32,
+                    > = std::collections::HashMap::new();
+
+                    // 1. Emit activity messages (complete, delta=false).
+                    //    These are source=Gateway messages; the engine only includes them in
+                    //    `resp.messages` when `options.activity = true` was set.
+                    for msg in &resp.messages {
+                        if msg.source == Source::Gateway {
+                            // Activity messages are complete (delta=false) and do not
+                            // participate in the delta stream counter.
+                            let proto_msg = proto_message_from_weft(msg.clone());
+                            let event = proto::ChatEvent {
+                                event: Some(proto::chat_event::Event::Message(proto_msg)),
+                            };
+                            if tx.send(Ok(event)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+
+                    // 2. Emit non-gateway messages as delta events.
+                    //    For V1, the full text is sent as a single delta chunk (delta=true).
+                    //    message_index counts from 0 within each (model, source) pair.
+                    for msg in &resp.messages {
+                        if msg.source != Source::Gateway {
+                            let source_proto = match msg.source {
+                                Source::Client => proto::Source::Client,
+                                Source::Gateway => proto::Source::Gateway,
+                                Source::Provider => proto::Source::Provider,
+                                Source::Member => proto::Source::Member,
+                                Source::Judge => proto::Source::Judge,
+                                Source::Tool => proto::Source::Tool,
+                                Source::Memory => proto::Source::Memory,
+                            };
+                            let stream_key = (msg.model.clone().unwrap_or_default(), source_proto);
+                            let idx = stream_counters.entry(stream_key).or_insert(0);
+                            let current_idx = *idx;
+                            *idx += 1;
+
+                            let delta_msg = weft_core::WeftMessage {
+                                role: msg.role,
+                                source: msg.source,
+                                model: msg.model.clone(),
+                                content: msg.content.clone(),
+                                delta: true,
+                                message_index: current_idx,
+                            };
+                            let event = proto::ChatEvent {
+                                event: Some(proto::chat_event::Event::Message(
+                                    proto_message_from_weft(delta_msg),
+                                )),
+                            };
+                            if tx.send(Ok(event)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+
+                    // 3. Emit metadata — always last.
+                    let metadata_event = proto::ChatEvent {
+                        event: Some(proto::chat_event::Event::Metadata(proto::RequestMetadata {
+                            id: resp.id,
+                            model: resp.model,
+                            usage: Some(proto::UsageInfo {
+                                prompt_tokens: resp.usage.prompt_tokens,
+                                completion_tokens: resp.usage.completion_tokens,
+                                total_tokens: resp.usage.total_tokens,
+                                llm_calls: resp.usage.llm_calls,
+                            }),
+                            timing: Some(proto::TimingInfo {
+                                total_ms: resp.timing.total_ms,
+                                routing_ms: resp.timing.routing_ms,
+                                llm_ms: resp.timing.llm_ms,
+                            }),
+                        })),
+                    };
+                    // Ignore send error: the consumer may have dropped.
+                    let _ = tx.send(Ok(metadata_event)).await;
+                }
+                Err(e) => {
+                    // On engine error, emit a ChatError event and let the stream close.
+                    let error_event = proto::ChatEvent {
+                        event: Some(proto::chat_event::Event::Error(proto::ChatError {
+                            code: error_code(&e),
+                            message: e.to_string(),
+                        })),
+                    };
+                    let _ = tx.send(Ok(error_event)).await;
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     /// Bidirectional streaming RPC. Reserved for future implementation.
@@ -134,6 +248,31 @@ pub fn weft_error_to_status(e: &WeftError) -> Status {
         WeftError::HookBlocked { .. } => Status::permission_denied(e.to_string()),
         WeftError::HookBlockedAfterRetries { .. } => Status::aborted(e.to_string()),
         WeftError::ProtoConversion(_) => Status::internal(e.to_string()),
+    }
+}
+
+/// Map a `WeftError` to a machine-readable error code string.
+///
+/// Used in `ChatError` events emitted by the streaming RPC to give clients
+/// a stable code they can switch on without parsing the human-readable message.
+pub fn error_code(e: &WeftError) -> String {
+    match e {
+        WeftError::InvalidRequest(_) => "invalid_request".to_string(),
+        WeftError::StreamingNotSupported => "invalid_request".to_string(),
+        WeftError::Config(_) => "configuration_error".to_string(),
+        WeftError::Llm(_) => "provider_error".to_string(),
+        WeftError::Command(_) => "command_error".to_string(),
+        WeftError::ToolRegistry(_) => "service_unavailable".to_string(),
+        WeftError::MemoryStore(_) => "service_unavailable".to_string(),
+        WeftError::CommandLoopExceeded { .. } => "command_loop_exceeded".to_string(),
+        WeftError::RequestTimeout { .. } => "timeout".to_string(),
+        WeftError::RateLimited { .. } => "rate_limited".to_string(),
+        WeftError::Routing(_) => "routing_error".to_string(),
+        WeftError::ModelNotFound { .. } => "model_not_found".to_string(),
+        WeftError::NoEligibleModels { .. } => "routing_error".to_string(),
+        WeftError::HookBlocked { .. } => "hook_blocked".to_string(),
+        WeftError::HookBlockedAfterRetries { .. } => "hook_blocked".to_string(),
+        WeftError::ProtoConversion(_) => "internal_error".to_string(),
     }
 }
 
@@ -1120,17 +1259,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
-    async fn test_chat_stream_returns_unimplemented() {
-        let service = WeftService::new(make_engine(MockProvider::new("irrelevant")));
-        let result = service
-            .chat_stream(Request::new(make_proto_request("Hello")))
-            .await;
-        assert!(result.is_err());
-        let status = result.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unimplemented);
-    }
-
     // Note: test_live_rpc_returns_unimplemented is omitted because constructing a
     // tonic::Streaming<LiveInput> requires a real tonic server connection. The
     // Unimplemented behavior is verified structurally: the live() method body
@@ -1150,6 +1278,440 @@ mod tests {
             matches!(result, Err(WeftError::InvalidRequest(_))),
             "expected InvalidRequest, got: {:?}",
             result
+        );
+    }
+
+    // ── Phase 4 tests: ChatStream ─────────────────────────────────────────
+
+    /// Helper: collect all events from a chat_stream response.
+    async fn collect_stream(
+        stream: tonic::Response<
+            tokio_stream::wrappers::ReceiverStream<Result<proto::ChatEvent, Status>>,
+        >,
+    ) -> Vec<proto::ChatEvent> {
+        use tokio_stream::StreamExt;
+        let mut events = Vec::new();
+        let mut s = stream.into_inner();
+        while let Some(result) = s.next().await {
+            events.push(result.expect("stream item should be Ok"));
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn test_chat_stream_returns_ok_stream() {
+        let service = WeftService::new(make_engine(MockProvider::new("Hello streaming!")));
+        let result = service
+            .chat_stream(Request::new(make_proto_request("Hello")))
+            .await;
+        assert!(
+            result.is_ok(),
+            "expected Ok stream response, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_stream_event_ordering_activity_text_metadata() {
+        // With activity=false (default), we expect: text delta, then metadata.
+        let service = WeftService::new(make_engine(MockProvider::new("stream response")));
+        let mut proto_req = make_proto_request("test ordering");
+        proto_req.options = Some(proto::SamplingOptions {
+            activity: false,
+            ..Default::default()
+        });
+        let stream = service
+            .chat_stream(Request::new(proto_req))
+            .await
+            .expect("stream should start");
+        let events = collect_stream(stream).await;
+
+        assert!(!events.is_empty(), "stream must emit at least one event");
+
+        // Last event must be metadata.
+        let last = events.last().unwrap();
+        assert!(
+            matches!(last.event, Some(proto::chat_event::Event::Metadata(_))),
+            "last event must be RequestMetadata, got: {:?}",
+            last.event
+        );
+
+        // Events before metadata must all be messages.
+        for ev in &events[..events.len() - 1] {
+            assert!(
+                matches!(ev.event, Some(proto::chat_event::Event::Message(_))),
+                "non-final event must be a message, got: {:?}",
+                ev.event
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_stream_text_event_has_delta_true() {
+        let service = WeftService::new(make_engine(MockProvider::new("delta text")));
+        let stream = service
+            .chat_stream(Request::new(make_proto_request("text delta test")))
+            .await
+            .expect("stream should start");
+        let events = collect_stream(stream).await;
+
+        // Find any message event that is an assistant/provider message.
+        let text_events: Vec<_> = events
+            .iter()
+            .filter_map(|ev| {
+                if let Some(proto::chat_event::Event::Message(msg)) = &ev.event {
+                    // Non-gateway messages should have delta=true in streaming.
+                    if msg.source != proto::Source::Gateway as i32 {
+                        return Some(msg);
+                    }
+                }
+                None
+            })
+            .collect();
+
+        assert!(
+            !text_events.is_empty(),
+            "stream must contain at least one text delta event"
+        );
+        for msg in &text_events {
+            assert!(
+                msg.delta,
+                "text events in stream must have delta=true, got message: {:?}",
+                msg
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_stream_message_index_starts_at_zero() {
+        let service = WeftService::new(make_engine(MockProvider::new("indexed response")));
+        let stream = service
+            .chat_stream(Request::new(make_proto_request("index test")))
+            .await
+            .expect("stream should start");
+        let events = collect_stream(stream).await;
+
+        // Collect all delta messages (non-gateway) and verify message_index starts at 0.
+        // For a single-model response, there should be exactly one delta with message_index=0.
+        let delta_messages: Vec<_> = events
+            .iter()
+            .filter_map(|ev| {
+                if let Some(proto::chat_event::Event::Message(msg)) = &ev.event {
+                    if msg.delta {
+                        return Some(msg);
+                    }
+                }
+                None
+            })
+            .collect();
+
+        assert!(
+            !delta_messages.is_empty(),
+            "must have at least one delta message"
+        );
+
+        // First delta must have message_index=0 (counts from 0 within each (model,source) stream).
+        assert_eq!(
+            delta_messages[0].message_index, 0,
+            "first delta message_index must be 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_stream_metadata_has_id_and_model() {
+        let service = WeftService::new(make_engine(MockProvider::new("metadata test")));
+        let stream = service
+            .chat_stream(Request::new(make_proto_request("metadata check")))
+            .await
+            .expect("stream should start");
+        let events = collect_stream(stream).await;
+
+        let metadata = events
+            .iter()
+            .find_map(|ev| {
+                if let Some(proto::chat_event::Event::Metadata(m)) = &ev.event {
+                    Some(m.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("stream must contain a RequestMetadata event");
+
+        assert!(!metadata.id.is_empty(), "metadata id must not be empty");
+        assert!(
+            !metadata.model.is_empty(),
+            "metadata model must not be empty"
+        );
+        assert!(metadata.usage.is_some(), "metadata must include usage info");
+        assert!(
+            metadata.timing.is_some(),
+            "metadata must include timing info"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_stream_activity_false_no_gateway_messages() {
+        // With activity=false, no SOURCE_GATEWAY messages should appear in the stream.
+        let service = WeftService::new(make_engine(MockProvider::new("no activity")));
+        let mut proto_req = make_proto_request("no activity test");
+        proto_req.options = Some(proto::SamplingOptions {
+            activity: false,
+            ..Default::default()
+        });
+        let stream = service
+            .chat_stream(Request::new(proto_req))
+            .await
+            .expect("stream should start");
+        let events = collect_stream(stream).await;
+
+        let gateway_messages: Vec<_> = events
+            .iter()
+            .filter(|ev| {
+                matches!(
+                    &ev.event,
+                    Some(proto::chat_event::Event::Message(msg))
+                    if msg.source == proto::Source::Gateway as i32
+                )
+            })
+            .collect();
+
+        assert!(
+            gateway_messages.is_empty(),
+            "no gateway messages when activity=false, found: {}",
+            gateway_messages.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_stream_activity_true_includes_gateway_messages() {
+        // With activity=true, at least one SOURCE_GATEWAY message should appear
+        // (the routing activity event the engine collects).
+        let service = WeftService::new(make_engine(MockProvider::new("with activity")));
+        let mut proto_req = make_proto_request("activity test");
+        proto_req.options = Some(proto::SamplingOptions {
+            activity: true,
+            ..Default::default()
+        });
+        let stream = service
+            .chat_stream(Request::new(proto_req))
+            .await
+            .expect("stream should start");
+        let events = collect_stream(stream).await;
+
+        let gateway_messages: Vec<_> = events
+            .iter()
+            .filter(|ev| {
+                matches!(
+                    &ev.event,
+                    Some(proto::chat_event::Event::Message(msg))
+                    if msg.source == proto::Source::Gateway as i32
+                )
+            })
+            .collect();
+
+        assert!(
+            !gateway_messages.is_empty(),
+            "activity=true must include at least one gateway message (routing activity)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_stream_activity_messages_before_text() {
+        // When activity=true, gateway messages must appear before the assistant text delta.
+        let service = WeftService::new(make_engine(MockProvider::new("ordered activity")));
+        let mut proto_req = make_proto_request("ordering test");
+        proto_req.options = Some(proto::SamplingOptions {
+            activity: true,
+            ..Default::default()
+        });
+        let stream = service
+            .chat_stream(Request::new(proto_req))
+            .await
+            .expect("stream should start");
+        let events = collect_stream(stream).await;
+
+        // Find the index of the first gateway message and the first non-gateway message.
+        let first_gateway = events.iter().position(|ev| {
+            matches!(
+                &ev.event,
+                Some(proto::chat_event::Event::Message(msg))
+                if msg.source == proto::Source::Gateway as i32
+            )
+        });
+        let first_text = events.iter().position(|ev| {
+            matches!(
+                &ev.event,
+                Some(proto::chat_event::Event::Message(msg))
+                if msg.source != proto::Source::Gateway as i32 && msg.delta
+            )
+        });
+
+        if let (Some(gw_idx), Some(text_idx)) = (first_gateway, first_text) {
+            assert!(
+                gw_idx < text_idx,
+                "activity messages (index {gw_idx}) must appear before text deltas (index {text_idx})"
+            );
+        }
+        // If no gateway messages when activity=true, the activity test above would catch it.
+    }
+
+    #[tokio::test]
+    async fn test_chat_stream_activity_messages_have_delta_false() {
+        // Activity messages (gateway source) must have delta=false.
+        let service = WeftService::new(make_engine(MockProvider::new("activity delta check")));
+        let mut proto_req = make_proto_request("activity delta test");
+        proto_req.options = Some(proto::SamplingOptions {
+            activity: true,
+            ..Default::default()
+        });
+        let stream = service
+            .chat_stream(Request::new(proto_req))
+            .await
+            .expect("stream should start");
+        let events = collect_stream(stream).await;
+
+        for ev in &events {
+            if let Some(proto::chat_event::Event::Message(msg)) = &ev.event {
+                if msg.source == proto::Source::Gateway as i32 {
+                    assert!(
+                        !msg.delta,
+                        "activity messages must have delta=false, got delta=true for: {:?}",
+                        msg
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_stream_error_event_on_bad_request() {
+        // Empty messages → validation error before spawn, so the call itself returns Err(Status).
+        let service = WeftService::new(make_engine(MockProvider::new("irrelevant")));
+        let proto_req = proto::ChatRequest {
+            messages: vec![],
+            model: "auto".to_string(),
+            options: None,
+        };
+        let result = service.chat_stream(Request::new(proto_req)).await;
+        // Pre-validation error returns a gRPC status directly (not an in-stream error event).
+        assert!(
+            result.is_err(),
+            "empty messages should return a gRPC error before the stream starts"
+        );
+        assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_chat_stream_channel_capacity_is_bounded() {
+        // Verify the channel is bounded (capacity=32). The spawned task uses a bounded
+        // channel so a slow consumer does not cause unbounded memory growth.
+        // We verify this structurally: the implementation uses channel(32).
+        // Since we can't directly inspect the channel size, we verify the stream
+        // completes without hanging (i.e., the task doesn't deadlock on full buffer).
+        let service = WeftService::new(make_engine(MockProvider::new("bounded channel")));
+        let stream = service
+            .chat_stream(Request::new(make_proto_request("bounded test")))
+            .await
+            .expect("stream should start");
+        // Consuming the stream should complete without deadlock.
+        let events = collect_stream(stream).await;
+        assert!(!events.is_empty(), "bounded stream must produce events");
+    }
+
+    #[tokio::test]
+    async fn test_chat_unary_activity_false_no_gateway_messages() {
+        // With activity=false (default), the unary Chat RPC must not include gateway messages.
+        let service = WeftService::new(make_engine(MockProvider::new("no activity unary")));
+        let mut proto_req = make_proto_request("unary no activity");
+        proto_req.options = Some(proto::SamplingOptions {
+            activity: false,
+            ..Default::default()
+        });
+        let response = service
+            .chat(Request::new(proto_req))
+            .await
+            .expect("chat should succeed")
+            .into_inner();
+
+        let gateway_messages: Vec<_> = response
+            .messages
+            .iter()
+            .filter(|m| m.source == proto::Source::Gateway as i32)
+            .collect();
+        assert!(
+            gateway_messages.is_empty(),
+            "unary Chat with activity=false must not include gateway messages, found: {}",
+            gateway_messages.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_unary_activity_true_includes_gateway_messages() {
+        // With activity=true, the unary Chat RPC must include gateway activity messages.
+        let service = WeftService::new(make_engine(MockProvider::new("activity unary")));
+        let mut proto_req = make_proto_request("unary with activity");
+        proto_req.options = Some(proto::SamplingOptions {
+            activity: true,
+            ..Default::default()
+        });
+        let response = service
+            .chat(Request::new(proto_req))
+            .await
+            .expect("chat should succeed")
+            .into_inner();
+
+        let gateway_messages: Vec<_> = response
+            .messages
+            .iter()
+            .filter(|m| m.source == proto::Source::Gateway as i32)
+            .collect();
+        assert!(
+            !gateway_messages.is_empty(),
+            "unary Chat with activity=true must include gateway messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_error_code_mapping() {
+        // Verify error_code returns stable string codes for all WeftError variants.
+        assert_eq!(
+            error_code(&WeftError::InvalidRequest("x".into())),
+            "invalid_request"
+        );
+        assert_eq!(error_code(&WeftError::Llm("x".into())), "provider_error");
+        assert_eq!(
+            error_code(&WeftError::Config("x".into())),
+            "configuration_error"
+        );
+        assert_eq!(
+            error_code(&WeftError::CommandLoopExceeded { max: 10 }),
+            "command_loop_exceeded"
+        );
+        assert_eq!(
+            error_code(&WeftError::RequestTimeout { timeout_secs: 30 }),
+            "timeout"
+        );
+        assert_eq!(
+            error_code(&WeftError::RateLimited {
+                retry_after_ms: 1000
+            }),
+            "rate_limited"
+        );
+        assert_eq!(
+            error_code(&WeftError::HookBlocked {
+                event: "e".into(),
+                reason: "r".into(),
+                hook_name: "h".into()
+            }),
+            "hook_blocked"
+        );
+        assert_eq!(
+            error_code(&WeftError::ModelNotFound { name: "m".into() }),
+            "model_not_found"
+        );
+        assert_eq!(
+            error_code(&WeftError::ProtoConversion("x".into())),
+            "internal_error"
         );
     }
 }

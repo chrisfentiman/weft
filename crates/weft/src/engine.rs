@@ -27,6 +27,13 @@
 //!       - [HOOK: PostToolUse] — can modify result
 //! 8. Build HTTP response, return
 //! 9. [HOOK: RequestEnd] — fire-and-forget (semaphore-gated)
+//!
+//! ## Activity events (Phase 4)
+//!
+//! When `options.activity = true`, the engine collects routing decisions and hook
+//! events as `ActivityEvent` values during processing and includes them as
+//! `source: gateway` system messages in the response. See `ActivityEvent` and
+//! `assemble_response`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -57,6 +64,42 @@ use weft_core::HookEvent;
 
 /// Built-in command names intercepted by the engine before the command registry.
 const BUILTIN_COMMANDS: &[&str] = &["recall", "remember"];
+
+// ── Activity events ───────────────────────────────────────────────────────────
+
+/// An activity event collected during request processing.
+///
+/// When `options.activity = true`, these are converted to `source: gateway`
+/// system messages and prepended to the response message list.
+/// `Hook` and `CouncilStart` variants are wired in future phases (hook firing
+/// and council mode respectively) — defined here so the types are ready.
+#[derive(Debug, Clone)]
+pub(crate) enum ActivityEvent {
+    Routing(weft_core::RoutingActivity),
+    #[allow(dead_code)]
+    Hook(weft_core::HookActivity),
+    #[allow(dead_code)]
+    CouncilStart(weft_core::CouncilStartActivity),
+}
+
+impl ActivityEvent {
+    /// Convert this activity event to a `WeftMessage` with `source: Gateway`.
+    pub(crate) fn to_message(&self) -> WeftMessage {
+        let content = match self {
+            ActivityEvent::Routing(r) => ContentPart::Routing(r.clone()),
+            ActivityEvent::Hook(h) => ContentPart::Hook(h.clone()),
+            ActivityEvent::CouncilStart(c) => ContentPart::CouncilStart(c.clone()),
+        };
+        WeftMessage {
+            role: Role::System,
+            source: Source::Gateway,
+            model: None,
+            content: vec![content],
+            delta: false,
+            message_index: 0,
+        }
+    }
+}
 
 /// Convert from router's `RoutingDomainKind` to hooks' `HookRoutingDomain`.
 ///
@@ -312,7 +355,18 @@ impl GatewayEngine {
             .await?;
 
         // Unpack the routing result.
-        let (selected_commands, inject_tools, selected_model_name, hook_context) = routing_result;
+        let (
+            selected_commands,
+            inject_tools,
+            selected_model_name,
+            hook_context,
+            routing_activity_events,
+        ) = routing_result;
+
+        // Collect activity events for the response.
+        // Routing events are always gathered here — they are only included in the response
+        // message list when `request.options.activity = true` (handled by assemble_response).
+        let activity_events: Vec<ActivityEvent> = routing_activity_events;
 
         debug!(
             model = %selected_model_name,
@@ -498,6 +552,8 @@ impl GatewayEngine {
                                 final_text,
                                 &selected_model_name,
                                 completion.usage,
+                                &activity_events,
+                                request.options.activity,
                             ),
                             commands_executed,
                         ));
@@ -756,7 +812,9 @@ impl GatewayEngine {
 
     /// Route all domains with per-domain PreRoute/PostRoute hooks.
     ///
-    /// Returns `(selected_commands, inject_tools, selected_model_name, accumulated_hook_context)`.
+    /// Returns `(selected_commands, inject_tools, selected_model_name, accumulated_hook_context,
+    /// activity_events)` where `activity_events` carries routing decisions and hook events
+    /// for inclusion in the response when `options.activity = true`.
     ///
     /// Per-domain hooks fire for each routing domain independently:
     /// - PreRoute can modify candidates or routing_input for that domain.
@@ -772,7 +830,16 @@ impl GatewayEngine {
         &self,
         user_message: &str,
         all_commands: &[CommandStub],
-    ) -> Result<(Vec<CommandStub>, bool, String, Option<String>), WeftError> {
+    ) -> Result<
+        (
+            Vec<CommandStub>,
+            bool,
+            String,
+            Option<String>,
+            Vec<ActivityEvent>,
+        ),
+        WeftError,
+    > {
         let threshold = self.config.router.classifier.threshold;
         let max_commands = self.config.router.classifier.max_commands;
         let skip_tools_when_unnecessary = self.config.router.skip_tools_when_unnecessary;
@@ -1218,11 +1285,24 @@ impl GatewayEngine {
                     Some(context_parts.join("\n"))
                 };
 
+                // Build a RoutingActivity event capturing the model selection decision.
+                let model_score = routing_decision
+                    .model
+                    .as_ref()
+                    .map(|m| m.score)
+                    .unwrap_or(1.0_f32);
+                let routing_activity = ActivityEvent::Routing(weft_core::RoutingActivity {
+                    model: selected_model_name.clone(),
+                    score: model_score,
+                    filters: vec![],
+                });
+
                 Ok((
                     selected_commands,
                     inject_tools,
                     selected_model_name,
                     accumulated_context,
+                    vec![routing_activity],
                 ))
             }
             Err(e) => {
@@ -1236,7 +1316,14 @@ impl GatewayEngine {
                     all_commands.iter().take(max_commands).cloned().collect();
                 fallback.sort_by(|a, b| a.name.cmp(&b.name));
 
-                Ok((fallback, true, default_model, None))
+                // Build a RoutingActivity for the fallback decision (score 0.0 signals fallback).
+                let fallback_activity = ActivityEvent::Routing(weft_core::RoutingActivity {
+                    model: default_model.clone(),
+                    score: 0.0_f32,
+                    filters: vec![],
+                });
+
+                Ok((fallback, true, default_model, None, vec![fallback_activity]))
             }
         }
     }
@@ -1903,15 +1990,18 @@ fn extract_latest_user_text(messages: &[WeftMessage]) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Assemble the final `WeftResponse` from the LLM output.
+/// Assemble the final `WeftResponse` from the LLM output and optional activity events.
 ///
-/// This is the simple (no-activity) path used in Phase 3 — activity assembly
-/// is extended in Phase 4 when `options.activity` is wired in.
+/// When `include_activity` is `true`, gateway activity events (routing decisions, hook
+/// events) are prepended to the message list as `source: Gateway` system messages.
+/// The assistant response message always follows.
 fn assemble_response(
     model_instruction: &str,
     llm_text: String,
     model_name: &str,
     usage: Option<TokenUsage>,
+    activity_events: &[ActivityEvent],
+    include_activity: bool,
 ) -> WeftResponse {
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
 
@@ -1921,17 +2011,28 @@ fn assemble_response(
 
     let total_tokens = prompt_tokens + completion_tokens;
 
+    let mut messages = Vec::new();
+
+    // Prepend activity messages when requested.
+    if include_activity {
+        for event in activity_events {
+            messages.push(event.to_message());
+        }
+    }
+
+    messages.push(WeftMessage {
+        role: Role::Assistant,
+        source: Source::Provider,
+        model: Some(model_name.to_string()),
+        content: vec![ContentPart::Text(llm_text)],
+        delta: false,
+        message_index: 0,
+    });
+
     WeftResponse {
         id,
         model: model_instruction.to_string(),
-        messages: vec![WeftMessage {
-            role: Role::Assistant,
-            source: Source::Provider,
-            model: Some(model_name.to_string()),
-            content: vec![ContentPart::Text(llm_text)],
-            delta: false,
-            message_index: 0,
-        }],
+        messages,
         usage: WeftUsage {
             prompt_tokens,
             completion_tokens,
