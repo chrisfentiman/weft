@@ -43,16 +43,28 @@ If no command matches the request, respond directly. Do not explain or apologize
 /// # Arguments
 /// - `selected_commands`: The semantically-filtered list of command stubs to inject.
 /// - `agent_system_prompt`: The operator-configured system prompt from `gateway.system_prompt`.
+/// - `memory_stubs`: Optional built-in memory command stubs `(name, description)`.
+///   When `Some`, `/recall` and `/remember` stubs are appended after the tool registry commands.
+///   These are always available when memory stores are configured — not gated by semantic routing.
 pub fn assemble_system_prompt(
     selected_commands: &[CommandStub],
     agent_system_prompt: &str,
+    memory_stubs: Option<&[(&str, &str)]>,
 ) -> String {
-    // Build dash-list command stubs: `- /name — Use when <description>`
-    let command_stubs: String = selected_commands
+    // Build dash-list from tool registry commands: `- /name — Use when <description>`
+    let mut stub_lines: Vec<String> = selected_commands
         .iter()
         .map(|cmd| format!("- /{} \u{2014} Use when {}", cmd.name, cmd.description))
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect();
+
+    // Append built-in memory command stubs after tool registry commands.
+    if let Some(mem_stubs) = memory_stubs {
+        for (name, description) in mem_stubs {
+            stub_lines.push(format!("- /{name} \u{2014} Use when {description}"));
+        }
+    }
+
+    let command_stubs = stub_lines.join("\n");
 
     // Replace the placeholder in the foundational prompt
     let foundational = FOUNDATIONAL_PROMPT_TEMPLATE.replace("{command_stubs}", &command_stubs);
@@ -125,7 +137,7 @@ mod tests {
             "search the web for current information",
         )];
         let agent_prompt = "You are a helpful assistant.";
-        let prompt = assemble_system_prompt(&stubs, agent_prompt);
+        let prompt = assemble_system_prompt(&stubs, agent_prompt, None);
 
         // Contains foundational preamble
         assert!(prompt.contains("You have commands available"));
@@ -153,7 +165,7 @@ mod tests {
             make_stub("web_search", "search the web for current information"),
             make_stub("code_review", "review code for issues and improvements"),
         ];
-        let prompt = assemble_system_prompt(&stubs, "");
+        let prompt = assemble_system_prompt(&stubs, "", None);
 
         // Dash-list format: `- /name — Use when <description>`
         assert!(
@@ -171,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_system_prompt_no_commands_shows_empty_stubs() {
-        let prompt = assemble_system_prompt(&[], "Do something.");
+        let prompt = assemble_system_prompt(&[], "Do something.", None);
 
         // No TOON table — placeholder replaced with empty string
         assert!(!prompt.contains("commands[0]{name, description}:"));
@@ -182,7 +194,7 @@ mod tests {
     #[test]
     fn test_system_prompt_empty_agent_prompt() {
         let stubs = vec![make_stub("recall", "retrieve memory")];
-        let prompt = assemble_system_prompt(&stubs, "");
+        let prompt = assemble_system_prompt(&stubs, "", None);
 
         // Should still produce valid prompt with foundational content
         assert!(prompt.contains("You have commands available"));
@@ -191,7 +203,7 @@ mod tests {
 
     #[test]
     fn test_system_prompt_contains_call_syntax_examples() {
-        let prompt = assemble_system_prompt(&[], "");
+        let prompt = assemble_system_prompt(&[], "", None);
 
         // The foundational prompt must show call syntax with key: value pairs
         assert!(prompt.contains("key: value, key2: \"quoted value\""));
@@ -200,7 +212,7 @@ mod tests {
 
     #[test]
     fn test_system_prompt_contains_blocking_requirement() {
-        let prompt = assemble_system_prompt(&[], "");
+        let prompt = assemble_system_prompt(&[], "", None);
 
         // Must have BLOCKING REQUIREMENT language
         assert!(prompt.contains("BLOCKING REQUIREMENT"));
@@ -210,7 +222,7 @@ mod tests {
     #[test]
     fn test_system_prompt_no_toon_jargon_in_stubs() {
         let stubs = vec![make_stub("web_search", "search the web")];
-        let prompt = assemble_system_prompt(&stubs, "");
+        let prompt = assemble_system_prompt(&stubs, "", None);
         // Command stubs section must not use TOON fenced blocks
         assert!(!prompt.contains("```toon"));
         // But command stubs show in dash-list format
@@ -220,7 +232,7 @@ mod tests {
     #[test]
     fn test_system_prompt_use_when_trigger_conditions() {
         let stubs = vec![make_stub("web_search", "search the web")];
-        let prompt = assemble_system_prompt(&stubs, "");
+        let prompt = assemble_system_prompt(&stubs, "", None);
         // "Use when" trigger condition must appear before each command description
         assert!(prompt.contains("Use when search the web"));
     }
@@ -334,5 +346,78 @@ mod tests {
         let toon = format_command_results_toon(&results);
         assert!(toon.starts_with("```toon\n"));
         assert!(toon.ends_with("```"));
+    }
+
+    // ── memory stubs in system prompt ────────────────────────────────────
+
+    #[test]
+    fn test_memory_stubs_included_when_provided() {
+        let stubs = vec![make_stub("web_search", "search the web")];
+        let memory_stubs: &[(&str, &str)] = &[
+            (
+                "recall",
+                "you need to retrieve relevant context from memory",
+            ),
+            (
+                "remember",
+                "the user shares important information worth preserving",
+            ),
+        ];
+        let prompt = assemble_system_prompt(&stubs, "Agent prompt.", Some(memory_stubs));
+
+        // Both memory stubs appear in dash-list format
+        assert!(
+            prompt.contains(
+                "- /recall \u{2014} Use when you need to retrieve relevant context from memory"
+            ),
+            "recall stub must appear in prompt"
+        );
+        assert!(
+            prompt.contains("- /remember \u{2014} Use when the user shares important information worth preserving"),
+            "remember stub must appear in prompt"
+        );
+        // Tool stubs still present
+        assert!(prompt.contains("- /web_search \u{2014} Use when search the web"));
+    }
+
+    #[test]
+    fn test_memory_stubs_excluded_when_none() {
+        let stubs = vec![make_stub("web_search", "search the web")];
+        let prompt = assemble_system_prompt(&stubs, "Agent prompt.", None);
+
+        // No memory stubs injected
+        assert!(
+            !prompt.contains("/recall"),
+            "recall must not appear when no memory config"
+        );
+        assert!(
+            !prompt.contains("/remember"),
+            "remember must not appear when no memory config"
+        );
+        // Tool stubs still present
+        assert!(prompt.contains("- /web_search \u{2014} Use when search the web"));
+    }
+
+    #[test]
+    fn test_memory_stubs_appended_after_tool_stubs() {
+        let stubs = vec![make_stub("web_search", "search the web")];
+        let memory_stubs: &[(&str, &str)] = &[("recall", "you need to retrieve relevant context")];
+        let prompt = assemble_system_prompt(&stubs, "", Some(memory_stubs));
+
+        // Memory stubs appear after tool stubs
+        let tool_pos = prompt.find("web_search").expect("tool stub must appear");
+        let memory_pos = prompt.find("recall").expect("memory stub must appear");
+        assert!(
+            tool_pos < memory_pos,
+            "tool stubs must appear before memory stubs"
+        );
+    }
+
+    #[test]
+    fn test_no_memory_stubs_when_empty_slice() {
+        let prompt = assemble_system_prompt(&[], "", Some(&[]));
+        // Empty memory stubs slice should produce the same output as None
+        assert!(!prompt.contains("/recall"));
+        assert!(!prompt.contains("/remember"));
     }
 }

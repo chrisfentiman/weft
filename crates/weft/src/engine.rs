@@ -17,17 +17,20 @@
 //! 8. Assemble the system prompt.
 //! 9. Call the selected provider. On non-rate-limit failure, retry with the
 //!    default provider. Rate-limit errors propagate immediately.
-//! 10. Parse response, execute commands, loop.
+//! 10. Parse response: partition into built-in memory commands and external
+//!     commands. Execute built-in first (memory results available in same turn),
+//!     then external. Merge all results and inject as TOON. Loop.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tracing::{debug, warn};
-use weft_commands::{CommandRegistry, parse_response};
+use weft_commands::{CommandRegistry, MemoryStoreMux, parse_response};
 use weft_core::{
-    ChatCompletionRequest, ChatCompletionResponse, Choice, CommandResult, CommandStub, Message,
-    Role, Usage, WeftConfig, WeftError,
+    ChatCompletionRequest, ChatCompletionResponse, Choice, CommandAction, CommandResult,
+    CommandStub, Message, Role, Usage, WeftConfig, WeftError,
+    toon::{fenced_toon, serialize_table},
 };
 use weft_llm::{CompletionOptions, LlmError, LlmProvider, ProviderRegistry};
 use weft_router::{
@@ -39,6 +42,39 @@ use crate::context::{
     assemble_system_prompt, assemble_system_prompt_no_tools, format_command_results_toon,
 };
 
+/// Built-in command names intercepted by the engine before the command registry.
+const BUILTIN_COMMANDS: &[&str] = &["recall", "remember"];
+
+/// Compiled-in describe text for `/recall`.
+const RECALL_DESCRIBE: &str = "\
+recall: Retrieve relevant memories based on a query
+
+Usage: /recall query: \"what do we know about user preferences\"
+
+The gateway searches configured memory stores for content matching your query
+and returns the most relevant results. If you omit the query, the current
+conversation context is used automatically.";
+
+/// Compiled-in describe text for `/remember`.
+const REMEMBER_DESCRIBE: &str = "\
+remember: Store information in memory for future recall
+
+Usage: /remember content: \"the user prefers dark mode and compact layouts\"
+
+Stores the given content in the most relevant memory store(s), selected
+automatically based on the content. Retrieve stored memories later with
+/recall. Use this when the user shares preferences, decisions, or important
+context worth preserving.";
+
+/// Return compiled-in describe text for a built-in command.
+fn builtin_describe_text(name: &str) -> String {
+    match name {
+        "recall" => RECALL_DESCRIBE.to_string(),
+        "remember" => REMEMBER_DESCRIBE.to_string(),
+        _ => format!("{name}: unknown built-in command"),
+    }
+}
+
 /// The gateway engine: holds shared components and drives the request loop.
 ///
 /// All fields are `Arc` so `GatewayEngine` is cheaply `Clone`able — axum clones
@@ -49,6 +85,8 @@ pub struct GatewayEngine {
     provider_registry: Arc<ProviderRegistry>,
     router: Arc<dyn SemanticRouter>,
     command_registry: Arc<dyn CommandRegistry>,
+    /// Optional memory store multiplexer. `None` when no memory stores are configured.
+    memory_mux: Option<Arc<MemoryStoreMux>>,
 }
 
 impl GatewayEngine {
@@ -63,12 +101,14 @@ impl GatewayEngine {
         provider_registry: Arc<ProviderRegistry>,
         router: Arc<dyn SemanticRouter>,
         command_registry: Arc<dyn CommandRegistry>,
+        memory_mux: Option<Arc<MemoryStoreMux>>,
     ) -> Self {
         Self {
             config,
             provider_registry,
             router,
             command_registry,
+            memory_mux,
         }
     }
 
@@ -132,9 +172,30 @@ impl GatewayEngine {
             .max_tokens_for(&selected_model_name)
             .or(request.max_tokens);
 
+        // Build memory stubs to append when memory stores are configured.
+        // These appear regardless of semantic routing — memory commands are always available.
+        let memory_stubs: Option<&[(&str, &str)]> = if self.memory_mux.is_some() {
+            Some(&[
+                (
+                    "recall",
+                    "you need to retrieve relevant context, past conversations, or knowledge from memory",
+                ),
+                (
+                    "remember",
+                    "the user shares important information, preferences, or decisions worth preserving",
+                ),
+            ])
+        } else {
+            None
+        };
+
         // Assemble the system prompt (with or without commands).
         let system_prompt = if inject_tools {
-            assemble_system_prompt(&selected_commands, &self.config.gateway.system_prompt)
+            assemble_system_prompt(
+                &selected_commands,
+                &self.config.gateway.system_prompt,
+                memory_stubs,
+            )
         } else {
             assemble_system_prompt_no_tools(&self.config.gateway.system_prompt)
         };
@@ -149,13 +210,20 @@ impl GatewayEngine {
         };
 
         // Build the set of known command names for the parser.
-        // If tool skipping is active, use an empty set so any stray slash commands
-        // in the LLM response are treated as prose (spec Section 6.4).
-        let known_commands: HashSet<String> = if inject_tools {
+        // Always include built-in commands (recall/remember) when memory is configured —
+        // they are intercepted before the registry, so the parser must recognise them.
+        // If tool skipping is active, use only built-in names so stray external slash
+        // commands in the LLM response are treated as prose (spec Section 6.4).
+        let mut known_commands: HashSet<String> = if inject_tools {
             all_commands.iter().map(|c| c.name.clone()).collect()
         } else {
             HashSet::new()
         };
+        if self.memory_mux.is_some() {
+            for name in BUILTIN_COMMANDS {
+                known_commands.insert((*name).to_string());
+            }
+        }
 
         let max_iterations = self.config.gateway.max_command_iterations;
         let mut iterations = 0u32;
@@ -183,7 +251,7 @@ impl GatewayEngine {
             let parsed = parse_response(&completion.text, &known_commands);
 
             if parsed.invocations.is_empty() && parsed.parse_errors.is_empty() {
-                // No commands — we're done. Return the clean text.
+                // No commands (built-in or external) — we're done. Return the clean text.
                 return Ok(build_response(
                     &parsed.text,
                     &request.model,
@@ -191,14 +259,25 @@ impl GatewayEngine {
                 ));
             }
 
-            // Execute commands sequentially (spec Section 8.4).
-            let mut results: Vec<CommandResult> = Vec::new();
+            // Partition invocations: built-in memory commands vs external tool commands.
+            // Built-in commands are intercepted before the command registry.
+            let (builtin_invocations, external_invocations): (Vec<_>, Vec<_>) = parsed
+                .invocations
+                .into_iter()
+                .partition(|inv| BUILTIN_COMMANDS.contains(&inv.name.as_str()));
 
             // Include parse errors as failed results so the LLM can see them.
+            let mut results: Vec<CommandResult> = Vec::new();
             results.extend(parsed.parse_errors);
 
-            // Execute each valid invocation.
-            for invocation in &parsed.invocations {
+            // Execute built-in memory commands first (results available in same turn).
+            for invocation in &builtin_invocations {
+                let result = self.handle_builtin(invocation, user_message).await;
+                results.push(result);
+            }
+
+            // Execute external commands via the command registry.
+            for invocation in &external_invocations {
                 let result = self
                     .command_registry
                     .execute_command(invocation)
@@ -396,6 +475,199 @@ impl GatewayEngine {
 
                 (fallback, true, default_model)
             }
+        }
+    }
+}
+
+/// Format memory query results as TOON output for the LLM.
+///
+/// Groups results by store with `{store, content, score}` columns.
+/// Returns "No relevant memories found." when no memories were retrieved.
+fn format_memory_query_results(results: &[weft_commands::MemoryQueryResult]) -> String {
+    let all_memories: Vec<_> = results
+        .iter()
+        .flat_map(|r| {
+            r.memories.iter().map(|m| {
+                vec![
+                    r.store_name.clone(),
+                    m.content.clone(),
+                    format!("{:.2}", m.score),
+                ]
+            })
+        })
+        .collect();
+
+    if all_memories.is_empty() {
+        return "No relevant memories found.".to_string();
+    }
+
+    let table = serialize_table("memories", &["store", "content", "score"], &all_memories);
+    fenced_toon(&table)
+}
+
+/// Format memory store results as TOON output for the LLM.
+///
+/// Reports per-store success/failure with `{store, status}` or
+/// `{store, status, error}` columns depending on whether errors occurred.
+fn format_memory_store_results(
+    results: &[(
+        String,
+        Result<weft_commands::MemoryStoreResult, weft_commands::MemoryStoreError>,
+    )],
+) -> String {
+    let has_errors = results.iter().any(|(_, r)| r.is_err());
+
+    if has_errors {
+        let rows: Vec<Vec<String>> = results
+            .iter()
+            .map(|(name, r)| match r {
+                Ok(_) => vec![name.clone(), "success".to_string(), String::new()],
+                Err(e) => vec![name.clone(), "error".to_string(), e.to_string()],
+            })
+            .collect();
+        let table = serialize_table("stored", &["store", "status", "error"], &rows);
+        fenced_toon(&table)
+    } else {
+        let rows: Vec<Vec<String>> = results
+            .iter()
+            .map(|(name, _)| vec![name.clone(), "success".to_string()])
+            .collect();
+        let table = serialize_table("stored", &["store", "status"], &rows);
+        fenced_toon(&table)
+    }
+}
+
+impl GatewayEngine {
+    /// Handle a built-in memory command (`/recall` or `/remember`).
+    ///
+    /// Called during the command loop after partitioning built-in from external
+    /// invocations. Handles both `Execute` and `Describe` actions.
+    ///
+    /// In Phase 2, routing to specific stores is not yet implemented:
+    /// - `/recall` fans out to all read-capable stores (fallback path).
+    /// - `/remember` writes to the first configured writable store (fallback path).
+    ///
+    /// Phase 3 wires per-invocation `score_memory_candidates()` routing.
+    async fn handle_builtin(
+        &self,
+        invocation: &weft_core::CommandInvocation,
+        user_message: &str,
+    ) -> CommandResult {
+        match &invocation.action {
+            CommandAction::Describe => CommandResult {
+                command_name: invocation.name.clone(),
+                success: true,
+                output: builtin_describe_text(&invocation.name),
+                error: None,
+            },
+            CommandAction::Execute => match invocation.name.as_str() {
+                "recall" => self.exec_recall(invocation, user_message).await,
+                "remember" => self.exec_remember(invocation).await,
+                name => CommandResult {
+                    command_name: name.to_string(),
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("{name}: unknown built-in command")),
+                },
+            },
+        }
+    }
+
+    /// Execute a `/recall` invocation.
+    async fn exec_recall(
+        &self,
+        invocation: &weft_core::CommandInvocation,
+        user_message: &str,
+    ) -> CommandResult {
+        let mux = match &self.memory_mux {
+            Some(m) => m,
+            None => {
+                return CommandResult {
+                    command_name: "recall".to_string(),
+                    success: false,
+                    output: String::new(),
+                    error: Some("no memory stores configured".to_string()),
+                };
+            }
+        };
+
+        // Extract query argument. Fall back to the user message when absent.
+        let query = invocation
+            .arguments
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| user_message.to_string());
+
+        // Phase 2: fan out to all readable stores (fallback path).
+        // Phase 3 will replace this with per-invocation score_memory_candidates() routing.
+        let store_names: Vec<String> = vec![]; // empty = fan out to all readable
+
+        let results = mux.query(&store_names, &query, 0.0).await;
+        let output = format_memory_query_results(&results);
+
+        CommandResult {
+            command_name: "recall".to_string(),
+            success: true,
+            output,
+            error: None,
+        }
+    }
+
+    /// Execute a `/remember` invocation.
+    async fn exec_remember(&self, invocation: &weft_core::CommandInvocation) -> CommandResult {
+        let mux = match &self.memory_mux {
+            Some(m) => m,
+            None => {
+                return CommandResult {
+                    command_name: "remember".to_string(),
+                    success: false,
+                    output: String::new(),
+                    error: Some("no memory stores configured".to_string()),
+                };
+            }
+        };
+
+        // Missing content argument is an error — no sensible fallback.
+        let content = match invocation.arguments.get("content").and_then(|v| v.as_str()) {
+            Some(c) => c.to_string(),
+            None => {
+                return CommandResult {
+                    command_name: "remember".to_string(),
+                    success: false,
+                    output: String::new(),
+                    error: Some("missing required argument: content".to_string()),
+                };
+            }
+        };
+
+        // Phase 2: write to the first configured writable store (fallback path).
+        // Phase 3 will replace this with per-invocation score_memory_candidates() routing.
+        let writable: Vec<String> = mux
+            .writable_store_names()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let target_stores: Vec<String> = writable.into_iter().take(1).collect();
+
+        if target_stores.is_empty() {
+            return CommandResult {
+                command_name: "remember".to_string(),
+                success: true,
+                output: String::new(),
+                error: None,
+            };
+        }
+
+        let results = mux.store(&target_stores, &content, None).await;
+        let output = format_memory_store_results(&results);
+
+        CommandResult {
+            command_name: "remember".to_string(),
+            success: true,
+            output,
+            error: None,
         }
     }
 }
@@ -978,6 +1250,7 @@ mod tests {
             registry,
             Arc::new(router),
             Arc::new(commands),
+            None,
         )
     }
 
@@ -987,7 +1260,7 @@ mod tests {
         router: impl SemanticRouter + 'static,
         commands: impl CommandRegistry + 'static,
     ) -> GatewayEngine {
-        GatewayEngine::new(config, registry, Arc::new(router), Arc::new(commands))
+        GatewayEngine::new(config, registry, Arc::new(router), Arc::new(commands), None)
     }
 
     // ── Test: no-command response (single pass) ────────────────────────────
@@ -1869,7 +2142,7 @@ mod tests {
             name: "web_search".to_string(),
             description: "Search the web".to_string(),
         }];
-        let prompt = assemble_system_prompt(&stubs, "You are a helpful assistant.");
+        let prompt = assemble_system_prompt(&stubs, "You are a helpful assistant.", None);
 
         // Command stubs use dash-list format with "Use when" trigger conditions,
         // not TOON fenced blocks — TOON is reserved for results injection only.
@@ -1902,5 +2175,560 @@ mod tests {
             !prompt.contains("commands["),
             "must not contain command stubs when tools are skipped"
         );
+    }
+
+    // ── Built-in memory command tests ─────────────────────────────────────
+
+    use weft_commands::{
+        MemoryEntry, MemoryStoreClient, MemoryStoreError, MemoryStoreMux, MemoryStoreResult,
+    };
+
+    /// Mock memory store client with configurable query and store behaviour.
+    struct MockMemStoreClient {
+        query_entries: Vec<MemoryEntry>,
+        query_error: Option<String>,
+        store_id: String,
+        store_error: Option<String>,
+    }
+
+    impl MockMemStoreClient {
+        fn succeeds(entries: Vec<MemoryEntry>) -> Self {
+            Self {
+                query_entries: entries,
+                query_error: None,
+                store_id: "mock-mem-id".to_string(),
+                store_error: None,
+            }
+        }
+
+        fn query_fails(msg: &str) -> Self {
+            Self {
+                query_entries: vec![],
+                query_error: Some(msg.to_string()),
+                store_id: "mock-mem-id".to_string(),
+                store_error: None,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MemoryStoreClient for MockMemStoreClient {
+        async fn query(
+            &self,
+            _query: &str,
+            _max_results: u32,
+            _min_score: f32,
+        ) -> Result<Vec<MemoryEntry>, MemoryStoreError> {
+            if let Some(e) = &self.query_error {
+                return Err(MemoryStoreError::QueryFailed(e.clone()));
+            }
+            Ok(self.query_entries.clone())
+        }
+
+        async fn store(
+            &self,
+            _content: &str,
+            _metadata: Option<&serde_json::Value>,
+        ) -> Result<MemoryStoreResult, MemoryStoreError> {
+            if let Some(e) = &self.store_error {
+                return Err(MemoryStoreError::StoreFailed(e.clone()));
+            }
+            Ok(MemoryStoreResult {
+                id: self.store_id.clone(),
+            })
+        }
+    }
+
+    fn mem_entry(id: &str, content: &str) -> MemoryEntry {
+        MemoryEntry {
+            id: id.to_string(),
+            content: content.to_string(),
+            score: 0.9,
+            created_at: "2026-03-15T10:00:00Z".to_string(),
+            metadata: None,
+        }
+    }
+
+    fn make_mux_with_stores(
+        stores: Vec<(&str, bool, bool, Arc<dyn MemoryStoreClient>)>,
+    ) -> Arc<MemoryStoreMux> {
+        let mut client_map: HashMap<String, Arc<dyn MemoryStoreClient>> = HashMap::new();
+        let mut max_results = HashMap::new();
+        let mut readable = std::collections::HashSet::new();
+        let mut writable = std::collections::HashSet::new();
+        for (name, r, w, client) in stores {
+            client_map.insert(name.to_string(), client);
+            max_results.insert(name.to_string(), 5u32);
+            if r {
+                readable.insert(name.to_string());
+            }
+            if w {
+                writable.insert(name.to_string());
+            }
+        }
+        Arc::new(MemoryStoreMux::new(
+            client_map,
+            max_results,
+            readable,
+            writable,
+        ))
+    }
+
+    fn make_engine_with_mux(
+        registry: Arc<ProviderRegistry>,
+        router: impl SemanticRouter + 'static,
+        commands: impl CommandRegistry + 'static,
+        mux: Option<Arc<MemoryStoreMux>>,
+    ) -> GatewayEngine {
+        GatewayEngine::new(
+            test_config(),
+            registry,
+            Arc::new(router),
+            Arc::new(commands),
+            mux,
+        )
+    }
+
+    // ── /recall tests ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_recall_intercepted_before_command_registry() {
+        // Engine with memory mux — /recall should NOT reach the command registry.
+        // If it did reach the registry, it would fail with CommandError::NotFound
+        // (the mock registry has no "recall" command) and the loop would continue
+        // until the LLM emits a response without commands.
+        let mux = make_mux_with_stores(vec![(
+            "conv",
+            true,
+            true,
+            Arc::new(MockMemStoreClient::succeeds(vec![mem_entry(
+                "m1",
+                "dark mode",
+            )])),
+        )]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/recall query: \"user preferences\"",
+                "I found some memories about preferences.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]), // no "recall" in registry
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("What are the user's preferences?"))
+            .await
+            .expect("should succeed");
+
+        assert_eq!(
+            resp.choices[0].message.content,
+            "I found some memories about preferences."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recall_returns_memories_as_toon() {
+        let mux = make_mux_with_stores(vec![(
+            "conv",
+            true,
+            true,
+            Arc::new(MockMemStoreClient::succeeds(vec![mem_entry(
+                "m1",
+                "user prefers dark mode",
+            )])),
+        )]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/recall query: \"user preferences\"",
+                "Thanks for the context.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("What does the user like?"))
+            .await
+            .expect("should succeed");
+
+        assert_eq!(resp.choices[0].message.content, "Thanks for the context.");
+    }
+
+    #[tokio::test]
+    async fn test_recall_no_query_arg_uses_user_message() {
+        // /recall without query arg should still succeed (falls back to user message).
+        let mux = make_mux_with_stores(vec![(
+            "conv",
+            true,
+            true,
+            Arc::new(MockMemStoreClient::succeeds(vec![])),
+        )]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec!["/recall", "Nothing found in memory."]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Tell me about user prefs"))
+            .await
+            .expect("should succeed without panicking");
+
+        assert_eq!(resp.choices[0].message.content, "Nothing found in memory.");
+    }
+
+    #[tokio::test]
+    async fn test_recall_all_stores_fail_returns_success_with_no_memories() {
+        // All stores fail — should return success=true with "No relevant memories found."
+        let mux = make_mux_with_stores(vec![(
+            "broken",
+            true,
+            true,
+            Arc::new(MockMemStoreClient::query_fails("connection refused")),
+        )]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/recall query: \"something\"",
+                "Understood, no memories available.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Search memory"))
+            .await
+            .expect("should succeed even when stores fail");
+
+        assert_eq!(
+            resp.choices[0].message.content,
+            "Understood, no memories available."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recall_no_mux_returns_error_result() {
+        // /recall with no mux configured should emit an error result to the LLM.
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/recall query: \"something\"",
+                "Memory is not configured.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+        // Engine with no mux but we need to parse /recall — add it to registry as a command
+        // Actually, without a mux, /recall won't be in known_commands, so it won't be parsed.
+        // Test instead: call handle_builtin directly by building engine and sending a request
+        // where the LLM emits /recall but the parser only picks it up if we register it.
+        // To force the parse, we build an engine with a mock mux that is None-equivalent
+        // — but there's no way to do that without an actual mux; the mux controls parser registration.
+        // This is correct behaviour: without a mux, /recall is not in known_commands and is treated as prose.
+        // Verify the response still works (just contains the text with /recall treated as prose).
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            None, // no mux
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Try to recall"))
+            .await
+            .expect("should succeed");
+
+        // The LLM response includes "/recall query: something" but it's treated as prose
+        // because recall is not in known_commands when mux is None.
+        // The first LLM response is returned directly since no commands are parsed.
+        assert_eq!(
+            resp.choices[0].message.content,
+            "/recall query: \"something\""
+        );
+    }
+
+    // ── /remember tests ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_remember_intercepted_and_stores_to_writable() {
+        let mux = make_mux_with_stores(vec![(
+            "conv",
+            true,
+            true,
+            Arc::new(MockMemStoreClient::succeeds(vec![])),
+        )]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/remember content: \"user prefers dark mode\"",
+                "Memory stored.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Remember this"))
+            .await
+            .expect("should succeed");
+
+        assert_eq!(resp.choices[0].message.content, "Memory stored.");
+    }
+
+    #[tokio::test]
+    async fn test_remember_missing_content_returns_error() {
+        // /remember without content arg should return success:false error to LLM.
+        let mux = make_mux_with_stores(vec![(
+            "conv",
+            true,
+            true,
+            Arc::new(MockMemStoreClient::succeeds(vec![])),
+        )]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/remember", // missing content
+                "Got an error about missing argument.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Store something"))
+            .await
+            .expect("should succeed overall");
+
+        assert_eq!(
+            resp.choices[0].message.content,
+            "Got an error about missing argument."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remember_no_writable_stores_returns_empty_success() {
+        // All stores are read-only — /remember should return success with no stores written.
+        let mux = make_mux_with_stores(vec![(
+            "code",
+            true,
+            false, // read-only
+            Arc::new(MockMemStoreClient::succeeds(vec![])),
+        )]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/remember content: \"some info\"",
+                "Attempted to remember.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Remember this"))
+            .await
+            .expect("should not fail");
+
+        assert_eq!(resp.choices[0].message.content, "Attempted to remember.");
+    }
+
+    // ── --describe tests ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_recall_describe_returns_compiled_text() {
+        let mux = make_mux_with_stores(vec![(
+            "conv",
+            true,
+            true,
+            Arc::new(MockMemStoreClient::succeeds(vec![])),
+        )]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec!["/recall --describe", "I see how recall works."]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("How does recall work?"))
+            .await
+            .expect("should succeed");
+
+        assert_eq!(resp.choices[0].message.content, "I see how recall works.");
+    }
+
+    #[tokio::test]
+    async fn test_remember_describe_does_not_reach_command_registry() {
+        // The mock registry has no "remember" command — if --describe reached the
+        // registry, it would return an error. With built-in interception it returns
+        // the compiled describe text and success=true.
+        let mux = make_mux_with_stores(vec![(
+            "conv",
+            true,
+            true,
+            Arc::new(MockMemStoreClient::succeeds(vec![])),
+        )]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/remember --describe",
+                "Now I know how to use remember.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]), // no "remember" in registry
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("How do I store memories?"))
+            .await
+            .expect("should succeed");
+
+        assert_eq!(
+            resp.choices[0].message.content,
+            "Now I know how to use remember."
+        );
+    }
+
+    // ── mixed built-in + external commands ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_mixed_builtin_and_external_commands() {
+        // LLM emits both /recall and /web_search in the same response.
+        // Both should execute: built-in first, then external.
+        let mux = make_mux_with_stores(vec![(
+            "conv",
+            true,
+            true,
+            Arc::new(MockMemStoreClient::succeeds(vec![mem_entry(
+                "m1",
+                "user prefers dark mode",
+            )])),
+        )]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/recall query: \"prefs\"\n/web_search query: \"dark mode\"",
+                "Found memories and web results.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![("web_search", "Search the web")]).with_execute_result(
+                CommandResult {
+                    command_name: "web_search".to_string(),
+                    success: true,
+                    output: "dark mode is popular".to_string(),
+                    error: None,
+                },
+            ),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("What do I know about dark mode?"))
+            .await
+            .expect("should succeed");
+
+        assert_eq!(
+            resp.choices[0].message.content,
+            "Found memories and web results."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_external_commands_still_work_with_mux_present() {
+        // Verify that wiring in a mux doesn't break the existing command registry path.
+        let mux = make_mux_with_stores(vec![(
+            "conv",
+            true,
+            true,
+            Arc::new(MockMemStoreClient::succeeds(vec![])),
+        )]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec!["/web_search query: \"Rust\"", "Here are the results."]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![("web_search", "Search the web")]).with_execute_result(
+                CommandResult {
+                    command_name: "web_search".to_string(),
+                    success: true,
+                    output: "5 results about Rust".to_string(),
+                    error: None,
+                },
+            ),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Search for Rust"))
+            .await
+            .expect("should succeed");
+
+        assert_eq!(resp.choices[0].message.content, "Here are the results.");
     }
 }

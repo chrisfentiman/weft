@@ -7,13 +7,15 @@ mod context;
 mod engine;
 mod server;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use clap::Parser;
 use std::path::PathBuf;
 use tracing::{info, warn};
-use weft_commands::{GrpcToolRegistryClient, ToolRegistryCommandAdapter};
+use weft_commands::{
+    GrpcMemoryStoreClient, GrpcToolRegistryClient, MemoryStoreMux, ToolRegistryCommandAdapter,
+};
 use weft_core::{LlmProviderKind, WeftConfig};
 use weft_llm::{AnthropicProvider, OpenAIProvider, ProviderRegistry};
 use weft_router::{ModernBertRouter, RoutingCandidate, RoutingDomainKind};
@@ -115,11 +117,17 @@ async fn main() {
         .map(|d| d.enabled)
         .unwrap_or(true);
 
+    let memory_domain_active = config
+        .memory
+        .as_ref()
+        .map(|m| !m.stores.is_empty())
+        .unwrap_or(false);
+
     info!(
         commands_domain = true,
         model_domain = (model_count > 1),
         tool_necessity_domain = (tool_skipping && tool_domain_enabled),
-        memory_domain = false,
+        memory_domain = memory_domain_active,
         model_domain_threshold = ?model_domain_threshold,
         tool_skipping_active = tool_skipping,
         "routing domains configured"
@@ -283,6 +291,70 @@ async fn main() {
             Arc::new(EmptyCommandRegistry)
         };
 
+    // ── Build memory store multiplexer (optional) ─────────────────────────
+    //
+    // Builds one GrpcMemoryStoreClient per configured store, then wraps them
+    // in a MemoryStoreMux. Uses lazy gRPC connections (same pattern as the
+    // tool registry client) — connection failures appear on first /recall or /remember.
+
+    let memory_mux: Option<Arc<MemoryStoreMux>> = if let Some(mem_config) = &config.memory {
+        if mem_config.stores.is_empty() {
+            None
+        } else {
+            let mut stores: HashMap<String, Arc<dyn weft_commands::MemoryStoreClient>> =
+                HashMap::new();
+            let mut max_results_map: HashMap<String, u32> = HashMap::new();
+            let mut readable: HashSet<String> = HashSet::new();
+            let mut writable: HashSet<String> = HashSet::new();
+
+            for store_cfg in &mem_config.stores {
+                let client = GrpcMemoryStoreClient::new(
+                    store_cfg.endpoint.clone(),
+                    store_cfg.connect_timeout_ms,
+                    store_cfg.request_timeout_ms,
+                );
+                stores.insert(store_cfg.name.clone(), Arc::new(client));
+                max_results_map.insert(store_cfg.name.clone(), store_cfg.max_results);
+                if store_cfg.can_read() {
+                    readable.insert(store_cfg.name.clone());
+                }
+                if store_cfg.can_write() {
+                    writable.insert(store_cfg.name.clone());
+                }
+
+                let caps: Vec<&str> = store_cfg
+                    .capabilities
+                    .iter()
+                    .map(|c| match c {
+                        weft_core::StoreCapability::Read => "read",
+                        weft_core::StoreCapability::Write => "write",
+                    })
+                    .collect();
+                info!(
+                    store = %store_cfg.name,
+                    endpoint = %store_cfg.endpoint,
+                    capabilities = %caps.join(","),
+                    examples = store_cfg.examples.len(),
+                    "memory store registered"
+                );
+            }
+
+            let mux =
+                MemoryStoreMux::new(stores, max_results_map, readable.clone(), writable.clone());
+
+            info!(
+                memory_stores = mem_config.stores.len(),
+                readable = readable.len(),
+                writable = writable.len(),
+                "memory configured"
+            );
+
+            Some(Arc::new(mux))
+        }
+    } else {
+        None
+    };
+
     // ── Wire the gateway engine ────────────────────────────────────────────
 
     let engine = GatewayEngine::new(
@@ -290,6 +362,7 @@ async fn main() {
         provider_registry,
         router,
         command_registry,
+        memory_mux,
     );
 
     // ── Start the HTTP server ──────────────────────────────────────────────

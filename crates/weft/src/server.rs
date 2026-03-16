@@ -451,6 +451,7 @@ mod tests {
             make_registry(llm),
             Arc::new(MockRouter),
             Arc::new(MockRegistry),
+            None,
         );
         build_router(engine)
     }
@@ -603,6 +604,7 @@ mod tests {
             make_registry(MockLlmProvider::ok("irrelevant")),
             Arc::new(MockRouter),
             Arc::new(MockRegistry),
+            None,
         );
         let router = build_router(engine);
 
