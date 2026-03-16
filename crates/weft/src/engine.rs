@@ -32,7 +32,10 @@ use weft_core::{
     CommandStub, Message, Role, Usage, WeftConfig, WeftError,
     toon::{fenced_toon, serialize_table},
 };
-use weft_llm::{CompletionOptions, LlmError, LlmProvider, ProviderRegistry};
+use weft_llm::{
+    ChatCompletionInput, ChatCompletionOutput, Provider, ProviderError, ProviderRegistry,
+    ProviderRequest, ProviderResponse, TokenUsage,
+};
 use weft_router::{
     RoutingCandidate, RoutingDomainKind, ScoredCandidate, SemanticRouter, filter_by_threshold,
     take_top,
@@ -244,12 +247,6 @@ impl GatewayEngine {
         // Build the initial message list (clone from request).
         let mut messages = request.messages.clone();
 
-        let options = CompletionOptions {
-            max_tokens,
-            temperature: request.temperature,
-            model: model_id.clone(),
-        };
-
         // Build the set of known command names for the parser.
         // Always include built-in commands (recall/remember) when memory is configured —
         // they are intercepted before the registry, so the parser must recognise them.
@@ -276,14 +273,21 @@ impl GatewayEngine {
                 });
             }
 
-            // Call the selected LLM provider, with fallback to default on non-rate-limit error.
+            // Build the provider request for this model.
+            let provider_request = ProviderRequest::ChatCompletion(ChatCompletionInput {
+                system_prompt: system_prompt.clone(),
+                messages: messages.clone(),
+                model: model_id.clone().unwrap_or_default(),
+                max_tokens: max_tokens.unwrap_or(4096),
+                temperature: request.temperature,
+            });
+
+            // Call the selected provider, with fallback to default on non-rate-limit error.
             let completion = self
                 .call_with_fallback(
                     provider.clone(),
                     &selected_model_name,
-                    &system_prompt,
-                    &messages,
-                    &options,
+                    provider_request,
                     request.temperature,
                 )
                 .await?;
@@ -352,24 +356,27 @@ impl GatewayEngine {
         }
     }
 
-    /// Call the LLM provider, falling back to the default provider on non-rate-limit failure.
+    /// Call the provider, falling back to the default provider on non-rate-limit failure.
     ///
-    /// Fallback rules (spec Section 6.3):
-    /// - `RateLimited`: always propagate immediately, no retry.
+    /// Fallback rules:
+    /// - `RateLimited`: always propagate immediately, no fallback.
     /// - Any other error from a non-default model: retry with the default provider.
     /// - Any other error from the default model (or after fallback retry fails): propagate.
     async fn call_with_fallback(
         &self,
-        provider: Arc<dyn LlmProvider>,
+        provider: Arc<dyn Provider>,
         selected_model_name: &str,
-        system_prompt: &str,
-        messages: &[Message],
-        options: &CompletionOptions,
+        request: ProviderRequest,
         temperature: Option<f32>,
-    ) -> Result<weft_llm::CompletionResponse, WeftError> {
-        match provider.complete(system_prompt, messages, options).await {
-            Ok(response) => Ok(response),
-            Err(LlmError::RateLimited { retry_after_ms }) => {
+    ) -> Result<ChatCompletionOutput, WeftError> {
+        let result = provider.execute(request.clone()).await;
+        #[allow(unreachable_patterns)]
+        match result {
+            Ok(ProviderResponse::ChatCompletion(output)) => Ok(output),
+            Ok(_) => Err(WeftError::Llm(
+                "unexpected response type from provider".to_string(),
+            )),
+            Err(ProviderError::RateLimited { retry_after_ms }) => {
                 // Rate limit: propagate immediately, no fallback.
                 Err(WeftError::RateLimited { retry_after_ms })
             }
@@ -382,18 +389,34 @@ impl GatewayEngine {
                 );
                 let default_name = self.provider_registry.default_name();
                 let default_provider = self.provider_registry.default_provider();
-                let default_options = CompletionOptions {
-                    model: self
-                        .provider_registry
-                        .model_id(default_name)
-                        .map(String::from),
-                    max_tokens: self.provider_registry.max_tokens_for(default_name),
-                    temperature,
+
+                // Build a new request with the default model's identifiers.
+                let fallback_request = match request {
+                    ProviderRequest::ChatCompletion(mut input) => {
+                        input.model = self
+                            .provider_registry
+                            .model_id(default_name)
+                            .map(String::from)
+                            .unwrap_or_default();
+                        input.max_tokens = self
+                            .provider_registry
+                            .max_tokens_for(default_name)
+                            .unwrap_or(4096);
+                        input.temperature = temperature;
+                        ProviderRequest::ChatCompletion(input)
+                    }
+                    #[allow(unreachable_patterns)]
+                    other => other,
                 };
-                default_provider
-                    .complete(system_prompt, messages, &default_options)
-                    .await
-                    .map_err(|e| WeftError::Llm(e.to_string()))
+
+                #[allow(unreachable_patterns)]
+                match default_provider.execute(fallback_request).await {
+                    Ok(ProviderResponse::ChatCompletion(output)) => Ok(output),
+                    Ok(_) => Err(WeftError::Llm(
+                        "unexpected response type from default provider".to_string(),
+                    )),
+                    Err(e) => Err(WeftError::Llm(e.to_string())),
+                }
             }
             Err(e) => {
                 // Default model failed (or selected was already default): propagate.
@@ -993,7 +1016,7 @@ fn extract_latest_user_message(messages: &[Message]) -> Result<&str, WeftError> 
 fn build_response(
     clean_text: &str,
     model: &str,
-    usage: Option<weft_llm::LlmUsage>,
+    usage: Option<TokenUsage>,
 ) -> ChatCompletionResponse {
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let created = std::time::SystemTime::now()
@@ -1040,7 +1063,8 @@ mod tests {
         StoreCapability, WeftConfig,
     };
     use weft_llm::{
-        CompletionOptions, CompletionResponse, LlmError, LlmProvider, ProviderRegistry,
+        ChatCompletionOutput, Provider, ProviderError, ProviderRegistry, ProviderRequest,
+        ProviderResponse, TokenUsage,
     };
     use weft_router::{
         RouterError, RoutingCandidate, RoutingDecision, RoutingDomainKind, ScoredCandidate,
@@ -1049,7 +1073,7 @@ mod tests {
 
     // ── Mock implementations ───────────────────────────────────────────────
 
-    /// A mock LLM provider with configurable responses.
+    /// A mock provider with configurable responses.
     struct MockLlmProvider {
         /// Responses to return in order. Repeats last on exhaustion.
         responses: std::sync::Mutex<Vec<String>>,
@@ -1070,30 +1094,32 @@ mod tests {
     }
 
     #[async_trait]
-    impl LlmProvider for MockLlmProvider {
-        async fn complete(
+    impl Provider for MockLlmProvider {
+        async fn execute(
             &self,
-            _system_prompt: &str,
-            _messages: &[Message],
-            _options: &CompletionOptions,
-        ) -> Result<CompletionResponse, LlmError> {
+            _request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
             let mut guard = self.responses.lock().unwrap();
             let text = if guard.len() > 1 {
                 guard.remove(0)
             } else {
                 guard[0].clone()
             };
-            Ok(CompletionResponse {
+            Ok(ProviderResponse::ChatCompletion(ChatCompletionOutput {
                 text,
-                usage: Some(weft_llm::LlmUsage {
+                usage: Some(TokenUsage {
                     prompt_tokens: 10,
                     completion_tokens: 5,
                 }),
-            })
+            }))
+        }
+
+        fn name(&self) -> &str {
+            "mock"
         }
     }
 
-    /// An LLM that records which model was requested and returns a fixed response.
+    /// A provider that records which model was requested and returns a fixed response.
     struct RecordingLlmProvider {
         response: String,
         recorded_model: std::sync::Mutex<Option<String>>,
@@ -1113,50 +1139,61 @@ mod tests {
     }
 
     #[async_trait]
-    impl LlmProvider for RecordingLlmProvider {
-        async fn complete(
+    impl Provider for RecordingLlmProvider {
+        async fn execute(
             &self,
-            _system_prompt: &str,
-            _messages: &[Message],
-            options: &CompletionOptions,
-        ) -> Result<CompletionResponse, LlmError> {
-            *self.recorded_model.lock().unwrap() = options.model.clone();
-            Ok(CompletionResponse {
+            request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            // Record the model from the request. Only ChatCompletion exists now;
+            // when future variants land, update this to handle them.
+            #[allow(irrefutable_let_patterns)]
+            if let ProviderRequest::ChatCompletion(ref input) = request {
+                *self.recorded_model.lock().unwrap() = Some(input.model.clone());
+            }
+            Ok(ProviderResponse::ChatCompletion(ChatCompletionOutput {
                 text: self.response.clone(),
                 usage: None,
-            })
+            }))
+        }
+
+        fn name(&self) -> &str {
+            "recording"
         }
     }
 
-    /// An LLM that always returns a rate-limit error.
+    /// A provider that always returns a rate-limit error.
     struct RateLimitedLlmProvider;
 
     #[async_trait]
-    impl LlmProvider for RateLimitedLlmProvider {
-        async fn complete(
+    impl Provider for RateLimitedLlmProvider {
+        async fn execute(
             &self,
-            _: &str,
-            _: &[Message],
-            _: &CompletionOptions,
-        ) -> Result<CompletionResponse, LlmError> {
-            Err(LlmError::RateLimited {
+            _request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            Err(ProviderError::RateLimited {
                 retry_after_ms: 1000,
             })
         }
+
+        fn name(&self) -> &str {
+            "rate-limited"
+        }
     }
 
-    /// An LLM that always returns a provider error.
+    /// A provider that always returns a request failure error.
     struct FailingLlmProvider;
 
     #[async_trait]
-    impl LlmProvider for FailingLlmProvider {
-        async fn complete(
+    impl Provider for FailingLlmProvider {
+        async fn execute(
             &self,
-            _: &str,
-            _: &[Message],
-            _: &CompletionOptions,
-        ) -> Result<CompletionResponse, LlmError> {
-            Err(LlmError::RequestFailed("network error".to_string()))
+            _request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            Err(ProviderError::RequestFailed("network error".to_string()))
+        }
+
+        fn name(&self) -> &str {
+            "failing"
         }
     }
 
@@ -1504,14 +1541,14 @@ mod tests {
 
     /// Build a single-model `ProviderRegistry` backed by the given provider.
     fn single_model_registry(
-        provider: impl LlmProvider + 'static,
+        provider: impl Provider + 'static,
         model_name: &str,
         model_id: &str,
     ) -> Arc<ProviderRegistry> {
         let mut providers = HashMap::new();
         providers.insert(
             model_name.to_string(),
-            Arc::new(provider) as Arc<dyn LlmProvider>,
+            Arc::new(provider) as Arc<dyn Provider>,
         );
         let mut model_ids = HashMap::new();
         model_ids.insert(model_name.to_string(), model_id.to_string());
@@ -1527,17 +1564,17 @@ mod tests {
 
     /// Build a two-model `ProviderRegistry` for fallback tests.
     fn two_model_registry(
-        default_provider: impl LlmProvider + 'static,
-        non_default_provider: impl LlmProvider + 'static,
+        default_provider: impl Provider + 'static,
+        non_default_provider: impl Provider + 'static,
     ) -> Arc<ProviderRegistry> {
         let mut providers = HashMap::new();
         providers.insert(
             "default-model".to_string(),
-            Arc::new(default_provider) as Arc<dyn LlmProvider>,
+            Arc::new(default_provider) as Arc<dyn Provider>,
         );
         providers.insert(
             "complex-model".to_string(),
-            Arc::new(non_default_provider) as Arc<dyn LlmProvider>,
+            Arc::new(non_default_provider) as Arc<dyn Provider>,
         );
         let mut model_ids = HashMap::new();
         model_ids.insert("default-model".to_string(), "claude-default".to_string());
@@ -1865,22 +1902,24 @@ mod tests {
             ..(*test_config()).clone()
         });
 
-        /// An LLM that sleeps forever before responding.
+        /// A provider that sleeps forever before responding.
         struct SlowLlmProvider;
 
         #[async_trait]
-        impl LlmProvider for SlowLlmProvider {
-            async fn complete(
+        impl Provider for SlowLlmProvider {
+            async fn execute(
                 &self,
-                _: &str,
-                _: &[Message],
-                _: &CompletionOptions,
-            ) -> Result<CompletionResponse, LlmError> {
+                _request: ProviderRequest,
+            ) -> Result<ProviderResponse, ProviderError> {
                 tokio::time::sleep(Duration::from_secs(60)).await;
-                Ok(CompletionResponse {
+                Ok(ProviderResponse::ChatCompletion(ChatCompletionOutput {
                     text: "never".to_string(),
                     usage: None,
-                })
+                }))
+            }
+
+            fn name(&self) -> &str {
+                "slow"
             }
         }
 
@@ -2094,11 +2133,11 @@ mod tests {
         let mut providers = HashMap::new();
         providers.insert(
             "default-model".to_string(),
-            default_provider as Arc<dyn LlmProvider>,
+            default_provider as Arc<dyn Provider>,
         );
         providers.insert(
             "complex-model".to_string(),
-            recording_provider.clone() as Arc<dyn LlmProvider>,
+            recording_provider.clone() as Arc<dyn Provider>,
         );
 
         let mut model_ids = HashMap::new();
@@ -2143,40 +2182,50 @@ mod tests {
         // Provider records the system prompt to verify no command stubs
         struct SystemPromptCapture {
             captured: std::sync::Mutex<Option<String>>,
+            response_text: &'static str,
         }
 
         #[async_trait]
-        impl LlmProvider for SystemPromptCapture {
-            async fn complete(
+        impl Provider for SystemPromptCapture {
+            async fn execute(
                 &self,
-                system_prompt: &str,
-                _messages: &[Message],
-                _options: &CompletionOptions,
-            ) -> Result<CompletionResponse, LlmError> {
-                *self.captured.lock().unwrap() = Some(system_prompt.to_string());
-                Ok(CompletionResponse {
-                    text: "no tools needed".to_string(),
+                request: ProviderRequest,
+            ) -> Result<ProviderResponse, ProviderError> {
+                // Only ChatCompletion exists now; allow until future variants land.
+                #[allow(irrefutable_let_patterns)]
+                if let ProviderRequest::ChatCompletion(ref input) = request {
+                    *self.captured.lock().unwrap() = Some(input.system_prompt.clone());
+                }
+                Ok(ProviderResponse::ChatCompletion(ChatCompletionOutput {
+                    text: self.response_text.to_string(),
                     usage: None,
-                })
+                }))
+            }
+
+            fn name(&self) -> &str {
+                "system-prompt-capture"
             }
         }
 
         let capture = Arc::new(SystemPromptCapture {
             captured: std::sync::Mutex::new(None),
+            response_text: "no tools needed",
         });
 
         let registry = single_model_registry(
             {
                 struct WrappedCapture(Arc<SystemPromptCapture>);
                 #[async_trait]
-                impl LlmProvider for WrappedCapture {
-                    async fn complete(
+                impl Provider for WrappedCapture {
+                    async fn execute(
                         &self,
-                        system_prompt: &str,
-                        messages: &[Message],
-                        options: &CompletionOptions,
-                    ) -> Result<CompletionResponse, LlmError> {
-                        self.0.complete(system_prompt, messages, options).await
+                        request: ProviderRequest,
+                    ) -> Result<ProviderResponse, ProviderError> {
+                        self.0.execute(request).await
+                    }
+
+                    fn name(&self) -> &str {
+                        "wrapped-capture"
                     }
                 }
                 WrappedCapture(capture.clone())
@@ -2212,42 +2261,50 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_injection_when_tools_needed() {
-        struct SystemPromptCapture {
+        struct SystemPromptCapture2 {
             captured: std::sync::Mutex<Option<String>>,
         }
 
         #[async_trait]
-        impl LlmProvider for SystemPromptCapture {
-            async fn complete(
+        impl Provider for SystemPromptCapture2 {
+            async fn execute(
                 &self,
-                system_prompt: &str,
-                _messages: &[Message],
-                _options: &CompletionOptions,
-            ) -> Result<CompletionResponse, LlmError> {
-                *self.captured.lock().unwrap() = Some(system_prompt.to_string());
-                Ok(CompletionResponse {
+                request: ProviderRequest,
+            ) -> Result<ProviderResponse, ProviderError> {
+                // Only ChatCompletion exists now; allow until future variants land.
+                #[allow(irrefutable_let_patterns)]
+                if let ProviderRequest::ChatCompletion(ref input) = request {
+                    *self.captured.lock().unwrap() = Some(input.system_prompt.clone());
+                }
+                Ok(ProviderResponse::ChatCompletion(ChatCompletionOutput {
                     text: "response".to_string(),
                     usage: None,
-                })
+                }))
+            }
+
+            fn name(&self) -> &str {
+                "system-prompt-capture2"
             }
         }
 
-        let capture = Arc::new(SystemPromptCapture {
+        let capture = Arc::new(SystemPromptCapture2 {
             captured: std::sync::Mutex::new(None),
         });
 
         let registry = single_model_registry(
             {
-                struct W(Arc<SystemPromptCapture>);
+                struct W(Arc<SystemPromptCapture2>);
                 #[async_trait]
-                impl LlmProvider for W {
-                    async fn complete(
+                impl Provider for W {
+                    async fn execute(
                         &self,
-                        sp: &str,
-                        m: &[Message],
-                        o: &CompletionOptions,
-                    ) -> Result<CompletionResponse, LlmError> {
-                        self.0.complete(sp, m, o).await
+                        request: ProviderRequest,
+                    ) -> Result<ProviderResponse, ProviderError> {
+                        self.0.execute(request).await
+                    }
+
+                    fn name(&self) -> &str {
+                        "w2"
                     }
                 }
                 W(capture.clone())
@@ -2291,42 +2348,50 @@ mod tests {
             memory_score: Some(0.9),
         };
 
-        struct SystemPromptCapture {
+        struct SystemPromptCapture3 {
             captured: std::sync::Mutex<Option<String>>,
         }
 
         #[async_trait]
-        impl LlmProvider for SystemPromptCapture {
-            async fn complete(
+        impl Provider for SystemPromptCapture3 {
+            async fn execute(
                 &self,
-                system_prompt: &str,
-                _messages: &[Message],
-                _options: &CompletionOptions,
-            ) -> Result<CompletionResponse, LlmError> {
-                *self.captured.lock().unwrap() = Some(system_prompt.to_string());
-                Ok(CompletionResponse {
+                request: ProviderRequest,
+            ) -> Result<ProviderResponse, ProviderError> {
+                // Only ChatCompletion exists now; allow until future variants land.
+                #[allow(irrefutable_let_patterns)]
+                if let ProviderRequest::ChatCompletion(ref input) = request {
+                    *self.captured.lock().unwrap() = Some(input.system_prompt.clone());
+                }
+                Ok(ProviderResponse::ChatCompletion(ChatCompletionOutput {
                     text: "response".to_string(),
                     usage: None,
-                })
+                }))
+            }
+
+            fn name(&self) -> &str {
+                "system-prompt-capture3"
             }
         }
 
-        let capture = Arc::new(SystemPromptCapture {
+        let capture = Arc::new(SystemPromptCapture3 {
             captured: std::sync::Mutex::new(None),
         });
 
         let registry = single_model_registry(
             {
-                struct W(Arc<SystemPromptCapture>);
+                struct W(Arc<SystemPromptCapture3>);
                 #[async_trait]
-                impl LlmProvider for W {
-                    async fn complete(
+                impl Provider for W {
+                    async fn execute(
                         &self,
-                        sp: &str,
-                        m: &[Message],
-                        o: &CompletionOptions,
-                    ) -> Result<CompletionResponse, LlmError> {
-                        self.0.complete(sp, m, o).await
+                        request: ProviderRequest,
+                    ) -> Result<ProviderResponse, ProviderError> {
+                        self.0.execute(request).await
+                    }
+
+                    fn name(&self) -> &str {
+                        "w3"
                     }
                 }
                 W(capture.clone())

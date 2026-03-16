@@ -1,9 +1,10 @@
 use tracing::{debug, warn};
-use weft_core::Message;
 use weft_core::Role;
 
 use super::wire::{AnthropicMessage, AnthropicRequest, AnthropicResponse};
-use crate::{CompletionOptions, CompletionResponse, LlmError, LlmProvider, LlmUsage};
+use crate::{
+    ChatCompletionOutput, Provider, ProviderError, ProviderRequest, ProviderResponse, TokenUsage,
+};
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -11,7 +12,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Anthropic Messages API provider.
 ///
 /// One provider instance corresponds to one API endpoint (credentials + base_url).
-/// The model identifier is passed per-request via `CompletionOptions.model`.
+/// The model identifier is passed per-request via `ChatCompletionInput.model`.
 pub struct AnthropicProvider {
     client: reqwest::Client,
     api_key: String,
@@ -31,27 +32,16 @@ impl AnthropicProvider {
             base_url,
         }
     }
-}
 
-#[async_trait::async_trait]
-impl LlmProvider for AnthropicProvider {
-    async fn complete(
+    async fn chat_completion(
         &self,
-        system_prompt: &str,
-        messages: &[Message],
-        options: &CompletionOptions,
-    ) -> Result<CompletionResponse, LlmError> {
-        // Providers MUST return an error if model is None (defensive check).
-        let model = options.model.as_deref().ok_or_else(|| {
-            LlmError::RequestFailed(
-                "CompletionOptions.model is None -- engine misconfiguration".to_string(),
-            )
-        })?;
-
+        input: crate::ChatCompletionInput,
+    ) -> Result<ChatCompletionOutput, ProviderError> {
         // Build the system string: the provided system_prompt plus any System-role messages
         // concatenated in order.
-        let mut system_parts = vec![system_prompt.to_string()];
-        let wire_messages: Vec<AnthropicMessage> = messages
+        let mut system_parts = vec![input.system_prompt.clone()];
+        let wire_messages: Vec<AnthropicMessage> = input
+            .messages
             .iter()
             .filter_map(|m| match m.role {
                 Role::System => {
@@ -70,17 +60,16 @@ impl LlmProvider for AnthropicProvider {
             .collect();
 
         let system = system_parts.join("\n\n");
-        let max_tokens = options.max_tokens.unwrap_or(4096);
 
         let request = AnthropicRequest {
-            model: model.to_string(),
+            model: input.model.clone(),
             system,
             messages: wire_messages,
-            max_tokens,
-            temperature: options.temperature,
+            max_tokens: input.max_tokens,
+            temperature: input.temperature,
         };
 
-        debug!(model = %model, max_tokens, "sending Anthropic request");
+        debug!(model = %input.model, max_tokens = input.max_tokens, "sending Anthropic request");
 
         let response = self
             .client
@@ -91,7 +80,7 @@ impl LlmProvider for AnthropicProvider {
             .json(&request)
             .send()
             .await
-            .map_err(|e| LlmError::RequestFailed(e.to_string()))?;
+            .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
 
         let status = response.status().as_u16();
 
@@ -104,7 +93,7 @@ impl LlmProvider for AnthropicProvider {
                 .and_then(|s| s.parse::<u64>().ok())
                 .map(|secs| secs * 1000)
                 .unwrap_or(60_000);
-            return Err(LlmError::RateLimited { retry_after_ms });
+            return Err(ProviderError::RateLimited { retry_after_ms });
         }
 
         if status != 200 {
@@ -113,16 +102,16 @@ impl LlmProvider for AnthropicProvider {
                 .await
                 .unwrap_or_else(|_| "<failed to read body>".to_string());
             warn!(status, "Anthropic API returned non-200");
-            return Err(LlmError::ProviderError { status, body });
+            return Err(ProviderError::ProviderHttpError { status, body });
         }
 
         let body_text = response
             .text()
             .await
-            .map_err(|e| LlmError::RequestFailed(e.to_string()))?;
+            .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
 
         let anthropic_response: AnthropicResponse = serde_json::from_str(&body_text)
-            .map_err(|e| LlmError::DeserializationError(e.to_string()))?;
+            .map_err(|e| ProviderError::DeserializationError(e.to_string()))?;
 
         // Extract text from the first text content block
         let text = anthropic_response
@@ -132,12 +121,33 @@ impl LlmProvider for AnthropicProvider {
             .and_then(|b| b.text.clone())
             .unwrap_or_default();
 
-        let usage = anthropic_response.usage.map(|u| LlmUsage {
+        let usage = anthropic_response.usage.map(|u| TokenUsage {
             prompt_tokens: u.input_tokens,
             completion_tokens: u.output_tokens,
         });
 
-        Ok(CompletionResponse { text, usage })
+        Ok(ChatCompletionOutput { text, usage })
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for AnthropicProvider {
+    async fn execute(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        match request {
+            ProviderRequest::ChatCompletion(input) => {
+                let output = self.chat_completion(input).await?;
+                Ok(ProviderResponse::ChatCompletion(output))
+            }
+            // For now, only ChatCompletion is implemented.
+            #[allow(unreachable_patterns)]
+            _ => Err(ProviderError::Unsupported(
+                "Anthropic provider currently supports chat_completions only".to_string(),
+            )),
+        }
+    }
+
+    fn name(&self) -> &str {
+        "anthropic"
     }
 }
 
@@ -145,6 +155,7 @@ impl LlmProvider for AnthropicProvider {
 mod tests {
     use super::*;
     use serde_json::json;
+    use weft_core::{Message, Role};
 
     fn make_provider(base_url: &str) -> AnthropicProvider {
         AnthropicProvider::new("test-key".to_string(), Some(base_url.to_string()))
@@ -157,12 +168,14 @@ mod tests {
         }]
     }
 
-    fn options_with_model(model: &str) -> CompletionOptions {
-        CompletionOptions {
-            max_tokens: None,
+    fn make_request(model: &str) -> ProviderRequest {
+        ProviderRequest::ChatCompletion(crate::ChatCompletionInput {
+            system_prompt: "system".to_string(),
+            messages: make_messages(),
+            model: model.to_string(),
+            max_tokens: 4096,
             temperature: None,
-            model: Some(model.to_string()),
-        }
+        })
     }
 
     #[tokio::test]
@@ -187,41 +200,20 @@ mod tests {
 
         let provider = make_provider(&server.url());
         let result = provider
-            .complete(
-                "system",
-                &make_messages(),
-                &options_with_model("claude-test"),
-            )
+            .execute(make_request("claude-test"))
             .await
             .expect("should succeed");
 
-        assert_eq!(result.text, "Hello! How can I help?");
-        let usage = result.usage.expect("usage should be present");
+        // Only ChatCompletion variant exists; when future variants land this becomes refutable.
+        #[allow(irrefutable_let_patterns)]
+        let ProviderResponse::ChatCompletion(output) = result else {
+            panic!("expected ChatCompletion response");
+        };
+        assert_eq!(output.text, "Hello! How can I help?");
+        let usage = output.usage.expect("usage should be present");
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 8);
         mock.assert_async().await;
-    }
-
-    #[tokio::test]
-    async fn test_model_none_returns_error() {
-        let mut server = mockito::Server::new_async().await;
-        // No mock needed — should fail before hitting the server
-        let _mock = server
-            .mock("POST", "/")
-            .with_status(200)
-            .create_async()
-            .await;
-
-        let provider = make_provider(&server.url());
-        let options = CompletionOptions::default(); // model is None
-        let result = provider
-            .complete("system", &make_messages(), &options)
-            .await;
-
-        assert!(
-            matches!(result, Err(LlmError::RequestFailed(_))),
-            "None model should return RequestFailed"
-        );
     }
 
     #[tokio::test]
@@ -235,17 +227,11 @@ mod tests {
             .await;
 
         let provider = make_provider(&server.url());
-        let result = provider
-            .complete(
-                "system",
-                &make_messages(),
-                &options_with_model("claude-test"),
-            )
-            .await;
+        let result = provider.execute(make_request("claude-test")).await;
 
         assert!(matches!(
             result,
-            Err(LlmError::ProviderError { status: 400, .. })
+            Err(ProviderError::ProviderHttpError { status: 400, .. })
         ));
     }
 
@@ -261,17 +247,11 @@ mod tests {
             .await;
 
         let provider = make_provider(&server.url());
-        let result = provider
-            .complete(
-                "system",
-                &make_messages(),
-                &options_with_model("claude-test"),
-            )
-            .await;
+        let result = provider.execute(make_request("claude-test")).await;
 
         assert!(matches!(
             result,
-            Err(LlmError::RateLimited {
+            Err(ProviderError::RateLimited {
                 retry_after_ms: 30_000
             })
         ));
@@ -313,9 +293,14 @@ mod tests {
         ];
 
         let provider = make_provider(&server.url());
-        let result = provider
-            .complete("base system", &messages, &options_with_model("claude-test"))
-            .await;
+        let request = ProviderRequest::ChatCompletion(crate::ChatCompletionInput {
+            system_prompt: "base system".to_string(),
+            messages,
+            model: "claude-test".to_string(),
+            max_tokens: 4096,
+            temperature: None,
+        });
+        let result = provider.execute(request).await;
 
         assert!(result.is_ok());
         mock.assert_async().await;
@@ -345,14 +330,14 @@ mod tests {
             .await;
 
         let provider = make_provider(&server.url());
-        let options = CompletionOptions {
-            max_tokens: Some(512),
+        let request = ProviderRequest::ChatCompletion(crate::ChatCompletionInput {
+            system_prompt: "system".to_string(),
+            messages: make_messages(),
+            model: "claude-test".to_string(),
+            max_tokens: 512,
             temperature: Some(0.7),
-            model: Some("claude-test".to_string()),
-        };
-        let result = provider
-            .complete("system", &make_messages(), &options)
-            .await;
+        });
+        let result = provider.execute(request).await;
         assert!(result.is_ok());
         mock.assert_async().await;
     }
@@ -369,14 +354,44 @@ mod tests {
             .await;
 
         let provider = make_provider(&server.url());
-        let result = provider
-            .complete(
-                "system",
-                &make_messages(),
-                &options_with_model("claude-test"),
+        let result = provider.execute(make_request("claude-test")).await;
+
+        assert!(matches!(
+            result,
+            Err(ProviderError::DeserializationError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_execute_unsupported_variant_returns_unsupported() {
+        // ChatCompletion should succeed — not unsupported.
+        // When future variants are added, they must return Unsupported from AnthropicProvider.
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input_tokens": 5, "output_tokens": 2}
+                })
+                .to_string(),
             )
+            .create_async()
             .await;
 
-        assert!(matches!(result, Err(LlmError::DeserializationError(_))));
+        let provider = make_provider(&server.url());
+        let result = provider.execute(make_request("claude-test")).await;
+        assert!(
+            result.is_ok(),
+            "ChatCompletion should not return Unsupported"
+        );
+    }
+
+    #[test]
+    fn test_provider_name() {
+        let provider = AnthropicProvider::new("key".to_string(), None);
+        assert_eq!(provider.name(), "anthropic");
     }
 }

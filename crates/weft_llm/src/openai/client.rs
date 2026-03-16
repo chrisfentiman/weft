@@ -1,15 +1,17 @@
 use tracing::{debug, warn};
-use weft_core::{Message, Role};
+use weft_core::Role;
 
 use super::wire::{OpenAIMessage, OpenAIRequest, OpenAIResponse};
-use crate::{CompletionOptions, CompletionResponse, LlmError, LlmProvider, LlmUsage};
+use crate::{
+    ChatCompletionOutput, Provider, ProviderError, ProviderRequest, ProviderResponse, TokenUsage,
+};
 
 const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
 
 /// OpenAI Chat Completions API provider.
 ///
 /// One provider instance corresponds to one API endpoint (credentials + base_url).
-/// The model identifier is passed per-request via `CompletionOptions.model`.
+/// The model identifier is passed per-request via `ChatCompletionInput.model`.
 pub struct OpenAIProvider {
     client: reqwest::Client,
     api_key: String,
@@ -29,36 +31,24 @@ impl OpenAIProvider {
             base_url,
         }
     }
-}
 
-#[async_trait::async_trait]
-impl LlmProvider for OpenAIProvider {
-    async fn complete(
+    async fn chat_completion(
         &self,
-        system_prompt: &str,
-        messages: &[Message],
-        options: &CompletionOptions,
-    ) -> Result<CompletionResponse, LlmError> {
-        // Providers MUST return an error if model is None (defensive check).
-        let model = options.model.as_deref().ok_or_else(|| {
-            LlmError::RequestFailed(
-                "CompletionOptions.model is None -- engine misconfiguration".to_string(),
-            )
-        })?;
-
+        input: crate::ChatCompletionInput,
+    ) -> Result<ChatCompletionOutput, ProviderError> {
         // System prompt goes as first message with role "system".
         // Any Role::System messages in the messages slice are also mapped to role "system".
         let mut wire_messages = Vec::new();
 
         // Prepend the system_prompt as a system role message
-        if !system_prompt.is_empty() {
+        if !input.system_prompt.is_empty() {
             wire_messages.push(OpenAIMessage {
                 role: "system".to_string(),
-                content: system_prompt.to_string(),
+                content: input.system_prompt.clone(),
             });
         }
 
-        for m in messages {
+        for m in &input.messages {
             let role = match m.role {
                 Role::System => "system",
                 Role::User => "user",
@@ -70,16 +60,14 @@ impl LlmProvider for OpenAIProvider {
             });
         }
 
-        let max_tokens = options.max_tokens.unwrap_or(4096);
-
         let request = OpenAIRequest {
-            model: model.to_string(),
+            model: input.model.clone(),
             messages: wire_messages,
-            max_tokens: Some(max_tokens),
-            temperature: options.temperature,
+            max_tokens: Some(input.max_tokens),
+            temperature: input.temperature,
         };
 
-        debug!(model = %model, max_tokens, "sending OpenAI request");
+        debug!(model = %input.model, max_tokens = input.max_tokens, "sending OpenAI request");
 
         let response = self
             .client
@@ -89,7 +77,7 @@ impl LlmProvider for OpenAIProvider {
             .json(&request)
             .send()
             .await
-            .map_err(|e| LlmError::RequestFailed(e.to_string()))?;
+            .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
 
         let status = response.status().as_u16();
 
@@ -101,7 +89,7 @@ impl LlmProvider for OpenAIProvider {
                 .and_then(|s| s.parse::<u64>().ok())
                 .map(|secs| secs * 1000)
                 .unwrap_or(60_000);
-            return Err(LlmError::RateLimited { retry_after_ms });
+            return Err(ProviderError::RateLimited { retry_after_ms });
         }
 
         if status != 200 {
@@ -110,16 +98,16 @@ impl LlmProvider for OpenAIProvider {
                 .await
                 .unwrap_or_else(|_| "<failed to read body>".to_string());
             warn!(status, "OpenAI API returned non-200");
-            return Err(LlmError::ProviderError { status, body });
+            return Err(ProviderError::ProviderHttpError { status, body });
         }
 
         let body_text = response
             .text()
             .await
-            .map_err(|e| LlmError::RequestFailed(e.to_string()))?;
+            .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
 
         let openai_response: OpenAIResponse = serde_json::from_str(&body_text)
-            .map_err(|e| LlmError::DeserializationError(e.to_string()))?;
+            .map_err(|e| ProviderError::DeserializationError(e.to_string()))?;
 
         let text = openai_response
             .choices
@@ -127,12 +115,33 @@ impl LlmProvider for OpenAIProvider {
             .map(|c| c.message.content.clone())
             .unwrap_or_default();
 
-        let usage = openai_response.usage.map(|u| LlmUsage {
+        let usage = openai_response.usage.map(|u| TokenUsage {
             prompt_tokens: u.prompt_tokens,
             completion_tokens: u.completion_tokens,
         });
 
-        Ok(CompletionResponse { text, usage })
+        Ok(ChatCompletionOutput { text, usage })
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for OpenAIProvider {
+    async fn execute(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        match request {
+            ProviderRequest::ChatCompletion(input) => {
+                let output = self.chat_completion(input).await?;
+                Ok(ProviderResponse::ChatCompletion(output))
+            }
+            // For now, only ChatCompletion is implemented.
+            #[allow(unreachable_patterns)]
+            _ => Err(ProviderError::Unsupported(
+                "OpenAI provider currently supports chat_completions only".to_string(),
+            )),
+        }
+    }
+
+    fn name(&self) -> &str {
+        "openai"
     }
 }
 
@@ -140,6 +149,7 @@ impl LlmProvider for OpenAIProvider {
 mod tests {
     use super::*;
     use serde_json::json;
+    use weft_core::{Message, Role};
 
     fn make_provider(base_url: &str) -> OpenAIProvider {
         OpenAIProvider::new("test-key".to_string(), Some(base_url.to_string()))
@@ -152,12 +162,14 @@ mod tests {
         }]
     }
 
-    fn options_with_model(model: &str) -> CompletionOptions {
-        CompletionOptions {
-            max_tokens: None,
+    fn make_request(model: &str) -> ProviderRequest {
+        ProviderRequest::ChatCompletion(crate::ChatCompletionInput {
+            system_prompt: "system".to_string(),
+            messages: make_messages(),
+            model: model.to_string(),
+            max_tokens: 4096,
             temperature: None,
-            model: Some(model.to_string()),
-        }
+        })
     }
 
     #[tokio::test]
@@ -184,36 +196,20 @@ mod tests {
 
         let provider = make_provider(&server.url());
         let result = provider
-            .complete("system", &make_messages(), &options_with_model("gpt-test"))
+            .execute(make_request("gpt-test"))
             .await
             .expect("should succeed");
 
-        assert_eq!(result.text, "Hello! How can I help?");
-        let usage = result.usage.expect("usage should be present");
+        // Only ChatCompletion variant exists; when future variants land this becomes refutable.
+        #[allow(irrefutable_let_patterns)]
+        let ProviderResponse::ChatCompletion(output) = result else {
+            panic!("expected ChatCompletion response");
+        };
+        assert_eq!(output.text, "Hello! How can I help?");
+        let usage = output.usage.expect("usage should be present");
         assert_eq!(usage.prompt_tokens, 12);
         assert_eq!(usage.completion_tokens, 9);
         mock.assert_async().await;
-    }
-
-    #[tokio::test]
-    async fn test_model_none_returns_error() {
-        let mut server = mockito::Server::new_async().await;
-        let _mock = server
-            .mock("POST", "/")
-            .with_status(200)
-            .create_async()
-            .await;
-
-        let provider = make_provider(&server.url());
-        let options = CompletionOptions::default(); // model is None
-        let result = provider
-            .complete("system", &make_messages(), &options)
-            .await;
-
-        assert!(
-            matches!(result, Err(LlmError::RequestFailed(_))),
-            "None model should return RequestFailed"
-        );
     }
 
     #[tokio::test]
@@ -227,13 +223,11 @@ mod tests {
             .await;
 
         let provider = make_provider(&server.url());
-        let result = provider
-            .complete("system", &make_messages(), &options_with_model("gpt-test"))
-            .await;
+        let result = provider.execute(make_request("gpt-test")).await;
 
         assert!(matches!(
             result,
-            Err(LlmError::ProviderError { status: 400, .. })
+            Err(ProviderError::ProviderHttpError { status: 400, .. })
         ));
     }
 
@@ -249,13 +243,11 @@ mod tests {
             .await;
 
         let provider = make_provider(&server.url());
-        let result = provider
-            .complete("system", &make_messages(), &options_with_model("gpt-test"))
-            .await;
+        let result = provider.execute(make_request("gpt-test")).await;
 
         assert!(matches!(
             result,
-            Err(LlmError::RateLimited {
+            Err(ProviderError::RateLimited {
                 retry_after_ms: 60_000
             })
         ));
@@ -288,13 +280,14 @@ mod tests {
             .await;
 
         let provider = make_provider(&server.url());
-        let result = provider
-            .complete(
-                "You are a helpful assistant.",
-                &make_messages(),
-                &options_with_model("gpt-test"),
-            )
-            .await;
+        let request = ProviderRequest::ChatCompletion(crate::ChatCompletionInput {
+            system_prompt: "You are a helpful assistant.".to_string(),
+            messages: make_messages(),
+            model: "gpt-test".to_string(),
+            max_tokens: 4096,
+            temperature: None,
+        });
+        let result = provider.execute(request).await;
 
         assert!(result.is_ok());
         mock.assert_async().await;
@@ -325,14 +318,14 @@ mod tests {
             .await;
 
         let provider = make_provider(&server.url());
-        let options = CompletionOptions {
-            max_tokens: Some(256),
+        let request = ProviderRequest::ChatCompletion(crate::ChatCompletionInput {
+            system_prompt: "system".to_string(),
+            messages: make_messages(),
+            model: "gpt-test".to_string(),
+            max_tokens: 256,
             temperature: Some(0.5),
-            model: Some("gpt-test".to_string()),
-        };
-        let result = provider
-            .complete("system", &make_messages(), &options)
-            .await;
+        });
+        let result = provider.execute(request).await;
         assert!(result.is_ok());
         mock.assert_async().await;
     }
@@ -355,10 +348,14 @@ mod tests {
             .await;
 
         let provider = make_provider(&server.url());
-        // Empty system prompt should not add a system message
-        let result = provider
-            .complete("", &make_messages(), &options_with_model("gpt-test"))
-            .await;
+        let request = ProviderRequest::ChatCompletion(crate::ChatCompletionInput {
+            system_prompt: "".to_string(),
+            messages: make_messages(),
+            model: "gpt-test".to_string(),
+            max_tokens: 4096,
+            temperature: None,
+        });
+        let result = provider.execute(request).await;
         assert!(result.is_ok());
     }
 
@@ -374,10 +371,46 @@ mod tests {
             .await;
 
         let provider = make_provider(&server.url());
-        let result = provider
-            .complete("system", &make_messages(), &options_with_model("gpt-test"))
+        let result = provider.execute(make_request("gpt-test")).await;
+
+        assert!(matches!(
+            result,
+            Err(ProviderError::DeserializationError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_execute_unsupported_variant_returns_unsupported() {
+        // There are no non-ChatCompletion variants yet, so we verify the match
+        // arm compiles and the ChatCompletion arm works. When future variants are
+        // added, they must return Unsupported from OpenAIProvider.
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                    "usage": null
+                })
+                .to_string(),
+            )
+            .create_async()
             .await;
 
-        assert!(matches!(result, Err(LlmError::DeserializationError(_))));
+        let provider = make_provider(&server.url());
+        // ChatCompletion should succeed — not unsupported
+        let result = provider.execute(make_request("gpt-test")).await;
+        assert!(
+            result.is_ok(),
+            "ChatCompletion should not return Unsupported"
+        );
+    }
+
+    #[test]
+    fn test_provider_name() {
+        let provider = OpenAIProvider::new("key".to_string(), None);
+        assert_eq!(provider.name(), "openai");
     }
 }

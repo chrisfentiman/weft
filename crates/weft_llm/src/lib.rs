@@ -1,89 +1,46 @@
-//! `weft_llm` — LLM provider trait and implementations.
+//! `weft_llm` — Universal AI provider trait and implementations.
 //!
 //! Contains:
-//! - `LlmProvider` trait for sending conversations to an LLM backend
-//! - `LlmError` error type
-//! - `CompletionOptions` for per-request options
-//! - `CompletionResponse` and `LlmUsage` for provider responses
+//! - `Provider` trait for executing requests against an AI provider backend
+//! - `ProviderError` error type
+//! - `ProviderRequest` / `ProviderResponse` enums covering all capability types
+//! - `ChatCompletionInput` / `ChatCompletionOutput` for chat completion requests
+//! - `TokenUsage` for provider-reported token counts
+//! - `Capability` newtype with well-known constants
 //! - `AnthropicProvider`: Anthropic Messages API implementation
 //! - `OpenAIProvider`: OpenAI Chat Completions API implementation
-//! - `ProviderRegistry`: Registry of named LLM providers keyed by model routing name
+//! - `ProviderRegistry`: Registry of named providers keyed by model routing name
 
 pub mod anthropic;
 pub mod openai;
+pub mod provider;
 pub mod registry;
 
 pub use anthropic::AnthropicProvider;
 pub use openai::OpenAIProvider;
+pub use provider::{
+    Capability, ChatCompletionInput, ChatCompletionOutput, ProviderError, ProviderRequest,
+    ProviderResponse, TokenUsage,
+};
 pub use registry::ProviderRegistry;
 
 use async_trait::async_trait;
-use weft_core::Message;
 
-/// Options forwarded from the client request to the LLM provider.
-#[derive(Debug, Clone, Default)]
-pub struct CompletionOptions {
-    /// Maximum tokens in response. If None, use provider/config default.
-    pub max_tokens: Option<u32>,
-    /// Sampling temperature. If None, use provider default.
-    pub temperature: Option<f32>,
-    /// Model identifier to use for this request.
-    ///
-    /// **Contract:** The engine guarantees this is always `Some` when calling providers.
-    /// The engine resolves the model from the routing decision and `ProviderRegistry::model_id()`
-    /// before constructing `CompletionOptions`. The `Option` exists only because
-    /// `CompletionOptions` derives `Default` (used in tests); production code paths
-    /// always set this field.
-    ///
-    /// **Provider behavior:** Providers MUST return `LlmError` if `model` is `None`.
-    /// This is a defensive check -- it should never fire if the engine is wired correctly.
-    pub model: Option<String>,
-}
-
-/// A backend LLM provider (Anthropic, OpenAI, etc.)
+/// A universal AI provider.
 ///
-/// Send + Sync required: shared across request handlers via Arc.
-/// 'static required: no borrowed references from the provider.
+/// Providers handle requests they support and return `ProviderError::Unsupported`
+/// for request types they cannot handle.
+///
+/// Send + Sync + 'static: shared across request handlers via Arc.
 #[async_trait]
-pub trait LlmProvider: Send + Sync + 'static {
-    /// Send a conversation to the LLM and receive the complete response.
+pub trait Provider: Send + Sync + 'static {
+    /// Execute a provider request and return the response.
+    async fn execute(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError>;
+
+    /// The name of this provider instance, for logging and diagnostics.
     ///
-    /// `system_prompt`: The assembled system prompt (Weft foundational + agent).
-    /// `messages`: The full conversation including injected command results.
-    /// `options`: Per-request options (max_tokens, temperature) forwarded from the client.
-    ///
-    /// Returns the assistant's response text and usage info. Not streaming -- full response.
-    async fn complete(
-        &self,
-        system_prompt: &str,
-        messages: &[Message],
-        options: &CompletionOptions,
-    ) -> Result<CompletionResponse, LlmError>;
-}
-
-/// Response from an LLM provider.
-#[derive(Debug, Clone)]
-pub struct CompletionResponse {
-    /// The assistant's response text.
-    pub text: String,
-    /// Token usage from the provider, if available.
-    pub usage: Option<LlmUsage>,
-}
-
-#[derive(Debug, Clone)]
-pub struct LlmUsage {
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum LlmError {
-    #[error("provider request failed: {0}")]
-    RequestFailed(String),
-    #[error("provider returned non-200: status={status}, body={body}")]
-    ProviderError { status: u16, body: String },
-    #[error("response deserialization failed: {0}")]
-    DeserializationError(String),
-    #[error("rate limited, retry after {retry_after_ms}ms")]
-    RateLimited { retry_after_ms: u64 },
+    /// This is informational -- the actual capability filtering happens at the
+    /// model level via config, not at the provider level. A single provider
+    /// instance may serve multiple models with different capabilities.
+    fn name(&self) -> &str;
 }

@@ -158,18 +158,18 @@ async fn main() {
 
     // ── Build ProviderRegistry ─────────────────────────────────────────────
     //
-    // One `LlmProvider` instance per `ProviderConfig`. Multiple model entries
-    // under the same provider share the same `Arc<dyn LlmProvider>`.
+    // One `Provider` instance per `ProviderConfig`. Multiple model entries
+    // under the same provider share the same `Arc<dyn Provider>`.
     //
-    // Build a map from provider name -> Arc<dyn LlmProvider> first, then
+    // Build a map from provider name -> Arc<dyn Provider> first, then
     // iterate resolved models to build the registry maps.
 
     let resolved_models = config.router.resolve_models();
 
     // One provider instance per unique provider name.
-    let mut provider_instances: HashMap<String, Arc<dyn weft_llm::LlmProvider>> = HashMap::new();
+    let mut provider_instances: HashMap<String, Arc<dyn weft_llm::Provider>> = HashMap::new();
     for provider_config in &config.router.providers {
-        let instance: Arc<dyn weft_llm::LlmProvider> = match &provider_config.kind {
+        let instance: Arc<dyn weft_llm::Provider> = match &provider_config.kind {
             LlmProviderKind::Anthropic => Arc::new(AnthropicProvider::new(
                 provider_config.api_key.clone(),
                 provider_config.base_url.clone(),
@@ -183,7 +183,7 @@ async fn main() {
     }
 
     // Build registry maps: model routing name -> provider/model_id/max_tokens.
-    let mut registry_providers: HashMap<String, Arc<dyn weft_llm::LlmProvider>> = HashMap::new();
+    let mut registry_providers: HashMap<String, Arc<dyn weft_llm::Provider>> = HashMap::new();
     let mut registry_model_ids: HashMap<String, String> = HashMap::new();
     let mut registry_max_tokens: HashMap<String, u32> = HashMap::new();
 
