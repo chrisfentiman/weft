@@ -6,7 +6,7 @@
 use weft_core::{ContentPart, Role, Source, WeftMessage, WeftResponse, WeftTiming, WeftUsage};
 use weft_llm::TokenUsage;
 
-use super::util::ActivityEvent;
+use crate::util::ActivityEvent;
 
 /// Assemble the final `WeftResponse` from the LLM output and optional activity events.
 ///

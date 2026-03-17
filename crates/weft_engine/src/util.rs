@@ -4,9 +4,7 @@
 //! command constants and describe text, and the `extract_latest_user_text`
 //! helper used by the request loop.
 
-use weft_core::{
-    ContentPart, HookRoutingDomain, Role, Source, WeftMessage,
-};
+use weft_core::{ContentPart, HookRoutingDomain, Role, Source, WeftMessage};
 use weft_router::RoutingDomainKind;
 
 /// Built-in command names intercepted by the engine before the command registry.

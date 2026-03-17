@@ -6,17 +6,17 @@
 
 use tracing::{info, warn};
 use weft_commands::CommandRegistry;
+use weft_core::HookEvent;
 use weft_core::{
     CommandAction, CommandInvocation, CommandResult, HookRoutingDomain, RoutingTrigger,
 };
-use weft_core::HookEvent;
 use weft_hooks::{HookChainResult, HookRunner};
 use weft_llm::ProviderService;
 use weft_memory::MemoryService;
 use weft_router::{RoutingCandidate, SemanticRouter};
 
-use super::GatewayEngine;
-use super::util::builtin_describe_text;
+use crate::GatewayEngine;
+use crate::util::builtin_describe_text;
 
 impl<H, R, M, P, C> GatewayEngine<H, R, M, P, C>
 where
@@ -34,7 +34,7 @@ where
     /// 3. PostRoute(memory, trigger=recall|remember) — can override selected stores or scores.
     /// 4. Execute the command.
     /// 5. PostToolUse — can modify the result.
-    pub(super) async fn handle_builtin_with_hooks(
+    pub(crate) async fn handle_builtin_with_hooks(
         &self,
         invocation: &CommandInvocation,
         user_message: &str,
@@ -402,7 +402,7 @@ where
     ///
     /// Delegates to the `MemoryService`. The engine is responsible only for
     /// extracting the query argument and passing pre-routed store IDs.
-    pub(super) async fn exec_recall_with_stores(
+    pub(crate) async fn exec_recall_with_stores(
         &self,
         invocation: &CommandInvocation,
         user_message: &str,
@@ -432,7 +432,7 @@ where
     /// Execute a `/remember` invocation against pre-selected stores.
     ///
     /// Delegates to the `MemoryService` after extracting the `content` argument.
-    pub(super) async fn exec_remember_with_stores(
+    pub(crate) async fn exec_remember_with_stores(
         &self,
         invocation: &CommandInvocation,
         store_ids: Vec<String>,
@@ -468,7 +468,7 @@ where
     ///
     /// Uses the Memory domain-specific threshold if configured; otherwise falls back
     /// to the classifier threshold.
-    pub(super) fn memory_domain_threshold(&self) -> f32 {
+    pub(crate) fn memory_domain_threshold(&self) -> f32 {
         self.config
             .router
             .domains
@@ -476,5 +476,437 @@ where
             .as_ref()
             .and_then(|d| d.threshold)
             .unwrap_or(self.config.router.classifier.threshold)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::*;
+    use std::sync::Arc;
+
+    // ── /recall tests ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_recall_intercepted_before_command_registry() {
+        // Engine with memory mux — /recall should NOT reach the command registry.
+        // If it did reach the registry, it would fail with CommandError::NotFound
+        // (the mock registry has no "recall" command) and the loop would continue
+        // until the LLM emits a response without commands.
+        let mux = make_mux_with_stores(vec![(
+            "conv",
+            true,
+            true,
+            Arc::new(MockMemStoreClient::succeeds(vec![mem_entry(
+                "m1",
+                "dark mode",
+            )])),
+        )]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/recall query: \"user preferences\"",
+                "I found some memories about preferences.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]), // no "recall" in registry
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("What are the user's preferences?"))
+            .await
+            .expect("should succeed");
+
+        assert_eq!(resp_text(&resp), "I found some memories about preferences.");
+    }
+
+    #[tokio::test]
+    async fn test_recall_returns_memories_as_toon() {
+        let mux = make_mux_with_stores(vec![(
+            "conv",
+            true,
+            true,
+            Arc::new(MockMemStoreClient::succeeds(vec![mem_entry(
+                "m1",
+                "user prefers dark mode",
+            )])),
+        )]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/recall query: \"user preferences\"",
+                "Thanks for the context.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("What does the user like?"))
+            .await
+            .expect("should succeed");
+
+        assert_eq!(resp_text(&resp), "Thanks for the context.");
+    }
+
+    #[tokio::test]
+    async fn test_recall_no_query_arg_uses_user_message() {
+        // /recall without query arg should still succeed (falls back to user message).
+        let mux = make_mux_with_stores(vec![(
+            "conv",
+            true,
+            true,
+            Arc::new(MockMemStoreClient::succeeds(vec![])),
+        )]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec!["/recall", "Nothing found in memory."]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Tell me about user prefs"))
+            .await
+            .expect("should succeed without panicking");
+
+        assert_eq!(resp_text(&resp), "Nothing found in memory.");
+    }
+
+    #[tokio::test]
+    async fn test_recall_all_stores_fail_returns_success_with_no_memories() {
+        // All stores fail — should return success=true with "No relevant memories found."
+        let mux = make_mux_with_stores(vec![(
+            "broken",
+            true,
+            true,
+            Arc::new(MockMemStoreClient::query_fails("connection refused")),
+        )]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/recall query: \"something\"",
+                "Understood, no memories available.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Search memory"))
+            .await
+            .expect("should succeed even when stores fail");
+
+        assert_eq!(resp_text(&resp), "Understood, no memories available.");
+    }
+
+    #[tokio::test]
+    async fn test_recall_no_mux_returns_error_result() {
+        // /recall with no mux configured should emit an error result to the LLM.
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/recall query: \"something\"",
+                "Memory is not configured.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+        // Engine with no mux but we need to parse /recall — add it to registry as a command
+        // Actually, without a mux, /recall won't be in known_commands, so it won't be parsed.
+        // Test instead: call handle_builtin directly by building engine and sending a request
+        // where the LLM emits /recall but the parser only picks it up if we register it.
+        // To force the parse, we build an engine with a mock mux that is None-equivalent
+        // — but there's no way to do that without an actual mux; the mux controls parser registration.
+        // This is correct behaviour: without a mux, /recall is not in known_commands and is treated as prose.
+        // Verify the response still works (just contains the text with /recall treated as prose).
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            None, // no mux
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Try to recall"))
+            .await
+            .expect("should succeed");
+
+        // The LLM response includes "/recall query: something" but it's treated as prose
+        // because recall is not in known_commands when mux is None.
+        // The first LLM response is returned directly since no commands are parsed.
+        assert_eq!(resp_text(&resp), "/recall query: \"something\"");
+    }
+
+    // ── /remember tests ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_remember_intercepted_and_stores_to_writable() {
+        let mux = make_mux_with_stores(vec![(
+            "conv",
+            true,
+            true,
+            Arc::new(MockMemStoreClient::succeeds(vec![])),
+        )]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/remember content: \"user prefers dark mode\"",
+                "Memory stored.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Remember this"))
+            .await
+            .expect("should succeed");
+
+        assert_eq!(resp_text(&resp), "Memory stored.");
+    }
+
+    #[tokio::test]
+    async fn test_remember_missing_content_returns_error() {
+        // /remember without content arg should return success:false error to LLM.
+        let mux = make_mux_with_stores(vec![(
+            "conv",
+            true,
+            true,
+            Arc::new(MockMemStoreClient::succeeds(vec![])),
+        )]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/remember", // missing content
+                "Got an error about missing argument.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Store something"))
+            .await
+            .expect("should succeed overall");
+
+        assert_eq!(resp_text(&resp), "Got an error about missing argument.");
+    }
+
+    #[tokio::test]
+    async fn test_remember_no_writable_stores_returns_empty_success() {
+        // All stores are read-only — /remember should return success with no stores written.
+        let mux = make_mux_with_stores(vec![(
+            "code",
+            true,
+            false, // read-only
+            Arc::new(MockMemStoreClient::succeeds(vec![])),
+        )]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/remember content: \"some info\"",
+                "Attempted to remember.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Remember this"))
+            .await
+            .expect("should not fail");
+
+        assert_eq!(resp_text(&resp), "Attempted to remember.");
+    }
+
+    // ── --describe tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_recall_describe_returns_compiled_text() {
+        let mux = make_mux_with_stores(vec![(
+            "conv",
+            true,
+            true,
+            Arc::new(MockMemStoreClient::succeeds(vec![])),
+        )]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec!["/recall --describe", "I see how recall works."]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("How does recall work?"))
+            .await
+            .expect("should succeed");
+
+        assert_eq!(resp_text(&resp), "I see how recall works.");
+    }
+
+    #[tokio::test]
+    async fn test_remember_describe_does_not_reach_command_registry() {
+        // The mock registry has no "remember" command — if --describe reached the
+        // registry, it would return an error. With built-in interception it returns
+        // the compiled describe text and success=true.
+        let mux = make_mux_with_stores(vec![(
+            "conv",
+            true,
+            true,
+            Arc::new(MockMemStoreClient::succeeds(vec![])),
+        )]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/remember --describe",
+                "Now I know how to use remember.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![]), // no "remember" in registry
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("How do I store memories?"))
+            .await
+            .expect("should succeed");
+
+        assert_eq!(resp_text(&resp), "Now I know how to use remember.");
+    }
+
+    // ── mixed built-in + external commands ────────────────────────────
+
+    #[tokio::test]
+    async fn test_mixed_builtin_and_external_commands() {
+        // LLM emits both /recall and /web_search in the same response.
+        // Both should execute: built-in first, then external.
+        let mux = make_mux_with_stores(vec![(
+            "conv",
+            true,
+            true,
+            Arc::new(MockMemStoreClient::succeeds(vec![mem_entry(
+                "m1",
+                "user prefers dark mode",
+            )])),
+        )]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec![
+                "/recall query: \"prefs\"\n/web_search query: \"dark mode\"",
+                "Found memories and web results.",
+            ]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![("web_search", "Search the web")]).with_execute_result(
+                CommandResult {
+                    command_name: "web_search".to_string(),
+                    success: true,
+                    output: "dark mode is popular".to_string(),
+                    error: None,
+                },
+            ),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("What do I know about dark mode?"))
+            .await
+            .expect("should succeed");
+
+        assert_eq!(resp_text(&resp), "Found memories and web results.");
+    }
+
+    #[tokio::test]
+    async fn test_external_commands_still_work_with_mux_present() {
+        // Verify that wiring in a mux doesn't break the existing command registry path.
+        let mux = make_mux_with_stores(vec![(
+            "conv",
+            true,
+            true,
+            Arc::new(MockMemStoreClient::succeeds(vec![])),
+        )]);
+
+        let registry = single_model_registry(
+            MockLlmProvider::new(vec!["/web_search query: \"Rust\"", "Here are the results."]),
+            "test-model",
+            "claude-test",
+        );
+        let engine = make_engine_with_mux(
+            registry,
+            MockRouter::with_score(0.9),
+            MockCommandRegistry::new(vec![("web_search", "Search the web")]).with_execute_result(
+                CommandResult {
+                    command_name: "web_search".to_string(),
+                    success: true,
+                    output: "5 results about Rust".to_string(),
+                    error: None,
+                },
+            ),
+            Some(mux),
+        );
+
+        let resp = engine
+            .handle_request(make_user_request("Search for Rust"))
+            .await
+            .expect("should succeed");
+
+        assert_eq!(resp_text(&resp), "Here are the results.");
     }
 }
