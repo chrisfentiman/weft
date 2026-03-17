@@ -17,7 +17,7 @@ use tracing::{info, warn};
 use weft_commands::{GrpcToolRegistryClient, ToolRegistryCommandAdapter};
 use weft_core::{WeftConfig, WireFormat};
 use weft_llm::{AnthropicProvider, Capability, OpenAIProvider, ProviderRegistry, RhaiProvider};
-use weft_memory::{GrpcMemoryStoreClient, MemoryStoreMux};
+use weft_memory::{DefaultMemoryService, GrpcMemoryStoreClient, MemoryStoreMux, StoreInfo};
 use weft_router::{ModernBertRouter, RoutingCandidate, RoutingDomainKind};
 
 use crate::engine::tool_necessity_candidates;
@@ -352,13 +352,15 @@ async fn main() {
             Arc::new(BinaryCommandRegistry::Empty)
         };
 
-    // ── Build memory store multiplexer (optional) ─────────────────────────
+    // ── Build memory service (optional) ────────────────────────────────────
     //
-    // Builds one GrpcMemoryStoreClient per configured store, then wraps them
-    // in a MemoryStoreMux. Uses lazy gRPC connections (same pattern as the
-    // tool registry client) — connection failures appear on first /recall or /remember.
+    // Builds one GrpcMemoryStoreClient per configured store, wraps them in a
+    // MemoryStoreMux, then constructs a DefaultMemoryService with the mux and
+    // store metadata (name, capabilities, examples) for routing candidate construction.
+    // Uses lazy gRPC connections — failures appear on first /recall or /remember.
 
-    let memory_mux: Option<Arc<MemoryStoreMux>> = if let Some(mem_config) = &config.memory {
+    let memory_service: Option<Arc<DefaultMemoryService>> = if let Some(mem_config) = &config.memory
+    {
         if mem_config.stores.is_empty() {
             None
         } else {
@@ -367,6 +369,7 @@ async fn main() {
             let mut max_results_map: HashMap<String, u32> = HashMap::new();
             let mut readable: HashSet<String> = HashSet::new();
             let mut writable: HashSet<String> = HashSet::new();
+            let mut store_infos: Vec<StoreInfo> = Vec::new();
 
             for store_cfg in &mem_config.stores {
                 let client = GrpcMemoryStoreClient::new(
@@ -376,21 +379,23 @@ async fn main() {
                 );
                 stores.insert(store_cfg.name.clone(), Arc::new(client));
                 max_results_map.insert(store_cfg.name.clone(), store_cfg.max_results);
+
+                let mut caps: Vec<String> = Vec::new();
                 if store_cfg.can_read() {
                     readable.insert(store_cfg.name.clone());
+                    caps.push("read".to_string());
                 }
                 if store_cfg.can_write() {
                     writable.insert(store_cfg.name.clone());
+                    caps.push("write".to_string());
                 }
 
-                let caps: Vec<&str> = store_cfg
-                    .capabilities
-                    .iter()
-                    .map(|c| match c {
-                        weft_core::StoreCapability::Read => "read",
-                        weft_core::StoreCapability::Write => "write",
-                    })
-                    .collect();
+                store_infos.push(StoreInfo {
+                    name: store_cfg.name.clone(),
+                    capabilities: caps.clone(),
+                    examples: store_cfg.examples.clone(),
+                });
+
                 info!(
                     store = %store_cfg.name,
                     endpoint = %store_cfg.endpoint,
@@ -410,7 +415,10 @@ async fn main() {
                 "memory configured"
             );
 
-            Some(Arc::new(mux))
+            Some(Arc::new(DefaultMemoryService::new(
+                Arc::new(mux),
+                store_infos,
+            )))
         }
     } else {
         None
@@ -441,7 +449,7 @@ async fn main() {
         provider_registry,
         router,
         command_registry,
-        memory_mux,
+        memory_service,
         hook_registry,
     );
 

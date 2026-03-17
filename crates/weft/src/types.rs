@@ -10,6 +10,7 @@ use weft_core::{CommandDescription, CommandInvocation, CommandResult, CommandStu
 use weft_engine::GatewayEngine;
 use weft_hooks::HookRegistry;
 use weft_llm::ProviderRegistry;
+use weft_memory::DefaultMemoryService;
 use weft_router::ModernBertRouter;
 
 /// Unified command registry for the weft binary.
@@ -59,7 +60,13 @@ impl weft_commands::CommandRegistry for BinaryCommandRegistry {
 ///
 /// - `H = HookRegistry`: HTTP hook runner
 /// - `R = ModernBertRouter`: ModernBERT bi-encoder semantic classifier
+/// - `M = DefaultMemoryService`: memory service backed by MemoryStoreMux
 /// - `P = ProviderRegistry`: provider dispatch table
 /// - `C = BinaryCommandRegistry`: tool/command dispatch (live gRPC or no-op)
-pub type WeftEngine =
-    GatewayEngine<HookRegistry, ModernBertRouter, ProviderRegistry, BinaryCommandRegistry>;
+pub type WeftEngine = GatewayEngine<
+    HookRegistry,
+    ModernBertRouter,
+    DefaultMemoryService,
+    ProviderRegistry,
+    BinaryCommandRegistry,
+>;

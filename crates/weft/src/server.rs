@@ -28,6 +28,7 @@ use weft_proto::weft::v1 as proto;
 use weft_commands::CommandRegistry;
 use weft_hooks::HookRunner;
 use weft_llm::ProviderService;
+use weft_memory::MemoryService;
 use weft_router::SemanticRouter;
 
 use crate::grpc::WeftService;
@@ -189,10 +190,11 @@ fn unix_timestamp() -> u64 {
 /// Uses `tonic::service::Routes::into_axum_router()` to compose the gRPC server
 /// with axum on a single port. The tonic router handles `content-type: application/grpc`;
 /// axum handles everything else.
-pub fn build_router<H, R, P, C>(weft_service: Arc<WeftService<H, R, P, C>>) -> Router
+pub fn build_router<H, R, M, P, C>(weft_service: Arc<WeftService<H, R, M, P, C>>) -> Router
 where
     H: HookRunner + Send + Sync + 'static,
     R: SemanticRouter + Send + Sync + 'static,
+    M: MemoryService,
     P: ProviderService + Send + Sync + 'static,
     C: CommandRegistry + Send + Sync + 'static,
 {
@@ -208,9 +210,9 @@ where
     let http_router = Router::new()
         .route(
             "/v1/chat/completions",
-            post(chat_completions_handler::<H, R, P, C>),
+            post(chat_completions_handler::<H, R, M, P, C>),
         )
-        .route("/health", get(health_handler::<H, R, P, C>))
+        .route("/health", get(health_handler::<H, R, M, P, C>))
         .with_state(Arc::clone(&weft_service));
 
     // Merge: gRPC router handles application/grpc requests; HTTP router handles the rest.
@@ -272,13 +274,15 @@ async fn shutdown_signal() {
 /// chat completion response. Translates to/from `WeftRequest`/`WeftResponse`
 /// and calls `WeftService::handle_weft_request()` — the same code path as gRPC.
 /// Streaming is not supported in v1.
-async fn chat_completions_handler<H, R, P, C>(
-    State(weft_service): State<Arc<WeftService<H, R, P, C>>>,
+#[allow(clippy::type_complexity)]
+async fn chat_completions_handler<H, R, M, P, C>(
+    State(weft_service): State<Arc<WeftService<H, R, M, P, C>>>,
     Json(openai_req): Json<OpenAiChatRequest>,
 ) -> Result<Json<OpenAiChatResponse>, ApiError>
 where
     H: HookRunner + Send + Sync + 'static,
     R: SemanticRouter + Send + Sync + 'static,
+    M: MemoryService,
     P: ProviderService + Send + Sync + 'static,
     C: CommandRegistry + Send + Sync + 'static,
 {
@@ -323,12 +327,14 @@ where
 /// `GET /health`
 ///
 /// Returns gateway health status. Always 200 if the process is up.
-async fn health_handler<H, R, P, C>(
-    State(weft_service): State<Arc<WeftService<H, R, P, C>>>,
+#[allow(clippy::type_complexity)]
+async fn health_handler<H, R, M, P, C>(
+    State(weft_service): State<Arc<WeftService<H, R, M, P, C>>>,
 ) -> Json<HealthResponse>
 where
     H: HookRunner + Send + Sync + 'static,
     R: SemanticRouter + Send + Sync + 'static,
+    M: MemoryService,
     P: ProviderService + Send + Sync + 'static,
     C: CommandRegistry + Send + Sync + 'static,
 {
@@ -715,14 +721,21 @@ mod tests {
 
     fn make_weft_service(
         llm: impl Provider + 'static,
-    ) -> Arc<WeftService<weft_hooks::HookRegistry, MockRouter, ProviderRegistry, MockRegistry>>
-    {
+    ) -> Arc<
+        WeftService<
+            weft_hooks::HookRegistry,
+            MockRouter,
+            weft_memory::NullMemoryService,
+            ProviderRegistry,
+            MockRegistry,
+        >,
+    > {
         let engine = crate::engine::GatewayEngine::new(
             test_config(),
             make_registry(llm),
             Arc::new(MockRouter),
             Arc::new(MockRegistry),
-            None,
+            None::<Arc<weft_memory::NullMemoryService>>,
             std::sync::Arc::new(weft_hooks::HookRegistry::empty()),
         );
         Arc::new(WeftService::new(engine))

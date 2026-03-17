@@ -22,6 +22,7 @@ use weft_commands::CommandRegistry;
 use weft_engine::GatewayEngine;
 use weft_hooks::HookRunner;
 use weft_llm::ProviderService;
+use weft_memory::MemoryService;
 use weft_router::SemanticRouter;
 
 // ── Conversion types ────────────────────────────────────────────────────────
@@ -43,14 +44,15 @@ use weft_core::{
 /// Generic over the engine type params so the binary can use concrete types.
 /// `GatewayEngine` is `Clone` (all `Arc` internals) — cloned into the service.
 /// `WeftService` can be cloned and shared across request handlers.
-pub struct WeftService<H, R, P, C> {
-    engine: GatewayEngine<H, R, P, C>,
+pub struct WeftService<H, R, M, P, C> {
+    engine: GatewayEngine<H, R, M, P, C>,
 }
 
-impl<H, R, P, C> Clone for WeftService<H, R, P, C>
+impl<H, R, M, P, C> Clone for WeftService<H, R, M, P, C>
 where
     H: HookRunner + Send + Sync + 'static,
     R: SemanticRouter + Send + Sync + 'static,
+    M: MemoryService,
     P: ProviderService + Send + Sync + 'static,
     C: CommandRegistry + Send + Sync + 'static,
 {
@@ -61,15 +63,16 @@ where
     }
 }
 
-impl<H, R, P, C> WeftService<H, R, P, C>
+impl<H, R, M, P, C> WeftService<H, R, M, P, C>
 where
     H: HookRunner + Send + Sync + 'static,
     R: SemanticRouter + Send + Sync + 'static,
+    M: MemoryService,
     P: ProviderService + Send + Sync + 'static,
     C: CommandRegistry + Send + Sync + 'static,
 {
     /// Create a new `WeftService` wrapping the given engine.
-    pub fn new(engine: GatewayEngine<H, R, P, C>) -> Self {
+    pub fn new(engine: GatewayEngine<H, R, M, P, C>) -> Self {
         Self { engine }
     }
 
@@ -91,10 +94,11 @@ where
 // ── tonic trait implementation ───────────────────────────────────────────────
 
 #[tonic::async_trait]
-impl<H, R, P, C> proto::weft_server::Weft for WeftService<H, R, P, C>
+impl<H, R, M, P, C> proto::weft_server::Weft for WeftService<H, R, M, P, C>
 where
     H: HookRunner + Send + Sync + 'static,
     R: SemanticRouter + Send + Sync + 'static,
+    M: MemoryService,
     P: ProviderService + Send + Sync + 'static,
     C: CommandRegistry + Send + Sync + 'static,
 {
@@ -868,8 +872,13 @@ mod tests {
 
     fn make_engine(
         provider: impl Provider + 'static,
-    ) -> GatewayEngine<weft_hooks::HookRegistry, MockRouter, ProviderRegistry, MockCommandRegistry>
-    {
+    ) -> GatewayEngine<
+        weft_hooks::HookRegistry,
+        MockRouter,
+        weft_memory::NullMemoryService,
+        ProviderRegistry,
+        MockCommandRegistry,
+    > {
         let mut providers = HashMap::new();
         providers.insert(
             "test-model".to_string(),
@@ -899,7 +908,7 @@ mod tests {
             registry,
             Arc::new(MockRouter),
             Arc::new(MockCommandRegistry),
-            None,
+            None::<Arc<weft_memory::NullMemoryService>>,
             Arc::new(weft_hooks::HookRegistry::empty()),
         )
     }

@@ -45,13 +45,12 @@ use weft_core::{
     CommandAction, CommandResult, CommandStub, ContentPart, HookRoutingDomain, Role,
     RoutingTrigger, SamplingOptions, Source, WeftConfig, WeftError, WeftMessage, WeftRequest,
     WeftResponse, WeftTiming, WeftUsage,
-    toon::{fenced_toon, serialize_table},
 };
 use weft_llm::{
     Capability, Provider, ProviderError, ProviderRequest, ProviderResponse, ProviderService,
     TokenUsage,
 };
-use weft_memory::MemoryStoreMux;
+use weft_memory::{MemoryService, StoreInfo};
 use weft_router::{
     RoutingCandidate, RoutingDomainKind, ScoredCandidate, SemanticRouter, filter_by_threshold,
     take_top,
@@ -151,22 +150,23 @@ fn builtin_describe_text(name: &str) -> String {
 /// Generic parameters:
 /// - `H`: hook runner (e.g. `weft_hooks::HookRegistry` or `NullHookRunner`)
 /// - `R`: semantic router (e.g. `weft_router::ModernBertClassifier`)
+/// - `M`: memory service (e.g. `weft_memory::DefaultMemoryService`)
 /// - `P`: provider service (e.g. `weft_llm::ProviderRegistry`)
 /// - `C`: command registry (e.g. `weft_commands::ToolRegistryCommandAdapter`)
 ///
 /// All fields are `Arc` so `GatewayEngine` is cheaply cloneable — axum clones
 /// it into each request handler. A manual `Clone` impl avoids requiring the
 /// type params themselves to be `Clone` (they are behind `Arc`).
-pub struct GatewayEngine<H, R, P, C> {
+pub struct GatewayEngine<H, R, M, P, C> {
     config: Arc<WeftConfig>,
     providers: Arc<P>,
     router: Arc<R>,
     commands: Arc<C>,
-    /// Optional memory store multiplexer. `None` when no memory stores are configured.
-    memory_mux: Option<Arc<MemoryStoreMux>>,
-    /// All memory store routing candidates (from config). Used for the Memory domain
-    /// in `route_all_domains()` and for per-invocation routing by both `/recall` and
-    /// `/remember`. Empty if no memory stores are configured.
+    /// Optional memory service. `None` when no memory stores are configured.
+    memory: Option<Arc<M>>,
+    /// All memory store routing candidates (from `memory.stores()`). Used for the Memory
+    /// domain in `route_all_domains()` and for per-invocation routing by both `/recall`
+    /// and `/remember`. Empty if no memory stores are configured.
     memory_candidates: Vec<RoutingCandidate>,
     /// Memory candidates filtered to read-capable stores only. Used by `/recall`
     /// for per-invocation routing via `score_memory_candidates()`.
@@ -181,14 +181,14 @@ pub struct GatewayEngine<H, R, P, C> {
     request_end_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
-impl<H, R, P, C> Clone for GatewayEngine<H, R, P, C> {
+impl<H, R, M, P, C> Clone for GatewayEngine<H, R, M, P, C> {
     fn clone(&self) -> Self {
         Self {
             config: Arc::clone(&self.config),
             providers: Arc::clone(&self.providers),
             router: Arc::clone(&self.router),
             commands: Arc::clone(&self.commands),
-            memory_mux: self.memory_mux.clone(),
+            memory: self.memory.clone(),
             memory_candidates: self.memory_candidates.clone(),
             read_memory_candidates: self.read_memory_candidates.clone(),
             write_memory_candidates: self.write_memory_candidates.clone(),
@@ -198,10 +198,11 @@ impl<H, R, P, C> Clone for GatewayEngine<H, R, P, C> {
     }
 }
 
-impl<H, R, P, C> GatewayEngine<H, R, P, C>
+impl<H, R, M, P, C> GatewayEngine<H, R, M, P, C>
 where
     H: HookRunner + Send + Sync + 'static,
     R: SemanticRouter + Send + Sync + 'static,
+    M: MemoryService,
     P: ProviderService + Send + Sync + 'static,
     C: CommandRegistry + Send + Sync + 'static,
 {
@@ -212,20 +213,24 @@ where
 
     /// Construct a new gateway engine.
     ///
-    /// `memory_mux`: Optional memory store multiplexer. `None` when no memory stores configured.
+    /// `memory`: Optional memory service. `None` when no memory stores configured.
     pub fn new(
         config: Arc<WeftConfig>,
         providers: Arc<P>,
         router: Arc<R>,
         commands: Arc<C>,
-        memory_mux: Option<Arc<MemoryStoreMux>>,
+        memory: Option<Arc<M>>,
         hooks: Arc<H>,
     ) -> Self {
-        // Build per-capability candidate sets from config memory stores.
-        // These are derived from the same config used to build the mux, so they
-        // will always be consistent with the mux's readable/writable sets.
+        // Build per-capability candidate sets from the memory service's store metadata.
+        // `memory.stores()` returns `StoreInfo` with capability labels and examples
+        // so the engine can build routing candidates without importing config types.
         let (memory_candidates, read_memory_candidates, write_memory_candidates) =
-            build_memory_candidates(&config);
+            if let Some(mem) = &memory {
+                build_memory_candidates_from_stores(&mem.stores())
+            } else {
+                (vec![], vec![], vec![])
+            };
 
         let request_end_concurrency = config.request_end_concurrency;
         let request_end_semaphore = Arc::new(tokio::sync::Semaphore::new(request_end_concurrency));
@@ -235,7 +240,7 @@ where
             providers,
             router,
             commands,
-            memory_mux,
+            memory,
             memory_candidates,
             read_memory_candidates,
             write_memory_candidates,
@@ -411,7 +416,8 @@ where
 
         // Build memory stubs to append when memory stores are configured.
         // These appear regardless of semantic routing — memory commands are always available.
-        let memory_stubs: Option<&[(&str, &str)]> = if self.memory_mux.is_some() {
+        let memory_is_configured = self.memory.as_ref().is_some_and(|m| m.is_configured());
+        let memory_stubs: Option<&[(&str, &str)]> = if memory_is_configured {
             Some(&[
                 (
                     "recall",
@@ -457,7 +463,7 @@ where
         } else {
             HashSet::new()
         };
-        if self.memory_mux.is_some() {
+        if memory_is_configured {
             for name in BUILTIN_COMMANDS {
                 known_commands.insert((*name).to_string());
             }
@@ -946,8 +952,15 @@ where
             ));
         }
 
-        // Memory domain: include when memory stores are configured.
-        if self.memory_mux.is_some() && !self.memory_candidates.is_empty() {
+        // Memory domain: include when memory stores are configured AND config has a memory section.
+        // The config gate preserves the pre-existing invariant: memory domain routing only activates
+        // when the operator has explicitly configured memory stores. Without this gate, tests that
+        // build a memory service without a matching config section would spuriously activate memory
+        // domain routing at request-start (in route_all_domains).
+        if self.memory.as_ref().is_some_and(|m| m.is_configured())
+            && !self.memory_candidates.is_empty()
+            && self.config.memory.is_some()
+        {
             let memory_domain_enabled = self
                 .config
                 .router
@@ -1386,68 +1399,11 @@ where
     }
 }
 
-/// Format memory query results as TOON output for the LLM.
-///
-/// Groups results by store with `{store, content, score}` columns.
-/// Returns "No relevant memories found." when no memories were retrieved.
-fn format_memory_query_results(results: &[weft_memory::MemoryQueryResult]) -> String {
-    let all_memories: Vec<_> = results
-        .iter()
-        .flat_map(|r| {
-            r.memories.iter().map(|m| {
-                vec![
-                    r.store_name.clone(),
-                    m.content.clone(),
-                    format!("{:.2}", m.score),
-                ]
-            })
-        })
-        .collect();
-
-    if all_memories.is_empty() {
-        return "No relevant memories found.".to_string();
-    }
-
-    let table = serialize_table("memories", &["store", "content", "score"], &all_memories);
-    fenced_toon(&table)
-}
-
-/// Format memory store results as TOON output for the LLM.
-///
-/// Reports per-store success/failure with `{store, status}` or
-/// `{store, status, error}` columns depending on whether errors occurred.
-fn format_memory_store_results(
-    results: &[(
-        String,
-        Result<weft_memory::MemoryStoreResult, weft_memory::MemoryStoreError>,
-    )],
-) -> String {
-    let has_errors = results.iter().any(|(_, r)| r.is_err());
-
-    if has_errors {
-        let rows: Vec<Vec<String>> = results
-            .iter()
-            .map(|(name, r)| match r {
-                Ok(_) => vec![name.clone(), "success".to_string(), String::new()],
-                Err(e) => vec![name.clone(), "error".to_string(), e.to_string()],
-            })
-            .collect();
-        let table = serialize_table("stored", &["store", "status", "error"], &rows);
-        fenced_toon(&table)
-    } else {
-        let rows: Vec<Vec<String>> = results
-            .iter()
-            .map(|(name, _)| vec![name.clone(), "success".to_string()])
-            .collect();
-        let table = serialize_table("stored", &["store", "status"], &rows);
-        fenced_toon(&table)
-    }
-}
-
-impl<H, R, P, C> GatewayEngine<H, R, P, C>
+impl<H, R, M, P, C> GatewayEngine<H, R, M, P, C>
 where
     H: HookRunner + Send + Sync + 'static,
     R: SemanticRouter + Send + Sync + 'static,
+    M: MemoryService,
     P: ProviderService + Send + Sync + 'static,
     C: CommandRegistry + Send + Sync + 'static,
 {
@@ -1725,21 +1681,22 @@ where
             }
         };
 
-        // Validate that selected store names exist in the memory mux.
-        // Drop unknown stores with a warning.
-        let validated_store_ids = if let Some(mux) = &self.memory_mux {
-            let all_stores: std::collections::HashSet<String> = match trigger {
-                RoutingTrigger::RecallCommand => mux
-                    .readable_store_names()
+        // Validate that selected store names exist in the memory service.
+        // Drop unknown stores with a warning. Capability is enforced by the service itself.
+        let validated_store_ids = if let Some(mem) = &self.memory {
+            let all_stores: std::collections::HashSet<String> = {
+                let cap_filter = match trigger {
+                    RoutingTrigger::RecallCommand => "read",
+                    RoutingTrigger::RememberCommand => "write",
+                    RoutingTrigger::RequestStart => "",
+                };
+                mem.stores()
                     .into_iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-                RoutingTrigger::RememberCommand => mux
-                    .writable_store_names()
-                    .into_iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-                RoutingTrigger::RequestStart => std::collections::HashSet::new(),
+                    .filter(|s| {
+                        cap_filter.is_empty() || s.capabilities.iter().any(|c| c == cap_filter)
+                    })
+                    .map(|s| s.name)
+                    .collect()
             };
 
             let validated: Vec<String> = final_store_ids
@@ -1824,15 +1781,15 @@ where
 
     /// Execute a `/recall` invocation against pre-selected stores.
     ///
-    /// Used by `handle_builtin_with_hooks` after routing hooks have determined
-    /// which stores to query. If `store_ids` is empty, fans out to all readable.
+    /// Delegates to the `MemoryService`. The engine is responsible only for
+    /// extracting the query argument and passing pre-routed store IDs.
     async fn exec_recall_with_stores(
         &self,
         invocation: &weft_core::CommandInvocation,
         user_message: &str,
         store_ids: Vec<String>,
     ) -> CommandResult {
-        let mux = match &self.memory_mux {
+        let mem = match &self.memory {
             Some(m) => m,
             None => {
                 return CommandResult {
@@ -1848,31 +1805,20 @@ where
             .arguments
             .get("query")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| user_message.to_string());
+            .unwrap_or("");
 
-        // If store_ids is empty, fan out to all readable stores.
-        let results = mux.query(&store_ids, &query, 0.0).await;
-        let output = format_memory_query_results(&results);
-
-        CommandResult {
-            command_name: "recall".to_string(),
-            success: true,
-            output,
-            error: None,
-        }
+        mem.recall(&store_ids, query, user_message).await
     }
 
     /// Execute a `/remember` invocation against pre-selected stores.
     ///
-    /// Used by `handle_builtin_with_hooks` after routing hooks have determined
-    /// which stores to write. If `store_ids` is empty, uses first writable store.
+    /// Delegates to the `MemoryService` after extracting the `content` argument.
     async fn exec_remember_with_stores(
         &self,
         invocation: &weft_core::CommandInvocation,
         store_ids: Vec<String>,
     ) -> CommandResult {
-        let mux = match &self.memory_mux {
+        let mem = match &self.memory {
             Some(m) => m,
             None => {
                 return CommandResult {
@@ -1885,7 +1831,7 @@ where
         };
 
         let content = match invocation.arguments.get("content").and_then(|v| v.as_str()) {
-            Some(c) => c.to_string(),
+            Some(c) => c,
             None => {
                 return CommandResult {
                     command_name: "remember".to_string(),
@@ -1896,36 +1842,7 @@ where
             }
         };
 
-        // Determine actual target stores.
-        let target_stores = if store_ids.is_empty() {
-            // Fallback: write to first writable store.
-            mux.writable_store_names()
-                .into_iter()
-                .take(1)
-                .map(|s| s.to_string())
-                .collect()
-        } else {
-            store_ids
-        };
-
-        if target_stores.is_empty() {
-            return CommandResult {
-                command_name: "remember".to_string(),
-                success: true,
-                output: String::new(),
-                error: None,
-            };
-        }
-
-        let results = mux.store(&target_stores, &content, None).await;
-        let output = format_memory_store_results(&results);
-
-        CommandResult {
-            command_name: "remember".to_string(),
-            success: true,
-            output,
-            error: None,
-        }
+        mem.remember(&store_ids, content).await
     }
 
     /// Get the memory domain threshold.
@@ -1943,39 +1860,35 @@ where
     }
 }
 
-/// Build memory routing candidates from config, split by capability.
+/// Build memory routing candidates from `MemoryService::stores()` metadata.
 ///
 /// Returns `(all_candidates, read_candidates, write_candidates)`.
-/// All three are empty when no memory stores are configured.
+/// All three are empty when no stores are provided.
 ///
 /// The candidates are used for:
 /// - `all_candidates`: Memory domain in `route_all_domains()` (for the "inject stubs" signal)
 /// - `read_candidates`: Per-invocation routing for `/recall` via `score_memory_candidates()`
 /// - `write_candidates`: Per-invocation routing for `/remember` via `score_memory_candidates()`
-fn build_memory_candidates(
-    config: &WeftConfig,
+fn build_memory_candidates_from_stores(
+    stores: &[StoreInfo],
 ) -> (
     Vec<RoutingCandidate>,
     Vec<RoutingCandidate>,
     Vec<RoutingCandidate>,
 ) {
-    let Some(mem_config) = &config.memory else {
-        return (vec![], vec![], vec![]);
-    };
-
     let mut all_candidates = Vec::new();
     let mut read_candidates = Vec::new();
     let mut write_candidates = Vec::new();
 
-    for store in &mem_config.stores {
+    for store in stores {
         let candidate = RoutingCandidate {
             id: store.name.clone(),
             examples: store.examples.clone(),
         };
-        if store.can_read() {
+        if store.capabilities.iter().any(|c| c == "read") {
             read_candidates.push(candidate.clone());
         }
-        if store.can_write() {
+        if store.capabilities.iter().any(|c| c == "write") {
             write_candidates.push(candidate.clone());
         }
         all_candidates.push(candidate);
@@ -2703,7 +2616,13 @@ mod tests {
         registry: Arc<ProviderRegistry>,
         router: R,
         commands: C,
-    ) -> GatewayEngine<weft_hooks::HookRegistry, R, ProviderRegistry, C>
+    ) -> GatewayEngine<
+        weft_hooks::HookRegistry,
+        R,
+        weft_memory::NullMemoryService,
+        ProviderRegistry,
+        C,
+    >
     where
         R: SemanticRouter + Send + Sync + 'static,
         C: CommandRegistry + Send + Sync + 'static,
@@ -2713,7 +2632,7 @@ mod tests {
             registry,
             Arc::new(router),
             Arc::new(commands),
-            None,
+            None::<Arc<weft_memory::NullMemoryService>>,
             Arc::new(weft_hooks::HookRegistry::empty()),
         )
     }
@@ -2723,7 +2642,13 @@ mod tests {
         registry: Arc<ProviderRegistry>,
         router: R,
         commands: C,
-    ) -> GatewayEngine<weft_hooks::HookRegistry, R, ProviderRegistry, C>
+    ) -> GatewayEngine<
+        weft_hooks::HookRegistry,
+        R,
+        weft_memory::NullMemoryService,
+        ProviderRegistry,
+        C,
+    >
     where
         R: SemanticRouter + Send + Sync + 'static,
         C: CommandRegistry + Send + Sync + 'static,
@@ -2733,7 +2658,7 @@ mod tests {
             registry,
             Arc::new(router),
             Arc::new(commands),
-            None,
+            None::<Arc<weft_memory::NullMemoryService>>,
             Arc::new(weft_hooks::HookRegistry::empty()),
         )
     }
@@ -3755,7 +3680,8 @@ mod tests {
     // ── Built-in memory command tests ─────────────────────────────────────
 
     use weft_memory::{
-        MemoryEntry, MemoryStoreClient, MemoryStoreError, MemoryStoreMux, MemoryStoreResult,
+        DefaultMemoryService, MemoryEntry, MemoryStoreClient, MemoryStoreError, MemoryStoreMux,
+        MemoryStoreResult, StoreInfo,
     };
 
     /// Mock memory store client with configurable query and store behaviour.
@@ -3863,19 +3789,62 @@ mod tests {
         router: R,
         commands: C,
         mux: Option<Arc<MemoryStoreMux>>,
-    ) -> GatewayEngine<weft_hooks::HookRegistry, R, ProviderRegistry, C>
+    ) -> GatewayEngine<weft_hooks::HookRegistry, R, DefaultMemoryService, ProviderRegistry, C>
     where
         R: SemanticRouter + Send + Sync + 'static,
         C: CommandRegistry + Send + Sync + 'static,
     {
+        let memory = mux.map(wrap_mux);
         GatewayEngine::new(
             test_config(),
             registry,
             Arc::new(router),
             Arc::new(commands),
-            mux,
+            memory,
             Arc::new(weft_hooks::HookRegistry::empty()),
         )
+    }
+
+    /// Wrap a `MemoryStoreMux` in a `DefaultMemoryService` with no examples (store_infos with
+    /// no examples). Used when tests only care about ops (query/store), not routing candidates.
+    fn wrap_mux(mux: Arc<MemoryStoreMux>) -> Arc<DefaultMemoryService> {
+        // Build store_infos from the mux's store names and capabilities.
+        // No examples — these tests use MockRouter with fixed scores and don't
+        // need semantic routing candidates populated.
+        let store_infos: Vec<StoreInfo> = {
+            let all: std::collections::HashSet<String> = mux
+                .store_names()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
+            let readable: std::collections::HashSet<String> = mux
+                .readable_store_names()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
+            let writable: std::collections::HashSet<String> = mux
+                .writable_store_names()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
+            all.into_iter()
+                .map(|name| {
+                    let mut caps = Vec::new();
+                    if readable.contains(&name) {
+                        caps.push("read".to_string());
+                    }
+                    if writable.contains(&name) {
+                        caps.push("write".to_string());
+                    }
+                    StoreInfo {
+                        name,
+                        capabilities: caps,
+                        examples: vec![],
+                    }
+                })
+                .collect()
+        };
+        Arc::new(DefaultMemoryService::new(mux, store_infos))
     }
 
     // ── /recall tests ─────────────────────────────────────────────────────
@@ -4389,34 +4358,72 @@ mod tests {
     }
 
     /// Build an engine with the given config, mux, and router.
+    ///
+    /// The config provides routing thresholds, domain settings, AND store metadata
+    /// (examples) for building routing candidates. The mux handles actual ops.
+    /// Internally constructs a `DefaultMemoryService` from the config's memory section.
     fn make_engine_with_config_and_mux<R, C>(
         config: Arc<WeftConfig>,
         registry: Arc<ProviderRegistry>,
         router: R,
         commands: C,
         mux: Option<Arc<MemoryStoreMux>>,
-    ) -> GatewayEngine<weft_hooks::HookRegistry, R, ProviderRegistry, C>
+    ) -> GatewayEngine<weft_hooks::HookRegistry, R, DefaultMemoryService, ProviderRegistry, C>
     where
         R: SemanticRouter + Send + Sync + 'static,
         C: CommandRegistry + Send + Sync + 'static,
     {
+        let memory = mux.map(|m| service_from_config_and_mux(&config, m));
         GatewayEngine::new(
             config,
             registry,
             Arc::new(router),
             Arc::new(commands),
-            mux,
+            memory,
             Arc::new(weft_hooks::HookRegistry::empty()),
         )
     }
 
-    // ── Phase 3: build_memory_candidates ──────────────────────────────────
+    /// Build a `DefaultMemoryService` from a config and a mux.
+    ///
+    /// Extracts `StoreInfo` (name, capabilities, examples) from the config's memory section
+    /// so that routing candidates are populated correctly, then wraps the mux for operations.
+    fn service_from_config_and_mux(
+        config: &WeftConfig,
+        mux: Arc<MemoryStoreMux>,
+    ) -> Arc<DefaultMemoryService> {
+        let store_infos: Vec<StoreInfo> = config
+            .memory
+            .as_ref()
+            .map(|mem| {
+                mem.stores
+                    .iter()
+                    .map(|s| {
+                        let mut caps = Vec::new();
+                        if s.can_read() {
+                            caps.push("read".to_string());
+                        }
+                        if s.can_write() {
+                            caps.push("write".to_string());
+                        }
+                        StoreInfo {
+                            name: s.name.clone(),
+                            capabilities: caps,
+                            examples: s.examples.clone(),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Arc::new(DefaultMemoryService::new(mux, store_infos))
+    }
+
+    // ── Phase 3: build_memory_candidates_from_stores ──────────────────────
 
     #[test]
-    fn test_build_memory_candidates_empty_when_no_config() {
-        // Config with no memory section produces empty candidate sets.
-        let config = test_config();
-        let (all, read, write) = build_memory_candidates(&config);
+    fn test_build_memory_candidates_empty_when_no_stores() {
+        // Empty store list produces empty candidate sets.
+        let (all, read, write) = build_memory_candidates_from_stores(&[]);
         assert!(all.is_empty());
         assert!(read.is_empty());
         assert!(write.is_empty());
@@ -4425,17 +4432,12 @@ mod tests {
     #[test]
     fn test_build_memory_candidates_read_write_store() {
         // A store with both capabilities appears in all three sets.
-        let config = config_with_memory(
-            &[(
-                "conv",
-                "http://localhost:50052",
-                true,
-                true,
-                vec!["recall conv"],
-            )],
-            None,
-        );
-        let (all, read, write) = build_memory_candidates(&config);
+        let stores = vec![StoreInfo {
+            name: "conv".to_string(),
+            capabilities: vec!["read".to_string(), "write".to_string()],
+            examples: vec!["recall conv".to_string()],
+        }];
+        let (all, read, write) = build_memory_candidates_from_stores(&stores);
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, "conv");
         assert_eq!(read.len(), 1);
@@ -4447,17 +4449,12 @@ mod tests {
     #[test]
     fn test_build_memory_candidates_read_only_store() {
         // A read-only store appears in all and read, but not write.
-        let config = config_with_memory(
-            &[(
-                "kb",
-                "http://localhost:50053",
-                true,
-                false,
-                vec!["knowledge base"],
-            )],
-            None,
-        );
-        let (all, read, write) = build_memory_candidates(&config);
+        let stores = vec![StoreInfo {
+            name: "kb".to_string(),
+            capabilities: vec!["read".to_string()],
+            examples: vec!["knowledge base".to_string()],
+        }];
+        let (all, read, write) = build_memory_candidates_from_stores(&stores);
         assert_eq!(all.len(), 1);
         assert_eq!(read.len(), 1);
         assert!(write.is_empty());
@@ -4466,17 +4463,12 @@ mod tests {
     #[test]
     fn test_build_memory_candidates_write_only_store() {
         // A write-only store appears in all and write, but not read.
-        let config = config_with_memory(
-            &[(
-                "audit",
-                "http://localhost:50054",
-                false,
-                true,
-                vec!["audit log"],
-            )],
-            None,
-        );
-        let (all, read, write) = build_memory_candidates(&config);
+        let stores = vec![StoreInfo {
+            name: "audit".to_string(),
+            capabilities: vec!["write".to_string()],
+            examples: vec!["audit log".to_string()],
+        }];
+        let (all, read, write) = build_memory_candidates_from_stores(&stores);
         assert_eq!(all.len(), 1);
         assert!(read.is_empty());
         assert_eq!(write.len(), 1);
@@ -4485,33 +4477,24 @@ mod tests {
     #[test]
     fn test_build_memory_candidates_multiple_stores() {
         // Multiple stores split correctly by capability.
-        let config = config_with_memory(
-            &[
-                (
-                    "conv",
-                    "http://localhost:50052",
-                    true,
-                    true,
-                    vec!["conversation"],
-                ),
-                (
-                    "kb",
-                    "http://localhost:50053",
-                    true,
-                    false,
-                    vec!["knowledge base"],
-                ),
-                (
-                    "audit",
-                    "http://localhost:50054",
-                    false,
-                    true,
-                    vec!["audit"],
-                ),
-            ],
-            None,
-        );
-        let (all, read, write) = build_memory_candidates(&config);
+        let stores = vec![
+            StoreInfo {
+                name: "conv".to_string(),
+                capabilities: vec!["read".to_string(), "write".to_string()],
+                examples: vec!["conversation".to_string()],
+            },
+            StoreInfo {
+                name: "kb".to_string(),
+                capabilities: vec!["read".to_string()],
+                examples: vec!["knowledge base".to_string()],
+            },
+            StoreInfo {
+                name: "audit".to_string(),
+                capabilities: vec!["write".to_string()],
+                examples: vec!["audit".to_string()],
+            },
+        ];
+        let (all, read, write) = build_memory_candidates_from_stores(&stores);
         assert_eq!(all.len(), 3);
         assert_eq!(read.len(), 2); // conv + kb
         assert_eq!(write.len(), 2); // conv + audit
@@ -5101,7 +5084,13 @@ mod tests {
         router: R,
         commands: C,
         hook_registry: weft_hooks::HookRegistry,
-    ) -> GatewayEngine<weft_hooks::HookRegistry, R, ProviderRegistry, C>
+    ) -> GatewayEngine<
+        weft_hooks::HookRegistry,
+        R,
+        weft_memory::NullMemoryService,
+        ProviderRegistry,
+        C,
+    >
     where
         R: SemanticRouter + Send + Sync + 'static,
         C: CommandRegistry + Send + Sync + 'static,
@@ -5111,7 +5100,7 @@ mod tests {
             registry,
             Arc::new(router),
             Arc::new(commands),
-            None,
+            None::<Arc<weft_memory::NullMemoryService>>,
             Arc::new(hook_registry),
         )
     }
@@ -5306,7 +5295,7 @@ mod tests {
             ),
             Arc::new(MockRouter::with_model("complex-model")),
             Arc::new(MockCommandRegistry::new(vec![])),
-            None,
+            None::<Arc<weft_memory::NullMemoryService>>,
             Arc::new(hook_reg),
         );
 
@@ -5402,7 +5391,7 @@ mod tests {
             ),
             Arc::new(MockRouter::with_model("complex-model")),
             Arc::new(MockCommandRegistry::new(vec![])),
-            None,
+            None::<Arc<weft_memory::NullMemoryService>>,
             Arc::new(hook_reg),
         );
 
@@ -5435,7 +5424,7 @@ mod tests {
             ),
             Arc::new(MockRouter::with_model("complex-model")),
             Arc::new(MockCommandRegistry::new(vec![])),
-            None,
+            None::<Arc<weft_memory::NullMemoryService>>,
             Arc::new(hook_reg),
         );
 
@@ -5790,7 +5779,7 @@ mod tests {
             ),
             Arc::new(MockRouter::with_score(0.9)),
             Arc::new(MockCommandRegistry::new(vec![])),
-            None,
+            None::<Arc<weft_memory::NullMemoryService>>,
             Arc::new(hook_reg),
         );
 
@@ -5994,17 +5983,18 @@ mod tests {
         commands: C,
         hook_registry: weft_hooks::HookRegistry,
         mux: Option<Arc<MemoryStoreMux>>,
-    ) -> GatewayEngine<weft_hooks::HookRegistry, R, ProviderRegistry, C>
+    ) -> GatewayEngine<weft_hooks::HookRegistry, R, DefaultMemoryService, ProviderRegistry, C>
     where
         R: SemanticRouter + Send + Sync + 'static,
         C: CommandRegistry + Send + Sync + 'static,
     {
+        let memory = mux.map(wrap_mux);
         GatewayEngine::new(
             test_config(),
             registry,
             Arc::new(router),
             Arc::new(commands),
-            mux,
+            memory,
             Arc::new(hook_registry),
         )
     }
@@ -6423,7 +6413,7 @@ mod tests {
             ),
             Arc::new(MockRouter::with_model("default-model")),
             Arc::new(MockCommandRegistry::new(vec![])),
-            None,
+            None::<Arc<weft_memory::NullMemoryService>>,
             Arc::new(hook_reg),
         );
 
