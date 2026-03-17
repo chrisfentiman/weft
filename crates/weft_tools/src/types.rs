@@ -1,8 +1,7 @@
-//! gRPC mapping types for the ToolRegistry service.
+//! Domain types for the ToolRegistry service.
 //!
-//! These types are the domain bridge between the protobuf wire format and the rest of the
-//! command system. They are consumed by `ToolRegistryClient` implementations and the
-//! `ToolRegistryCommandAdapter`.
+//! These types bridge the protobuf wire format and the rest of the tool system.
+//! Consumed by `ToolRegistryClient` implementations and `ToolRegistryCommandAdapter`.
 
 /// Summary of a tool from the remote registry.
 /// Maps to the gRPC `ToolInfo` message.

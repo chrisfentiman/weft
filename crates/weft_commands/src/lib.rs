@@ -1,25 +1,25 @@
-//! `weft_commands` — Command registry trait, parser, gRPC client, and adapter.
+//! `weft_commands` — Command registry trait, parser, and adapter.
 //!
 //! Contains:
 //! - `CommandRegistry` trait for managing available commands
-//! - `ToolRegistryClient` trait for communicating with a remote gRPC ToolRegistry
-//! - `CommandError` and `ToolRegistryError` error types
+//! - `CommandError` error type
 //! - `parser`: slash command parser for LLM output
-//! - `grpc_client`: tonic client implementing `ToolRegistryClient`
 //! - `adapter`: `ToolRegistryCommandAdapter` bridging `ToolRegistryClient` to `CommandRegistry`
-//! - `types`: gRPC mapping types (`ToolInfo`, `ToolDescription`, `ToolExecutionResult`)
 //!
+//! Tool client types have moved to `weft_tools`.
 //! Memory store types and clients have moved to `weft_memory`.
 
 pub mod adapter;
-pub mod grpc_client;
 pub mod parser;
-pub mod types;
 
 pub use adapter::ToolRegistryCommandAdapter;
-pub use grpc_client::GrpcToolRegistryClient;
 pub use parser::{ParsedResponse, parse_response};
-pub use types::{ToolDescription, ToolExecutionResult, ToolInfo};
+
+// Re-export tool types from weft_tools for consumers that import via weft_commands.
+pub use weft_tools::{
+    GrpcToolRegistryClient, ToolDescription, ToolExecutionResult, ToolInfo, ToolRegistryClient,
+    ToolRegistryError,
+};
 
 // Re-export memory types from weft_memory for backward compatibility.
 pub use weft_memory::{
@@ -46,21 +46,6 @@ pub trait CommandRegistry: Send + Sync + 'static {
     ) -> Result<CommandResult, CommandError>;
 }
 
-/// Client interface to a remote gRPC ToolRegistry service.
-/// Co-located with commands because the only consumer is the ToolRegistryCommandAdapter.
-#[async_trait]
-pub trait ToolRegistryClient: Send + Sync + 'static {
-    async fn list_tools(&self) -> Result<Vec<ToolInfo>, ToolRegistryError>;
-
-    async fn describe_tool(&self, name: &str) -> Result<ToolDescription, ToolRegistryError>;
-
-    async fn execute_tool(
-        &self,
-        name: &str,
-        arguments: serde_json::Value,
-    ) -> Result<ToolExecutionResult, ToolRegistryError>;
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum CommandError {
     #[error("command not found: {0}")]
@@ -71,16 +56,4 @@ pub enum CommandError {
     InvalidArguments { name: String, reason: String },
     #[error("registry unavailable: {0}")]
     RegistryUnavailable(String),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ToolRegistryError {
-    #[error("connection failed: {0}")]
-    ConnectionFailed(String),
-    #[error("tool not found: {0}")]
-    ToolNotFound(String),
-    #[error("execution failed: {0}")]
-    ExecutionFailed(String),
-    #[error("grpc error: {0}")]
-    GrpcError(String),
 }

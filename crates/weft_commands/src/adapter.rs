@@ -12,7 +12,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use weft_core::{CommandAction, CommandDescription, CommandInvocation, CommandResult, CommandStub};
 
-use crate::{CommandError, CommandRegistry, ToolRegistryClient, ToolRegistryError};
+use crate::{CommandError, CommandRegistry};
+use weft_tools::{ToolRegistryClient, ToolRegistryError};
 
 /// Implements `CommandRegistry` by delegating to a `ToolRegistryClient`.
 ///
@@ -151,11 +152,11 @@ fn tool_registry_to_command_error(e: ToolRegistryError) -> CommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ToolDescription, ToolExecutionResult, ToolInfo, ToolRegistryError};
     use async_trait::async_trait;
     use serde_json::json;
     use std::sync::Arc;
     use weft_core::CommandAction;
+    use weft_tools::{ToolDescription, ToolExecutionResult, ToolInfo, ToolRegistryError};
 
     /// Mock client for testing the adapter.
     struct MockToolRegistryClient {

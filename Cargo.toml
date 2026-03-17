@@ -26,6 +26,7 @@ prost = { version = "0.13" }
 weft_proto = { path = "crates/weft_proto" }
 weft_engine = { path = "crates/weft_engine" }
 weft_memory = { path = "crates/weft_memory" }
+weft_tools = { path = "crates/weft_tools" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
