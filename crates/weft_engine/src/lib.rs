@@ -47,6 +47,7 @@ use weft_router::{MemoryStoreRef, RoutingCandidate, SemanticRouter, build_memory
 pub mod context;
 
 mod activity;
+mod hooks;
 mod memory;
 mod provider;
 mod request;

@@ -498,44 +498,17 @@ where
                 commands_executed += 1;
 
                 // ── [HOOK: PostToolUse] ──────────────────────────────────────
-                let post_tool_payload = serde_json::json!({
-                    "command": effective_invocation.name,
-                    "action": match &effective_invocation.action {
-                        CommandAction::Execute => "execute",
-                        CommandAction::Describe => "describe",
-                    },
-                    "success": cmd_result.success,
-                    "output": cmd_result.output,
-                    "error": cmd_result.error,
-                });
-
-                match self
-                    .hooks
-                    .run_chain(
-                        HookEvent::PostToolUse,
-                        post_tool_payload,
-                        Some(&effective_invocation.name),
-                    )
-                    .await
-                {
-                    HookChainResult::Allowed { payload, .. } => {
-                        // Apply any modifications to the result.
-                        if let Some(output) = payload.get("output").and_then(|v| v.as_str()) {
-                            cmd_result.output = output.to_string();
-                        }
-                        if let Some(success) = payload.get("success").and_then(|v| v.as_bool()) {
-                            cmd_result.success = success;
-                        }
-                    }
-                    HookChainResult::Blocked { hook_name, reason } => {
-                        // Block on PostToolUse is non-blocking per spec — log and continue.
-                        warn!(
-                            hook = %hook_name,
-                            reason = %reason,
-                            "PostToolUse hook returned Block (non-blocking event) — ignoring"
-                        );
-                    }
-                }
+                let action = match &effective_invocation.action {
+                    CommandAction::Execute => "execute",
+                    CommandAction::Describe => "describe",
+                };
+                crate::hooks::apply_post_tool_use(
+                    &*self.hooks,
+                    &effective_invocation.name,
+                    action,
+                    &mut cmd_result,
+                )
+                .await;
 
                 results.push(cmd_result);
             }

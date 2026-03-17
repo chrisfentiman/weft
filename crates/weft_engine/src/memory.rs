@@ -91,39 +91,13 @@ where
                 error: None,
             };
 
-            let post_tool_payload = serde_json::json!({
-                "command": effective_invocation.name,
-                "action": "describe",
-                "success": cmd_result.success,
-                "output": cmd_result.output,
-                "error": cmd_result.error,
-            });
-
-            match self
-                .hooks
-                .run_chain(
-                    HookEvent::PostToolUse,
-                    post_tool_payload,
-                    Some(&effective_invocation.name),
-                )
-                .await
-            {
-                HookChainResult::Allowed { payload, .. } => {
-                    if let Some(output) = payload.get("output").and_then(|v| v.as_str()) {
-                        cmd_result.output = output.to_string();
-                    }
-                    if let Some(success) = payload.get("success").and_then(|v| v.as_bool()) {
-                        cmd_result.success = success;
-                    }
-                }
-                HookChainResult::Blocked { hook_name, reason } => {
-                    warn!(
-                        hook = %hook_name,
-                        reason = %reason,
-                        "PostToolUse hook returned Block (non-blocking event) — ignoring"
-                    );
-                }
-            }
+            crate::hooks::apply_post_tool_use(
+                &*self.hooks,
+                &effective_invocation.name,
+                "describe",
+                &mut cmd_result,
+            )
+            .await;
 
             return cmd_result;
         }
@@ -361,39 +335,13 @@ where
         };
 
         // ── [HOOK: PostToolUse] ──────────────────────────────────────────────
-        let post_tool_payload = serde_json::json!({
-            "command": effective_invocation.name,
-            "action": "execute",
-            "success": cmd_result.success,
-            "output": cmd_result.output,
-            "error": cmd_result.error,
-        });
-
-        match self
-            .hooks
-            .run_chain(
-                HookEvent::PostToolUse,
-                post_tool_payload,
-                Some(&effective_invocation.name),
-            )
-            .await
-        {
-            HookChainResult::Allowed { payload, .. } => {
-                if let Some(output) = payload.get("output").and_then(|v| v.as_str()) {
-                    cmd_result.output = output.to_string();
-                }
-                if let Some(success) = payload.get("success").and_then(|v| v.as_bool()) {
-                    cmd_result.success = success;
-                }
-            }
-            HookChainResult::Blocked { hook_name, reason } => {
-                warn!(
-                    hook = %hook_name,
-                    reason = %reason,
-                    "PostToolUse hook returned Block (non-blocking event) — ignoring"
-                );
-            }
-        }
+        crate::hooks::apply_post_tool_use(
+            &*self.hooks,
+            &effective_invocation.name,
+            "execute",
+            &mut cmd_result,
+        )
+        .await;
 
         cmd_result
     }

@@ -281,206 +281,102 @@ where
 
         // ── Per-domain PostRoute hooks ────────────────────────────────────────
         // PostRoute hooks may override the selections made by route_domains.
+        // Domains fire in order: Commands, ToolNecessity, Model.  This order
+        // is part of the hook contract — do not reorder.
 
-        // PostRoute: Commands domain.
-        {
-            let commands_domain_candidates = domains
-                .iter()
-                .find(|(k, _)| *k == RoutingDomainKind::Commands)
-                .map(|(_, c)| c.clone())
-                .unwrap_or_default();
-
-            // Build scored commands representation for the hook payload.
-            // Use score 1.0 for selected commands as a conservative approximation when
-            // we don't have individual scores from route_domains (they're in RoutingResult).
-            let selected_cmd_ids: Vec<String> = result
-                .selected_commands
-                .iter()
-                .map(|c| c.name.clone())
-                .collect();
-
-            let post_commands_payload = serde_json::json!({
-                "domain": HookRoutingDomain::Commands,
-                "trigger": RoutingTrigger::RequestStart,
-                "candidates": commands_domain_candidates.iter().map(|c| serde_json::json!({"id": c.id, "description": c.examples.first().cloned().unwrap_or_default()})).collect::<Vec<_>>(),
-                "scores": selected_cmd_ids.iter().map(|id| serde_json::json!({"id": id, "score": 1.0})).collect::<Vec<_>>(),
-                "selected": selected_cmd_ids,
-            });
-
-            match self
-                .hooks
-                .run_chain(
-                    HookEvent::PostRoute,
-                    post_commands_payload,
-                    Some(HookRoutingDomain::Commands.as_matcher_target()),
-                )
-                .await
-            {
-                HookChainResult::Blocked { reason, hook_name } => {
-                    // Block on commands domain = empty commands (not 403).
-                    info!(
-                        hook = %hook_name,
-                        reason = %reason,
-                        "PostRoute hook blocked commands domain — using empty command set"
-                    );
-                    result.selected_commands.clear();
-                }
-                HookChainResult::Allowed { payload, context } => {
-                    if let Some(ctx) = context {
-                        context_parts.push(ctx);
-                    }
-                    // PostRoute may override the selected command IDs.
-                    if let Some(override_ids) = payload
-                        .get("selected")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect::<Vec<_>>()
-                        })
-                    {
-                        result.selected_commands = all_commands
-                            .iter()
-                            .filter(|cmd| override_ids.contains(&cmd.name))
-                            .cloned()
-                            .collect();
-                    }
-                }
-            }
-        }
-
-        // PostRoute: ToolNecessity domain (only if it was included).
         let tool_necessity_domain_exists = domains
             .iter()
             .any(|(k, _)| *k == RoutingDomainKind::ToolNecessity);
-
-        if !tool_necessity_blocked && tool_necessity_domain_exists {
-            let selected_necessity = if result.inject_tools {
-                "needs_tools"
-            } else {
-                "no_tools"
-            };
-            let tn_domain_candidates = domains
-                .iter()
-                .find(|(k, _)| *k == RoutingDomainKind::ToolNecessity)
-                .map(|(_, c)| c.clone())
-                .unwrap_or_default();
-
-            let post_tn_payload = serde_json::json!({
-                "domain": HookRoutingDomain::ToolNecessity,
-                "trigger": RoutingTrigger::RequestStart,
-                "candidates": tn_domain_candidates.iter().map(|c| serde_json::json!({"id": c.id})).collect::<Vec<_>>(),
-                "scores": [],
-                "selected": [selected_necessity],
-            });
-
-            match self
-                .hooks
-                .run_chain(
-                    HookEvent::PostRoute,
-                    post_tn_payload,
-                    Some(HookRoutingDomain::ToolNecessity.as_matcher_target()),
-                )
-                .await
-            {
-                HookChainResult::Blocked { hook_name, reason } => {
-                    // Block on tool_necessity = conservative (inject tools).
-                    info!(
-                        hook = %hook_name,
-                        reason = %reason,
-                        "PostRoute hook blocked tool_necessity domain — conservative: inject tools"
-                    );
-                    result.inject_tools = true;
-                }
-                HookChainResult::Allowed { payload, context } => {
-                    if let Some(ctx) = context {
-                        context_parts.push(ctx);
-                    }
-                    // PostRoute can override tool_necessity selection.
-                    let override_selected = payload
-                        .get("selected")
-                        .and_then(|v| v.as_array())
-                        .and_then(|arr| arr.first())
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-
-                    match override_selected.as_deref() {
-                        Some("needs_tools") => result.inject_tools = true,
-                        Some("no_tools") => result.inject_tools = false,
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        // PostRoute: Model domain (only if it was included).
         let model_domain_exists = domains.iter().any(|(k, _)| *k == RoutingDomainKind::Model);
 
-        if model_domain_exists {
-            let model_domain_candidates = domains
-                .iter()
-                .find(|(k, _)| *k == RoutingDomainKind::Model)
-                .map(|(_, c)| c.clone())
-                .unwrap_or_default();
+        /// Descriptor for a single domain in the PostRoute loop.
+        struct PostRouteDomain {
+            kind: RoutingDomainKind,
+            hook_domain: HookRoutingDomain,
+            /// Was this domain blocked by a PreRoute hook?  Blocked domains are skipped.
+            pre_route_blocked: bool,
+            /// Does this domain appear in the `domains` vec?  Absent domains are skipped.
+            exists: bool,
+        }
 
-            let model_score = result
-                .activity_events
-                .first()
-                .map(|a| a.score)
-                .unwrap_or(1.0);
+        let post_route_domains = [
+            PostRouteDomain {
+                kind: RoutingDomainKind::Commands,
+                hook_domain: HookRoutingDomain::Commands,
+                pre_route_blocked: commands_blocked,
+                exists: true, // Commands domain is always present.
+            },
+            PostRouteDomain {
+                kind: RoutingDomainKind::ToolNecessity,
+                hook_domain: HookRoutingDomain::ToolNecessity,
+                pre_route_blocked: tool_necessity_blocked,
+                exists: tool_necessity_domain_exists,
+            },
+            PostRouteDomain {
+                kind: RoutingDomainKind::Model,
+                hook_domain: HookRoutingDomain::Model,
+                pre_route_blocked: false, // Model PreRoute block returns Err — never reaches here.
+                exists: model_domain_exists,
+            },
+        ];
 
-            let post_model_payload = serde_json::json!({
-                "domain": HookRoutingDomain::Model,
-                "trigger": RoutingTrigger::RequestStart,
-                "candidates": model_domain_candidates.iter().map(|c| serde_json::json!({"id": c.id})).collect::<Vec<_>>(),
-                "scores": [serde_json::json!({"id": result.selected_model, "score": model_score})],
-                "selected": [result.selected_model],
-            });
+        for domain_desc in &post_route_domains {
+            if !domain_desc.exists || domain_desc.pre_route_blocked {
+                continue;
+            }
+
+            let payload = build_post_route_payload(&domains, &result, &domain_desc.kind);
 
             match self
                 .hooks
                 .run_chain(
                     HookEvent::PostRoute,
-                    post_model_payload,
-                    Some(HookRoutingDomain::Model.as_matcher_target()),
+                    payload,
+                    Some(domain_desc.hook_domain.as_matcher_target()),
                 )
                 .await
             {
                 HookChainResult::Blocked { reason, hook_name } => {
-                    // Hard block on model domain.
-                    return Err(WeftError::HookBlocked {
-                        event: "PostRoute".to_string(),
-                        reason,
-                        hook_name,
-                    });
+                    match domain_desc.kind {
+                        RoutingDomainKind::Commands => {
+                            info!(
+                                hook = %hook_name,
+                                reason = %reason,
+                                "PostRoute hook blocked commands domain — using empty command set"
+                            );
+                            result.selected_commands.clear();
+                        }
+                        RoutingDomainKind::ToolNecessity => {
+                            info!(
+                                hook = %hook_name,
+                                reason = %reason,
+                                "PostRoute hook blocked tool_necessity domain — conservative: inject tools"
+                            );
+                            result.inject_tools = true;
+                        }
+                        RoutingDomainKind::Model => {
+                            return Err(WeftError::HookBlocked {
+                                event: "PostRoute".to_string(),
+                                reason,
+                                hook_name,
+                            });
+                        }
+                        RoutingDomainKind::Memory => {
+                            unreachable!("Memory domain PostRoute is handled in memory.rs")
+                        }
+                    }
                 }
                 HookChainResult::Allowed { payload, context } => {
                     if let Some(ctx) = context {
                         context_parts.push(ctx);
                     }
-                    let override_model = payload
-                        .get("selected")
-                        .and_then(|v| v.as_array())
-                        .and_then(|arr| arr.first())
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-
-                    if let Some(model) = override_model {
-                        // Validate that the model exists in the provider registry.
-                        if self.providers.model_id(&model).is_some() {
-                            // Update activity events to reflect override.
-                            for event in &mut result.activity_events {
-                                event.model = model.clone();
-                            }
-                            result.selected_model = model;
-                        } else {
-                            warn!(
-                                model = %model,
-                                "PostRoute hook override model not found in registry — using default"
-                            );
-                            result.selected_model = default_model.clone();
-                        }
-                    }
+                    self.apply_post_route_override(
+                        &payload,
+                        &domain_desc.kind,
+                        &mut result,
+                        all_commands,
+                        &default_model,
+                    );
                 }
             }
         }
@@ -500,6 +396,159 @@ where
         };
 
         Ok((result, accumulated_context))
+    }
+
+    /// Apply the override from an `Allowed` PostRoute hook payload to `result`.
+    ///
+    /// Extracts the `selected` array from the payload and applies domain-specific
+    /// override logic:
+    /// - **Commands:** filters `all_commands` to those whose name appears in
+    ///   `selected`, replaces `result.selected_commands`.
+    /// - **ToolNecessity:** reads the first `selected` entry (`"needs_tools"` /
+    ///   `"no_tools"`), sets `result.inject_tools`.
+    /// - **Model:** reads the first `selected` entry, validates against the
+    ///   provider registry, updates `result.selected_model` and activity events.
+    ///   Falls back to `default_model` if the override name is unknown.
+    fn apply_post_route_override(
+        &self,
+        payload: &serde_json::Value,
+        kind: &RoutingDomainKind,
+        result: &mut RoutingResult,
+        all_commands: &[CommandStub],
+        default_model: &str,
+    ) {
+        match kind {
+            RoutingDomainKind::Commands => {
+                if let Some(override_ids) = payload
+                    .get("selected")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect::<Vec<_>>()
+                    })
+                {
+                    result.selected_commands = all_commands
+                        .iter()
+                        .filter(|cmd| override_ids.contains(&cmd.name))
+                        .cloned()
+                        .collect();
+                }
+            }
+            RoutingDomainKind::ToolNecessity => {
+                let override_selected = payload
+                    .get("selected")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+
+                match override_selected.as_deref() {
+                    Some("needs_tools") => result.inject_tools = true,
+                    Some("no_tools") => result.inject_tools = false,
+                    _ => {}
+                }
+            }
+            RoutingDomainKind::Model => {
+                let override_model = payload
+                    .get("selected")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+
+                if let Some(model) = override_model {
+                    if self.providers.model_id(&model).is_some() {
+                        for event in &mut result.activity_events {
+                            event.model = model.clone();
+                        }
+                        result.selected_model = model;
+                    } else {
+                        warn!(
+                            model = %model,
+                            "PostRoute hook override model not found in registry — using default"
+                        );
+                        result.selected_model = default_model.to_string();
+                    }
+                }
+            }
+            RoutingDomainKind::Memory => {
+                unreachable!("Memory domain PostRoute is handled in memory.rs")
+            }
+        }
+    }
+}
+
+/// Build the `candidates`, `scores`, and `selected` payload for a PostRoute hook.
+///
+/// Each domain has a slightly different payload shape:
+/// - **Commands:** candidates include `id` + `description`; scores use 1.0 for
+///   each selected command; selected is an array of command-name strings.
+/// - **ToolNecessity:** candidates include `id` only; scores is empty; selected
+///   is `["needs_tools"]` or `["no_tools"]`.
+/// - **Model:** candidates include `id` only; scores include the model score from
+///   the first activity event; selected is `[model_name]`.
+fn build_post_route_payload(
+    domains: &[(RoutingDomainKind, Vec<RoutingCandidate>)],
+    result: &RoutingResult,
+    kind: &RoutingDomainKind,
+) -> serde_json::Value {
+    let hook_domain = crate::util::routing_domain_to_hook_domain(kind);
+    let domain_candidates: Vec<RoutingCandidate> = domains
+        .iter()
+        .find(|(k, _)| k == kind)
+        .map(|(_, c)| c.clone())
+        .unwrap_or_default();
+
+    match kind {
+        RoutingDomainKind::Commands => {
+            let selected_cmd_ids: Vec<String> = result
+                .selected_commands
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
+            serde_json::json!({
+                "domain": hook_domain,
+                "trigger": RoutingTrigger::RequestStart,
+                "candidates": domain_candidates.iter().map(|c| serde_json::json!({
+                    "id": c.id,
+                    "description": c.examples.first().cloned().unwrap_or_default(),
+                })).collect::<Vec<_>>(),
+                "scores": selected_cmd_ids.iter().map(|id| serde_json::json!({"id": id, "score": 1.0})).collect::<Vec<_>>(),
+                "selected": selected_cmd_ids,
+            })
+        }
+        RoutingDomainKind::ToolNecessity => {
+            let selected_necessity = if result.inject_tools {
+                "needs_tools"
+            } else {
+                "no_tools"
+            };
+            serde_json::json!({
+                "domain": hook_domain,
+                "trigger": RoutingTrigger::RequestStart,
+                "candidates": domain_candidates.iter().map(|c| serde_json::json!({"id": c.id})).collect::<Vec<_>>(),
+                "scores": [],
+                "selected": [selected_necessity],
+            })
+        }
+        RoutingDomainKind::Model => {
+            let model_score = result
+                .activity_events
+                .first()
+                .map(|a| a.score)
+                .unwrap_or(1.0);
+            serde_json::json!({
+                "domain": hook_domain,
+                "trigger": RoutingTrigger::RequestStart,
+                "candidates": domain_candidates.iter().map(|c| serde_json::json!({"id": c.id})).collect::<Vec<_>>(),
+                "scores": [serde_json::json!({"id": result.selected_model, "score": model_score})],
+                "selected": [result.selected_model],
+            })
+        }
+        RoutingDomainKind::Memory => {
+            unreachable!("Memory domain PostRoute is handled in memory.rs")
+        }
     }
 }
 
