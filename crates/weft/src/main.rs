@@ -15,11 +15,11 @@ use clap::Parser;
 use std::path::PathBuf;
 use tracing::{info, warn};
 use weft_commands::ToolRegistryCommandAdapter;
-use weft_tools::GrpcToolRegistryClient;
 use weft_core::{WeftConfig, WireFormat};
 use weft_llm::{AnthropicProvider, Capability, OpenAIProvider, ProviderRegistry, RhaiProvider};
 use weft_memory::{DefaultMemoryService, GrpcMemoryStoreClient, MemoryStoreMux, StoreInfo};
 use weft_router::{ModernBertRouter, RoutingCandidate, RoutingDomainKind};
+use weft_tools::GrpcToolRegistryClient;
 
 use crate::engine::tool_necessity_candidates;
 use crate::grpc::WeftService;

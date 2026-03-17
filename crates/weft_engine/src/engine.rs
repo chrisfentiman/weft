@@ -50,10 +50,11 @@ use weft_llm::{
     Capability, Provider, ProviderError, ProviderRequest, ProviderResponse, ProviderService,
     TokenUsage,
 };
-use weft_memory::{MemoryService, StoreInfo};
+use weft_memory::MemoryService;
 use weft_router::{
-    RoutingCandidate, RoutingDomainKind, ScoredCandidate, SemanticRouter, filter_by_threshold,
-    take_top,
+    MemoryStoreRef, RoutingCandidate, RoutingDomainKind, RoutingInput, RoutingResult,
+    SemanticRouter, build_memory_candidates, build_model_candidates, route_domains,
+    tool_necessity_candidates,
 };
 
 use crate::context::{
@@ -223,14 +224,26 @@ where
         hooks: Arc<H>,
     ) -> Self {
         // Build per-capability candidate sets from the memory service's store metadata.
-        // `memory.stores()` returns `StoreInfo` with capability labels and examples
-        // so the engine can build routing candidates without importing config types.
-        let (memory_candidates, read_memory_candidates, write_memory_candidates) =
-            if let Some(mem) = &memory {
-                build_memory_candidates_from_stores(&mem.stores())
-            } else {
-                (vec![], vec![], vec![])
-            };
+        // Convert `StoreInfo` to `MemoryStoreRef` so `weft_router` doesn't depend on `weft_memory`.
+        let mem_candidates = if let Some(mem) = &memory {
+            let refs: Vec<MemoryStoreRef> = mem
+                .stores()
+                .into_iter()
+                .map(|s| MemoryStoreRef {
+                    name: s.name,
+                    capabilities: s.capabilities,
+                    examples: s.examples,
+                })
+                .collect();
+            build_memory_candidates(&refs)
+        } else {
+            weft_router::MemoryCandidates::default()
+        };
+        let (memory_candidates, read_memory_candidates, write_memory_candidates) = (
+            mem_candidates.all,
+            mem_candidates.read,
+            mem_candidates.write,
+        );
 
         let request_end_concurrency = config.request_end_concurrency;
         let request_end_semaphore = Arc::new(tokio::sync::Semaphore::new(request_end_concurrency));
@@ -378,23 +391,21 @@ where
         })?;
 
         // Build all routing domains and call the router once — with per-domain PreRoute/PostRoute hooks.
-        let routing_result = self
-            .route_all_domains_with_hooks(&user_text, &all_commands)
-            .await?;
+        let (routing_result, hook_context) =
+            self.route_with_hooks(&user_text, &all_commands).await?;
 
-        // Unpack the routing result.
-        let (
-            selected_commands,
-            inject_tools,
-            selected_model_name,
-            hook_context,
-            routing_activity_events,
-        ) = routing_result;
+        let selected_commands = routing_result.selected_commands;
+        let inject_tools = routing_result.inject_tools;
+        let selected_model_name = routing_result.selected_model;
 
         // Collect activity events for the response.
         // Routing events are always gathered here — they are only included in the response
         // message list when `request.options.activity = true` (handled by assemble_response).
-        let activity_events: Vec<ActivityEvent> = routing_activity_events;
+        let activity_events: Vec<ActivityEvent> = routing_result
+            .activity_events
+            .into_iter()
+            .map(ActivityEvent::Routing)
+            .collect();
 
         debug!(
             model = %selected_model_name,
@@ -877,9 +888,9 @@ where
 
     /// Route all domains with per-domain PreRoute/PostRoute hooks.
     ///
-    /// Returns `(selected_commands, inject_tools, selected_model_name, accumulated_hook_context,
-    /// activity_events)` where `activity_events` carries routing decisions and hook events
-    /// for inclusion in the response when `options.activity = true`.
+    /// Returns `(RoutingResult, Option<String>)` where the `Option<String>` is the
+    /// accumulated hook context injected into the system prompt. `RoutingResult` carries
+    /// the selected commands, inject_tools flag, selected model, and activity events.
     ///
     /// Per-domain hooks fire for each routing domain independently:
     /// - PreRoute can modify candidates or routing_input for that domain.
@@ -889,22 +900,13 @@ where
     /// Block on commands domain = empty command set (proceed with no tools).
     /// Block on tool_necessity domain = conservative (inject tools).
     ///
-    /// On router failure, falls back to: all commands (capped by max_commands),
-    /// `inject_tools = true` (conservative), and the default model.
-    async fn route_all_domains_with_hooks(
+    /// On router failure, `route_domains` falls back to: all commands (capped by
+    /// max_commands), `inject_tools = true` (conservative), and the default model.
+    async fn route_with_hooks(
         &self,
         user_message: &str,
         all_commands: &[CommandStub],
-    ) -> Result<
-        (
-            Vec<CommandStub>,
-            bool,
-            String,
-            Option<String>,
-            Vec<ActivityEvent>,
-        ),
-        WeftError,
-    > {
+    ) -> Result<(RoutingResult, Option<String>), WeftError> {
         let threshold = self.config.router.classifier.threshold;
         let max_commands = self.config.router.classifier.max_commands;
         let skip_tools_when_unnecessary = self.config.router.skip_tools_when_unnecessary;
@@ -1102,300 +1104,261 @@ where
             .last()
             .unwrap_or(user_message);
 
-        let decision = self.router.route(effective_routing_input, &domains).await;
+        // ── Pure routing call ────────────────────────────────────────────────
+        // `route_domains` handles the router fallback internally. On failure it
+        // returns conservative defaults (all commands, inject_tools=true, default model).
+        let routing_input = RoutingInput {
+            user_message: effective_routing_input,
+            all_commands,
+            threshold,
+            max_commands,
+            skip_tools_when_unnecessary,
+            default_model: &default_model,
+            domains: domains.clone(),
+        };
 
-        // ── Post-route processing and PostRoute hooks ────────────────────────
-        match decision {
-            Ok(routing_decision) => {
-                // ── Commands ──────────────────────────────────────────────
-                // Apply commands_blocked from PreRoute hook.
-                let scored_commands = if commands_blocked {
-                    vec![]
-                } else {
-                    routing_decision.commands.clone()
-                };
-                let filtered = filter_by_threshold(scored_commands.clone(), threshold);
-                let top: Vec<ScoredCandidate> = take_top(filtered, max_commands);
+        let mut result = route_domains(&*self.router, &routing_input)
+            .await
+            .map_err(|e| WeftError::Routing(e.to_string()))?;
 
-                // Fire PostRoute for Commands domain.
-                let commands_domain_idx = domains
-                    .iter()
-                    .position(|(k, _)| *k == RoutingDomainKind::Commands);
-                let commands_domain_candidates = commands_domain_idx
-                    .and_then(|i| domains.get(i))
-                    .map(|(_, c)| c.clone())
-                    .unwrap_or_default();
+        // If commands were blocked by PreRoute, clear the selected commands.
+        if commands_blocked {
+            result.selected_commands.clear();
+        }
 
-                let selected_cmd_ids = top.iter().map(|c| c.id.clone()).collect::<Vec<_>>();
-                let post_commands_payload = serde_json::json!({
-                    "domain": HookRoutingDomain::Commands,
-                    "trigger": RoutingTrigger::RequestStart,
-                    "candidates": commands_domain_candidates.iter().map(|c| serde_json::json!({"id": c.id, "description": c.examples.first().cloned().unwrap_or_default()})).collect::<Vec<_>>(),
-                    "scores": scored_commands.iter().map(|c| serde_json::json!({"id": c.id, "score": c.score})).collect::<Vec<_>>(),
-                    "selected": selected_cmd_ids,
-                });
+        // If tool_necessity was blocked by PreRoute, force conservative inject_tools=true.
+        if tool_necessity_blocked {
+            result.inject_tools = true;
+        }
 
-                let final_cmd_ids = match self
-                    .hooks
-                    .run_chain(
-                        HookEvent::PostRoute,
-                        post_commands_payload,
-                        Some(HookRoutingDomain::Commands.as_matcher_target()),
-                    )
-                    .await
-                {
-                    HookChainResult::Blocked { reason, hook_name } => {
-                        // Block on commands domain = empty commands (not 403).
-                        info!(
-                            hook = %hook_name,
-                            reason = %reason,
-                            "PostRoute hook blocked commands domain — using empty command set"
-                        );
-                        vec![]
+        // Log router fallback if score is 0.0 (signals fallback path in route_domains).
+        if result.activity_events.first().map(|a| a.score) == Some(0.0) {
+            warn!(
+                "semantic router failed, using fallback: all commands, inject tools, default model"
+            );
+        }
+
+        // ── Per-domain PostRoute hooks ────────────────────────────────────────
+        // PostRoute hooks may override the selections made by route_domains.
+
+        // PostRoute: Commands domain.
+        {
+            let commands_domain_candidates = domains
+                .iter()
+                .find(|(k, _)| *k == RoutingDomainKind::Commands)
+                .map(|(_, c)| c.clone())
+                .unwrap_or_default();
+
+            // Build scored commands representation for the hook payload.
+            // Use score 1.0 for selected commands as a conservative approximation when
+            // we don't have individual scores from route_domains (they're in RoutingResult).
+            let selected_cmd_ids: Vec<String> = result
+                .selected_commands
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
+
+            let post_commands_payload = serde_json::json!({
+                "domain": HookRoutingDomain::Commands,
+                "trigger": RoutingTrigger::RequestStart,
+                "candidates": commands_domain_candidates.iter().map(|c| serde_json::json!({"id": c.id, "description": c.examples.first().cloned().unwrap_or_default()})).collect::<Vec<_>>(),
+                "scores": selected_cmd_ids.iter().map(|id| serde_json::json!({"id": id, "score": 1.0})).collect::<Vec<_>>(),
+                "selected": selected_cmd_ids,
+            });
+
+            match self
+                .hooks
+                .run_chain(
+                    HookEvent::PostRoute,
+                    post_commands_payload,
+                    Some(HookRoutingDomain::Commands.as_matcher_target()),
+                )
+                .await
+            {
+                HookChainResult::Blocked { reason, hook_name } => {
+                    // Block on commands domain = empty commands (not 403).
+                    info!(
+                        hook = %hook_name,
+                        reason = %reason,
+                        "PostRoute hook blocked commands domain — using empty command set"
+                    );
+                    result.selected_commands.clear();
+                }
+                HookChainResult::Allowed { payload, context } => {
+                    if let Some(ctx) = context {
+                        context_parts.push(ctx);
                     }
-                    HookChainResult::Allowed { payload, context } => {
-                        if let Some(ctx) = context {
-                            context_parts.push(ctx);
-                        }
-                        payload
-                            .get("selected")
-                            .and_then(|v| v.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or(selected_cmd_ids)
-                    }
-                };
-
-                // Build selected commands from final_cmd_ids.
-                let score_map: std::collections::HashMap<&str, f32> =
-                    top.iter().map(|r| (r.id.as_str(), r.score)).collect();
-
-                let mut selected_commands: Vec<CommandStub> = all_commands
-                    .iter()
-                    .filter(|cmd| final_cmd_ids.contains(&cmd.name))
-                    .cloned()
-                    .collect();
-
-                // Preserve top-score ordering.
-                selected_commands.sort_by(|a, b| {
-                    let sa = score_map.get(a.name.as_str()).copied().unwrap_or(0.0);
-                    let sb = score_map.get(b.name.as_str()).copied().unwrap_or(0.0);
-                    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-                });
-
-                // ── Tool necessity ────────────────────────────────────────
-                let tool_necessity_domain_exists = domains
-                    .iter()
-                    .any(|(k, _)| *k == RoutingDomainKind::ToolNecessity);
-
-                let base_inject_tools = !matches!(
-                    routing_decision.tools_needed,
-                    Some(false) if skip_tools_when_unnecessary
-                );
-
-                // Fire PostRoute for ToolNecessity if the domain was included.
-                let inject_tools = if tool_necessity_blocked {
-                    // Conservative: inject tools when blocked.
-                    true
-                } else if tool_necessity_domain_exists {
-                    let selected_necessity = if base_inject_tools {
-                        "needs_tools"
-                    } else {
-                        "no_tools"
-                    };
-                    let tn_domain_candidates = domains
-                        .iter()
-                        .find(|(k, _)| *k == RoutingDomainKind::ToolNecessity)
-                        .map(|(_, c)| c.clone())
-                        .unwrap_or_default();
-
-                    let post_tn_payload = serde_json::json!({
-                        "domain": HookRoutingDomain::ToolNecessity,
-                        "trigger": RoutingTrigger::RequestStart,
-                        "candidates": tn_domain_candidates.iter().map(|c| serde_json::json!({"id": c.id})).collect::<Vec<_>>(),
-                        "scores": [],
-                        "selected": [selected_necessity],
-                    });
-
-                    match self
-                        .hooks
-                        .run_chain(
-                            HookEvent::PostRoute,
-                            post_tn_payload,
-                            Some(HookRoutingDomain::ToolNecessity.as_matcher_target()),
-                        )
-                        .await
+                    // PostRoute may override the selected command IDs.
+                    if let Some(override_ids) = payload
+                        .get("selected")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect::<Vec<_>>()
+                        })
                     {
-                        HookChainResult::Blocked { hook_name, reason } => {
-                            // Block on tool_necessity = conservative (inject tools).
-                            info!(
-                                hook = %hook_name,
-                                reason = %reason,
-                                "PostRoute hook blocked tool_necessity domain — conservative: inject tools"
-                            );
-                            true
-                        }
-                        HookChainResult::Allowed { payload, context } => {
-                            if let Some(ctx) = context {
-                                context_parts.push(ctx);
-                            }
-                            // PostRoute can override tool_necessity selection.
-                            let override_selected = payload
-                                .get("selected")
-                                .and_then(|v| v.as_array())
-                                .and_then(|arr| arr.first())
-                                .and_then(|v| v.as_str())
-                                .map(String::from);
-
-                            match override_selected.as_deref() {
-                                Some("needs_tools") => true,
-                                Some("no_tools") => false,
-                                _ => base_inject_tools,
-                            }
-                        }
+                        result.selected_commands = all_commands
+                            .iter()
+                            .filter(|cmd| override_ids.contains(&cmd.name))
+                            .cloned()
+                            .collect();
                     }
-                } else {
-                    base_inject_tools
-                };
-
-                // ── Model selection ───────────────────────────────────────
-                let base_model_name = routing_decision
-                    .model
-                    .as_ref()
-                    .map(|m| m.id.clone())
-                    .unwrap_or_else(|| default_model.clone());
-
-                // Fire PostRoute for Model domain if it was included.
-                let model_domain_exists =
-                    domains.iter().any(|(k, _)| *k == RoutingDomainKind::Model);
-
-                let selected_model_name = if model_domain_exists {
-                    let model_domain_candidates = domains
-                        .iter()
-                        .find(|(k, _)| *k == RoutingDomainKind::Model)
-                        .map(|(_, c)| c.clone())
-                        .unwrap_or_default();
-
-                    let model_scores = routing_decision
-                        .model
-                        .as_ref()
-                        .map(|m| vec![serde_json::json!({"id": m.id, "score": m.score})])
-                        .unwrap_or_default();
-
-                    let post_model_payload = serde_json::json!({
-                        "domain": HookRoutingDomain::Model,
-                        "trigger": RoutingTrigger::RequestStart,
-                        "candidates": model_domain_candidates.iter().map(|c| serde_json::json!({"id": c.id})).collect::<Vec<_>>(),
-                        "scores": model_scores,
-                        "selected": [base_model_name],
-                    });
-
-                    match self
-                        .hooks
-                        .run_chain(
-                            HookEvent::PostRoute,
-                            post_model_payload,
-                            Some(HookRoutingDomain::Model.as_matcher_target()),
-                        )
-                        .await
-                    {
-                        HookChainResult::Blocked { reason, hook_name } => {
-                            // Hard block on model domain.
-                            return Err(WeftError::HookBlocked {
-                                event: "PostRoute".to_string(),
-                                reason,
-                                hook_name,
-                            });
-                        }
-                        HookChainResult::Allowed { payload, context } => {
-                            if let Some(ctx) = context {
-                                context_parts.push(ctx);
-                            }
-                            let override_model = payload
-                                .get("selected")
-                                .and_then(|v| v.as_array())
-                                .and_then(|arr| arr.first())
-                                .and_then(|v| v.as_str())
-                                .map(String::from);
-
-                            if let Some(model) = override_model {
-                                // Validate that the model exists in the provider registry.
-                                if self.providers.model_id(&model).is_some() {
-                                    model
-                                } else {
-                                    warn!(
-                                        model = %model,
-                                        "PostRoute hook override model not found in registry — using default"
-                                    );
-                                    default_model.clone()
-                                }
-                            } else {
-                                base_model_name
-                            }
-                        }
-                    }
-                } else {
-                    base_model_name
-                };
-
-                debug!(
-                    selected_commands = selected_commands.len(),
-                    total_commands = all_commands.len(),
-                    inject_tools = inject_tools,
-                    model = %selected_model_name,
-                    "semantic router decision"
-                );
-
-                let accumulated_context = if context_parts.is_empty() {
-                    None
-                } else {
-                    Some(context_parts.join("\n"))
-                };
-
-                // Build a RoutingActivity event capturing the model selection decision.
-                let model_score = routing_decision
-                    .model
-                    .as_ref()
-                    .map(|m| m.score)
-                    .unwrap_or(1.0_f32);
-                let routing_activity = ActivityEvent::Routing(weft_core::RoutingActivity {
-                    model: selected_model_name.clone(),
-                    score: model_score,
-                    filters: vec![],
-                });
-
-                Ok((
-                    selected_commands,
-                    inject_tools,
-                    selected_model_name,
-                    accumulated_context,
-                    vec![routing_activity],
-                ))
-            }
-            Err(e) => {
-                // Router failure: conservative fallback.
-                warn!(
-                    error = %e,
-                    "semantic router failed, using fallback: all commands, inject tools, default model"
-                );
-
-                let mut fallback: Vec<CommandStub> =
-                    all_commands.iter().take(max_commands).cloned().collect();
-                fallback.sort_by(|a, b| a.name.cmp(&b.name));
-
-                // Build a RoutingActivity for the fallback decision (score 0.0 signals fallback).
-                let fallback_activity = ActivityEvent::Routing(weft_core::RoutingActivity {
-                    model: default_model.clone(),
-                    score: 0.0_f32,
-                    filters: vec![],
-                });
-
-                Ok((fallback, true, default_model, None, vec![fallback_activity]))
+                }
             }
         }
+
+        // PostRoute: ToolNecessity domain (only if it was included).
+        let tool_necessity_domain_exists = domains
+            .iter()
+            .any(|(k, _)| *k == RoutingDomainKind::ToolNecessity);
+
+        if !tool_necessity_blocked && tool_necessity_domain_exists {
+            let selected_necessity = if result.inject_tools {
+                "needs_tools"
+            } else {
+                "no_tools"
+            };
+            let tn_domain_candidates = domains
+                .iter()
+                .find(|(k, _)| *k == RoutingDomainKind::ToolNecessity)
+                .map(|(_, c)| c.clone())
+                .unwrap_or_default();
+
+            let post_tn_payload = serde_json::json!({
+                "domain": HookRoutingDomain::ToolNecessity,
+                "trigger": RoutingTrigger::RequestStart,
+                "candidates": tn_domain_candidates.iter().map(|c| serde_json::json!({"id": c.id})).collect::<Vec<_>>(),
+                "scores": [],
+                "selected": [selected_necessity],
+            });
+
+            match self
+                .hooks
+                .run_chain(
+                    HookEvent::PostRoute,
+                    post_tn_payload,
+                    Some(HookRoutingDomain::ToolNecessity.as_matcher_target()),
+                )
+                .await
+            {
+                HookChainResult::Blocked { hook_name, reason } => {
+                    // Block on tool_necessity = conservative (inject tools).
+                    info!(
+                        hook = %hook_name,
+                        reason = %reason,
+                        "PostRoute hook blocked tool_necessity domain — conservative: inject tools"
+                    );
+                    result.inject_tools = true;
+                }
+                HookChainResult::Allowed { payload, context } => {
+                    if let Some(ctx) = context {
+                        context_parts.push(ctx);
+                    }
+                    // PostRoute can override tool_necessity selection.
+                    let override_selected = payload
+                        .get("selected")
+                        .and_then(|v| v.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+
+                    match override_selected.as_deref() {
+                        Some("needs_tools") => result.inject_tools = true,
+                        Some("no_tools") => result.inject_tools = false,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // PostRoute: Model domain (only if it was included).
+        let model_domain_exists = domains.iter().any(|(k, _)| *k == RoutingDomainKind::Model);
+
+        if model_domain_exists {
+            let model_domain_candidates = domains
+                .iter()
+                .find(|(k, _)| *k == RoutingDomainKind::Model)
+                .map(|(_, c)| c.clone())
+                .unwrap_or_default();
+
+            let model_score = result
+                .activity_events
+                .first()
+                .map(|a| a.score)
+                .unwrap_or(1.0);
+
+            let post_model_payload = serde_json::json!({
+                "domain": HookRoutingDomain::Model,
+                "trigger": RoutingTrigger::RequestStart,
+                "candidates": model_domain_candidates.iter().map(|c| serde_json::json!({"id": c.id})).collect::<Vec<_>>(),
+                "scores": [serde_json::json!({"id": result.selected_model, "score": model_score})],
+                "selected": [result.selected_model],
+            });
+
+            match self
+                .hooks
+                .run_chain(
+                    HookEvent::PostRoute,
+                    post_model_payload,
+                    Some(HookRoutingDomain::Model.as_matcher_target()),
+                )
+                .await
+            {
+                HookChainResult::Blocked { reason, hook_name } => {
+                    // Hard block on model domain.
+                    return Err(WeftError::HookBlocked {
+                        event: "PostRoute".to_string(),
+                        reason,
+                        hook_name,
+                    });
+                }
+                HookChainResult::Allowed { payload, context } => {
+                    if let Some(ctx) = context {
+                        context_parts.push(ctx);
+                    }
+                    let override_model = payload
+                        .get("selected")
+                        .and_then(|v| v.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+
+                    if let Some(model) = override_model {
+                        // Validate that the model exists in the provider registry.
+                        if self.providers.model_id(&model).is_some() {
+                            // Update activity events to reflect override.
+                            for event in &mut result.activity_events {
+                                event.model = model.clone();
+                            }
+                            result.selected_model = model;
+                        } else {
+                            warn!(
+                                model = %model,
+                                "PostRoute hook override model not found in registry — using default"
+                            );
+                            result.selected_model = default_model.clone();
+                        }
+                    }
+                }
+            }
+        }
+
+        debug!(
+            selected_commands = result.selected_commands.len(),
+            total_commands = all_commands.len(),
+            inject_tools = result.inject_tools,
+            model = %result.selected_model,
+            "semantic router decision"
+        );
+
+        let accumulated_context = if context_parts.is_empty() {
+            None
+        } else {
+            Some(context_parts.join("\n"))
+        };
+
+        Ok((result, accumulated_context))
     }
 }
 
@@ -1858,90 +1821,6 @@ where
             .and_then(|d| d.threshold)
             .unwrap_or(self.config.router.classifier.threshold)
     }
-}
-
-/// Build memory routing candidates from `MemoryService::stores()` metadata.
-///
-/// Returns `(all_candidates, read_candidates, write_candidates)`.
-/// All three are empty when no stores are provided.
-///
-/// The candidates are used for:
-/// - `all_candidates`: Memory domain in `route_all_domains()` (for the "inject stubs" signal)
-/// - `read_candidates`: Per-invocation routing for `/recall` via `score_memory_candidates()`
-/// - `write_candidates`: Per-invocation routing for `/remember` via `score_memory_candidates()`
-fn build_memory_candidates_from_stores(
-    stores: &[StoreInfo],
-) -> (
-    Vec<RoutingCandidate>,
-    Vec<RoutingCandidate>,
-    Vec<RoutingCandidate>,
-) {
-    let mut all_candidates = Vec::new();
-    let mut read_candidates = Vec::new();
-    let mut write_candidates = Vec::new();
-
-    for store in stores {
-        let candidate = RoutingCandidate {
-            id: store.name.clone(),
-            examples: store.examples.clone(),
-        };
-        if store.capabilities.iter().any(|c| c == "read") {
-            read_candidates.push(candidate.clone());
-        }
-        if store.capabilities.iter().any(|c| c == "write") {
-            write_candidates.push(candidate.clone());
-        }
-        all_candidates.push(candidate);
-    }
-
-    (all_candidates, read_candidates, write_candidates)
-}
-
-/// Build the Model domain routing candidates from config.
-///
-/// Each `ModelEntry` in all providers becomes a `RoutingCandidate` with
-/// the model routing name as `id` and its examples array.
-fn build_model_candidates(config: &WeftConfig) -> Vec<RoutingCandidate> {
-    config
-        .router
-        .providers
-        .iter()
-        .flat_map(|p| {
-            p.models.iter().map(|m| RoutingCandidate {
-                id: m.name.clone(),
-                examples: m.examples.clone(),
-            })
-        })
-        .collect()
-}
-
-/// Static ToolNecessity candidates.
-///
-/// These examples are tunable defaults. They are hardcoded in one place for
-/// easy modification without changing multiple callsites.
-pub fn tool_necessity_candidates() -> Vec<RoutingCandidate> {
-    vec![
-        RoutingCandidate {
-            id: "needs_tools".to_string(),
-            examples: vec![
-                "Search the web for the latest news about Rust".to_string(),
-                "Look up the current stock price of Apple".to_string(),
-                "Run this code and show me the output".to_string(),
-                "Find documents about our Q3 strategy".to_string(),
-                "Execute a database query for user counts".to_string(),
-            ],
-        },
-        RoutingCandidate {
-            id: "no_tools".to_string(),
-            examples: vec![
-                "What is the capital of France?".to_string(),
-                "Explain how async/await works in Rust".to_string(),
-                "Write a poem about the ocean".to_string(),
-                "What do you think about functional programming?".to_string(),
-                "Hello, how are you today?".to_string(),
-            ],
-        },
-    ]
 }
 
 /// Extract the text of the last user message from the conversation.
@@ -4418,90 +4297,91 @@ mod tests {
         Arc::new(DefaultMemoryService::new(mux, store_infos))
     }
 
-    // ── Phase 3: build_memory_candidates_from_stores ──────────────────────
+    // ── Phase 3: build_memory_candidates (via weft_router) ────────────────
+    // These tests verify the moved candidate builder via the weft_router re-export.
 
     #[test]
     fn test_build_memory_candidates_empty_when_no_stores() {
         // Empty store list produces empty candidate sets.
-        let (all, read, write) = build_memory_candidates_from_stores(&[]);
-        assert!(all.is_empty());
-        assert!(read.is_empty());
-        assert!(write.is_empty());
+        let result = build_memory_candidates(&[]);
+        assert!(result.all.is_empty());
+        assert!(result.read.is_empty());
+        assert!(result.write.is_empty());
     }
 
     #[test]
     fn test_build_memory_candidates_read_write_store() {
         // A store with both capabilities appears in all three sets.
-        let stores = vec![StoreInfo {
+        let stores = vec![weft_router::MemoryStoreRef {
             name: "conv".to_string(),
             capabilities: vec!["read".to_string(), "write".to_string()],
             examples: vec!["recall conv".to_string()],
         }];
-        let (all, read, write) = build_memory_candidates_from_stores(&stores);
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0].id, "conv");
-        assert_eq!(read.len(), 1);
-        assert_eq!(read[0].id, "conv");
-        assert_eq!(write.len(), 1);
-        assert_eq!(write[0].id, "conv");
+        let result = build_memory_candidates(&stores);
+        assert_eq!(result.all.len(), 1);
+        assert_eq!(result.all[0].id, "conv");
+        assert_eq!(result.read.len(), 1);
+        assert_eq!(result.read[0].id, "conv");
+        assert_eq!(result.write.len(), 1);
+        assert_eq!(result.write[0].id, "conv");
     }
 
     #[test]
     fn test_build_memory_candidates_read_only_store() {
         // A read-only store appears in all and read, but not write.
-        let stores = vec![StoreInfo {
+        let stores = vec![weft_router::MemoryStoreRef {
             name: "kb".to_string(),
             capabilities: vec!["read".to_string()],
             examples: vec!["knowledge base".to_string()],
         }];
-        let (all, read, write) = build_memory_candidates_from_stores(&stores);
-        assert_eq!(all.len(), 1);
-        assert_eq!(read.len(), 1);
-        assert!(write.is_empty());
+        let result = build_memory_candidates(&stores);
+        assert_eq!(result.all.len(), 1);
+        assert_eq!(result.read.len(), 1);
+        assert!(result.write.is_empty());
     }
 
     #[test]
     fn test_build_memory_candidates_write_only_store() {
         // A write-only store appears in all and write, but not read.
-        let stores = vec![StoreInfo {
+        let stores = vec![weft_router::MemoryStoreRef {
             name: "audit".to_string(),
             capabilities: vec!["write".to_string()],
             examples: vec!["audit log".to_string()],
         }];
-        let (all, read, write) = build_memory_candidates_from_stores(&stores);
-        assert_eq!(all.len(), 1);
-        assert!(read.is_empty());
-        assert_eq!(write.len(), 1);
+        let result = build_memory_candidates(&stores);
+        assert_eq!(result.all.len(), 1);
+        assert!(result.read.is_empty());
+        assert_eq!(result.write.len(), 1);
     }
 
     #[test]
     fn test_build_memory_candidates_multiple_stores() {
         // Multiple stores split correctly by capability.
         let stores = vec![
-            StoreInfo {
+            weft_router::MemoryStoreRef {
                 name: "conv".to_string(),
                 capabilities: vec!["read".to_string(), "write".to_string()],
                 examples: vec!["conversation".to_string()],
             },
-            StoreInfo {
+            weft_router::MemoryStoreRef {
                 name: "kb".to_string(),
                 capabilities: vec!["read".to_string()],
                 examples: vec!["knowledge base".to_string()],
             },
-            StoreInfo {
+            weft_router::MemoryStoreRef {
                 name: "audit".to_string(),
                 capabilities: vec!["write".to_string()],
                 examples: vec!["audit".to_string()],
             },
         ];
-        let (all, read, write) = build_memory_candidates_from_stores(&stores);
-        assert_eq!(all.len(), 3);
-        assert_eq!(read.len(), 2); // conv + kb
-        assert_eq!(write.len(), 2); // conv + audit
-        assert!(read.iter().any(|c| c.id == "conv"));
-        assert!(read.iter().any(|c| c.id == "kb"));
-        assert!(write.iter().any(|c| c.id == "conv"));
-        assert!(write.iter().any(|c| c.id == "audit"));
+        let result = build_memory_candidates(&stores);
+        assert_eq!(result.all.len(), 3);
+        assert_eq!(result.read.len(), 2); // conv + kb
+        assert_eq!(result.write.len(), 2); // conv + audit
+        assert!(result.read.iter().any(|c| c.id == "conv"));
+        assert!(result.read.iter().any(|c| c.id == "kb"));
+        assert!(result.write.iter().any(|c| c.id == "conv"));
+        assert!(result.write.iter().any(|c| c.id == "audit"));
     }
 
     // ── Phase 3: route_all_domains includes Memory domain ─────────────────

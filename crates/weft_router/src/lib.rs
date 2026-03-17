@@ -1,4 +1,4 @@
-//! `weft_router` — Semantic router trait and ModernBERT implementation.
+//! `weft_router` — Semantic router trait, ModernBERT implementation, and pure routing service.
 //!
 //! Contains:
 //! - `SemanticRouter` trait for making all routing decisions for a request
@@ -6,13 +6,19 @@
 //! - `RoutingDomainKind`, `RoutingCandidate`, `RoutingDecision`, `ScoredCandidate` domain types
 //! - `ModernBertRouter`: ModernBERT bi-encoder via ONNX Runtime
 //! - Score filtering helpers: `filter_by_threshold` and `take_top`
+//! - `routing_service`: Pure routing logic (`route_domains`, candidate builders, `RoutingResult`)
 
 pub mod bert;
 pub mod domain;
+pub mod routing_service;
 pub(crate) mod tokenizer;
 
 pub use bert::ModernBertRouter;
 pub use domain::{RoutingCandidate, RoutingDecision, RoutingDomainKind, ScoredCandidate};
+pub use routing_service::{
+    MemoryCandidates, MemoryStoreRef, RoutingInput, RoutingResult, build_memory_candidates,
+    build_model_candidates, route_domains, tool_necessity_candidates,
+};
 
 use async_trait::async_trait;
 
