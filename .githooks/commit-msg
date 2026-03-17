@@ -1,31 +1,249 @@
 #!/usr/bin/env bash
 #
-# Conventional Commits enforcement
-# Allows: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert
-# Format: type(scope): description  OR  type: description
+# Conventional Commits enforcement with file-type validation
+#
+# Ensures commits are thematic and types match the staged files.
+# Versioning impact: feat/fix bump version, everything else doesn't.
+
+set -euo pipefail
 
 commit_msg_file="$1"
 commit_msg=$(cat "$commit_msg_file")
 
 # Skip merge commits
-if echo "$commit_msg" | grep -qE "^Merge "; then
-  exit 0
-fi
+[[ "$commit_msg" =~ ^Merge\  ]] && exit 0
 
-# Conventional commit pattern
-pattern="^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-zA-Z0-9_-]+\))?(!)?: .+"
+subject=$(head -1 "$commit_msg_file")
 
-if ! echo "$commit_msg" | head -1 | grep -qE "$pattern"; then
-  echo "ERROR: Commit message does not follow Conventional Commits format."
-  echo ""
+# ─── FORMAT ──────────────────────────────────────────────────────
+[[ "$subject" =~ ^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-zA-Z0-9_-]+\))?(!)?\:\ .+ ]] || {
+  echo "ERROR: Not Conventional Commits format."
   echo "Expected: type(scope): description"
-  echo "Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert"
-  echo ""
-  echo "Examples:"
-  echo "  feat(gateway): add OpenAI-compatible endpoint"
-  echo "  fix(routing): handle empty tool registries"
-  echo "  chore: initial project setup"
-  echo ""
-  echo "Got: $(head -1 "$commit_msg_file")"
+  echo "Got: $subject"
   exit 1
+}
+commit_type="${BASH_REMATCH[1]}"
+
+# ─── LENGTH ──────────────────────────────────────────────────────
+(( ${#subject} <= 72 )) || {
+  echo "ERROR: Subject ${#subject} chars (max 72)."
+  exit 1
+}
+
+body_count=$(awk 'NR>2 && /[^[:space:]]/{c++} END{print c+0}' "$commit_msg_file")
+(( body_count <= 20 )) || {
+  echo "ERROR: Body $body_count lines (max 20)."
+  exit 1
+}
+
+line_num=0
+while IFS= read -r line; do
+  (( ++line_num ))
+  (( line_num <= 2 )) && continue
+  [[ "$line" =~ ^[[:space:]]*https?:// ]] && continue
+  (( ${#line} <= 80 )) || {
+    echo "ERROR: Line $line_num is ${#line} chars (max 80)."
+    echo "Got: $line"
+    exit 1
+  }
+done < "$commit_msg_file"
+
+# ─── NO INTERNAL REFS ───────────────────────────────────────────
+[[ ! "$commit_msg" =~ [Pp]hase\ [0-9]|[Rr]evision\ [0-9]|[Aa]ttempt\ [0-9]|[Rr]eview\ \#[0-9]|[Rr]emediation|[Pp]er\ [Ss]pec|[Ff]rom\ [Rr]eview|[Ff]rom\ the\ [Ss]pec|[Ss]pec\ [Ss]ection|[Rr]eviewer\ [Ff]eedback|[Aa]rchitect\ [Rr]evision ]] || {
+  echo "ERROR: Contains internal pipeline references."
+  echo "Describe WHAT and WHY, not which iteration."
+  exit 1
+}
+
+# ─── FILE CLASSIFICATION ────────────────────────────────────────
+# Classify every staged file into exactly one category using a
+# precedence-based system. Categories are tracked as individual
+# integer variables for bash 3.x compatibility.
+
+cat_src=0
+cat_test=0
+cat_docs=0
+cat_ci=0
+cat_build=0
+cat_infra=0
+cat_config=0
+cat_proto=0
+
+staged=$(git diff --cached --name-only 2>/dev/null || true)
+[[ -z "$staged" ]] && exit 0
+
+while IFS= read -r f; do
+  case "$f" in
+    # CI/CD — most specific first
+    .github/*|.gitlab-ci*|Dockerfile*|docker-compose*|*.dockerfile)
+      (( cat_ci++ )) ;;
+
+    # Infrastructure / dev tooling
+    .githooks/*|.claude/*|.gitignore|.editorconfig|.rustfmt.toml|clippy.toml|deny.toml|rustfmt.toml)
+      (( cat_infra++ )) ;;
+
+    # Documentation
+    *.md|docs/*|LICENSE*|CHANGELOG*|CONTRIBUTING*)
+      (( cat_docs++ )) ;;
+
+    # Test files (Rust convention: _test.rs, tests/ dir)
+    *_test.rs|*/tests/*|tests/*)
+      (( cat_test++ )) ;;
+
+    # Proto files — these generate source, count as src
+    *.proto|*/proto/*)
+      (( cat_proto++ )) ;;
+
+    # Build system
+    */build.rs|build.rs)
+      (( cat_build++ )) ;;
+
+    # Cargo manifests — context-dependent
+    # Root Cargo.toml with src changes = build, alone = build
+    Cargo.toml|*/Cargo.toml|Cargo.lock)
+      (( cat_build++ )) ;;
+
+    # Config files
+    config/*|*.toml|*.yaml|*.yml)
+      (( cat_config++ )) ;;
+
+    # Rust source
+    *.rs)
+      (( cat_src++ )) ;;
+
+    # Model files, assets, gitkeep
+    models/*|*.gitkeep)
+      (( cat_infra++ )) ;;
+
+    # Catch-all: treat as source
+    *)
+      (( cat_src++ )) ;;
+  esac
+done <<< "$staged"
+
+# Derived booleans for readability
+has_src=$(( cat_src + cat_proto > 0 ? 1 : 0 ))
+has_test=$(( cat_test > 0 ? 1 : 0 ))
+has_docs=$(( cat_docs > 0 ? 1 : 0 ))
+has_ci=$(( cat_ci > 0 ? 1 : 0 ))
+has_build=$(( cat_build > 0 ? 1 : 0 ))
+has_infra=$(( cat_infra > 0 ? 1 : 0 ))
+has_config=$(( cat_config > 0 ? 1 : 0 ))
+
+# ─── TYPE VALIDATION ────────────────────────────────────────────
+# Matrix of allowed combinations per commit type.
+#
+# feat/fix:     MUST have src. MAY have test, build, config, proto.
+#               MUST NOT have ci, infra, docs (split those out).
+# refactor:     Same as feat/fix but no new files expected.
+# perf:         Same as feat/fix.
+# test:         MUST have test. MAY have src (test helpers).
+#               MUST NOT have ci, infra, docs.
+# docs:         MUST have docs. MUST NOT have src, ci, infra.
+#               MAY have config (doc config).
+# build:        MUST have build. MAY have config.
+#               MUST NOT have src (unless build.rs-only), ci, infra.
+# ci:           MUST have ci. MUST NOT have src, infra, docs.
+# chore:        MUST NOT have src. Anything else is fine.
+# style:        MUST have src (formatting changes). MUST NOT have ci, infra.
+# revert:       Anything goes (reverting a mixed commit is valid).
+
+err() { echo "ERROR: $1"; echo "$2"; exit 1; }
+
+case "$commit_type" in
+  feat|fix|perf)
+    (( has_src || has_build )) || \
+      err "Type '$commit_type' requires source or build changes." \
+          "Check staged files include .rs or Cargo.toml changes."
+    (( has_ci )) && \
+      err "Type '$commit_type' includes CI files." \
+          "Split CI changes into a separate 'ci' commit."
+    (( has_infra )) && \
+      err "Type '$commit_type' includes infra files (.githooks, .claude, etc)." \
+          "Split infra changes into a separate 'chore' commit."
+    (( has_docs )) && \
+      err "Type '$commit_type' includes documentation files." \
+          "Split doc changes into a separate 'docs' commit."
+    ;;
+
+  refactor)
+    (( has_src )) || \
+      err "Type 'refactor' requires source changes." \
+          "Refactor only applies to source code."
+    (( has_ci + has_infra + has_docs == 0 )) || \
+      err "Type 'refactor' mixed with non-source files." \
+          "Split non-source changes into separate commits."
+    ;;
+
+  style)
+    (( has_src )) || \
+      err "Type 'style' requires source changes." \
+          "Style only applies to formatting/whitespace in source."
+    (( has_ci + has_infra == 0 )) || \
+      err "Type 'style' mixed with non-source files." \
+          "Split non-source changes out."
+    ;;
+
+  test)
+    (( has_test )) || \
+      err "Type 'test' requires test files." \
+          "Use 'feat' or 'fix' if adding tests alongside source."
+    (( has_ci + has_infra + has_docs == 0 )) || \
+      err "Type 'test' mixed with non-test files." \
+          "Split non-test changes out."
+    ;;
+
+  docs)
+    (( has_docs )) || \
+      err "Type 'docs' requires documentation files." \
+          "Only non-doc files found."
+    (( has_src + has_ci + has_infra == 0 )) || \
+      err "Type 'docs' mixed with source/CI/infra." \
+          "Split source changes into a separate commit."
+    ;;
+
+  build)
+    (( has_build + has_config > 0 )) || \
+      err "Type 'build' requires build system files." \
+          "Cargo.toml, build.rs, config files expected."
+    (( has_ci + has_infra + has_docs == 0 )) || \
+      err "Type 'build' mixed with CI/infra/docs." \
+          "Split those into separate commits."
+    # src is OK with build (build.rs changes often accompany src)
+    ;;
+
+  ci)
+    (( has_ci )) || \
+      err "Type 'ci' requires CI/CD files." \
+          "Only non-CI files found."
+    (( has_src + has_infra + has_docs == 0 )) || \
+      err "Type 'ci' mixed with source/infra/docs." \
+          "Split non-CI changes out."
+    ;;
+
+  chore)
+    (( has_src == 0 )) || \
+      err "Type 'chore' must not include source changes." \
+          "Use 'feat', 'fix', or 'refactor' for source changes."
+    ;;
+
+  revert)
+    # Reverts can touch anything — the original commit was thematic
+    ;;
+esac
+
+# ─── THEMATIC CHECK ─────────────────────────────────────────────
+# Even within allowed types, flag suspiciously broad commits.
+# A commit touching src + ci + docs + infra is never thematic.
+if (( has_src && has_ci )); then
+  err "Mixing source code with CI files in one commit." \
+      "Commit source and CI changes separately."
+fi
+if (( has_src && has_infra )); then
+  err "Mixing source code with infra files in one commit." \
+      "Commit source and .githooks/.claude changes separately."
+fi
+if (( has_ci && has_infra )); then
+  err "Mixing CI with infra files in one commit." \
+      "Commit CI and infra changes separately."
 fi

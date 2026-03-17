@@ -1,0 +1,43 @@
+[package]
+name = "weft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "weft"
+path = "src/main.rs"
+
+[dependencies]
+weft_core = { path = "../weft_core" }
+weft_engine = { path = "../weft_engine" }
+weft_hooks = { path = "../weft_hooks" }
+weft_llm = { path = "../weft_llm" }
+weft_memory = { path = "../weft_memory" }
+weft_rhai = { path = "../weft_rhai" }
+weft_router = { path = "../weft_router" }
+weft_commands = { path = "../weft_commands" }
+weft_tools = { path = "../weft_tools" }
+weft_proto = { workspace = true }
+tonic = { workspace = true }
+tokio-stream = { workspace = true }
+axum = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+regex = { workspace = true }
+rhai = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+weft_hooks = { path = "../weft_hooks", features = ["test-support"] }
+tower = { version = "0.5", features = ["util"] }
+mockito = { workspace = true }
+tempfile = { version = "3" }

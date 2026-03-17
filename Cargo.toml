@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0"
+
+[workspace.dependencies]
+# Async
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+async-trait = { version = "0.1" }
+
+# HTTP
+axum = { version = "0.8" }
+reqwest = { version = "0.12", features = ["json"] }
+
+# gRPC
+tonic = { version = "0.13" }
+tonic-build = { version = "0.13" }
+prost = { version = "0.13" }
+
+# Internal
+weft_proto = { path = "crates/weft_proto" }
+weft_engine = { path = "crates/weft_engine" }
+weft_memory = { path = "crates/weft_memory" }
+weft_tools = { path = "crates/weft_tools" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+toml = { version = "0.8" }
+
+# ML
+ort = { version = "2.0.0-rc.12" }
+tokenizers = { version = "0.21" }
+
+# Error handling
+thiserror = { version = "2" }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+mockito = { version = "1" }
+regex = { version = "1" }
+rhai = { version = "1", features = ["sync", "serde"] }

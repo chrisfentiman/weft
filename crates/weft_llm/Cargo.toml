@@ -1,0 +1,23 @@
+[package]
+name = "weft_llm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+weft_core = { path = "../weft_core" }
+weft_rhai = { path = "../weft_rhai" }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+rhai = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+mockito = { version = "1" }
+tempfile = { version = "3" }
+tokio = { workspace = true }
+serde_json = { workspace = true }

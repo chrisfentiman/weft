@@ -1,0 +1,17 @@
+[package]
+name = "weft_rhai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rhai = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { version = "3" }
+tokio = { workspace = true }
+serde_json = { workspace = true }

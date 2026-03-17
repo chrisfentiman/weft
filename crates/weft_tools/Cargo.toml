@@ -1,0 +1,21 @@
+[package]
+name = "weft_tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+weft_core = { path = "../weft_core" }
+async-trait = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio-stream = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }

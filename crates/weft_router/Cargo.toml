@@ -1,0 +1,15 @@
+[package]
+name = "weft_router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+weft_core = { path = "../weft_core" }
+async-trait = { workspace = true }
+ort = { workspace = true }
+tokenizers = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+ndarray = "0.17"

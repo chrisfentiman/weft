@@ -1,0 +1,22 @@
+[package]
+name = "weft_memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+weft_core = { path = "../weft_core" }
+async-trait = { workspace = true }
+futures = { version = "0.3" }
+tonic = { workspace = true }
+prost = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio-stream = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }

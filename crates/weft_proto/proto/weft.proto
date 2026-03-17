@@ -1,0 +1,310 @@
+syntax = "proto3";
+
+package weft.v1;
+
+service Weft {
+  // Unary chat: send a request, get back a complete response.
+  rpc Chat(ChatRequest) returns (ChatResponse);
+
+  // Server-streaming: send a request, receive events as they occur.
+  rpc ChatStream(ChatRequest) returns (stream ChatEvent);
+
+  // Bidirectional streaming for live/interactive sessions. Reserved for future.
+  rpc Live(stream LiveInput) returns (stream LiveOutput);
+}
+
+// --- Request ---
+
+message ChatRequest {
+  // Conversation history. At least one message with role=USER required.
+  repeated WeftMessage messages = 1;
+
+  // Model routing instruction (slash-separated syntax).
+  // Examples: "auto", "council/complex", "anthropic/opus"
+  // Empty string treated as "auto".
+  string model = 2;
+
+  // Sampling and behavior options. All fields optional.
+  SamplingOptions options = 3;
+}
+
+message SamplingOptions {
+  // Sampling temperature (0.0-2.0). 0 means use provider default.
+  float temperature = 1;
+
+  // Nucleus sampling threshold. 0 means use provider default.
+  float top_p = 2;
+
+  // Top-k sampling. 0 means use provider default.
+  uint32 top_k = 3;
+
+  // Maximum tokens in the response. 0 means use provider/model default.
+  uint32 max_tokens = 4;
+
+  // Stop sequences. Empty means none.
+  repeated string stop = 5;
+
+  // Frequency penalty (-2.0 to 2.0). 0 means none.
+  float frequency_penalty = 6;
+
+  // Presence penalty (-2.0 to 2.0). 0 means none.
+  float presence_penalty = 7;
+
+  // Random seed for deterministic sampling. 0 means non-deterministic.
+  int64 seed = 8;
+
+  // Response format constraint.
+  ResponseFormat response_format = 9;
+
+  // Include gateway activity messages in the response.
+  bool activity = 10;
+}
+
+message ResponseFormat {
+  // "text" (default) or "json_object".
+  string type = 1;
+}
+
+// --- Message ---
+
+message WeftMessage {
+  // Who produced this message.
+  Role role = 1;
+
+  // Where this message came from. See Source enum.
+  Source source = 2;
+
+  // Which model produced this (for assistant messages). Empty for user/system.
+  string model = 3;
+
+  // Message content. At least one part required.
+  // For simple text, a single TextContent part.
+  repeated ContentPart content = 4;
+
+  // True when this message is an incremental text delta (streaming only).
+  // False (default) for complete messages.
+  // Client groups consecutive deltas by (model, source) to reconstruct.
+  bool delta = 5;
+
+  // Delta sequence counter within each (model, source) pair.
+  // Each unique (model, source) combination is an independent logical stream.
+  // Deltas within a stream are numbered 0, 1, 2, ... in order.
+  // The client groups by (model, source) and orders by message_index
+  // to reconstruct each stream.
+  uint32 message_index = 6;
+}
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_USER = 1;
+  ROLE_ASSISTANT = 2;
+  ROLE_SYSTEM = 3;
+}
+
+enum Source {
+  SOURCE_UNSPECIFIED = 0;  // Defaults to CLIENT on input
+  SOURCE_CLIENT = 1;       // The actual user
+  SOURCE_GATEWAY = 2;      // Gateway-injected (activity, directives)
+  SOURCE_PROVIDER = 3;     // Normal LLM response
+  SOURCE_MEMBER = 4;       // Council member response
+  SOURCE_JUDGE = 5;        // Council judge synthesis
+  SOURCE_TOOL = 6;         // Command execution results
+  SOURCE_MEMORY = 7;       // Memory recall/store results
+}
+
+// --- Content Parts ---
+
+message ContentPart {
+  oneof part {
+    TextContent text = 1;
+    ImageContent image = 2;
+    AudioContent audio = 3;
+    VideoContent video = 4;
+    DocumentContent document = 5;
+
+    // Activity content types (source: gateway)
+    RoutingContent routing = 10;
+    HookContent hook = 11;
+    CouncilStartContent council_start = 12;
+
+    // Tool/memory content types
+    CommandCallContent command_call = 20;
+    CommandResultContent command_result = 21;
+    MemoryResultContent memory_result = 22;
+    MemoryStoredContent memory_stored = 23;
+  }
+}
+
+message TextContent {
+  string text = 1;
+}
+
+message ImageContent {
+  oneof source {
+    string url = 1;
+    bytes data = 2;  // Base64-decoded raw bytes
+  }
+  string media_type = 3;  // e.g. "image/png", "image/jpeg"
+}
+
+message AudioContent {
+  oneof source {
+    string url = 1;
+    bytes data = 2;
+  }
+  string media_type = 3;  // e.g. "audio/wav", "audio/mp3"
+}
+
+message VideoContent {
+  oneof source {
+    string url = 1;
+    bytes data = 2;
+  }
+  string media_type = 3;  // e.g. "video/mp4"
+}
+
+message DocumentContent {
+  oneof source {
+    string url = 1;
+    bytes data = 2;
+  }
+  string media_type = 3;  // e.g. "application/pdf"
+  string filename = 4;    // Original filename, if known
+}
+
+// --- Activity content types ---
+
+message RoutingContent {
+  string model = 1;            // Which model was selected
+  float score = 2;             // Router confidence score
+  repeated string filters = 3; // Applied filter segments
+}
+
+message HookContent {
+  string event = 1;      // Which hook event fired
+  string hook_name = 2;  // Name of the hook
+  string decision = 3;   // "allow", "block", "modify"
+  string reason = 4;     // Block/modify reason (empty if allow)
+}
+
+message CouncilStartContent {
+  repeated string models = 1;  // Participating model names
+  string judge = 2;            // Judge model name
+}
+
+// --- Tool content types ---
+
+message CommandCallContent {
+  string command = 1;         // Command name
+  string arguments_json = 2;  // JSON-encoded arguments
+}
+
+message CommandResultContent {
+  string command = 1;  // Command name
+  bool success = 2;
+  string output = 3;   // Result text
+  string error = 4;    // Error message if !success
+}
+
+message MemoryResultContent {
+  string store = 1;               // Memory store name
+  repeated MemoryEntry entries = 2;
+}
+
+message MemoryStoredContent {
+  string store = 1;  // Memory store name
+  string id = 2;     // Assigned memory ID
+}
+
+message MemoryEntry {
+  string id = 1;
+  string content = 2;
+  float score = 3;
+  string created_at = 4;
+}
+
+// --- Response ---
+
+message ChatResponse {
+  // Request identifier.
+  string id = 1;
+
+  // Echoes the model routing instruction from the request.
+  string model = 2;
+
+  // Response messages. May include activity messages if requested.
+  repeated WeftMessage messages = 3;
+
+  // Aggregated usage across all LLM calls.
+  UsageInfo usage = 4;
+
+  // Timing breakdown.
+  TimingInfo timing = 5;
+}
+
+message UsageInfo {
+  uint32 prompt_tokens = 1;
+  uint32 completion_tokens = 2;
+  uint32 total_tokens = 3;
+  uint32 llm_calls = 4;
+}
+
+message TimingInfo {
+  uint64 total_ms = 1;
+  uint64 routing_ms = 2;
+  uint64 llm_ms = 3;
+}
+
+// --- Streaming Events ---
+
+message ChatEvent {
+  oneof event {
+    // A message: complete (delta=false) or incremental text chunk (delta=true).
+    // Complete messages carry activity events, tool results, etc.
+    // Delta messages carry streaming text fragments for in-progress responses.
+    // Client groups deltas by (model, source), orders by message_index.
+    WeftMessage message = 1;
+
+    // Usage and timing metadata. Always the last event.
+    RequestMetadata metadata = 2;
+
+    // Error during processing. Stream terminates after this.
+    ChatError error = 3;
+  }
+}
+
+message RequestMetadata {
+  string id = 1;
+  string model = 2;
+  UsageInfo usage = 3;
+  TimingInfo timing = 4;
+}
+
+message ChatError {
+  string code = 1;     // Machine-readable error code
+  string message = 2;  // Human-readable description
+}
+
+// --- Live (Reserved) ---
+
+message LiveInput {
+  oneof input {
+    // Initial session setup.
+    ChatRequest setup = 1;
+    // Incremental user input during a session.
+    WeftMessage message = 2;
+    // Client-side event (e.g., cancel).
+    LiveControl control = 3;
+  }
+}
+
+message LiveOutput {
+  oneof output {
+    ChatEvent event = 1;
+    LiveControl control = 2;
+  }
+}
+
+message LiveControl {
+  string action = 1;  // "cancel", "ping", "pong"
+}
