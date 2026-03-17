@@ -9,7 +9,6 @@ weft_core = { path = "../weft_core" }
 weft_memory = { path = "../weft_memory" }
 weft_tools = { path = "../weft_tools" }
 async-trait = { workspace = true }
-futures = { version = "0.3" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 

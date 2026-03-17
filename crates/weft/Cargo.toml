@@ -17,6 +17,7 @@ weft_memory = { path = "../weft_memory" }
 weft_rhai = { path = "../weft_rhai" }
 weft_router = { path = "../weft_router" }
 weft_commands = { path = "../weft_commands" }
+weft_tools = { path = "../weft_tools" }
 weft_proto = { workspace = true }
 tonic = { workspace = true }
 tokio-stream = { workspace = true }
