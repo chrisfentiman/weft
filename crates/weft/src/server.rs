@@ -90,15 +90,10 @@ struct OpenAiUsage {
 /// All messages are assigned `Source::Client` since this is the OpenAI compat
 /// layer and there is no source attribution in the OpenAI format.
 ///
-/// # Spec deviation note
-///
-/// The spec (Section 10.1) declares this as `fn openai_to_weft(...) -> Result<WeftRequest, WeftError>`.
-/// This implementation is intentionally infallible: every field in `OpenAiChatRequest` maps
-/// cleanly to `WeftRequest` without conditions that can fail at translation time. Validation
-/// (empty messages, missing user role, streaming) is performed by the axum handler before this
-/// function is called, so returning `Ok(...)` unconditionally would add noise without safety.
-/// If future translation logic introduces fallible steps, the signature should be updated to
-/// match the spec.
+/// Intentionally infallible: every field in `OpenAiChatRequest` maps cleanly to
+/// `WeftRequest` without conditions that can fail at translation time. Validation
+/// (empty messages, missing user role, streaming) is performed by the axum handler
+/// before this function is called.
 fn openai_to_weft(req: OpenAiChatRequest) -> WeftRequest {
     let messages: Vec<WeftMessage> = req
         .messages
@@ -907,7 +902,7 @@ mod tests {
         assert_eq!(health["status"], "ok");
         assert!(health["classifier_loaded"].is_boolean());
         assert!(health["tool_registry_connected"].is_boolean());
-        // Phase 5: grpc_service field must be present
+        // grpc_service field must be present
         assert!(health["grpc_service"].is_string());
         assert_eq!(health["grpc_service"], "serving");
     }

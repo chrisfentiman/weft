@@ -2043,7 +2043,7 @@ api_key = "sk-test"
         assert_eq!(config.effective_max_pre_response_retries(), 3);
     }
 
-    // ── Phase 2: WireFormat, capabilities, wire_script tests ─────────────────
+    // ── WireFormat, capabilities, wire_script tests ───────────────────────────
 
     #[test]
     fn test_wire_format_anthropic_parses() {

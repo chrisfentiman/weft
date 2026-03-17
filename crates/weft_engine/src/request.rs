@@ -242,7 +242,7 @@ where
         // Always include built-in commands (recall/remember) when memory is configured —
         // they are intercepted before the registry, so the parser must recognise them.
         // If tool skipping is active, use only built-in names so stray external slash
-        // commands in the LLM response are treated as prose (spec Section 6.4).
+        // commands in the LLM response are treated as prose.
         let mut known_commands: HashSet<String> = if inject_tools {
             all_commands.iter().map(|c| c.name.clone()).collect()
         } else {
@@ -1065,7 +1065,7 @@ mod hook_tests {
     use weft_hooks::{HookRegistry, RegisteredHook};
     use weft_memory::DefaultMemoryService;
 
-    // ── Phase 4: RequestStart hook integration ─────────────────────────────
+    // ── RequestStart hook integration ──────────────────────────────────────
 
     #[tokio::test]
     async fn test_request_start_hook_blocks_returns_hook_blocked_error() {
@@ -1127,7 +1127,7 @@ mod hook_tests {
         assert_eq!(resp_text(&resp), "Response text");
     }
 
-    // ── Phase 4: PreRoute hook integration ─────────────────────────────────
+    // ── PreRoute hook integration ───────────────────────────────────────────
 
     #[tokio::test]
     async fn test_pre_route_hook_blocks_model_domain_returns_hook_blocked() {
@@ -1214,7 +1214,7 @@ mod hook_tests {
         );
     }
 
-    // ── Phase 4: PostRoute hook integration ────────────────────────────────
+    // ── PostRoute hook integration ──────────────────────────────────────────
 
     #[tokio::test]
     async fn test_post_route_hook_overrides_model_selection() {
@@ -1276,7 +1276,7 @@ mod hook_tests {
         assert_eq!(resp_text(&resp), "fallback response");
     }
 
-    // ── Phase 4: PreToolUse hook integration ───────────────────────────────
+    // ── PreToolUse hook integration ─────────────────────────────────────────
 
     #[tokio::test]
     async fn test_pre_tool_use_blocks_command_returns_failed_result() {
@@ -1352,7 +1352,7 @@ mod hook_tests {
         assert_eq!(resp_text(&resp), "Done.");
     }
 
-    // ── Phase 4: PostToolUse hook integration ──────────────────────────────
+    // ── PostToolUse hook integration ────────────────────────────────────────
 
     #[tokio::test]
     async fn test_post_tool_use_hook_modifies_output() {
@@ -1395,7 +1395,7 @@ mod hook_tests {
         assert_eq!(resp_text(&resp), "Search result was: hooked output");
     }
 
-    // ── Phase 4: PreResponse hook integration ──────────────────────────────
+    // ── PreResponse hook integration ────────────────────────────────────────
 
     #[tokio::test]
     async fn test_pre_response_hook_blocks_triggers_regeneration() {
@@ -1513,7 +1513,7 @@ mod hook_tests {
         assert_eq!(resp_text(&resp), "modified text");
     }
 
-    // ── Phase 4: RequestEnd hook integration ───────────────────────────────
+    // ── RequestEnd hook integration ─────────────────────────────────────────
 
     #[tokio::test]
     async fn test_request_end_hook_fires_after_response() {
@@ -1618,7 +1618,7 @@ mod hook_tests {
         );
     }
 
-    // ── Phase 4: no-hooks unchanged behavior ───────────────────────────────
+    // ── No-hooks unchanged behavior ─────────────────────────────────────────
 
     #[tokio::test]
     async fn test_no_hooks_configured_behavior_unchanged() {
@@ -1647,7 +1647,7 @@ mod hook_tests {
         assert_eq!(resp_text(&resp), "Results found.");
     }
 
-    // ── Phase 4: hook priority ordering ────────────────────────────────────
+    // ── Hook priority ordering ──────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_hooks_execute_in_priority_order_lower_first() {
@@ -1691,7 +1691,7 @@ mod hook_tests {
         );
     }
 
-    // ── Phase 4: memory command hook integration ───────────────────────────
+    // ── Memory command hook integration ────────────────────────────────────
 
     /// Build a `GatewayEngine` with a custom hook registry AND a memory mux.
     fn make_engine_with_hooks_and_mux<R, C>(

@@ -73,7 +73,6 @@ impl ModelRoutingInstruction {
 // ── Filter Resolution ─────────────────────────────────────────────────────────
 
 /// Lightweight model info for filter resolution. Constructed from ProviderRegistry.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
     pub routing_name: String,

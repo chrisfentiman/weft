@@ -187,7 +187,7 @@ impl SemanticRouter for ModernBertRouter {
     /// - **Model**: highest-scoring candidate returned; threshold gating applied
     ///   if `domain_thresholds[Model]` is set -- below threshold returns None.
     /// - **ToolNecessity**: binary decision comparing "needs_tools" vs "no_tools".
-    /// - **Memory**: all candidates scored (no stores connected yet).
+    /// - **Memory**: all candidates scored; caller selects stores above threshold.
     async fn route(
         &self,
         user_message: &str,
@@ -278,7 +278,6 @@ impl SemanticRouter for ModernBertRouter {
                     };
                 }
                 RoutingDomainKind::Memory => {
-                    // Interface only: no stores connected yet. Store scores for future use.
                     decision.memory_stores = scored;
                 }
             }

@@ -1,3 +1,5 @@
+//! Anthropic Messages API provider implementation.
+
 pub mod client;
 mod wire;
 

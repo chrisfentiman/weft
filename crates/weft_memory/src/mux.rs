@@ -1,8 +1,7 @@
 //! Memory store multiplexer.
 //!
 //! Routes memory operations to one or more named stores, filtered by capability.
-//! Both `/recall` and `/remember` perform per-invocation routing (Phase 2/3).
-//! In Phase 1 this module is constructed and exposes the routing API that Phase 2 will use.
+//! Both `/recall` and `/remember` perform per-invocation routing.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

@@ -85,7 +85,7 @@ pub fn assemble_system_prompt(
 /// instructions, no TOON block.
 ///
 /// If the LLM emits slash commands anyway, the parser runs with an empty known-
-/// commands set and treats them as prose (spec Section 6.4).
+/// commands set and treats them as prose.
 pub fn assemble_system_prompt_no_tools(agent_system_prompt: &str) -> String {
     agent_system_prompt.to_string()
 }

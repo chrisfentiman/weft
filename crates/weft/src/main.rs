@@ -81,7 +81,7 @@ async fn main() {
 
     info!(path = %cli.config.display(), "configuration loaded");
 
-    // ── Startup log: providers and models (spec Section 12) ───────────────
+    // ── Startup log: providers and models ─────────────────────────────────
 
     let provider_count = config.router.providers.len();
     let model_count: usize = config.router.providers.iter().map(|p| p.models.len()).sum();
@@ -136,7 +136,7 @@ async fn main() {
         "routing domains configured"
     );
 
-    // Warn about models with fewer than 3 examples (spec Section 11.9).
+    // Warn about models with fewer than 3 examples.
     for provider in &config.router.providers {
         for model in &provider.models {
             if model.examples.len() < 3 {

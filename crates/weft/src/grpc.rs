@@ -2,7 +2,7 @@
 //!
 //! `WeftService` implements the `Weft` gRPC service defined in `weft.proto`.
 //! It is the single code path to the engine — both the tonic `chat()` RPC method
-//! and the OpenAI compat HTTP handler (Phase 5) call `handle_weft_request()`.
+//! and the OpenAI compat HTTP handler call `handle_weft_request()`.
 //!
 //! `WeftService` is constructed once in `main.rs` and shared between the gRPC
 //! server and the OpenAI compat HTTP handler via `Arc<WeftService>`.
@@ -1336,7 +1336,7 @@ mod tests {
         );
     }
 
-    // ── Phase 4 tests: ChatStream ─────────────────────────────────────────
+    // ── ChatStream tests ───────────────────────────────────────────────────
 
     /// Helper: collect all events from a chat_stream response.
     async fn collect_stream(

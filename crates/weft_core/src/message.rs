@@ -4,7 +4,6 @@
 //! Proto-generated types are wire types only — conversion happens at the gRPC boundary.
 
 /// A fully attributed message in the Weft protocol.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct WeftMessage {
     pub role: Role,
@@ -45,7 +44,6 @@ pub enum Role {
 }
 
 /// A typed content part within a message.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum ContentPart {
     // --- General content ---

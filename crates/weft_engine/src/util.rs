@@ -16,7 +16,7 @@ pub(crate) const BUILTIN_COMMANDS: &[&str] = &["recall", "remember"];
 ///
 /// When `options.activity = true`, these are converted to `source: gateway`
 /// system messages and prepended to the response message list.
-/// `Hook` and `CouncilStart` variants are wired in future phases (hook firing
+/// `Hook` and `CouncilStart` variants are reserved for future use (hook firing
 /// and council mode respectively) — defined here so the types are ready.
 #[derive(Debug, Clone)]
 pub(crate) enum ActivityEvent {

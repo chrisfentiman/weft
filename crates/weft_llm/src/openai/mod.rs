@@ -1,3 +1,5 @@
+//! OpenAI Chat Completions API provider implementation.
+
 pub mod client;
 mod wire;
 

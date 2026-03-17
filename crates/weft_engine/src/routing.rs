@@ -571,9 +571,9 @@ mod tests {
         build_memory_candidates,
     };
 
-    // ── Phase 3: Build a WeftConfig with memory stores ────────────────────
+    // ── Build a WeftConfig with memory stores ──────────────────────────────
 
-    /// Build a WeftConfig with memory stores for Phase 3 routing tests.
+    /// Build a WeftConfig with memory stores for routing tests.
     ///
     /// `stores`: slice of `(name, endpoint, can_read, can_write, examples)`.
     /// `memory_threshold`: optional per-domain memory threshold.
@@ -1238,7 +1238,7 @@ mod tests {
         );
     }
 
-    // ── Phase 3: build_memory_candidates (via weft_router) ────────────────
+    // ── build_memory_candidates (via weft_router) ─────────────────────────
 
     #[test]
     fn test_build_memory_candidates_empty_when_no_stores() {
@@ -1319,7 +1319,7 @@ mod tests {
         assert!(result.write.iter().any(|c| c.id == "audit"));
     }
 
-    // ── Phase 3: route_all_domains includes Memory domain ─────────────────
+    // ── route_all_domains includes Memory domain ──────────────────────────
 
     #[tokio::test]
     async fn test_route_all_domains_includes_memory_when_configured() {
@@ -1367,7 +1367,7 @@ mod tests {
         assert_eq!(resp_text(&resp), "I found memory about dark mode.");
     }
 
-    // ── Phase 3: /recall per-invocation routing ────────────────────────────
+    // ── /recall per-invocation routing ─────────────────────────────────────
 
     #[tokio::test]
     async fn test_recall_routes_based_on_query_not_user_message() {
@@ -1552,7 +1552,7 @@ mod tests {
         assert_eq!(resp_text(&resp), "Got results from both stores.");
     }
 
-    // ── Phase 3: /remember per-invocation routing ─────────────────────────
+    // ── /remember per-invocation routing ───────────────────────────────────
 
     #[tokio::test]
     async fn test_remember_routes_based_on_content_not_user_message() {
@@ -1716,7 +1716,7 @@ mod tests {
         assert_eq!(resp_text(&resp), "Saved.");
     }
 
-    // ── Phase 3: memory domain threshold from config ──────────────────────
+    // ── Memory domain threshold from config ───────────────────────────────
 
     #[tokio::test]
     async fn test_memory_domain_threshold_gate_applied() {
@@ -1773,7 +1773,7 @@ mod tests {
         assert_eq!(resp_text(&resp), "Found memories.");
     }
 
-    // ── Phase 3: RoutingDecision::fallback() memory_stores population ─────
+    // ── RoutingDecision::fallback() memory_stores population ──────────────
 
     #[test]
     fn test_fallback_decision_populates_memory_stores() {
@@ -1827,7 +1827,7 @@ mod tests {
         assert!(decision.memory_stores.is_empty());
     }
 
-    // ── Phase 3: memory domain disabled via config ─────────────────────────
+    // ── Memory domain disabled via config ──────────────────────────────────
 
     #[tokio::test]
     async fn test_recall_with_memory_domain_disabled_fans_out_to_all() {

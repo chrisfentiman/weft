@@ -13,7 +13,7 @@ pub enum RoutingDomainKind {
     Model,
     /// Whether tools are needed at all for this turn.
     ToolNecessity,
-    /// Which memory stores to query (interface only -- no stores connected).
+    /// Which memory stores to query.
     Memory,
 }
 
@@ -75,7 +75,7 @@ impl RoutingDecision {
     ///   still applies in the engine -- with threshold 0.3, all pass)
     /// - Model: None (use the default model from ProviderRegistry)
     /// - ToolNecessity: None (undecided -> inject commands as normal, conservative)
-    /// - Memory: empty (no stores connected)
+    /// - Memory: empty (conservative fallback: caller retries with all stores)
     ///
     /// The fallback does NOT bypass post-routing filtering.
     pub fn fallback(domains: &[(RoutingDomainKind, Vec<RoutingCandidate>)]) -> Self {

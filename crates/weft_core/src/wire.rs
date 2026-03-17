@@ -14,7 +14,6 @@ use crate::routing::ModelRoutingInstruction;
 // ── Domain types ──────────────────────────────────────────────────────────────
 
 /// A validated chat request, ready for the engine.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct WeftRequest {
     /// Conversation messages.
@@ -26,7 +25,6 @@ pub struct WeftRequest {
 }
 
 /// Sampling and behavior options.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct SamplingOptions {
     pub temperature: Option<f32>,
@@ -42,7 +40,6 @@ pub struct SamplingOptions {
     pub activity: bool,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum ResponseFormat {
     Text,
@@ -50,7 +47,6 @@ pub enum ResponseFormat {
 }
 
 /// The engine's response, before wire-format conversion.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct WeftResponse {
     pub id: String,
@@ -62,7 +58,6 @@ pub struct WeftResponse {
     pub timing: WeftTiming,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct WeftUsage {
     pub prompt_tokens: u32,
@@ -71,7 +66,6 @@ pub struct WeftUsage {
     pub llm_calls: u32,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct WeftTiming {
     pub total_ms: u64,
