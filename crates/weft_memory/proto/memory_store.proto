@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package weft.memory_store.v1;
+
+service MemoryStore {
+  // Query relevant memories given a context string.
+  rpc Query(MemoryQueryRequest) returns (MemoryQueryResponse);
+
+  // Store a new memory.
+  rpc Store(MemoryStoreRequest) returns (MemoryStoreResponse);
+}
+
+message MemoryQueryRequest {
+  // The query or context string to search against.
+  string query = 1;
+  // Maximum number of memories to return. 0 means use server default.
+  uint32 max_results = 2;
+  // Minimum relevance score (0.0-1.0). 0.0 means use server default.
+  float min_score = 3;
+}
+
+message MemoryQueryResponse {
+  repeated MemoryEntry memories = 1;
+}
+
+message MemoryEntry {
+  // Unique identifier for this memory.
+  string id = 1;
+  // The memory content text.
+  string content = 2;
+  // Relevance score (0.0-1.0) for query results. 0.0 for store responses.
+  float score = 3;
+  // ISO 8601 timestamp when this memory was stored.
+  string created_at = 4;
+  // Optional metadata as JSON string. Empty string if none.
+  string metadata_json = 5;
+}
+
+message MemoryStoreRequest {
+  // The content to store as a memory.
+  string content = 1;
+  // Optional metadata as JSON string. Empty string if none.
+  string metadata_json = 2;
+}
+
+message MemoryStoreResponse {
+  // The ID assigned to the stored memory.
+  string id = 1;
+}

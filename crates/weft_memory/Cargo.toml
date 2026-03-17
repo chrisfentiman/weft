@@ -1,12 +1,11 @@
 [package]
-name = "weft_commands"
+name = "weft_memory"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 weft_core = { path = "../weft_core" }
-weft_memory = { path = "../weft_memory" }
 async-trait = { workspace = true }
 futures = { version = "0.3" }
 tonic = { workspace = true }

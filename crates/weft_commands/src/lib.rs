@@ -8,25 +8,24 @@
 //! - `grpc_client`: tonic client implementing `ToolRegistryClient`
 //! - `adapter`: `ToolRegistryCommandAdapter` bridging `ToolRegistryClient` to `CommandRegistry`
 //! - `types`: gRPC mapping types (`ToolInfo`, `ToolDescription`, `ToolExecutionResult`)
-//! - `memory_client`: `MemoryStoreClient` trait + `GrpcMemoryStoreClient` gRPC implementation
-//! - `memory_mux`: `MemoryStoreMux` — routes memory operations to N stores
-//! - `memory_types`: domain types (`MemoryEntry`, `MemoryQueryResult`, `MemoryStoreResult`)
+//!
+//! Memory store types and clients have moved to `weft_memory`.
 
 pub mod adapter;
 pub mod grpc_client;
-pub mod memory_client;
-pub mod memory_mux;
-pub mod memory_types;
 pub mod parser;
 pub mod types;
 
 pub use adapter::ToolRegistryCommandAdapter;
 pub use grpc_client::GrpcToolRegistryClient;
-pub use memory_client::{GrpcMemoryStoreClient, MemoryStoreClient, MemoryStoreError};
-pub use memory_mux::MemoryStoreMux;
-pub use memory_types::{MemoryEntry, MemoryQueryResult, MemoryStoreResult};
 pub use parser::{ParsedResponse, parse_response};
 pub use types::{ToolDescription, ToolExecutionResult, ToolInfo};
+
+// Re-export memory types from weft_memory for backward compatibility.
+pub use weft_memory::{
+    GrpcMemoryStoreClient, MemoryEntry, MemoryQueryResult, MemoryStoreClient, MemoryStoreError,
+    MemoryStoreMux, MemoryStoreResult,
+};
 
 use async_trait::async_trait;
 use weft_core::{CommandDescription, CommandInvocation, CommandResult, CommandStub};

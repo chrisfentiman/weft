@@ -13,6 +13,7 @@ weft_core = { path = "../weft_core" }
 weft_engine = { path = "../weft_engine" }
 weft_hooks = { path = "../weft_hooks" }
 weft_llm = { path = "../weft_llm" }
+weft_memory = { path = "../weft_memory" }
 weft_rhai = { path = "../weft_rhai" }
 weft_router = { path = "../weft_router" }
 weft_commands = { path = "../weft_commands" }

@@ -3,13 +3,13 @@
 //! `MemoryStoreClient` is the trait; `GrpcMemoryStoreClient` is the gRPC implementation.
 //! Connection is lazy: established on first use, cached via `tokio::sync::OnceCell`.
 //!
-//! Follows the same pattern as `GrpcToolRegistryClient`.
+//! Follows the same pattern as `GrpcToolRegistryClient` in `weft_commands`.
 
 use async_trait::async_trait;
 use tokio::sync::OnceCell;
 use tracing::{debug, warn};
 
-use crate::memory_types::{MemoryEntry, MemoryStoreResult};
+use crate::types::{MemoryEntry, MemoryStoreResult};
 
 // Include the tonic-generated code.
 pub(crate) mod proto {
@@ -19,8 +19,6 @@ pub(crate) mod proto {
 use proto::memory_store_client::MemoryStoreClient as TonicMemoryStoreClient;
 
 /// Client interface to a remote gRPC MemoryStore service.
-///
-/// Follows the same pattern as `ToolRegistryClient`.
 #[async_trait]
 pub trait MemoryStoreClient: Send + Sync + 'static {
     /// Query for relevant memories.

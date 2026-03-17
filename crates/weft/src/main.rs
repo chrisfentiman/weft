@@ -14,11 +14,10 @@ use std::sync::Arc;
 use clap::Parser;
 use std::path::PathBuf;
 use tracing::{info, warn};
-use weft_commands::{
-    GrpcMemoryStoreClient, GrpcToolRegistryClient, MemoryStoreMux, ToolRegistryCommandAdapter,
-};
+use weft_commands::{GrpcToolRegistryClient, ToolRegistryCommandAdapter};
 use weft_core::{WeftConfig, WireFormat};
 use weft_llm::{AnthropicProvider, Capability, OpenAIProvider, ProviderRegistry, RhaiProvider};
+use weft_memory::{GrpcMemoryStoreClient, MemoryStoreMux};
 use weft_router::{ModernBertRouter, RoutingCandidate, RoutingDomainKind};
 
 use crate::engine::tool_necessity_candidates;
@@ -363,7 +362,7 @@ async fn main() {
         if mem_config.stores.is_empty() {
             None
         } else {
-            let mut stores: HashMap<String, Arc<dyn weft_commands::MemoryStoreClient>> =
+            let mut stores: HashMap<String, Arc<dyn weft_memory::MemoryStoreClient>> =
                 HashMap::new();
             let mut max_results_map: HashMap<String, u32> = HashMap::new();
             let mut readable: HashSet<String> = HashSet::new();

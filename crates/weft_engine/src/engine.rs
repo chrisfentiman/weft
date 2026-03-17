@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
-use weft_commands::{CommandRegistry, MemoryStoreMux, parse_response};
+use weft_commands::{CommandRegistry, parse_response};
 use weft_core::{
     CommandAction, CommandResult, CommandStub, ContentPart, HookRoutingDomain, Role,
     RoutingTrigger, SamplingOptions, Source, WeftConfig, WeftError, WeftMessage, WeftRequest,
@@ -51,6 +51,7 @@ use weft_llm::{
     Capability, Provider, ProviderError, ProviderRequest, ProviderResponse, ProviderService,
     TokenUsage,
 };
+use weft_memory::MemoryStoreMux;
 use weft_router::{
     RoutingCandidate, RoutingDomainKind, ScoredCandidate, SemanticRouter, filter_by_threshold,
     take_top,
@@ -1389,7 +1390,7 @@ where
 ///
 /// Groups results by store with `{store, content, score}` columns.
 /// Returns "No relevant memories found." when no memories were retrieved.
-fn format_memory_query_results(results: &[weft_commands::MemoryQueryResult]) -> String {
+fn format_memory_query_results(results: &[weft_memory::MemoryQueryResult]) -> String {
     let all_memories: Vec<_> = results
         .iter()
         .flat_map(|r| {
@@ -1418,7 +1419,7 @@ fn format_memory_query_results(results: &[weft_commands::MemoryQueryResult]) -> 
 fn format_memory_store_results(
     results: &[(
         String,
-        Result<weft_commands::MemoryStoreResult, weft_commands::MemoryStoreError>,
+        Result<weft_memory::MemoryStoreResult, weft_memory::MemoryStoreError>,
     )],
 ) -> String {
     let has_errors = results.iter().any(|(_, r)| r.is_err());
@@ -3753,7 +3754,7 @@ mod tests {
 
     // ── Built-in memory command tests ─────────────────────────────────────
 
-    use weft_commands::{
+    use weft_memory::{
         MemoryEntry, MemoryStoreClient, MemoryStoreError, MemoryStoreMux, MemoryStoreResult,
     };
 

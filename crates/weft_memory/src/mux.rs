@@ -7,8 +7,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::memory_client::{MemoryStoreClient, MemoryStoreError};
-use crate::memory_types::{MemoryQueryResult, MemoryStoreResult};
+use crate::client::{MemoryStoreClient, MemoryStoreError};
+use crate::types::{MemoryQueryResult, MemoryStoreResult};
 
 /// Routes memory operations to N named stores, filtered by capability.
 ///
@@ -198,8 +198,8 @@ impl MemoryStoreMux {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory_client::MemoryStoreError;
-    use crate::memory_types::{MemoryEntry, MemoryStoreResult};
+    use crate::client::MemoryStoreError;
+    use crate::types::{MemoryEntry, MemoryStoreResult};
     use std::sync::Mutex;
 
     /// Configurable mock that returns preset results or errors.
