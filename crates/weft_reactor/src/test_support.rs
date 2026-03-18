@@ -433,6 +433,151 @@ impl HookRunner for BlockingHookRunner {
 /// to avoid a circular crate dependency in `weft_reactor` tests.
 pub struct NullEventLog;
 
+// ── TestEventLog ──────────────────────────────────────────────────────────────
+
+/// An in-memory [`EventLog`] implementation for Reactor integration tests.
+///
+/// Persists events per execution in a `RwLock<HashMap>`. Supports idempotency
+/// deduplication. Use this instead of `weft_eventlog_memory::InMemoryEventLog`
+/// to avoid the circular crate dependency that arises when testing `weft_reactor`
+/// itself.
+pub struct TestEventLog {
+    events: std::sync::RwLock<HashMap<ExecutionId, Vec<crate::event::Event>>>,
+    executions: std::sync::RwLock<HashMap<ExecutionId, Execution>>,
+}
+
+impl TestEventLog {
+    /// Create a new empty TestEventLog.
+    pub fn new() -> Self {
+        Self {
+            events: std::sync::RwLock::new(HashMap::new()),
+            executions: std::sync::RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+impl Default for TestEventLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl EventLog for TestEventLog {
+    async fn create_execution(&self, execution: &Execution) -> Result<(), EventLogError> {
+        let mut exec_map = self.executions.write().expect("poisoned lock");
+        let mut event_map = self.events.write().expect("poisoned lock");
+        if exec_map.contains_key(&execution.id) {
+            return Err(EventLogError::Storage(format!(
+                "execution {} already exists",
+                execution.id
+            )));
+        }
+        exec_map.insert(execution.id.clone(), execution.clone());
+        event_map.insert(execution.id.clone(), Vec::new());
+        Ok(())
+    }
+
+    async fn update_execution_status(
+        &self,
+        execution_id: &ExecutionId,
+        status: ExecutionStatus,
+    ) -> Result<(), EventLogError> {
+        let mut exec_map = self.executions.write().expect("poisoned lock");
+        match exec_map.get_mut(execution_id) {
+            Some(exec) => {
+                exec.status = status;
+                Ok(())
+            }
+            None => Err(EventLogError::ExecutionNotFound(execution_id.clone())),
+        }
+    }
+
+    async fn append(
+        &self,
+        execution_id: &ExecutionId,
+        event_type: &str,
+        payload: serde_json::Value,
+        schema_version: u32,
+        idempotency_key: Option<&str>,
+    ) -> Result<u64, EventLogError> {
+        let mut event_map = self.events.write().expect("poisoned lock");
+        let events = event_map
+            .get_mut(execution_id)
+            .ok_or_else(|| EventLogError::ExecutionNotFound(execution_id.clone()))?;
+
+        // Idempotency: return existing sequence if key already present.
+        if let Some(key) = idempotency_key {
+            for existing in events.iter() {
+                if existing
+                    .payload
+                    .get("idempotency_key")
+                    .and_then(|v| v.as_str())
+                    == Some(key)
+                {
+                    return Ok(existing.sequence);
+                }
+            }
+        }
+
+        let sequence = events.len() as u64 + 1;
+        events.push(crate::event::Event {
+            execution_id: execution_id.clone(),
+            sequence,
+            event_type: event_type.to_string(),
+            payload,
+            timestamp: chrono::Utc::now(),
+            schema_version,
+        });
+        Ok(sequence)
+    }
+
+    async fn read(
+        &self,
+        execution_id: &ExecutionId,
+        after_sequence: Option<u64>,
+    ) -> Result<Vec<crate::event::Event>, EventLogError> {
+        let event_map = self.events.read().expect("poisoned lock");
+        let events = event_map
+            .get(execution_id)
+            .ok_or_else(|| EventLogError::ExecutionNotFound(execution_id.clone()))?;
+        let result = match after_sequence {
+            None => events.clone(),
+            Some(n) => events.iter().filter(|e| e.sequence > n).cloned().collect(),
+        };
+        Ok(result)
+    }
+
+    async fn latest_of_type(
+        &self,
+        execution_id: &ExecutionId,
+        event_type: &str,
+    ) -> Result<Option<crate::event::Event>, EventLogError> {
+        let event_map = self.events.read().expect("poisoned lock");
+        let events = event_map
+            .get(execution_id)
+            .ok_or_else(|| EventLogError::ExecutionNotFound(execution_id.clone()))?;
+        let result = events
+            .iter()
+            .rev()
+            .find(|e| e.event_type == event_type)
+            .cloned();
+        Ok(result)
+    }
+
+    async fn count_by_type(
+        &self,
+        execution_id: &ExecutionId,
+        event_type: &str,
+    ) -> Result<u64, EventLogError> {
+        let event_map = self.events.read().expect("poisoned lock");
+        let events = event_map
+            .get(execution_id)
+            .ok_or_else(|| EventLogError::ExecutionNotFound(execution_id.clone()))?;
+        Ok(events.iter().filter(|e| e.event_type == event_type).count() as u64)
+    }
+}
+
 #[async_trait::async_trait]
 impl EventLog for NullEventLog {
     async fn create_execution(&self, _execution: &Execution) -> Result<(), EventLogError> {

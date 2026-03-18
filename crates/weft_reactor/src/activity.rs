@@ -528,8 +528,13 @@ api_key = "sk-test"
         max_tokens.insert("stub".to_string(), 4096u32);
         let mut capabilities: HashMap<String, HashSet<weft_llm::Capability>> = HashMap::new();
         capabilities.insert("stub".to_string(), HashSet::new());
-        let registry =
-            weft_llm::ProviderRegistry::new(providers, model_ids, max_tokens, capabilities, "stub".to_string());
+        let registry = weft_llm::ProviderRegistry::new(
+            providers,
+            model_ids,
+            max_tokens,
+            capabilities,
+            "stub".to_string(),
+        );
 
         Services {
             config: Arc::new(config),
