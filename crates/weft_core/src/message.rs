@@ -399,7 +399,9 @@ mod tests {
         match back {
             ContentPart::Image(media) => {
                 assert_eq!(media.media_type.as_deref(), Some("image/png"));
-                assert!(matches!(media.source, MediaSource::Url(u) if u == "https://example.com/image.png"));
+                assert!(
+                    matches!(media.source, MediaSource::Url(u) if u == "https://example.com/image.png")
+                );
             }
             other => panic!("expected ContentPart::Image, got {:?}", other),
         }

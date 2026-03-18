@@ -29,6 +29,7 @@ weft_memory = { path = "crates/weft_memory" }
 weft_tools = { path = "crates/weft_tools" }
 weft_reactor = { path = "crates/weft_reactor" }
 weft_eventlog_memory = { path = "crates/weft_eventlog_memory" }
+weft_eventlog_postgres = { path = "crates/weft_eventlog_postgres" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

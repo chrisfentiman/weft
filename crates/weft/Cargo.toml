@@ -19,6 +19,7 @@ weft_router = { path = "../weft_router" }
 weft_commands = { path = "../weft_commands" }
 weft_tools = { path = "../weft_tools" }
 weft_proto = { workspace = true }
+weft_eventlog_postgres = { path = "../weft_eventlog_postgres", optional = true }
 tonic = { workspace = true }
 tokio-stream = { workspace = true }
 axum = { workspace = true }

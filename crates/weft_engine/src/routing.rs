@@ -336,36 +336,34 @@ where
                 )
                 .await
             {
-                HookChainResult::Blocked { reason, hook_name } => {
-                    match domain_desc.kind {
-                        RoutingDomainKind::Commands => {
-                            info!(
-                                hook = %hook_name,
-                                reason = %reason,
-                                "PostRoute hook blocked commands domain — using empty command set"
-                            );
-                            result.selected_commands.clear();
-                        }
-                        RoutingDomainKind::ToolNecessity => {
-                            info!(
-                                hook = %hook_name,
-                                reason = %reason,
-                                "PostRoute hook blocked tool_necessity domain — conservative: inject tools"
-                            );
-                            result.inject_tools = true;
-                        }
-                        RoutingDomainKind::Model => {
-                            return Err(WeftError::HookBlocked {
-                                event: "PostRoute".to_string(),
-                                reason,
-                                hook_name,
-                            });
-                        }
-                        RoutingDomainKind::Memory => {
-                            unreachable!("Memory domain PostRoute is handled in memory.rs")
-                        }
+                HookChainResult::Blocked { reason, hook_name } => match domain_desc.kind {
+                    RoutingDomainKind::Commands => {
+                        info!(
+                            hook = %hook_name,
+                            reason = %reason,
+                            "PostRoute hook blocked commands domain — using empty command set"
+                        );
+                        result.selected_commands.clear();
                     }
-                }
+                    RoutingDomainKind::ToolNecessity => {
+                        info!(
+                            hook = %hook_name,
+                            reason = %reason,
+                            "PostRoute hook blocked tool_necessity domain — conservative: inject tools"
+                        );
+                        result.inject_tools = true;
+                    }
+                    RoutingDomainKind::Model => {
+                        return Err(WeftError::HookBlocked {
+                            event: "PostRoute".to_string(),
+                            reason,
+                            hook_name,
+                        });
+                    }
+                    RoutingDomainKind::Memory => {
+                        unreachable!("Memory domain PostRoute is handled in memory.rs")
+                    }
+                },
                 HookChainResult::Allowed { payload, context } => {
                     if let Some(ctx) = context {
                         context_parts.push(ctx);
@@ -419,14 +417,15 @@ where
     ) {
         match kind {
             RoutingDomainKind::Commands => {
-                if let Some(override_ids) = payload
-                    .get("selected")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect::<Vec<_>>()
-                    })
+                if let Some(override_ids) =
+                    payload
+                        .get("selected")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect::<Vec<_>>()
+                        })
                 {
                     result.selected_commands = all_commands
                         .iter()
