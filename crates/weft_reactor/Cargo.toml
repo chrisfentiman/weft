@@ -7,6 +7,11 @@ license.workspace = true
 [dependencies]
 # Workspace
 weft_core = { path = "../weft_core" }
+weft_hooks = { path = "../weft_hooks" }
+weft_llm = { path = "../weft_llm" }
+weft_commands = { path = "../weft_commands" }
+weft_router = { path = "../weft_router" }
+weft_memory = { path = "../weft_memory" }
 
 # Async
 tokio = { workspace = true }
