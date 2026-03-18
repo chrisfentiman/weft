@@ -142,6 +142,7 @@ pub enum ActivityError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     // ── Object safety and basic Activity impl ───────────────────────────────
@@ -273,20 +274,14 @@ mod tests {
         // are set to their simplest valid values.
         let input = make_minimal_input();
 
-        // No Services needed — EventPushingActivity ignores the services parameter.
-        // We cannot construct Services here (it requires live Arc impls). Using a
-        // dangling reference is safe here because the reference is never read.
-        //
-        // SAFETY: EventPushingActivity::execute never reads through `services`.
-        // The dangling pointer is never dereferenced, so no UB occurs. This
-        // pattern is only used inside #[cfg(test)] under our control.
-        let services_ref: &Services = unsafe { std::ptr::NonNull::dangling().as_ref() };
-
+        // Build a real Services with stub/null implementations. EventPushingActivity
+        // never calls into any service, but the signature requires &Services.
+        let services = make_stub_services();
         let log = NullEventLog;
 
         let activity = EventPushingActivity;
         activity
-            .execute(&exec_id, input, services_ref, &log, tx, cancel)
+            .execute(&exec_id, input, &services, &log, tx, cancel)
             .await;
 
         // Verify that exactly one event arrived on the receiver.
@@ -415,6 +410,137 @@ mod tests {
         };
         assert!(snap.tool_necessity.is_none());
         assert!(snap.tool_necessity_score.is_none());
+    }
+
+    // ── Test stubs ───────────────────────────────────────────────────────────
+
+    /// Stub LLM provider that panics if actually called.
+    /// Used in tests where no LLM calls are expected.
+    struct PanicProvider;
+
+    #[async_trait::async_trait]
+    impl weft_llm::Provider for PanicProvider {
+        async fn execute(
+            &self,
+            _request: weft_llm::ProviderRequest,
+        ) -> Result<weft_llm::ProviderResponse, weft_llm::ProviderError> {
+            panic!("PanicProvider: execute called unexpectedly in test")
+        }
+
+        fn name(&self) -> &str {
+            "panic-provider"
+        }
+    }
+
+    /// Stub semantic router that panics if actually called.
+    struct PanicRouter;
+
+    #[async_trait::async_trait]
+    impl weft_router::SemanticRouter for PanicRouter {
+        async fn route(
+            &self,
+            _user_message: &str,
+            _domains: &[(
+                weft_router::RoutingDomainKind,
+                Vec<weft_router::RoutingCandidate>,
+            )],
+        ) -> Result<weft_router::RoutingDecision, weft_router::RouterError> {
+            panic!("PanicRouter: route called unexpectedly in test")
+        }
+
+        async fn score_memory_candidates(
+            &self,
+            _text: &str,
+            _candidates: &[weft_router::RoutingCandidate],
+        ) -> Result<Vec<weft_router::ScoredCandidate>, weft_router::RouterError> {
+            panic!("PanicRouter: score_memory_candidates called unexpectedly in test")
+        }
+    }
+
+    /// Stub command registry that panics if actually called.
+    struct PanicCommandRegistry;
+
+    #[async_trait::async_trait]
+    impl weft_commands::CommandRegistry for PanicCommandRegistry {
+        async fn list_commands(
+            &self,
+        ) -> Result<Vec<weft_core::CommandStub>, weft_commands::CommandError> {
+            panic!("PanicCommandRegistry: list_commands called unexpectedly in test")
+        }
+
+        async fn describe_command(
+            &self,
+            _name: &str,
+        ) -> Result<weft_core::CommandDescription, weft_commands::CommandError> {
+            panic!("PanicCommandRegistry: describe_command called unexpectedly in test")
+        }
+
+        async fn execute_command(
+            &self,
+            _invocation: &weft_core::CommandInvocation,
+        ) -> Result<weft_core::CommandResult, weft_commands::CommandError> {
+            panic!("PanicCommandRegistry: execute_command called unexpectedly in test")
+        }
+    }
+
+    /// Build a minimal Services for tests that do not call any service methods.
+    fn make_stub_services() -> Services {
+        // Parse a minimal WeftConfig from TOML — the cheapest way to get a valid config.
+        let config: weft_core::WeftConfig = toml::from_str(
+            r#"
+[server]
+bind_address = "0.0.0.0:8080"
+
+[gateway]
+system_prompt = "test"
+max_command_iterations = 10
+request_timeout_secs = 300
+
+[router]
+default_model = "stub"
+
+[router.classifier]
+model_path = "models/stub.onnx"
+tokenizer_path = "models/tokenizer.json"
+threshold = 0.3
+max_commands = 20
+
+[[router.providers]]
+name = "stub"
+wire_format = "anthropic"
+api_key = "sk-test"
+
+  [[router.providers.models]]
+  name = "stub"
+  model = "stub-model"
+  max_tokens = 4096
+  examples = ["test"]
+"#,
+        )
+        .expect("minimal test TOML must parse");
+
+        // Build a ProviderRegistry with a single stub provider.
+        let mut providers: HashMap<String, Arc<dyn weft_llm::Provider>> = HashMap::new();
+        providers.insert("stub".to_string(), Arc::new(PanicProvider));
+        let mut model_ids = HashMap::new();
+        model_ids.insert("stub".to_string(), "stub-model".to_string());
+        let mut max_tokens = HashMap::new();
+        max_tokens.insert("stub".to_string(), 4096u32);
+        let mut capabilities: HashMap<String, HashSet<weft_llm::Capability>> = HashMap::new();
+        capabilities.insert("stub".to_string(), HashSet::new());
+        let registry =
+            weft_llm::ProviderRegistry::new(providers, model_ids, max_tokens, capabilities, "stub".to_string());
+
+        Services {
+            config: Arc::new(config),
+            providers: Arc::new(registry),
+            router: Arc::new(PanicRouter),
+            commands: Arc::new(PanicCommandRegistry),
+            memory: None,
+            hooks: Arc::new(weft_hooks::NullHookRunner),
+            reactor_handle: std::sync::OnceLock::new(),
+            request_end_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+        }
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────
