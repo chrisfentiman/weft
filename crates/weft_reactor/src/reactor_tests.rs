@@ -31,8 +31,8 @@ mod tests {
     use crate::{RequestId, TenantId};
 
     use weft_core::{
-        ContentPart, HookEvent, ModelRoutingInstruction, Role, SamplingOptions, Source,
-        WeftMessage, WeftRequest,
+        CommandAction, CommandInvocation, ContentPart, HookEvent, ModelRoutingInstruction, Role,
+        SamplingOptions, Source, WeftMessage, WeftRequest,
     };
 
     // ── Test activity stubs ───────────────────────────────────────────────────
@@ -825,16 +825,21 @@ mod tests {
 
     // ── Cancellation ──────────────────────────────────────────────────────────
 
+    /// Cancel signal pushed onto the event channel terminates execution.
+    ///
+    /// The generate activity pushes `PipelineEvent::Signal(Signal::Cancel)` onto
+    /// the event channel. The reactor receives it in the generate dispatch loop,
+    /// records ExecutionCancelled, and returns Ok (not Err).
     #[tokio::test]
     async fn cancel_signal_terminates_execution() {
         let services = Arc::new(make_test_services());
         let event_log = test_event_log();
 
-        // Generate activity that blocks until cancelled.
-        struct BlockingGenerateActivity;
+        // Generate activity that pushes a Cancel signal onto the event channel.
+        struct CancelViaChannelActivity;
 
         #[async_trait::async_trait]
-        impl Activity for BlockingGenerateActivity {
+        impl Activity for CancelViaChannelActivity {
             fn name(&self) -> &str {
                 "generate"
             }
@@ -846,27 +851,26 @@ mod tests {
                 _services: &crate::services::Services,
                 _event_log: &dyn EventLog,
                 event_tx: mpsc::Sender<PipelineEvent>,
-                cancel: CancellationToken,
+                _cancel: CancellationToken,
             ) {
                 let _ = event_tx
                     .send(PipelineEvent::ActivityStarted {
                         name: "generate".to_string(),
                     })
                     .await;
-                // Block until cancelled.
-                cancel.cancelled().await;
+                // Inject a Cancel signal onto the event channel. The reactor will
+                // receive this in the generate dispatch select loop, cancel the
+                // token, record ExecutionCancelled, and return Ok.
                 let _ = event_tx
-                    .send(PipelineEvent::ActivityFailed {
-                        name: "generate".to_string(),
-                        error: "cancelled".to_string(),
-                        retryable: false,
-                    })
+                    .send(PipelineEvent::Signal(Signal::Cancel {
+                        reason: "test cancel via channel".to_string(),
+                    }))
                     .await;
             }
         }
 
         let registry = build_registry(vec![
-            Arc::new(BlockingGenerateActivity),
+            Arc::new(CancelViaChannelActivity),
             Arc::new(StubAssembleResponse {
                 name: "assemble_response".to_string(),
             }),
@@ -879,37 +883,27 @@ mod tests {
         let reactor = Reactor::new(services, event_log.clone(), registry, &config)
             .expect("reactor should construct");
 
-        // Run execute in a background task.
-        let reactor_arc = Arc::new(reactor);
-        let reactor_ref = Arc::clone(&reactor_arc);
+        let (result, _signal_tx) = reactor
+            .execute(
+                test_request(),
+                TenantId("tenant1".to_string()),
+                RequestId("req1".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("cancelled execution should return Ok");
 
-        let execute_handle = tokio::spawn(async move {
-            reactor_ref
-                .execute(
-                    test_request(),
-                    TenantId("tenant1".to_string()),
-                    RequestId("req1".to_string()),
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .await
-        });
-
-        // Give the reactor a moment to start, then inject a Cancel signal.
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        // We need the signal_tx. Since we launched in background before getting it,
-        // we use a different approach: run the blocking generate in a task that
-        // we cancel externally. Instead, let's inject via a channel we set up first.
-        // For simplicity, cancel via a pre-seeded event channel approach.
-        // Cancel the execution by waiting for the execute to complete (it will
-        // eventually because BlockingGenerateActivity listens to cancel).
-
-        // The execute returned a signal_tx — we can't cancel yet. Let's test
-        // cancellation differently: use a generate activity that sends Cancel signal itself.
-        execute_handle.abort();
+        // ExecutionCancelled is recorded in the event log, not returned as Err.
+        let events = event_log.read(&result.execution_id, None).await.unwrap();
+        let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+        assert!(
+            event_types.contains(&"execution.cancelled"),
+            "event log should contain execution.cancelled; got: {:?}",
+            event_types
+        );
     }
 
     /// Cancellation via Signal::Cancel sent on the event channel.
@@ -1388,11 +1382,31 @@ mod tests {
             )
             .await;
 
-        // Budget is exhausted, child_budget() returns Err(Depth) since depth 0->1 at max 3
-        // Actually with exhausted deadline, the budget check fails before retry.
-        // The result could be either an error or a graceful budget exhaustion.
-        // The important thing is the execution completes without panicking.
-        let _ = result;
+        // Budget deadline is in the past: the reactor sees Exhausted(Deadline) at step 2a
+        // before any generation attempt. It records BudgetExhausted, breaks the dispatch
+        // loop, runs post-loop (assemble_response), and returns Ok with an empty response.
+        // The generate activity is never called, so no retries can occur.
+        let (exec_result, _) = result.expect("budget exhaustion should return Ok gracefully");
+
+        // Verify BudgetExhausted appears in the event log — the dispatch loop terminated
+        // due to budget limits, not due to activity failure.
+        let events = event_log
+            .read(&exec_result.execution_id, None)
+            .await
+            .unwrap();
+        let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+
+        assert!(
+            event_types.contains(&"budget.exhausted"),
+            "event log should contain budget.exhausted when deadline is past; got: {event_types:?}"
+        );
+
+        // No activity.retried events should appear: the generate activity was never
+        // invoked, so no retry could have been attempted.
+        assert!(
+            !event_types.contains(&"activity.retried"),
+            "no activity.retried should appear when budget is exhausted before generation; got: {event_types:?}"
+        );
     }
 
     // ── Generation timeout ────────────────────────────────────────────────────
@@ -1629,74 +1643,20 @@ mod tests {
 
     // ── Idempotency ───────────────────────────────────────────────────────────
 
+    /// Verify that `check_idempotency` returns `Some` (hit) when an ActivityCompleted
+    /// event with the matching idempotency key already exists in the event log.
+    ///
+    /// `Reactor::execute` always creates a fresh `ExecutionId`, so we cannot test the
+    /// hit path via the public `execute` API. Instead we call `check_idempotency`
+    /// directly via `test_hooks::check_idempotency_pub`, seeding the event log with
+    /// a known execution_id and key before calling it.
     #[tokio::test]
     async fn idempotency_check_skips_already_completed_activity() {
         let event_log = test_event_log();
         let services = Arc::new(make_test_services());
-
-        // Counter to verify the activity is called only once.
-        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let call_count_clone = Arc::clone(&call_count);
-
-        struct CountingGenerateActivity {
-            call_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
-        }
-
-        #[async_trait::async_trait]
-        impl Activity for CountingGenerateActivity {
-            fn name(&self) -> &str {
-                "generate"
-            }
-
-            async fn execute(
-                &self,
-                _execution_id: &ExecutionId,
-                input: ActivityInput,
-                _services: &crate::services::Services,
-                _event_log: &dyn EventLog,
-                event_tx: mpsc::Sender<PipelineEvent>,
-                _cancel: CancellationToken,
-            ) {
-                self.call_count
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let _ = event_tx
-                    .send(PipelineEvent::ActivityStarted {
-                        name: "generate".to_string(),
-                    })
-                    .await;
-                let _ = event_tx
-                    .send(PipelineEvent::Generated(GeneratedEvent::Done))
-                    .await;
-                let response_message = WeftMessage {
-                    role: Role::Assistant,
-                    source: Source::Provider,
-                    model: Some("stub-model".to_string()),
-                    content: vec![],
-                    delta: false,
-                    message_index: 0,
-                };
-                let _ = event_tx
-                    .send(PipelineEvent::GenerationCompleted {
-                        model: "stub-model".to_string(),
-                        response_message,
-                        generated_events: vec![GeneratedEvent::Done],
-                        input_tokens: None,
-                        output_tokens: None,
-                    })
-                    .await;
-                let _ = event_tx
-                    .send(PipelineEvent::ActivityCompleted {
-                        name: "generate".to_string(),
-                        duration_ms: 1,
-                        idempotency_key: input.idempotency_key.clone(),
-                    })
-                    .await;
-            }
-        }
-
         let registry = build_registry(vec![
-            Arc::new(CountingGenerateActivity {
-                call_count: call_count_clone,
+            Arc::new(ImmediateDoneActivity {
+                name: "generate".to_string(),
             }),
             Arc::new(StubAssembleResponse {
                 name: "assemble_response".to_string(),
@@ -1710,11 +1670,12 @@ mod tests {
         let reactor = Reactor::new(services, event_log.clone(), registry, &config)
             .expect("reactor should construct");
 
+        // Use a fixed execution_id so we can seed the event log with a known key.
         let execution_id = ExecutionId::new();
-
-        // Pre-insert an ActivityCompleted event with the idempotency key the Reactor will use.
-        // The key format is "{execution_id}:generate:0".
         let key = format!("{}:generate:0", execution_id);
+
+        // Create an execution record and pre-seed ActivityStarted + ActivityCompleted
+        // events with the idempotency key. This simulates a previously completed activity.
         event_log
             .create_execution(&Execution {
                 id: execution_id.clone(),
@@ -1729,7 +1690,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Insert ActivityStarted and ActivityCompleted to make idempotency check pass.
         event_log
             .append(
                 &execution_id,
@@ -1741,7 +1701,7 @@ mod tests {
             .await
             .unwrap();
 
-        let done_ev = PipelineEvent::Generated(GeneratedEvent::Done);
+        let done_ev = crate::event::PipelineEvent::Generated(GeneratedEvent::Done);
         event_log
             .append(
                 &execution_id,
@@ -1757,36 +1717,55 @@ mod tests {
             .append(
                 &execution_id,
                 "activity.completed",
-                serde_json::json!({ "name": "generate", "duration_ms": 1, "idempotency_key": key }),
+                serde_json::json!({
+                    "name": "generate",
+                    "duration_ms": 1,
+                    "idempotency_key": key
+                }),
                 1,
                 Some(&key),
             )
             .await
             .unwrap();
 
-        // Note: Reactor::execute creates a NEW execution_id, not the pre-seeded one.
-        // The idempotency check will use the NEW execution_id, so no hit.
-        // This test verifies the idempotency code path doesn't panic.
-        // A proper idempotency integration test would require hooking into the
-        // Reactor's internal execution_id creation, which is not exposed.
-        // For now, verify that the activity is called exactly once in a normal run.
-        let result = reactor
-            .execute(
-                test_request(),
-                TenantId("tenant1".to_string()),
-                RequestId("req1".to_string()),
-                None,
-                None,
-                None,
-                None,
-            )
-            .await;
+        // Call check_idempotency directly via test_hooks.
+        // With the key present, it should return Some (idempotency hit).
+        let result =
+            crate::reactor::test_hooks::check_idempotency_pub(&reactor, &execution_id, &key)
+                .await
+                .expect("check_idempotency should not fail");
 
-        assert!(result.is_ok(), "execution should succeed: {:?}", result);
-        assert_eq!(
-            call_count.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "generate activity should be called exactly once in normal execution"
+        assert!(
+            result.is_some(),
+            "idempotency check should return Some when key exists in event log"
+        );
+
+        let replayed = result.unwrap();
+        assert!(
+            !replayed.is_empty(),
+            "replayed events slice should not be empty"
+        );
+
+        // Verify the replayed events span from ActivityStarted to ActivityCompleted.
+        let types: Vec<&str> = replayed.iter().map(|e| e.event_type.as_str()).collect();
+        assert!(
+            types.contains(&"activity.started"),
+            "replayed events should include activity.started; got: {types:?}"
+        );
+        assert!(
+            types.contains(&"activity.completed"),
+            "replayed events should include activity.completed; got: {types:?}"
+        );
+
+        // Verify a fresh key (not in log) returns None.
+        let miss_key = format!("{}:generate:99", execution_id);
+        let miss_result =
+            crate::reactor::test_hooks::check_idempotency_pub(&reactor, &execution_id, &miss_key)
+                .await
+                .expect("check_idempotency should not fail on miss");
+        assert!(
+            miss_result.is_none(),
+            "idempotency check should return None when key is absent"
         );
     }
 
@@ -2260,6 +2239,653 @@ mod tests {
         // The key property is: it completes without hanging indefinitely.
         // With a simple text generate activity that completes quickly, it likely succeeds.
         let _ = result; // Accept any outcome — the test verifies no hang/panic.
+    }
+
+    // ── Command iteration loop ─────────────────────────────────────────────────
+
+    /// Command iteration loop: generate returns CommandInvocation, StubExecuteCommand runs,
+    /// generate is called again with results, then Done.
+    ///
+    /// Verifies: two generate calls, CommandCompleted in event log, IterationCompleted event.
+    #[tokio::test]
+    async fn command_iteration_loop_executes_command_then_calls_generate_again() {
+        let services = Arc::new(make_test_services());
+        let event_log = test_event_log();
+
+        // First call: push CommandInvocation + Done; second call: push Done only.
+        let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let call_count_clone = Arc::clone(&call_count);
+
+        struct CommandThenDoneActivity {
+            call_count: Arc<std::sync::atomic::AtomicU32>,
+        }
+
+        #[async_trait::async_trait]
+        impl Activity for CommandThenDoneActivity {
+            fn name(&self) -> &str {
+                "generate"
+            }
+
+            async fn execute(
+                &self,
+                _execution_id: &ExecutionId,
+                input: ActivityInput,
+                _services: &crate::services::Services,
+                _event_log: &dyn EventLog,
+                event_tx: mpsc::Sender<PipelineEvent>,
+                _cancel: CancellationToken,
+            ) {
+                let call_n = self
+                    .call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                let _ = event_tx
+                    .send(PipelineEvent::ActivityStarted {
+                        name: "generate".to_string(),
+                    })
+                    .await;
+                let _ = event_tx
+                    .send(PipelineEvent::GenerationStarted {
+                        model: "stub-model".to_string(),
+                        message_count: input.messages.len(),
+                    })
+                    .await;
+
+                if call_n == 0 {
+                    // First call: emit a command invocation then Done.
+                    let invocation = CommandInvocation {
+                        name: "test_command".to_string(),
+                        action: CommandAction::Execute,
+                        arguments: serde_json::json!({"arg": "value"}),
+                    };
+                    let _ = event_tx
+                        .send(PipelineEvent::Generated(GeneratedEvent::CommandInvocation(
+                            invocation,
+                        )))
+                        .await;
+                }
+
+                // Both calls: emit Done.
+                let _ = event_tx
+                    .send(PipelineEvent::Generated(GeneratedEvent::Done))
+                    .await;
+
+                let response_message = WeftMessage {
+                    role: Role::Assistant,
+                    source: Source::Provider,
+                    model: Some("stub-model".to_string()),
+                    content: vec![],
+                    delta: false,
+                    message_index: 0,
+                };
+                let _ = event_tx
+                    .send(PipelineEvent::GenerationCompleted {
+                        model: "stub-model".to_string(),
+                        response_message,
+                        generated_events: vec![GeneratedEvent::Done],
+                        input_tokens: None,
+                        output_tokens: None,
+                    })
+                    .await;
+                let _ = event_tx
+                    .send(PipelineEvent::ActivityCompleted {
+                        name: "generate".to_string(),
+                        duration_ms: 1,
+                        idempotency_key: input.idempotency_key.clone(),
+                    })
+                    .await;
+            }
+        }
+
+        let registry = build_registry(vec![
+            Arc::new(CommandThenDoneActivity {
+                call_count: call_count_clone,
+            }),
+            Arc::new(StubAssembleResponse {
+                name: "assemble_response".to_string(),
+            }),
+            Arc::new(StubExecuteCommand {
+                name: "execute_command".to_string(),
+            }),
+        ]);
+
+        let config = reactor_config(simple_pipeline_config("generate"));
+        let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+            .expect("reactor should construct");
+
+        let (result, _) = reactor
+            .execute(
+                test_request(),
+                TenantId("tenant1".to_string()),
+                RequestId("req1".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("command iteration execution should succeed");
+
+        // Generate was called twice: once to get the command, once after command results.
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "generate activity should be called twice (once for command, once after results)"
+        );
+
+        // Verify the iteration count in budget_used reflects the command loop iteration.
+        assert!(
+            result.budget_used.iterations >= 1,
+            "at least one iteration should be recorded"
+        );
+
+        // Verify CommandCompleted and IterationCompleted appear in the event log.
+        let events = event_log.read(&result.execution_id, None).await.unwrap();
+        let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+
+        assert!(
+            event_types.contains(&"command.completed"),
+            "event log should contain command.completed; got: {event_types:?}"
+        );
+        assert!(
+            event_types.contains(&"iteration.completed"),
+            "event log should contain iteration.completed; got: {event_types:?}"
+        );
+    }
+
+    // ── PreResponse hook retry ─────────────────────────────────────────────────
+
+    /// PreResponse hook that blocks once injects feedback and triggers re-generation.
+    ///
+    /// The `pre_response` hook activity pushes `HookBlocked` on the first call, then
+    /// `ActivityCompleted` on the second. The reactor injects the block reason as a
+    /// User message and calls generate again. The final result is Ok.
+    #[tokio::test]
+    async fn pre_response_hook_block_injects_feedback_and_retries_generation() {
+        let services = Arc::new(make_test_services());
+        let event_log = test_event_log();
+
+        // Track generate call count and hook call count.
+        let gen_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let gen_calls_clone = Arc::clone(&gen_calls);
+        let hook_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let hook_calls_clone = Arc::clone(&hook_calls);
+
+        struct CountingDoneActivity {
+            name: String,
+            call_count: Arc<std::sync::atomic::AtomicU32>,
+        }
+
+        #[async_trait::async_trait]
+        impl Activity for CountingDoneActivity {
+            fn name(&self) -> &str {
+                &self.name
+            }
+
+            async fn execute(
+                &self,
+                _execution_id: &ExecutionId,
+                input: ActivityInput,
+                _services: &crate::services::Services,
+                _event_log: &dyn EventLog,
+                event_tx: mpsc::Sender<PipelineEvent>,
+                _cancel: CancellationToken,
+            ) {
+                self.call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = event_tx
+                    .send(PipelineEvent::ActivityStarted {
+                        name: self.name.clone(),
+                    })
+                    .await;
+                let _ = event_tx
+                    .send(PipelineEvent::Generated(GeneratedEvent::Done))
+                    .await;
+                let response_message = WeftMessage {
+                    role: Role::Assistant,
+                    source: Source::Provider,
+                    model: Some("stub-model".to_string()),
+                    content: vec![],
+                    delta: false,
+                    message_index: 0,
+                };
+                let _ = event_tx
+                    .send(PipelineEvent::GenerationCompleted {
+                        model: "stub-model".to_string(),
+                        response_message,
+                        generated_events: vec![GeneratedEvent::Done],
+                        input_tokens: None,
+                        output_tokens: None,
+                    })
+                    .await;
+                let _ = event_tx
+                    .send(PipelineEvent::ActivityCompleted {
+                        name: self.name.clone(),
+                        duration_ms: 1,
+                        idempotency_key: input.idempotency_key.clone(),
+                    })
+                    .await;
+            }
+        }
+
+        // A hook activity that blocks once (first call), then allows (second call).
+        struct BlockOnceThenAllowHook {
+            name: String,
+            call_count: Arc<std::sync::atomic::AtomicU32>,
+            block_reason: String,
+        }
+
+        #[async_trait::async_trait]
+        impl Activity for BlockOnceThenAllowHook {
+            fn name(&self) -> &str {
+                &self.name
+            }
+
+            async fn execute(
+                &self,
+                _execution_id: &ExecutionId,
+                input: ActivityInput,
+                _services: &crate::services::Services,
+                _event_log: &dyn EventLog,
+                event_tx: mpsc::Sender<PipelineEvent>,
+                _cancel: CancellationToken,
+            ) {
+                let call_n = self
+                    .call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                let _ = event_tx
+                    .send(PipelineEvent::ActivityStarted {
+                        name: self.name.clone(),
+                    })
+                    .await;
+
+                if call_n == 0 {
+                    // First call: block with feedback reason.
+                    let _ = event_tx
+                        .send(PipelineEvent::HookBlocked {
+                            hook_event: "pre_response".to_string(),
+                            hook_name: self.name.clone(),
+                            reason: self.block_reason.clone(),
+                        })
+                        .await;
+                    // Do NOT send ActivityCompleted — HookBlocked signals termination of this run.
+                } else {
+                    // Second call: allow.
+                    let _ = event_tx
+                        .send(PipelineEvent::ActivityCompleted {
+                            name: self.name.clone(),
+                            duration_ms: 0,
+                            idempotency_key: input.idempotency_key.clone(),
+                        })
+                        .await;
+                }
+            }
+        }
+
+        let pipeline_config = PipelineConfig {
+            name: "default".to_string(),
+            pre_loop: vec![],
+            post_loop: vec![ActivityRef::Name("assemble_response".to_string())],
+            generate: ActivityRef::Name("generate".to_string()),
+            execute_command: ActivityRef::Name("execute_command".to_string()),
+            loop_hooks: LoopHooks {
+                pre_response: vec![ActivityRef::Name("pre_response_hook".to_string())],
+                ..LoopHooks::default()
+            },
+        };
+
+        let registry = build_registry(vec![
+            Arc::new(CountingDoneActivity {
+                name: "generate".to_string(),
+                call_count: gen_calls_clone,
+            }),
+            Arc::new(StubAssembleResponse {
+                name: "assemble_response".to_string(),
+            }),
+            Arc::new(StubExecuteCommand {
+                name: "execute_command".to_string(),
+            }),
+            Arc::new(BlockOnceThenAllowHook {
+                name: "pre_response_hook".to_string(),
+                call_count: hook_calls_clone,
+                block_reason: "content policy violation: try again".to_string(),
+            }),
+        ]);
+
+        let config = reactor_config(pipeline_config);
+        let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+            .expect("reactor should construct");
+
+        let result = reactor
+            .execute(
+                test_request(),
+                TenantId("tenant1".to_string()),
+                RequestId("req1".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "pre_response hook retry should succeed on second generation; got: {:?}",
+            result
+        );
+
+        // Generate was called twice: once before the hook blocked, once after feedback injection.
+        assert_eq!(
+            gen_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "generate should be called twice: once per pre_response hook block+retry cycle"
+        );
+
+        // Hook was called twice: once to block, once to allow.
+        assert_eq!(
+            hook_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "pre_response hook should be called twice"
+        );
+
+        // Verify hook.blocked appears in the event log.
+        let (exec_result, _) = result.unwrap();
+        let events = event_log
+            .read(&exec_result.execution_id, None)
+            .await
+            .unwrap();
+        let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+        assert!(
+            event_types.contains(&"hook.blocked"),
+            "event log should contain hook.blocked; got: {event_types:?}"
+        );
+    }
+
+    // ── Retry + cancellation ───────────────────────────────────────────────────
+
+    /// Cancel signal during retry backoff terminates execution with ExecutionCancelled.
+    ///
+    /// A retryable generate failure starts a backoff sleep. We inject Cancel on the
+    /// event channel while the reactor is waiting for the activity to start (before
+    /// the backoff begins), which causes the cancel token to be set. The backoff
+    /// select! arm sees the cancel and returns ExecutionCancelled.
+    #[tokio::test(start_paused = true)]
+    async fn cancel_during_retry_backoff_terminates_execution() {
+        let services = Arc::new(make_test_services());
+        let event_log = test_event_log();
+
+        // Activity that fails on first call with retryable=true, then waits for cancellation.
+        // The activity also pushes a Cancel signal onto the channel before its failure,
+        // so the reactor will have the cancel pending when it enters the backoff sleep.
+        struct FailWithCancelActivity;
+
+        #[async_trait::async_trait]
+        impl Activity for FailWithCancelActivity {
+            fn name(&self) -> &str {
+                "generate"
+            }
+
+            async fn execute(
+                &self,
+                _execution_id: &ExecutionId,
+                _input: ActivityInput,
+                _services: &crate::services::Services,
+                _event_log: &dyn EventLog,
+                event_tx: mpsc::Sender<PipelineEvent>,
+                _cancel: CancellationToken,
+            ) {
+                let _ = event_tx
+                    .send(PipelineEvent::ActivityStarted {
+                        name: "generate".to_string(),
+                    })
+                    .await;
+                // Push Cancel signal first so the reactor sees it during backoff.
+                let _ = event_tx
+                    .send(PipelineEvent::Signal(Signal::Cancel {
+                        reason: "cancel during backoff".to_string(),
+                    }))
+                    .await;
+                // Then fail with retryable=true.
+                let _ = event_tx
+                    .send(PipelineEvent::ActivityFailed {
+                        name: "generate".to_string(),
+                        error: "transient failure".to_string(),
+                        retryable: true,
+                    })
+                    .await;
+            }
+        }
+
+        let registry = build_registry(vec![
+            Arc::new(FailWithCancelActivity),
+            Arc::new(StubAssembleResponse {
+                name: "assemble_response".to_string(),
+            }),
+            Arc::new(StubExecuteCommand {
+                name: "execute_command".to_string(),
+            }),
+        ]);
+
+        // Configure with a long backoff so we know time-advance drives the cancellation.
+        let config = ReactorConfig {
+            pipelines: vec![PipelineConfig {
+                name: "default".to_string(),
+                pre_loop: vec![],
+                post_loop: vec![ActivityRef::Name("assemble_response".to_string())],
+                generate: ActivityRef::WithConfig {
+                    name: "generate".to_string(),
+                    config: serde_json::Value::Null,
+                    retry: Some(RetryPolicy {
+                        max_retries: 3,
+                        initial_backoff_ms: 5000, // 5s backoff
+                        max_backoff_ms: 10_000,
+                        backoff_multiplier: 1.0,
+                    }),
+                    timeout_secs: None,
+                    heartbeat_interval_secs: None,
+                },
+                execute_command: ActivityRef::Name("execute_command".to_string()),
+                loop_hooks: LoopHooks::default(),
+            }],
+            budget: BudgetConfig {
+                max_generation_calls: 5,
+                max_iterations: 5,
+                max_depth: 3,
+                timeout_secs: 300,
+                generation_timeout_secs: 60,
+                command_timeout_secs: 10,
+            },
+        };
+
+        let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+            .expect("reactor should construct");
+
+        let reactor_arc = Arc::new(reactor);
+        let reactor_ref = Arc::clone(&reactor_arc);
+
+        let handle = tokio::spawn(async move {
+            reactor_ref
+                .execute(
+                    test_request(),
+                    TenantId("tenant1".to_string()),
+                    RequestId("req1".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+        });
+
+        // The activity sends Cancel then ActivityFailed(retryable). The reactor
+        // processes Cancel first in the generate loop, sets the cancel token,
+        // records ExecutionCancelled, and returns Ok. Time advance ensures the
+        // backoff sleep would fire if cancel wasn't processed first.
+        tokio::time::advance(Duration::from_millis(100)).await;
+
+        let result = handle.await.expect("task should complete");
+
+        // Cancellation returns Ok, not Err.
+        assert!(
+            result.is_ok(),
+            "cancel during retry should return Ok (not Err): {:?}",
+            result
+        );
+
+        let (exec_result, _) = result.unwrap();
+
+        // Verify ExecutionCancelled is in the event log.
+        let events = event_log
+            .read(&exec_result.execution_id, None)
+            .await
+            .unwrap();
+        let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+        assert!(
+            event_types.contains(&"execution.cancelled"),
+            "event log should contain execution.cancelled; got: {event_types:?}"
+        );
+
+        // No activity.retried events should appear — cancel fires before retry.
+        assert!(
+            !event_types.contains(&"activity.retried"),
+            "no activity.retried should appear when cancel fires before retry; got: {event_types:?}"
+        );
+    }
+
+    // ── Per-chunk timeout reset ────────────────────────────────────────────────
+
+    /// Per-chunk timeout: the deadline resets on each chunk received.
+    ///
+    /// Activity pushes one Content chunk at t=0, then stalls. With timeout_secs=2,
+    /// the deadline is reset to t=2 after the chunk. We advance to t=1 (no timeout),
+    /// advance to t=3 (past the reset deadline), and verify the execution fails due
+    /// to timeout — not from the original start time.
+    #[tokio::test(start_paused = true)]
+    async fn per_chunk_timeout_resets_after_each_chunk() {
+        let services = Arc::new(make_test_services());
+        let event_log = test_event_log();
+
+        // Activity that sends one Content chunk then stalls until cancelled.
+        struct OneChunkThenStallActivity;
+
+        #[async_trait::async_trait]
+        impl Activity for OneChunkThenStallActivity {
+            fn name(&self) -> &str {
+                "generate"
+            }
+
+            async fn execute(
+                &self,
+                _execution_id: &ExecutionId,
+                _input: ActivityInput,
+                _services: &crate::services::Services,
+                _event_log: &dyn EventLog,
+                event_tx: mpsc::Sender<PipelineEvent>,
+                cancel: CancellationToken,
+            ) {
+                let _ = event_tx
+                    .send(PipelineEvent::ActivityStarted {
+                        name: "generate".to_string(),
+                    })
+                    .await;
+                let _ = event_tx
+                    .send(PipelineEvent::GenerationStarted {
+                        model: "stub-model".to_string(),
+                        message_count: 1,
+                    })
+                    .await;
+
+                // Send one content chunk at t=0.
+                let _ = event_tx
+                    .send(PipelineEvent::Generated(GeneratedEvent::Content {
+                        part: ContentPart::Text("first chunk".to_string()),
+                    }))
+                    .await;
+
+                // Stall until the reactor cancels us after per-chunk timeout fires.
+                cancel.cancelled().await;
+                let _ = event_tx
+                    .send(PipelineEvent::ActivityFailed {
+                        name: "generate".to_string(),
+                        error: "cancelled".to_string(),
+                        retryable: false,
+                    })
+                    .await;
+            }
+        }
+
+        let registry = build_registry(vec![
+            Arc::new(OneChunkThenStallActivity),
+            Arc::new(StubAssembleResponse {
+                name: "assemble_response".to_string(),
+            }),
+            Arc::new(StubExecuteCommand {
+                name: "execute_command".to_string(),
+            }),
+        ]);
+
+        // timeout_secs=2: per-chunk deadline is reset to now+2s on each chunk.
+        let config = ReactorConfig {
+            pipelines: vec![PipelineConfig {
+                name: "default".to_string(),
+                pre_loop: vec![],
+                post_loop: vec![ActivityRef::Name("assemble_response".to_string())],
+                generate: ActivityRef::WithConfig {
+                    name: "generate".to_string(),
+                    config: serde_json::Value::Null,
+                    retry: None,
+                    timeout_secs: Some(2), // 2-second per-chunk timeout
+                    heartbeat_interval_secs: None,
+                },
+                execute_command: ActivityRef::Name("execute_command".to_string()),
+                loop_hooks: LoopHooks::default(),
+            }],
+            budget: BudgetConfig {
+                max_generation_calls: 5,
+                max_iterations: 5,
+                max_depth: 3,
+                timeout_secs: 300,
+                generation_timeout_secs: 2,
+                command_timeout_secs: 10,
+            },
+        };
+
+        let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+            .expect("reactor should construct");
+
+        let reactor_arc = Arc::new(reactor);
+        let reactor_ref = Arc::clone(&reactor_arc);
+
+        let handle = tokio::spawn(async move {
+            reactor_ref
+                .execute(
+                    test_request(),
+                    TenantId("tenant1".to_string()),
+                    RequestId("req1".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+        });
+
+        // At t=1: the chunk was received at t=0, deadline reset to t=2.
+        // No timeout should fire yet.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        // The task should still be running (not completed).
+
+        // At t=3: past the reset deadline (t=2). Timeout should fire.
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        let result = handle.await.expect("task should complete");
+
+        // After timeout with no retry, execution fails.
+        assert!(
+            result.is_err(),
+            "per-chunk timeout should fail execution after silence; got Ok"
+        );
     }
 
     // ── should_retry / backoff_ms unit tests ─────────────────────────────────

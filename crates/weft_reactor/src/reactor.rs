@@ -30,8 +30,9 @@ use crate::registry::ActivityRegistry;
 use crate::services::Services;
 use crate::signal::Signal;
 
-// Channel buffer size. Large enough for streaming tokens without backpressure.
-const CHANNEL_BUFFER: usize = 512;
+// Channel buffer size. Spec mandates 256; the deadlock analysis in the spec
+// is based on this value (pre-loop activities bounded, generate runs async).
+const CHANNEL_BUFFER: usize = 256;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -1400,10 +1401,14 @@ impl Reactor {
             if cmd_failed {
                 let policy = pipeline.execute_command.retry_policy.as_ref();
                 if cmd_failed_retryable && should_retry(policy, 0, &state.budget, cancel) {
-                    // Simple single retry for commands (attempt tracking is per-dispatch iteration).
-                    // Full retry loop omitted for command simplicity — activities handle retries.
+                    // Command retry is not yet implemented. The spec's "on ActivityFailed with
+                    // retryable=true, apply retry policy" applies to generation activities.
+                    // Command-level retry requires per-command attempt tracking and a retry loop
+                    // equivalent to the generate dispatch loop, which is deferred to a future
+                    // phase. For now, log a warning and propagate the failure. Commands that need
+                    // retry should handle it internally (e.g., via idempotent re-submission).
                     warn!(
-                        "command '{}' failed (retryable): {}",
+                        "command '{}' failed (retryable=true): {}; command retry not yet implemented",
                         cmd_name, cmd_failed_error
                     );
                 }
@@ -1580,12 +1585,12 @@ impl Reactor {
         &self,
         execution_id: &ExecutionId,
         state: &mut ExecutionState,
-        _err: ReactorError,
+        err: ReactorError,
     ) -> Result<(), ReactorError> {
         self.record_event(
             execution_id,
             &PipelineEvent::ExecutionFailed {
-                error: "execution failed".to_string(),
+                error: err.to_string(),
                 partial_text: Some(state.accumulated_text.clone()),
             },
         )
@@ -1654,5 +1659,18 @@ pub mod test_hooks {
     /// Expose `backoff_ms` for unit testing.
     pub fn backoff_ms_pub(policy: &RetryPolicy, attempt: u32) -> u64 {
         backoff_ms(policy, attempt)
+    }
+
+    /// Expose `Reactor::check_idempotency` for unit testing.
+    ///
+    /// Allows tests to call the idempotency check directly with a known
+    /// execution_id rather than going through `execute()` which always creates
+    /// a fresh id.
+    pub async fn check_idempotency_pub(
+        reactor: &Reactor,
+        execution_id: &ExecutionId,
+        key: &str,
+    ) -> Result<Option<Vec<crate::event::Event>>, crate::error::ReactorError> {
+        reactor.check_idempotency(execution_id, key).await
     }
 }
