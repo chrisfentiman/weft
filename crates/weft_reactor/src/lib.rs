@@ -14,6 +14,7 @@
 //! - `weft_eventlog_memory` -- for tests and local dev
 //! - `weft_eventlog_postgres` -- for production (Phase 6)
 
+pub mod activities;
 pub mod activity;
 pub mod budget;
 pub mod config;
@@ -24,6 +25,9 @@ pub mod execution;
 pub mod registry;
 pub mod services;
 pub mod signal;
+
+#[cfg(test)]
+pub mod test_support;
 
 // Re-exports for convenience
 pub use activity::{Activity, ActivityError, ActivityInput, RoutingSnapshot};
