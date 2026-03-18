@@ -1,7 +1,7 @@
 //! Weft gateway binary entry point.
 //!
 //! Loads configuration, constructs concrete implementations of all components,
-//! wires them into the GatewayEngine, and starts the axum HTTP server.
+//! wires them into the Reactor, and starts the axum HTTP server.
 
 mod engine;
 mod event_log;
@@ -16,16 +16,24 @@ use clap::Parser;
 use std::path::PathBuf;
 use tracing::{info, warn};
 use weft_commands::ToolRegistryCommandAdapter;
-use weft_core::{WeftConfig, WireFormat};
+use weft_core::{HookEvent, WeftConfig, WireFormat};
 use weft_llm::{AnthropicProvider, Capability, OpenAIProvider, ProviderRegistry, RhaiProvider};
 use weft_memory::{DefaultMemoryService, GrpcMemoryStoreClient, MemoryStoreMux, StoreInfo};
-use weft_router::{ModernBertRouter, RoutingCandidate, RoutingDomainKind};
+use weft_reactor::{
+    ActivityRegistry, Reactor, ReactorConfig,
+    activities::{
+        AssemblePromptActivity, AssembleResponseActivity, ExecuteCommandActivity, GenerateActivity,
+        HookActivity, RouteActivity, ValidateActivity,
+    },
+    config::{ActivityRef, BudgetConfig, LoopHooks, PipelineConfig, RetryPolicy},
+    services::{ReactorHandle, Services},
+};
+use weft_router::{ModernBertRouter, RoutingCandidate, RoutingDomainKind, tool_necessity_candidates};
 use weft_tools::GrpcToolRegistryClient;
 
-use crate::engine::tool_necessity_candidates;
 use crate::grpc::WeftService;
 use crate::server::build_router;
-use crate::types::{BinaryCommandRegistry, WeftEngine};
+use crate::types::BinaryCommandRegistry;
 
 /// Weft — AI orchestration gateway
 #[derive(Debug, Parser)]
@@ -449,7 +457,7 @@ async fn main() {
     // Selects InMemoryEventLog or PostgresEventLog based on [event_log] config.
     // Defaults to InMemoryEventLog when the section is absent.
 
-    let _event_log = event_log::build_event_log(config.event_log.as_ref())
+    let event_log = event_log::build_event_log(config.event_log.as_ref())
         .await
         .unwrap_or_else(|e| {
             eprintln!("error: event log initialization failed: {e}");
@@ -465,24 +473,169 @@ async fn main() {
         "event log initialized"
     );
 
-    // ── Wire the gateway engine ────────────────────────────────────────────
+    // ── Build Services (trait objects) ────────────────────────────────────
+    //
+    // Services is constructed before the Reactor to break the circular dependency.
+    // The reactor_handle field is populated via OnceLock after Reactor construction.
 
-    let engine: WeftEngine = WeftEngine::new(
-        Arc::clone(&config),
-        provider_registry,
-        router,
-        command_registry,
-        memory_service,
-        hook_registry,
+    let services = Arc::new(Services {
+        config: Arc::clone(&config),
+        providers: provider_registry as Arc<dyn weft_llm::ProviderService + Send + Sync>,
+        router: router as Arc<dyn weft_router::SemanticRouter + Send + Sync>,
+        commands: command_registry as Arc<dyn weft_commands::CommandRegistry + Send + Sync>,
+        memory: memory_service
+            .map(|m| m as Arc<dyn weft_memory::MemoryService + Send + Sync>),
+        hooks: hook_registry as Arc<dyn weft_hooks::HookRunner + Send + Sync>,
+        reactor_handle: std::sync::OnceLock::new(),
+        request_end_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.request_end_concurrency,
+        )),
+    });
+
+    // ── Build ActivityRegistry ─────────────────────────────────────────────
+    //
+    // Register all built-in activities. Hook activities are registered for each
+    // lifecycle point. PreRoute/PostRoute hooks are handled inside RouteActivity
+    // and are not registered as separate activities.
+
+    let mut activity_registry = ActivityRegistry::new();
+    activity_registry
+        .register(Arc::new(ValidateActivity))
+        .unwrap_or_else(|e| {
+            eprintln!("error: failed to register ValidateActivity: {e}");
+            std::process::exit(1);
+        });
+    activity_registry
+        .register(Arc::new(RouteActivity))
+        .unwrap_or_else(|e| {
+            eprintln!("error: failed to register RouteActivity: {e}");
+            std::process::exit(1);
+        });
+    activity_registry
+        .register(Arc::new(AssemblePromptActivity))
+        .unwrap_or_else(|e| {
+            eprintln!("error: failed to register AssemblePromptActivity: {e}");
+            std::process::exit(1);
+        });
+    activity_registry
+        .register(Arc::new(GenerateActivity))
+        .unwrap_or_else(|e| {
+            eprintln!("error: failed to register GenerateActivity: {e}");
+            std::process::exit(1);
+        });
+    activity_registry
+        .register(Arc::new(ExecuteCommandActivity))
+        .unwrap_or_else(|e| {
+            eprintln!("error: failed to register ExecuteCommandActivity: {e}");
+            std::process::exit(1);
+        });
+    activity_registry
+        .register(Arc::new(AssembleResponseActivity))
+        .unwrap_or_else(|e| {
+            eprintln!("error: failed to register AssembleResponseActivity: {e}");
+            std::process::exit(1);
+        });
+    // Hook activities — one per lifecycle point.
+    for event in [
+        HookEvent::RequestStart,
+        HookEvent::RequestEnd,
+        HookEvent::PreResponse,
+        HookEvent::PreToolUse,
+        HookEvent::PostToolUse,
+    ] {
+        activity_registry
+            .register(Arc::new(HookActivity::new(event)))
+            .unwrap_or_else(|e| {
+                eprintln!("error: failed to register HookActivity for {event:?}: {e}");
+                std::process::exit(1);
+            });
+    }
+
+    info!("activity registry initialized");
+
+    // ── Build ReactorConfig ────────────────────────────────────────────────
+    //
+    // Always include all loop hook activities in the pipeline config. HookActivity
+    // for events with no registered hooks calls HookRunner::run_chain which returns
+    // Allowed immediately — the overhead is negligible.
+
+    let reactor_config = ReactorConfig {
+        pipelines: vec![PipelineConfig {
+            name: "default".to_string(),
+            pre_loop: vec![
+                ActivityRef::Name("validate".to_string()),
+                ActivityRef::Name("hook_request_start".to_string()),
+                ActivityRef::Name("route".to_string()),
+                ActivityRef::Name("assemble_prompt".to_string()),
+            ],
+            post_loop: vec![
+                ActivityRef::Name("assemble_response".to_string()),
+                ActivityRef::Name("hook_request_end".to_string()),
+            ],
+            generate: ActivityRef::WithConfig {
+                name: "generate".to_string(),
+                config: serde_json::Value::Null,
+                retry: Some(RetryPolicy::default()),
+                timeout_secs: Some(config.gateway.request_timeout_secs),
+                heartbeat_interval_secs: Some(15),
+            },
+            execute_command: ActivityRef::Name("execute_command".to_string()),
+            loop_hooks: LoopHooks {
+                pre_generate: vec![],
+                pre_response: vec![ActivityRef::Name("hook_pre_response".to_string())],
+                pre_tool_use: vec![ActivityRef::Name("hook_pre_tool_use".to_string())],
+                post_tool_use: vec![ActivityRef::Name("hook_post_tool_use".to_string())],
+            },
+        }],
+        budget: BudgetConfig {
+            max_generation_calls: 20,
+            max_iterations: config.gateway.max_command_iterations as u32,
+            max_depth: 5,
+            timeout_secs: config.gateway.request_timeout_secs,
+            generation_timeout_secs: config.gateway.request_timeout_secs,
+            command_timeout_secs: 10,
+        },
+    };
+
+    // ── Build Reactor ──────────────────────────────────────────────────────
+    //
+    // Constructs the Reactor with Services, EventLog, ActivityRegistry, and config.
+    // Resolves all activity name references to Arc<dyn Activity> at startup.
+
+    let reactor = Arc::new(
+        Reactor::new(
+            Arc::clone(&services),
+            event_log,
+            Arc::new(activity_registry),
+            &reactor_config,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("error: failed to build reactor: {e}");
+            std::process::exit(1);
+        }),
     );
+
+    info!("reactor initialized");
+
+    // ── Wire ReactorHandle into Services ──────────────────────────────────
+    //
+    // Breaking the Services <-> Reactor circular dependency: Services was built
+    // with reactor_handle empty (OnceLock starts unset). Now that we have the
+    // Arc<Reactor>, we create a ReactorHandle and set it.
+
+    let reactor_handle = Arc::new(ReactorHandle::new(Arc::clone(&reactor)));
+    services
+        .reactor_handle
+        .set(reactor_handle)
+        .expect("reactor_handle OnceLock must be unset at this point");
 
     // ── Wire WeftService (shared between gRPC and HTTP) ────────────────────
     //
-    // WeftService is the single code path to the engine. Both the tonic gRPC
+    // WeftService is the single code path to the reactor. Both the tonic gRPC
     // server and the axum HTTP router hold an Arc<WeftService> and call
-    // handle_weft_request() — no separate engine references in the HTTP handler.
+    // handle_weft_request() — no separate reactor references in the HTTP handler.
 
-    let weft_service = Arc::new(WeftService::new(engine));
+    let weft_service = Arc::new(WeftService::new(reactor, Arc::clone(&config)));
 
     // ── Start the combined gRPC + HTTP server ──────────────────────────────
 

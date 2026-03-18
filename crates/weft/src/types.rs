@@ -1,17 +1,11 @@
-//! Concrete engine and service type aliases for the weft binary.
+//! Concrete service type definitions for the weft binary.
 //!
-//! Defines the concrete generic instantiation of `GatewayEngine` and `WeftService`
-//! used by the binary. Shared between `grpc.rs`, `server.rs`, and `main.rs` so each
-//! module uses the same concrete type without repeating the type params.
+//! Defines the `BinaryCommandRegistry` used by the binary. Shared between
+//! `grpc.rs`, `server.rs`, and `main.rs`.
 
 use async_trait::async_trait;
 use weft_commands::ToolRegistryCommandAdapter;
 use weft_core::{CommandDescription, CommandInvocation, CommandResult, CommandStub};
-use weft_engine::GatewayEngine;
-use weft_hooks::HookRegistry;
-use weft_llm::ProviderRegistry;
-use weft_memory::DefaultMemoryService;
-use weft_router::ModernBertRouter;
 
 /// Unified command registry for the weft binary.
 ///
@@ -55,18 +49,3 @@ impl weft_commands::CommandRegistry for BinaryCommandRegistry {
         }
     }
 }
-
-/// Concrete engine type used by the weft binary.
-///
-/// - `H = HookRegistry`: HTTP hook runner
-/// - `R = ModernBertRouter`: ModernBERT bi-encoder semantic classifier
-/// - `M = DefaultMemoryService`: memory service backed by MemoryStoreMux
-/// - `P = ProviderRegistry`: provider dispatch table
-/// - `C = BinaryCommandRegistry`: tool/command dispatch (live gRPC or no-op)
-pub type WeftEngine = GatewayEngine<
-    HookRegistry,
-    ModernBertRouter,
-    DefaultMemoryService,
-    ProviderRegistry,
-    BinaryCommandRegistry,
->;
