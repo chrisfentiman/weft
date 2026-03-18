@@ -22,7 +22,7 @@ pub mod execution;
 pub mod signal;
 
 // Re-exports for convenience
-pub use budget::{Budget, BudgetCheck, BudgetExhaustedReason, BudgetWarningInfo};
+pub use budget::{Budget, BudgetCheck, BudgetExhaustedReason, BudgetWarningInfo, RetryPolicy};
 pub use error::ReactorError;
 pub use event::{BudgetSnapshot, EVENT_SCHEMA_VERSION, Event, GeneratedEvent, PipelineEvent};
 pub use event_log::{EventLog, EventLogError};

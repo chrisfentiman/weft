@@ -614,4 +614,98 @@ mod tests {
         assert_eq!(back.remaining_generation_calls, 8);
         assert_eq!(back.current_depth, 1);
     }
+
+    #[test]
+    fn test_pipeline_event_activity_retried_round_trip() {
+        let event = PipelineEvent::ActivityRetried {
+            name: "generate".to_string(),
+            attempt: 2,
+            backoff_ms: 2000,
+            error: "connection reset".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "activity.retried");
+        match back {
+            PipelineEvent::ActivityRetried {
+                name,
+                attempt,
+                backoff_ms,
+                error,
+            } => {
+                assert_eq!(name, "generate");
+                assert_eq!(attempt, 2);
+                assert_eq!(backoff_ms, 2000);
+                assert_eq!(error, "connection reset");
+            }
+            other => panic!("expected ActivityRetried, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pipeline_event_generation_timed_out_round_trip() {
+        let event = PipelineEvent::GenerationTimedOut {
+            model: "claude-3-opus".to_string(),
+            timeout_secs: 60,
+            chunks_received: 12,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "generation.timed_out");
+        match back {
+            PipelineEvent::GenerationTimedOut {
+                model,
+                timeout_secs,
+                chunks_received,
+            } => {
+                assert_eq!(model, "claude-3-opus");
+                assert_eq!(timeout_secs, 60);
+                assert_eq!(chunks_received, 12);
+            }
+            other => panic!("expected GenerationTimedOut, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pipeline_event_heartbeat_round_trip() {
+        let event = PipelineEvent::Heartbeat {
+            activity_name: "long-running-generate".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "heartbeat");
+        match back {
+            PipelineEvent::Heartbeat { activity_name } => {
+                assert_eq!(activity_name, "long-running-generate");
+            }
+            other => panic!("expected Heartbeat, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_event_struct_serde_round_trip_preserves_schema_version() {
+        let exec_id = ExecutionId::new();
+        let event = Event {
+            execution_id: exec_id.clone(),
+            sequence: 7,
+            event_type: "activity.retried".to_string(),
+            payload: serde_json::json!({
+                "name": "generate",
+                "attempt": 1,
+                "backoff_ms": 1000,
+                "error": "timeout"
+            }),
+            timestamp: Utc::now(),
+            schema_version: EVENT_SCHEMA_VERSION,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        // schema_version must appear in the serialized output
+        assert!(json.contains("schema_version"));
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.schema_version, EVENT_SCHEMA_VERSION);
+        assert_eq!(back.schema_version, 1);
+        assert_eq!(back.sequence, 7);
+        assert_eq!(back.event_type, "activity.retried");
+        assert_eq!(back.execution_id, exec_id);
+    }
 }

@@ -6,6 +6,34 @@ use serde::{Deserialize, Serialize};
 use crate::event::BudgetSnapshot;
 use crate::signal::BudgetUpdate;
 
+/// Retry configuration for activities that encounter transient failures.
+///
+/// Applied by the Reactor when an activity emits `ActivityFailed { retryable: true }`.
+/// The Reactor computes the next backoff using exponential back-off:
+/// `min(initial_backoff_ms * backoff_multiplier^attempt, max_backoff_ms)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    /// Maximum number of retry attempts. 0 means no retries.
+    pub max_retries: u32,
+    /// Initial back-off duration in milliseconds before the first retry.
+    pub initial_backoff_ms: u64,
+    /// Upper bound on back-off duration in milliseconds.
+    pub max_backoff_ms: u64,
+    /// Multiplier applied to the back-off on each successive retry.
+    pub backoff_multiplier: f64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            initial_backoff_ms: 1000,
+            max_backoff_ms: 30000,
+            backoff_multiplier: 2.0,
+        }
+    }
+}
+
 /// Resource limits for an execution.
 ///
 /// Budget is checked by the Reactor after processing each event.
@@ -454,5 +482,41 @@ mod tests {
         let back: Budget = serde_json::from_str(&json).unwrap();
         assert_eq!(back.max_generation_calls, 10);
         assert_eq!(back.max_depth, 3);
+    }
+
+    #[test]
+    fn test_retry_policy_default_values() {
+        let policy = RetryPolicy::default();
+        assert_eq!(policy.max_retries, 3);
+        assert_eq!(policy.initial_backoff_ms, 1000);
+        assert_eq!(policy.max_backoff_ms, 30000);
+        assert!((policy.backoff_multiplier - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_retry_policy_serde_round_trip() {
+        let policy = RetryPolicy::default();
+        let json = serde_json::to_string(&policy).unwrap();
+        let back: RetryPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.max_retries, policy.max_retries);
+        assert_eq!(back.initial_backoff_ms, policy.initial_backoff_ms);
+        assert_eq!(back.max_backoff_ms, policy.max_backoff_ms);
+        assert!((back.backoff_multiplier - policy.backoff_multiplier).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_retry_policy_custom_values_round_trip() {
+        let policy = RetryPolicy {
+            max_retries: 5,
+            initial_backoff_ms: 500,
+            max_backoff_ms: 60000,
+            backoff_multiplier: 1.5,
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        let back: RetryPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.max_retries, 5);
+        assert_eq!(back.initial_backoff_ms, 500);
+        assert_eq!(back.max_backoff_ms, 60000);
+        assert!((back.backoff_multiplier - 1.5).abs() < f64::EPSILON);
     }
 }

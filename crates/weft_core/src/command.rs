@@ -169,4 +169,64 @@ mod tests {
         assert!(!result.success);
         assert_eq!(result.error.as_deref(), Some("Connection timeout"));
     }
+
+    #[test]
+    fn test_command_result_serde_round_trip_success() {
+        let result = CommandResult {
+            command_name: "web_search".to_string(),
+            success: true,
+            output: "Found 10 results".to_string(),
+            error: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: CommandResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.command_name, result.command_name);
+        assert_eq!(back.success, result.success);
+        assert_eq!(back.output, result.output);
+        assert_eq!(back.error, result.error);
+    }
+
+    #[test]
+    fn test_command_result_serde_round_trip_failure() {
+        let result = CommandResult {
+            command_name: "web_search".to_string(),
+            success: false,
+            output: String::new(),
+            error: Some("rate limit exceeded".to_string()),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: CommandResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.command_name, result.command_name);
+        assert!(!back.success);
+        assert_eq!(back.error.as_deref(), Some("rate limit exceeded"));
+    }
+
+    #[test]
+    fn test_command_invocation_serde_round_trip_execute() {
+        let inv = CommandInvocation {
+            name: "web_search".to_string(),
+            action: CommandAction::Execute,
+            arguments: serde_json::json!({"query": "Rust async", "limit": 10}),
+        };
+        let json = serde_json::to_string(&inv).unwrap();
+        let back: CommandInvocation = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, inv.name);
+        assert_eq!(back.action, CommandAction::Execute);
+        assert_eq!(back.arguments["query"], "Rust async");
+        assert_eq!(back.arguments["limit"], 10);
+    }
+
+    #[test]
+    fn test_command_invocation_serde_round_trip_describe() {
+        let inv = CommandInvocation {
+            name: "recall".to_string(),
+            action: CommandAction::Describe,
+            arguments: serde_json::Value::Null,
+        };
+        let json = serde_json::to_string(&inv).unwrap();
+        let back: CommandInvocation = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "recall");
+        assert_eq!(back.action, CommandAction::Describe);
+        assert!(back.arguments.is_null());
+    }
 }
