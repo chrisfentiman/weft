@@ -7,8 +7,27 @@
 //! Constructed at startup and shared via `Arc<Services>` across all
 //! activity invocations. The `reactor_handle` field is populated after
 //! Reactor construction to break the circular dependency.
+//!
+//! # Two-phase construction (OnceLock pattern)
+//!
+//! `Services` and `Reactor` have a circular dependency: Reactor needs
+//! Services (for activities), and Services needs Reactor (for spawn_child).
+//! The OnceLock breaks this:
+//!
+//! 1. Build `Services` with `reactor_handle` empty (OnceLock starts unset).
+//! 2. Build `Reactor` with `Arc<Services>`.
+//! 3. Wrap reactor in `Arc`. Create `ReactorHandle` from it.
+//! 4. Set `services.reactor_handle` via `OnceLock::set()`.
+//!
+//! After step 4, any activity that calls `services.reactor_handle.get()`
+//! will receive the handle. Since activities only run after execute() is
+//! called (which is after construction completes), the handle is always
+//! set by the time activities need it.
 
 use std::sync::Arc;
+
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 /// Shared infrastructure for pipeline activities.
 ///
@@ -77,6 +96,103 @@ impl ReactorHandle {
     /// Construct a ReactorHandle wrapping the given Reactor.
     pub fn new(reactor: std::sync::Arc<crate::reactor::Reactor>) -> Self {
         Self { reactor }
+    }
+
+    /// Spawn a child execution.
+    ///
+    /// The child runs the default pipeline with its own `ExecutionId`,
+    /// inheriting the parent's remaining budget (depth incremented by 1).
+    /// When the child completes, a `ChildCompleted` event is pushed onto
+    /// the `parent_event_tx` channel so the parent's dispatch loop receives it.
+    ///
+    /// This method blocks the calling task until the child execution
+    /// completes. It does NOT block the parent Reactor's dispatch loop
+    /// because the caller (a generate activity) runs on a separate
+    /// `tokio::spawn` task.
+    ///
+    /// # Cancellation hierarchy
+    ///
+    /// When `parent_cancel` is `Some`, the child's `CancellationToken` is
+    /// created as a child of it via `child_token()`. Cancelling the parent
+    /// token therefore propagates to the child. Pass `None` for no
+    /// cancellation link.
+    ///
+    /// # Budget inheritance
+    ///
+    /// The child receives a budget derived from `parent_budget` via
+    /// `child_budget()`. On success, call `parent_budget.deduct_child_usage`
+    /// with the returned `Budget` to reduce the parent's remaining resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReactorError::BudgetExhausted` if `parent_budget.child_budget()`
+    /// fails (depth limit reached). Propagates any other error from the child
+    /// execution.
+    // Spec-mandated signature requires 9 positional parameters; grouping into
+    // a builder would change the public API contract. Allow lint locally.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_child(
+        &self,
+        request: weft_core::WeftRequest,
+        tenant_id: crate::execution::TenantId,
+        request_id: crate::execution::RequestId,
+        parent_id: crate::execution::ExecutionId,
+        parent_budget: crate::budget::Budget,
+        parent_event_tx: mpsc::Sender<crate::event::PipelineEvent>,
+        parent_cancel: Option<&CancellationToken>,
+        pipeline_name: &str,
+    ) -> Result<crate::budget::Budget, crate::error::ReactorError> {
+        // Pre-validate depth before spawning. This surfaces the Depth error
+        // synchronously (before we record ChildSpawned), matching the spec's
+        // contract that spawn_child returns Err(BudgetExhausted) at depth limit.
+        //
+        // reactor.execute() also calls child_budget() internally when parent_budget
+        // is Some, so we do NOT pass the pre-validated child budget here — we pass
+        // the parent_budget directly and let execute() perform the depth increment.
+        // The pre-call here only serves to return early with a clear error.
+        let _ = parent_budget
+            .child_budget()
+            .map_err(|r| crate::error::ReactorError::BudgetExhausted(r.to_string()))?;
+
+        // Record child spawn event on the parent's channel.
+        // This is fire-and-forget: if the parent channel is full, we lose the log event
+        // but still proceed with the child execution.
+        let _ = parent_event_tx
+            .send(crate::event::PipelineEvent::ChildSpawned {
+                child_id: "pending".to_string(),
+                pipeline_name: pipeline_name.to_string(),
+                reason: "spawn_child".to_string(),
+            })
+            .await;
+
+        // Pass the parent's budget directly. reactor.execute() calls child_budget()
+        // internally when parent_budget is Some, incrementing depth by 1.
+        let (result, _child_signal_tx) = self
+            .reactor
+            .execute(
+                request,
+                tenant_id,
+                request_id,
+                Some(parent_id.clone()),
+                Some(parent_budget),
+                None, // No client streaming for child executions
+                parent_cancel,
+            )
+            .await?;
+
+        // Push ChildCompleted onto parent's channel.
+        // Ignore send errors: if the parent channel is closed, we've already
+        // completed the child and can't do anything about the notification.
+        let _ = parent_event_tx
+            .send(crate::event::PipelineEvent::ChildCompleted {
+                child_id: result.execution_id.clone(),
+                status: "completed".to_string(),
+                result_summary: serde_json::to_value(&result.budget_used).unwrap_or_default(),
+            })
+            .await;
+
+        // Return child's final budget so caller can deduct from parent.
+        Ok(result.final_budget)
     }
 }
 

@@ -216,8 +216,7 @@ mod tests {
     use super::*;
     use crate::test_support::NullEventLog;
     use crate::test_support::{
-        collect_events, make_test_input, make_test_services,
-        make_test_services_with_failed_command,
+        collect_events, make_test_input, make_test_services, make_test_services_with_failed_command,
     };
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
@@ -445,9 +444,9 @@ mod tests {
         let events = collect_events(&mut rx);
 
         // CommandFailed must be pushed (observability event for failed results).
-        let cmd_failed = events.iter().find(|e| {
-            matches!(e, PipelineEvent::CommandFailed { name, .. } if name == "failing_cmd")
-        });
+        let cmd_failed = events.iter().find(
+            |e| matches!(e, PipelineEvent::CommandFailed { name, .. } if name == "failing_cmd"),
+        );
         assert!(
             cmd_failed.is_some(),
             "expected CommandFailed when command returns success=false"

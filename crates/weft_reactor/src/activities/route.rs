@@ -262,8 +262,7 @@ mod tests {
     use super::*;
     use crate::test_support::NullEventLog;
     use crate::test_support::{
-        collect_events, make_test_input, make_test_services,
-        make_test_services_with_blocking_hook,
+        collect_events, make_test_input, make_test_services, make_test_services_with_blocking_hook,
     };
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;

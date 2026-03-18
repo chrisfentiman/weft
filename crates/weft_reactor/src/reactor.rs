@@ -265,6 +265,13 @@ impl Reactor {
     ///
     /// Returns the execution result and the event channel sender so that
     /// external systems can inject signals after execute returns.
+    ///
+    /// `parent_cancel`: When `Some`, the execution's `CancellationToken` is
+    /// created as a child of the provided token. Cancelling the parent token
+    /// therefore also cancels this execution. Pass `None` for root executions.
+    // Spec-mandated signature requires 8 positional parameters; grouping into
+    // a builder would change the public API contract. Allow lint locally.
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         &self,
         request: weft_core::WeftRequest,
@@ -273,10 +280,16 @@ impl Reactor {
         parent_id: Option<ExecutionId>,
         parent_budget: Option<Budget>,
         client_tx: Option<mpsc::Sender<PipelineEvent>>,
+        parent_cancel: Option<&CancellationToken>,
     ) -> Result<(ExecutionResult, mpsc::Sender<PipelineEvent>), ReactorError> {
         // ── Setup ─────────────────────────────────────────────────────────────
         let execution_id = ExecutionId::new();
-        let cancel = CancellationToken::new();
+        // When a parent cancel token is provided (child execution), create a
+        // child token so that cancelling the parent also cancels this execution.
+        let cancel = match parent_cancel {
+            Some(parent) => parent.child_token(),
+            None => CancellationToken::new(),
+        };
 
         let (event_tx, mut event_rx) = mpsc::channel::<PipelineEvent>(CHANNEL_BUFFER);
 
