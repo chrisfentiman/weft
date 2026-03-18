@@ -215,7 +215,10 @@ fn extract_invocation(input: &ActivityInput) -> Result<CommandInvocation, String
 mod tests {
     use super::*;
     use crate::test_support::NullEventLog;
-    use crate::test_support::{collect_events, make_test_input, make_test_services};
+    use crate::test_support::{
+        collect_events, make_test_input, make_test_services,
+        make_test_services_with_failed_command,
+    };
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
     use weft_core::{CommandAction, CommandInvocation};
@@ -416,5 +419,77 @@ mod tests {
             reason: "reason".to_string(),
         };
         assert!(!command_error_retryable(&err));
+    }
+
+    // ── Command failure result (success=false) ───────────────────────────
+
+    #[tokio::test]
+    async fn execute_command_failed_result_pushes_command_completed_with_failure() {
+        // When the command registry returns CommandResult { success: false },
+        // the activity must push CommandFailed (for observability) and then
+        // CommandCompleted (with the failure result). ActivityCompleted must
+        // still be pushed — a failed command result is not an infrastructure error.
+        let services =
+            make_test_services_with_failed_command("failing_cmd", "command error detail");
+        let input = make_input_with_invocation("failing_cmd");
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let event_log = NullEventLog;
+        let exec_id = crate::execution::ExecutionId::new();
+
+        let activity = ExecuteCommandActivity::new();
+        activity
+            .execute(&exec_id, input, &services, &event_log, tx, cancel)
+            .await;
+
+        let events = collect_events(&mut rx);
+
+        // CommandFailed must be pushed (observability event for failed results).
+        let cmd_failed = events.iter().find(|e| {
+            matches!(e, PipelineEvent::CommandFailed { name, .. } if name == "failing_cmd")
+        });
+        assert!(
+            cmd_failed.is_some(),
+            "expected CommandFailed when command returns success=false"
+        );
+
+        // CommandCompleted must be pushed with success=false.
+        let cmd_completed = events
+            .iter()
+            .find(|e| {
+                matches!(e, PipelineEvent::CommandCompleted { name, .. } if name == "failing_cmd")
+            })
+            .expect("expected CommandCompleted after failed command result");
+        match cmd_completed {
+            PipelineEvent::CommandCompleted { result, .. } => {
+                assert!(
+                    !result.success,
+                    "CommandCompleted result must have success=false"
+                );
+                assert_eq!(
+                    result.error.as_deref(),
+                    Some("command error detail"),
+                    "CommandCompleted result must carry the error message"
+                );
+            }
+            _ => panic!("expected CommandCompleted"),
+        }
+
+        // ActivityCompleted must still be pushed — failed command is not an
+        // infrastructure error and does not abort the activity.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::ActivityCompleted { name, .. } if name == "execute_command")),
+            "expected ActivityCompleted even when command returns success=false"
+        );
+
+        // ActivityFailed must NOT be pushed.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
+            "ActivityFailed must not be pushed for a command-level failure result"
+        );
     }
 }

@@ -261,7 +261,10 @@ impl Activity for RouteActivity {
 mod tests {
     use super::*;
     use crate::test_support::NullEventLog;
-    use crate::test_support::{collect_events, make_test_input, make_test_services};
+    use crate::test_support::{
+        collect_events, make_test_input, make_test_services,
+        make_test_services_with_blocking_hook,
+    };
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
@@ -374,5 +377,50 @@ mod tests {
         if let Some(PipelineEvent::ActivityFailed { retryable, .. }) = failed {
             assert!(!retryable, "route failures should not be retryable");
         }
+    }
+
+    #[tokio::test]
+    async fn route_pre_route_hook_blocking_pushes_hook_blocked() {
+        // When the PreRoute hook blocks, the activity must push HookBlocked
+        // before ActivityFailed, and must not push RouteCompleted.
+        let input = make_test_input();
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let services =
+            make_test_services_with_blocking_hook(HookEvent::PreRoute, "blocked by policy");
+        let event_log = NullEventLog;
+        let exec_id = crate::execution::ExecutionId::new();
+
+        let activity = RouteActivity::new();
+        activity
+            .execute(&exec_id, input, &services, &event_log, tx, cancel)
+            .await;
+
+        let events = collect_events(&mut rx);
+
+        // HookBlocked must be present.
+        let hook_blocked = events.iter().find(|e| {
+            matches!(e, PipelineEvent::HookBlocked { hook_event, .. } if hook_event == "pre_route")
+        });
+        assert!(
+            hook_blocked.is_some(),
+            "expected HookBlocked for pre_route when hook blocks"
+        );
+
+        // ActivityFailed must be present (hook block is treated as failure).
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
+            "expected ActivityFailed after hook block"
+        );
+
+        // RouteCompleted must NOT be present — routing was aborted.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::RouteCompleted { .. })),
+            "RouteCompleted must not be pushed when pre_route hook blocks"
+        );
     }
 }

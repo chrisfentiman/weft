@@ -299,10 +299,13 @@ impl SemanticRouter for StubRouter {
 // ── Stub CommandRegistry ──────────────────────────────────────────────────────
 
 /// A stub command registry. By default, all commands succeed.
-/// Can be configured to fail with a specific error for a given command name.
+/// Can be configured to fail with a specific error for a given command name,
+/// or to return a `CommandResult { success: false }` for a given command name.
 struct StubCommandRegistry {
     /// If set, `execute_command` for the matching name returns this error.
     failing_command: Option<(String, weft_commands::CommandError)>,
+    /// If set, `execute_command` for the matching name returns a failed result (success=false).
+    failed_result_command: Option<(String, String)>,
 }
 
 #[async_trait::async_trait]
@@ -330,12 +333,24 @@ impl weft_commands::CommandRegistry for StubCommandRegistry {
         &self,
         invocation: &CommandInvocation,
     ) -> Result<CommandResult, weft_commands::CommandError> {
-        // Check if this command is configured to fail.
+        // Check if this command is configured to fail with an infrastructure error.
         if let Some((ref failing_name, ref err)) = self.failing_command {
             if invocation.name == *failing_name {
                 // We need to return the error. Since CommandError doesn't implement Clone,
                 // we match on the stored error to construct a matching one.
                 return Err(reconstruct_command_error(err));
+            }
+        }
+
+        // Check if this command is configured to return a failed result (success=false).
+        if let Some((ref failing_name, ref error_msg)) = self.failed_result_command {
+            if invocation.name == *failing_name {
+                return Ok(CommandResult {
+                    command_name: invocation.name.clone(),
+                    success: false,
+                    output: String::new(),
+                    error: Some(error_msg.clone()),
+                });
             }
         }
 
@@ -504,12 +519,25 @@ fn build_services(
     hooks: Arc<dyn HookRunner + Send + Sync>,
     failing_command: Option<(String, weft_commands::CommandError)>,
 ) -> Services {
+    build_services_full(provider, hooks, failing_command, None)
+}
+
+/// Build `Services` with full control over stub command registry configuration.
+fn build_services_full(
+    provider: Arc<dyn Provider>,
+    hooks: Arc<dyn HookRunner + Send + Sync>,
+    failing_command: Option<(String, weft_commands::CommandError)>,
+    failed_result_command: Option<(String, String)>,
+) -> Services {
     let config = Arc::new(make_test_config());
     let providers: Arc<dyn weft_llm::ProviderService + Send + Sync> =
         Arc::new(StubProviderServiceV2::new(provider));
     let router: Arc<dyn weft_router::SemanticRouter + Send + Sync> = Arc::new(StubRouter);
     let commands: Arc<dyn weft_commands::CommandRegistry + Send + Sync> =
-        Arc::new(StubCommandRegistry { failing_command });
+        Arc::new(StubCommandRegistry {
+            failing_command,
+            failed_result_command,
+        });
 
     Services {
         config,
@@ -573,6 +601,24 @@ pub fn make_test_services_with_command_error(
     });
     let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(weft_hooks::NullHookRunner);
     build_services(provider, hooks, Some((command_name.to_string(), err)))
+}
+
+/// Build test `Services` where executing a specific command returns a failed `CommandResult`.
+///
+/// The named command returns `CommandResult { success: false, error: Some(error_msg) }`.
+/// All other commands return a successful result. Use this when testing the
+/// `success: false` path in `ExecuteCommandActivity`.
+pub fn make_test_services_with_failed_command(command_name: &str, error_msg: &str) -> Services {
+    let provider: Arc<dyn Provider> = Arc::new(StubProvider {
+        response_text: "stub response".to_string(),
+    });
+    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(weft_hooks::NullHookRunner);
+    build_services_full(
+        provider,
+        hooks,
+        None,
+        Some((command_name.to_string(), error_msg.to_string())),
+    )
 }
 
 /// Build test `Services` with a hook runner that blocks the specified event.
@@ -721,6 +767,7 @@ mod tests {
     async fn stub_command_registry_lists_commands() {
         let registry = StubCommandRegistry {
             failing_command: None,
+            failed_result_command: None,
         };
         let cmds = registry.list_commands().await.unwrap();
         assert!(!cmds.is_empty());
@@ -730,6 +777,7 @@ mod tests {
     async fn stub_command_registry_executes_successfully() {
         let registry = StubCommandRegistry {
             failing_command: None,
+            failed_result_command: None,
         };
         let invocation = CommandInvocation {
             name: "test_command".to_string(),
@@ -747,6 +795,7 @@ mod tests {
                 "failing_cmd".to_string(),
                 weft_commands::CommandError::RegistryUnavailable("down".to_string()),
             )),
+            failed_result_command: None,
         };
         let invocation = CommandInvocation {
             name: "failing_cmd".to_string(),
