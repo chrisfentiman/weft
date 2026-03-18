@@ -96,6 +96,8 @@ pub struct ActivityInput {
     /// event with this key before executing the activity.
     /// See Section 3.10 of the spec for idempotency semantics.
     pub idempotency_key: Option<String>,
+    /// Accumulated token usage across all generation calls so far.
+    pub accumulated_usage: weft_core::WeftUsage,
 }
 
 /// Snapshot of routing decisions. Populated by RouteActivity.
@@ -581,6 +583,7 @@ api_key = "sk-test"
             accumulated_text: String::new(),
             available_commands: vec![],
             idempotency_key,
+            accumulated_usage: weft_core::WeftUsage::default(),
         }
     }
 }

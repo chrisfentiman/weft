@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-use weft_core::{ContentPart, Role, Source, WeftMessage, WeftResponse, WeftTiming, WeftUsage};
+use weft_core::{ContentPart, Role, Source, WeftMessage, WeftResponse, WeftTiming};
 
 use crate::activity::{Activity, ActivityInput};
 use crate::event::PipelineEvent;
@@ -101,7 +101,7 @@ impl Activity for AssembleResponseActivity {
             id: execution_id.to_string(),
             model: model.clone(),
             messages: vec![response_message],
-            usage: WeftUsage::default(),
+            usage: input.accumulated_usage.clone(),
             timing: WeftTiming::default(),
         };
 

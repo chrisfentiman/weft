@@ -125,6 +125,8 @@ struct ExecutionState {
     last_activity_event: HashMap<String, Instant>,
     /// Current retry attempt for the generate activity (0 = initial attempt).
     generate_retry_attempt: u32,
+    /// Accumulated token usage across all generation calls.
+    accumulated_usage: weft_core::WeftUsage,
 }
 
 impl ExecutionState {
@@ -142,6 +144,7 @@ impl ExecutionState {
             iteration: 0,
             last_activity_event: HashMap::new(),
             generate_retry_attempt: 0,
+            accumulated_usage: weft_core::WeftUsage::default(),
         }
     }
 }
@@ -831,6 +834,22 @@ impl Reactor {
                                         failed_error = error.clone();
                                         break 'generate;
                                     }
+                                    PipelineEvent::GenerationCompleted {
+                                        input_tokens,
+                                        output_tokens,
+                                        ..
+                                    } => {
+                                        // Accumulate token usage from each generation call.
+                                        if let Some(n) = input_tokens {
+                                            state.accumulated_usage.prompt_tokens += n;
+                                            state.accumulated_usage.total_tokens += n;
+                                        }
+                                        if let Some(n) = output_tokens {
+                                            state.accumulated_usage.completion_tokens += n;
+                                            state.accumulated_usage.total_tokens += n;
+                                        }
+                                        state.accumulated_usage.llm_calls += 1;
+                                    }
                                     _ => {
                                         // Recorded already, no state change needed.
                                     }
@@ -1155,6 +1174,7 @@ impl Reactor {
             accumulated_text: state.accumulated_text.clone(),
             available_commands: state.available_commands.clone(),
             idempotency_key,
+            accumulated_usage: state.accumulated_usage.clone(),
         }
     }
 

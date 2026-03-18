@@ -3,7 +3,6 @@
 //! Loads configuration, constructs concrete implementations of all components,
 //! wires them into the Reactor, and starts the axum HTTP server.
 
-mod engine;
 mod event_log;
 mod grpc;
 mod server;
@@ -28,7 +27,9 @@ use weft_reactor::{
     config::{ActivityRef, BudgetConfig, LoopHooks, PipelineConfig, RetryPolicy},
     services::{ReactorHandle, Services},
 };
-use weft_router::{ModernBertRouter, RoutingCandidate, RoutingDomainKind, tool_necessity_candidates};
+use weft_router::{
+    ModernBertRouter, RoutingCandidate, RoutingDomainKind, tool_necessity_candidates,
+};
 use weft_tools::GrpcToolRegistryClient;
 
 use crate::grpc::WeftService;
@@ -483,8 +484,7 @@ async fn main() {
         providers: provider_registry as Arc<dyn weft_llm::ProviderService + Send + Sync>,
         router: router as Arc<dyn weft_router::SemanticRouter + Send + Sync>,
         commands: command_registry as Arc<dyn weft_commands::CommandRegistry + Send + Sync>,
-        memory: memory_service
-            .map(|m| m as Arc<dyn weft_memory::MemoryService + Send + Sync>),
+        memory: memory_service.map(|m| m as Arc<dyn weft_memory::MemoryService + Send + Sync>),
         hooks: hook_registry as Arc<dyn weft_hooks::HookRunner + Send + Sync>,
         reactor_handle: std::sync::OnceLock::new(),
         request_end_semaphore: Arc::new(tokio::sync::Semaphore::new(

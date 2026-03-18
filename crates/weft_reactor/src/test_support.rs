@@ -827,6 +827,7 @@ pub fn make_test_input() -> ActivityInput {
         accumulated_text: String::new(),
         available_commands: vec![],
         idempotency_key: None,
+        accumulated_usage: weft_core::WeftUsage::default(),
     }
 }
 

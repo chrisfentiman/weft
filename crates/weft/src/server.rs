@@ -123,8 +123,11 @@ fn openai_to_weft(req: OpenAiChatRequest) -> WeftRequest {
 
 /// Translate a domain `WeftResponse` into an OpenAI-format response.
 ///
-/// Extracts the last assistant text message from the response.
-fn weft_to_openai(resp: weft_core::WeftResponse) -> OpenAiChatResponse {
+/// `request_model` is the model string from the original OpenAI request and is
+/// echoed back verbatim so clients see the model they asked for, not the
+/// internal routing name. The response id is prefixed with `chatcmpl-` to
+/// match the OpenAI wire format.
+fn weft_to_openai(resp: weft_core::WeftResponse, request_model: String) -> OpenAiChatResponse {
     // Extract the last assistant/provider text message.
     let assistant_text = resp
         .messages
@@ -139,11 +142,18 @@ fn weft_to_openai(resp: weft_core::WeftResponse) -> OpenAiChatResponse {
         })
         .unwrap_or_default();
 
+    // Prefix id with "chatcmpl-" to match OpenAI wire format.
+    let id = if resp.id.starts_with("chatcmpl-") {
+        resp.id
+    } else {
+        format!("chatcmpl-{}", resp.id)
+    };
+
     OpenAiChatResponse {
-        id: resp.id,
+        id,
         object: "chat.completion".to_string(),
         created: unix_timestamp(),
-        model: resp.model,
+        model: request_model,
         choices: vec![OpenAiChoice {
             index: 0,
             message: OpenAiMessage {
@@ -285,12 +295,15 @@ async fn chat_completions_handler(
         "handling chat completion request"
     );
 
+    // Capture request model before consuming openai_req (for echo in response).
+    let request_model = openai_req.model.clone();
+
     let weft_req = openai_to_weft(openai_req);
 
     // Call handle_weft_request — the same method the gRPC handler calls.
     // One code path to the engine regardless of entry point.
     match weft_service.handle_weft_request(weft_req).await {
-        Ok(weft_resp) => Ok(Json(weft_to_openai(weft_resp))),
+        Ok(weft_resp) => Ok(Json(weft_to_openai(weft_resp, request_model))),
         Err(e) => Err(ApiError::from_weft_error(e)),
     }
 }
@@ -465,11 +478,11 @@ mod tests {
     use serde_json::{Value, json};
     use std::collections::{HashMap, HashSet};
     use tower::ServiceExt;
-    use weft_commands::{CommandError, CommandRegistry, CommandDescription, CommandInvocation, CommandResult, CommandStub};
+    use weft_commands::{CommandError, CommandRegistry};
     use weft_core::{
-        ClassifierConfig, ContentPart, DomainsConfig, GatewayConfig, HookEvent, ModelEntry,
-        ProviderConfig, Role, RouterConfig, ServerConfig, Source, WeftConfig, WeftMessage,
-        WireFormat,
+        ClassifierConfig, CommandDescription, CommandInvocation, CommandResult, CommandStub,
+        ContentPart, DomainsConfig, GatewayConfig, HookEvent, ModelEntry, ProviderConfig, Role,
+        RouterConfig, ServerConfig, Source, WeftConfig, WeftMessage, WireFormat,
     };
     use weft_llm::{
         Capability, Provider, ProviderError, ProviderRegistry, ProviderRequest, ProviderResponse,
@@ -700,7 +713,9 @@ mod tests {
         registry.register(Arc::new(AssemblePromptActivity)).unwrap();
         registry.register(Arc::new(GenerateActivity)).unwrap();
         registry.register(Arc::new(ExecuteCommandActivity)).unwrap();
-        registry.register(Arc::new(AssembleResponseActivity)).unwrap();
+        registry
+            .register(Arc::new(AssembleResponseActivity))
+            .unwrap();
         registry
             .register(Arc::new(HookActivity::new(HookEvent::RequestStart)))
             .unwrap();
@@ -736,7 +751,14 @@ mod tests {
                 generate: ActivityRef::WithConfig {
                     name: "generate".to_string(),
                     config: serde_json::Value::Null,
-                    retry: Some(RetryPolicy::default()),
+                    // No retries in tests: retries add multi-second backoff delays
+                    // and are tested in weft_reactor unit tests, not here.
+                    retry: Some(RetryPolicy {
+                        max_retries: 0,
+                        initial_backoff_ms: 0,
+                        max_backoff_ms: 0,
+                        backoff_multiplier: 1.0,
+                    }),
                     timeout_secs: Some(config.gateway.request_timeout_secs),
                     heartbeat_interval_secs: Some(15),
                 },
@@ -1117,7 +1139,7 @@ mod tests {
             },
             timing: WeftTiming::default(),
         };
-        let openai_resp = weft_to_openai(resp);
+        let openai_resp = weft_to_openai(resp, "gpt-4".to_string());
         assert_eq!(openai_resp.choices[0].message.content, "Hello!");
         assert_eq!(openai_resp.usage.prompt_tokens, 10);
         assert_eq!(openai_resp.usage.completion_tokens, 5);
@@ -1135,7 +1157,7 @@ mod tests {
             usage: WeftUsage::default(),
             timing: WeftTiming::default(),
         };
-        let openai_resp = weft_to_openai(resp);
+        let openai_resp = weft_to_openai(resp, "auto".to_string());
         // No assistant message → empty content, not a panic
         assert_eq!(openai_resp.choices[0].message.content, "");
     }

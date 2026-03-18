@@ -33,7 +33,7 @@ use weft_core::{
     SamplingOptions, Source, WeftMessage,
 };
 
-use weft_reactor::{ExecutionResult, RequestId, Reactor, TenantId};
+use weft_reactor::{Reactor, RequestId, TenantId};
 
 // ── WeftService ─────────────────────────────────────────────────────────────
 
@@ -361,7 +361,10 @@ fn map_failed_reason(reason: &str) -> WeftError {
 
 /// Extract retry-after milliseconds from a reason string.
 ///
-/// Looks for a numeric value after "retry_after_ms:" or "retry after" in the reason.
+/// Handles two formats:
+/// - `"retry_after_ms: NNN"` — explicit millisecond value
+/// - `"retry after NNNms"` — provider error display format
+///
 /// Returns `None` if no parseable value is found.
 fn extract_retry_after_ms(reason: &str) -> Option<u64> {
     // Try "retry_after_ms: NNN" pattern first.
@@ -371,10 +374,17 @@ fn extract_retry_after_ms(reason: &str) -> Option<u64> {
         let end = trimmed
             .find(|c: char| !c.is_ascii_digit())
             .unwrap_or(trimmed.len());
-        trimmed[..end].parse().ok()
-    } else {
-        None
+        return trimmed[..end].parse().ok();
     }
+    // Try "retry after NNNms" pattern (ProviderError::RateLimited display format).
+    if let Some(pos) = reason.find("retry after ") {
+        let after = &reason[pos + "retry after ".len()..];
+        let end = after
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(after.len());
+        return after[..end].parse().ok();
+    }
+    None
 }
 
 /// Extract a capability string from a reason containing "no eligible models".
@@ -388,9 +398,9 @@ fn extract_capability_from_reason(reason: &str) -> String {
         if let Some(pos) = reason.find(prefix) {
             let after = &reason[pos + prefix.len()..];
             let end = after
-                .find(|c: char| c == '\'' || c == '"' || c == ',' || c == '.' || c == ' ')
+                .find(['\'', '"', ',', '.', ' '])
                 .unwrap_or(after.len());
-            let cap = after[..end].trim_matches(|c| c == '\'' || c == '"');
+            let cap = after[..end].trim_matches(['\'', '"']);
             if !cap.is_empty() {
                 return cap.to_string();
             }
@@ -407,10 +417,8 @@ fn extract_model_name_from_reason(reason: &str) -> String {
     for prefix in &["model not found: ", "model '", "model \""] {
         if let Some(pos) = reason.find(prefix) {
             let after = &reason[pos + prefix.len()..];
-            let end = after
-                .find(|c: char| c == '\'' || c == '"' || c == ',' || c == '.')
-                .unwrap_or(after.len());
-            let name = after[..end].trim_matches(|c| c == '\'' || c == '"');
+            let end = after.find(['\'', '"', ',', '.']).unwrap_or(after.len());
+            let name = after[..end].trim_matches(['\'', '"']);
             if !name.is_empty() {
                 return name.to_string();
             }
@@ -427,10 +435,8 @@ fn extract_hook_name_from_reason(reason: &str) -> String {
     for prefix in &["hook '", "hook \"", "hook_name: "] {
         if let Some(pos) = reason.find(prefix) {
             let after = &reason[pos + prefix.len()..];
-            let end = after
-                .find(|c: char| c == '\'' || c == '"' || c == ' ')
-                .unwrap_or(after.len());
-            let name = after[..end].trim_matches(|c| c == '\'' || c == '"');
+            let end = after.find(['\'', '"', ' ']).unwrap_or(after.len());
+            let name = after[..end].trim_matches(['\'', '"']);
             if !name.is_empty() {
                 return name.to_string();
             }
@@ -895,14 +901,19 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     // Bring the Weft trait into scope so we can call chat/chat_stream/live on WeftService.
+    use async_trait::async_trait;
+    use std::collections::{HashMap, HashSet};
+    use weft_commands::{CommandError, CommandRegistry};
+    use weft_core::HookEvent;
     use weft_core::{
         ClassifierConfig, ContentPart, DomainsConfig, GatewayConfig, ModelEntry, ProviderConfig,
         Role, RouterConfig, ServerConfig, Source, WeftConfig, WeftMessage, WireFormat,
     };
+    use weft_core::{CommandDescription, CommandInvocation, CommandResult, CommandStub};
     use weft_llm::{Capability, ProviderRegistry};
-    use weft_proto::weft::v1::weft_server::Weft;
+    use weft_llm::{Provider, ProviderError, ProviderRequest, ProviderResponse, TokenUsage};
     use weft_reactor::{
-        ActivityRegistry, ReactorConfig, ReactorError, ActivityError,
+        ActivityError, ActivityRegistry, EventLogError, ReactorConfig, ReactorError,
         activities::{
             AssemblePromptActivity, AssembleResponseActivity, ExecuteCommandActivity,
             GenerateActivity, HookActivity, RouteActivity, ValidateActivity,
@@ -910,12 +921,9 @@ mod tests {
         config::{ActivityRef, BudgetConfig, LoopHooks, PipelineConfig, RetryPolicy},
         services::{ReactorHandle, Services},
     };
-    use std::collections::{HashMap, HashSet};
-    use async_trait::async_trait;
-    use weft_commands::{CommandError, CommandRegistry, CommandDescription, CommandInvocation, CommandResult, CommandStub};
-    use weft_core::HookEvent;
-    use weft_llm::{Provider, ProviderError, ProviderRequest, ProviderResponse, TokenUsage};
-    use weft_router::{RouterError, RoutingCandidate, RoutingDecision, RoutingDomainKind, SemanticRouter};
+    use weft_router::{
+        RouterError, RoutingCandidate, RoutingDecision, RoutingDomainKind, SemanticRouter,
+    };
 
     // ── Test mocks ──────────────────────────────────────────────────────────
 
@@ -1117,7 +1125,9 @@ mod tests {
         registry.register(Arc::new(AssemblePromptActivity)).unwrap();
         registry.register(Arc::new(GenerateActivity)).unwrap();
         registry.register(Arc::new(ExecuteCommandActivity)).unwrap();
-        registry.register(Arc::new(AssembleResponseActivity)).unwrap();
+        registry
+            .register(Arc::new(AssembleResponseActivity))
+            .unwrap();
         registry
             .register(Arc::new(HookActivity::new(HookEvent::RequestStart)))
             .unwrap();
@@ -1281,10 +1291,14 @@ mod tests {
         let err = ReactorError::ActivityFailed(ActivityError::Failed {
             name: "generate".to_string(),
             reason: "rate limited: retry_after_ms: 2000".to_string(),
-            retryable: true,
         });
         let weft_err = reactor_error_to_weft_error(err);
-        assert!(matches!(weft_err, WeftError::RateLimited { retry_after_ms: 2000 }));
+        assert!(matches!(
+            weft_err,
+            WeftError::RateLimited {
+                retry_after_ms: 2000
+            }
+        ));
     }
 
     #[test]
@@ -1292,12 +1306,13 @@ mod tests {
         let err = ReactorError::ActivityFailed(ActivityError::Failed {
             name: "generate".to_string(),
             reason: "rate limited by provider".to_string(),
-            retryable: true,
         });
         let weft_err = reactor_error_to_weft_error(err);
         assert!(matches!(
             weft_err,
-            WeftError::RateLimited { retry_after_ms: 1000 }
+            WeftError::RateLimited {
+                retry_after_ms: 1000
+            }
         ));
     }
 
@@ -1306,7 +1321,6 @@ mod tests {
         let err = ReactorError::ActivityFailed(ActivityError::Failed {
             name: "generate".to_string(),
             reason: "provider returned an error".to_string(),
-            retryable: false,
         });
         let weft_err = reactor_error_to_weft_error(err);
         assert!(matches!(weft_err, WeftError::Llm(_)));
@@ -1317,7 +1331,6 @@ mod tests {
         let err = ReactorError::ActivityFailed(ActivityError::Failed {
             name: "route".to_string(),
             reason: "routing failed: no models match".to_string(),
-            retryable: false,
         });
         let weft_err = reactor_error_to_weft_error(err);
         assert!(matches!(weft_err, WeftError::Routing(_)));
@@ -1328,7 +1341,6 @@ mod tests {
         let err = ReactorError::ActivityFailed(ActivityError::Failed {
             name: "execute_command".to_string(),
             reason: "command execution failed".to_string(),
-            retryable: false,
         });
         let weft_err = reactor_error_to_weft_error(err);
         assert!(matches!(weft_err, WeftError::Command(_)));
@@ -1339,7 +1351,6 @@ mod tests {
         let err = ReactorError::ActivityFailed(ActivityError::Failed {
             name: "execute_command".to_string(),
             reason: "tool registry unavailable".to_string(),
-            retryable: false,
         });
         let weft_err = reactor_error_to_weft_error(err);
         assert!(matches!(weft_err, WeftError::ToolRegistry(_)));
@@ -1350,7 +1361,6 @@ mod tests {
         let err = ReactorError::ActivityFailed(ActivityError::Failed {
             name: "recall".to_string(),
             reason: "memory store connection failed".to_string(),
-            retryable: false,
         });
         let weft_err = reactor_error_to_weft_error(err);
         assert!(matches!(weft_err, WeftError::MemoryStore(_)));
@@ -1361,7 +1371,6 @@ mod tests {
         let err = ReactorError::ActivityFailed(ActivityError::Failed {
             name: "validate".to_string(),
             reason: "invalid request: messages array empty".to_string(),
-            retryable: false,
         });
         let weft_err = reactor_error_to_weft_error(err);
         assert!(matches!(weft_err, WeftError::InvalidRequest(_)));
@@ -1392,16 +1401,14 @@ mod tests {
             reason: "empty messages".to_string(),
         });
         let weft_err = reactor_error_to_weft_error(err);
-        assert!(
-            matches!(weft_err, WeftError::InvalidRequest(ref r) if r == "empty messages")
-        );
+        assert!(matches!(weft_err, WeftError::InvalidRequest(ref r) if r == "empty messages"));
     }
 
     #[test]
     fn test_activity_event_log_maps_to_llm() {
         let err = ReactorError::ActivityFailed(ActivityError::EventLog {
             name: "generate".to_string(),
-            source: "write failed".to_string(),
+            source: EventLogError::Storage("write failed".to_string()),
         });
         let weft_err = reactor_error_to_weft_error(err);
         assert!(matches!(weft_err, WeftError::Llm(_)));
@@ -1415,7 +1422,6 @@ mod tests {
         let err = ReactorError::ActivityFailed(ActivityError::Failed {
             name: "unknown".to_string(),
             reason: "some completely unknown error".to_string(),
-            retryable: false,
         });
         let weft_err = reactor_error_to_weft_error(err);
         assert!(matches!(weft_err, WeftError::Llm(_)));
