@@ -2142,10 +2142,20 @@ mod tests {
             "child budget should have depth 1"
         );
 
-        // Verify the child execution record exists in the event log.
-        // We can find it by looking for all executions (all exec IDs in the log).
-        // The child execution will have a different ID than parent_id.
-        // We know the child recorded at least execution.started with parent_id set.
+        // Verify the child execution record was stored with the correct parent_id.
+        // TestEventLog::all_executions() returns all execution records; the child
+        // is the one whose id differs from parent_id.
+        let all_execs = event_log.all_executions();
+        let child_exec = all_execs
+            .iter()
+            .find(|e| e.id != parent_id)
+            .expect("child execution record should exist in event log");
+        assert_eq!(
+            child_exec.parent_id.as_ref(),
+            Some(&parent_id),
+            "child execution record should have parent_id set to the calling parent"
+        );
+        assert_eq!(child_exec.depth, 1, "child execution should be at depth 1");
     }
 
     /// Budget inheritance: parent has 10 remaining, child uses 3, parent has 7 after.

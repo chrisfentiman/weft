@@ -88,8 +88,8 @@ pub struct Services {
 /// completes. Because the calling activity runs on a separate `tokio::spawn`
 /// task, this does NOT block the parent Reactor's dispatch loop.
 pub struct ReactorHandle {
-    /// The reactor instance. Phase 5 adds spawn_child which uses this.
-    pub reactor: std::sync::Arc<crate::reactor::Reactor>,
+    /// The reactor instance. Kept private to enforce construction via `new()`.
+    reactor: std::sync::Arc<crate::reactor::Reactor>,
 }
 
 impl ReactorHandle {

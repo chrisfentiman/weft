@@ -454,6 +454,14 @@ impl TestEventLog {
             executions: std::sync::RwLock::new(HashMap::new()),
         }
     }
+
+    /// Return all execution records currently stored, in arbitrary order.
+    ///
+    /// Used in tests to locate child executions and verify parent_id linkage.
+    pub fn all_executions(&self) -> Vec<Execution> {
+        let exec_map = self.executions.read().expect("poisoned lock");
+        exec_map.values().cloned().collect()
+    }
 }
 
 impl Default for TestEventLog {

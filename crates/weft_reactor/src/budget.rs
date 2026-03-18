@@ -164,6 +164,11 @@ impl Budget {
     }
 
     /// Child inherits parent's remaining resources, depth + 1.
+    ///
+    /// The child's max equals the parent's remaining at spawn time. This means
+    /// the child cannot consume more than the parent had left, and `deduct_child_usage`
+    /// correctly accounts for what the child actually spent.
+    ///
     /// Err(Depth) if current_depth + 1 >= max_depth.
     pub fn child_budget(&self) -> Result<Self, BudgetExhaustedReason> {
         let new_depth = self.current_depth + 1;
@@ -173,9 +178,11 @@ impl Budget {
         Ok(Self {
             max_depth: self.max_depth,
             current_depth: new_depth,
-            max_generation_calls: self.max_generation_calls,
+            // Child's max is parent's remaining — not the parent's original max.
+            // This ensures the child cannot exceed the parent's remaining budget.
+            max_generation_calls: self.remaining_generation_calls,
             remaining_generation_calls: self.remaining_generation_calls,
-            max_iterations: self.max_iterations,
+            max_iterations: self.remaining_iterations,
             remaining_iterations: self.remaining_iterations,
             deadline: self.deadline,
         })
@@ -381,6 +388,9 @@ mod tests {
         let child = b.child_budget().unwrap();
         assert_eq!(child.remaining_generation_calls, 7);
         assert_eq!(child.remaining_iterations, 3);
+        // Child's max equals parent's remaining — not parent's original max.
+        assert_eq!(child.max_generation_calls, b.remaining_generation_calls);
+        assert_eq!(child.max_iterations, b.remaining_iterations);
     }
 
     #[test]
