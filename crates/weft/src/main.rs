@@ -4,6 +4,7 @@
 //! wires them into the GatewayEngine, and starts the axum HTTP server.
 
 mod engine;
+mod event_log;
 mod grpc;
 mod server;
 mod types;
@@ -442,6 +443,27 @@ async fn main() {
         info!(hooks = config.hooks.len(), "hook registry initialized");
         std::sync::Arc::new(registry)
     };
+
+    // ── Construct event log backend ────────────────────────────────────────
+    //
+    // Selects InMemoryEventLog or PostgresEventLog based on [event_log] config.
+    // Defaults to InMemoryEventLog when the section is absent.
+
+    let _event_log = event_log::build_event_log(config.event_log.as_ref())
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("error: event log initialization failed: {e}");
+            std::process::exit(1);
+        });
+
+    info!(
+        backend = config
+            .event_log
+            .as_ref()
+            .map(|c| c.backend.as_str())
+            .unwrap_or("memory"),
+        "event log initialized"
+    );
 
     // ── Wire the gateway engine ────────────────────────────────────────────
 

@@ -55,11 +55,12 @@ use weft_reactor::signal::Signal;
 ///
 /// Persists all execution records and events to PostgreSQL using the schema
 /// defined in `schema.sql`. Thread-safe: clone or wrap in `Arc` to share
-/// across tasks.
+/// across tasks. Clone is cheap — the inner `PgPool` is wrapped in `Arc`.
 ///
 /// Construct with a `sqlx::PgPool` obtained from [`sqlx::PgPool::connect`]
 /// or [`sqlx::PgPoolOptions`]. The schema must exist before any methods are
 /// called.
+#[derive(Clone)]
 pub struct PostgresEventLog {
     pool: Arc<PgPool>,
 }
@@ -915,6 +916,54 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].schema_version, EVENT_SCHEMA_VERSION);
         assert_eq!(events[0].schema_version, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and schema.sql applied"]
+    async fn test_pipeline_event_jsonb_round_trip() {
+        use weft_reactor::event::GeneratedEvent;
+
+        let url = match std::env::var("DATABASE_URL").ok() {
+            Some(u) => u,
+            None => return,
+        };
+        let pool = connect_pool(&url).await;
+        let log = PostgresEventLog::new(pool);
+        let exec = make_execution();
+        log.create_execution(&exec).await.expect("create failed");
+
+        // Serialize an actual PipelineEvent variant to JSON, store it, read it
+        // back, and deserialize to verify the JSONB round-trip path works end-to-end:
+        // PipelineEvent -> serde_json::Value -> Postgres JSONB -> serde_json::Value -> PipelineEvent.
+        let original = PipelineEvent::Generated(GeneratedEvent::Done);
+        let payload = serde_json::to_value(&original).expect("serialize PipelineEvent");
+
+        let seq = log
+            .append(
+                &exec.id,
+                original.event_type_string(),
+                payload,
+                EVENT_SCHEMA_VERSION,
+                None,
+            )
+            .await
+            .expect("append failed");
+        assert_eq!(seq, 1);
+
+        let events = log.read(&exec.id, None).await.expect("read failed");
+        assert_eq!(events.len(), 1);
+
+        // Deserialize the stored payload back to PipelineEvent.
+        let round_tripped: PipelineEvent =
+            serde_json::from_value(events[0].payload.clone()).expect("deserialize PipelineEvent");
+        assert!(
+            matches!(
+                round_tripped,
+                PipelineEvent::Generated(GeneratedEvent::Done)
+            ),
+            "expected Generated(Done), got {:?}",
+            round_tripped
+        );
     }
 
     #[tokio::test]

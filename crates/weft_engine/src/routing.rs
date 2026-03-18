@@ -647,6 +647,7 @@ mod tests {
             hooks: vec![],
             max_pre_response_retries: 2,
             request_end_concurrency: 64,
+            event_log: None,
             gateway: GatewayConfig {
                 system_prompt: "You are a test assistant.".to_string(),
                 max_command_iterations: 10,
@@ -1888,6 +1889,7 @@ mod tests {
             hooks: vec![],
             max_pre_response_retries: 2,
             request_end_concurrency: 64,
+            event_log: None,
             gateway: GatewayConfig {
                 system_prompt: "You are a test assistant.".to_string(),
                 max_command_iterations: 10,

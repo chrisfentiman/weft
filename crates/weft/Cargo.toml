@@ -19,7 +19,10 @@ weft_router = { path = "../weft_router" }
 weft_commands = { path = "../weft_commands" }
 weft_tools = { path = "../weft_tools" }
 weft_proto = { workspace = true }
+weft_reactor = { workspace = true }
+weft_eventlog_memory = { workspace = true }
 weft_eventlog_postgres = { path = "../weft_eventlog_postgres", optional = true }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"], optional = true }
 tonic = { workspace = true }
 tokio-stream = { workspace = true }
 axum = { workspace = true }
@@ -36,6 +39,10 @@ uuid = { workspace = true }
 regex = { workspace = true }
 rhai = { workspace = true }
 reqwest = { workspace = true }
+
+[features]
+# Enable Postgres-backed event log. Requires DATABASE_URL at runtime.
+weft_eventlog_postgres = ["dep:weft_eventlog_postgres", "dep:sqlx"]
 
 [dev-dependencies]
 weft_hooks = { path = "../weft_hooks", features = ["test-support"] }

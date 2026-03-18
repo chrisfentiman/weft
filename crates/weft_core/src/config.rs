@@ -25,6 +25,27 @@ pub struct WeftConfig {
     /// Default: 64.
     #[serde(default = "default_request_end_concurrency")]
     pub request_end_concurrency: usize,
+    /// Event log backend selection. Optional — absent defaults to in-memory.
+    pub event_log: Option<EventLogConfig>,
+}
+
+/// Event log backend configuration.
+///
+/// Controls which `EventLog` implementation the binary constructs at startup.
+/// Absent or `backend = "memory"` uses `InMemoryEventLog` (no persistence).
+/// `backend = "postgres"` requires `database_url` and uses `PostgresEventLog`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct EventLogConfig {
+    /// Which backend to use: `"memory"` (default) or `"postgres"`.
+    #[serde(default = "default_event_log_backend")]
+    pub backend: String,
+    /// PostgreSQL connection URL. Required when `backend = "postgres"`.
+    /// Supports `env:VAR_NAME` prefix for loading from the environment.
+    pub database_url: Option<String>,
+}
+
+fn default_event_log_backend() -> String {
+    "memory".to_string()
 }
 
 fn default_max_pre_response_retries() -> u32 {
@@ -61,6 +82,15 @@ impl WeftConfig {
                 hook.secret = Some(resolved);
             }
         }
+        // Resolve env: references in event_log.database_url.
+        if let Some(ref mut el) = self.event_log
+            && let Some(ref url) = el.database_url.clone()
+            && url.starts_with("env:")
+        {
+            let resolved =
+                resolve_env_var(url).map_err(|e| format!("event_log.database_url: {e}"))?;
+            el.database_url = Some(resolved);
+        }
         Ok(())
     }
 
@@ -74,6 +104,20 @@ impl WeftConfig {
             memory.validate()?;
         }
         self.validate_hooks()?;
+        if let Some(ref el) = self.event_log {
+            if el.backend == "postgres" && el.database_url.is_none() {
+                return Err(
+                    "event_log.database_url is required when event_log.backend = \"postgres\""
+                        .to_string(),
+                );
+            }
+            if el.backend != "memory" && el.backend != "postgres" {
+                return Err(format!(
+                    "event_log.backend must be \"memory\" or \"postgres\", got \"{}\"",
+                    el.backend
+                ));
+            }
+        }
         Ok(())
     }
 
