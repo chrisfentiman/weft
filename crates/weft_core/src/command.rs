@@ -29,7 +29,7 @@ pub struct CommandDescription {
 }
 
 /// What the LLM wants to do with a command.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CommandAction {
     /// Execute the command with arguments.
     Execute,
@@ -44,7 +44,7 @@ pub enum CommandAction {
 /// The LLM writes arguments in TOON format (`key: value, key2: value2`).
 /// The parser converts TOON arguments to `serde_json::Value` at parse time
 /// so the rest of the system (command registry, gRPC client) works with JSON.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CommandInvocation {
     pub name: String,
     /// What action to take: execute or describe.
@@ -56,7 +56,7 @@ pub struct CommandInvocation {
 }
 
 /// Result of executing a command.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CommandResult {
     pub command_name: String,
     /// Whether the command succeeded.

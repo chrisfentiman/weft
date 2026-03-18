@@ -4,7 +4,7 @@
 //! Proto-generated types are wire types only — conversion happens at the gRPC boundary.
 
 /// A fully attributed message in the Weft protocol.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WeftMessage {
     pub role: Role,
     pub source: Source,
@@ -44,7 +44,8 @@ pub enum Role {
 }
 
 /// A typed content part within a message.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "data")]
 pub enum ContentPart {
     // --- General content ---
     Text(String),
@@ -99,33 +100,34 @@ impl ContentPart {
 }
 
 /// Media content that can be a URL or inline data.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MediaContent {
     pub source: MediaSource,
     pub media_type: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "value")]
 pub enum MediaSource {
     Url(String),
     Data(Vec<u8>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DocumentContent {
     pub source: MediaSource,
     pub media_type: Option<String>,
     pub filename: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RoutingActivity {
     pub model: String,
     pub score: f32,
     pub filters: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HookActivity {
     pub event: String,
     pub hook_name: String,
@@ -133,19 +135,19 @@ pub struct HookActivity {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CouncilStartActivity {
     pub models: Vec<String>,
     pub judge: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CommandCallContent {
     pub command: String,
     pub arguments_json: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CommandResultContent {
     pub command: String,
     pub success: bool,
@@ -153,13 +155,13 @@ pub struct CommandResultContent {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MemoryResultContent {
     pub store: String,
     pub entries: Vec<MemoryResultEntry>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MemoryResultEntry {
     pub id: String,
     pub content: String,
@@ -167,7 +169,7 @@ pub struct MemoryResultEntry {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MemoryStoredContent {
     pub store: String,
     pub id: String,
