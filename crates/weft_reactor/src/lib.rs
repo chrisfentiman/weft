@@ -22,12 +22,16 @@ pub mod error;
 pub mod event;
 pub mod event_log;
 pub mod execution;
+pub mod reactor;
 pub mod registry;
 pub mod services;
 pub mod signal;
 
 #[cfg(test)]
 pub mod test_support;
+
+#[cfg(test)]
+mod reactor_tests;
 
 // Re-exports for convenience
 pub use activity::{Activity, ActivityError, ActivityInput, RoutingSnapshot};
@@ -39,6 +43,7 @@ pub use error::ReactorError;
 pub use event::{BudgetSnapshot, EVENT_SCHEMA_VERSION, Event, GeneratedEvent, PipelineEvent};
 pub use event_log::{EventLog, EventLogError};
 pub use execution::{Execution, ExecutionId, ExecutionStatus, RequestId, TenantId};
+pub use reactor::{BudgetUsage, ExecutionResult, Reactor};
 pub use registry::{ActivityRegistry, RegistryError};
 pub use services::{ReactorHandle, Services};
 pub use signal::{BudgetUpdate, Signal};
