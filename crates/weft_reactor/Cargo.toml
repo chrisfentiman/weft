@@ -1,0 +1,38 @@
+[package]
+name = "weft_reactor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Workspace
+weft_core = { path = "../weft_core" }
+weft_hooks = { path = "../weft_hooks" }
+weft_llm = { path = "../weft_llm" }
+weft_commands = { path = "../weft_commands" }
+weft_router = { path = "../weft_router" }
+weft_memory = { path = "../weft_memory" }
+
+# Async
+tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+tracing = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+weft_eventlog_memory = { path = "../weft_eventlog_memory" }

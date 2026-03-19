@@ -17,10 +17,10 @@ pub use command::{
     CommandAction, CommandDescription, CommandInvocation, CommandResult, CommandStub,
 };
 pub use config::{
-    ClassifierConfig, DomainConfig, DomainsConfig, GatewayConfig, HookConfig, HookEvent,
-    HookRoutingDomain, HookType, MemoryConfig, MemoryStoreConfig, ModelEntry, ProviderConfig,
-    ResolvedModel, RouterConfig, RoutingTrigger, ServerConfig, StoreCapability, ToolRegistryConfig,
-    WeftConfig, WireFormat,
+    ClassifierConfig, DomainConfig, DomainsConfig, EventLogConfig, GatewayConfig, HookConfig,
+    HookEvent, HookRoutingDomain, HookType, MemoryConfig, MemoryStoreConfig, ModelEntry,
+    ProviderConfig, ResolvedModel, RouterConfig, RoutingTrigger, ServerConfig, StoreCapability,
+    ToolRegistryConfig, WeftConfig, WireFormat,
 };
 pub use error::WeftError;
 pub use message::{

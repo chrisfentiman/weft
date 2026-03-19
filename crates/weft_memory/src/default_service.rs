@@ -20,7 +20,7 @@ use crate::{
 
 /// Concrete `MemoryService` backed by a `MemoryStoreMux`.
 ///
-/// Constructed in the binary bootstrap and injected into `GatewayEngine`.
+/// Constructed in the binary bootstrap and injected into the reactor.
 /// All recall/remember logic lives here — the engine only decides *which*
 /// store_ids to pass in (via routing).
 ///

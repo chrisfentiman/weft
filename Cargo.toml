@@ -12,6 +12,7 @@ license = "AGPL-3.0"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 async-trait = { version = "0.1" }
+futures = { version = "0.3" }
 
 # HTTP
 axum = { version = "0.8" }
@@ -24,9 +25,11 @@ prost = { version = "0.13" }
 
 # Internal
 weft_proto = { path = "crates/weft_proto" }
-weft_engine = { path = "crates/weft_engine" }
 weft_memory = { path = "crates/weft_memory" }
 weft_tools = { path = "crates/weft_tools" }
+weft_reactor = { path = "crates/weft_reactor" }
+weft_eventlog_memory = { path = "crates/weft_eventlog_memory" }
+weft_eventlog_postgres = { path = "crates/weft_eventlog_postgres" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -44,7 +47,7 @@ thiserror = { version = "2" }
 clap = { version = "4", features = ["derive"] }
 
 # Utilities
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 mockito = { version = "1" }

@@ -25,12 +25,6 @@ use weft_core::{
 };
 use weft_proto::weft::v1 as proto;
 
-use weft_commands::CommandRegistry;
-use weft_hooks::HookRunner;
-use weft_llm::ProviderService;
-use weft_memory::MemoryService;
-use weft_router::SemanticRouter;
-
 use crate::grpc::WeftService;
 
 // ── OpenAI compat types (local to this module) ─────────────────────────────
@@ -129,8 +123,11 @@ fn openai_to_weft(req: OpenAiChatRequest) -> WeftRequest {
 
 /// Translate a domain `WeftResponse` into an OpenAI-format response.
 ///
-/// Extracts the last assistant text message from the response.
-fn weft_to_openai(resp: weft_core::WeftResponse) -> OpenAiChatResponse {
+/// `request_model` is the model string from the original OpenAI request and is
+/// echoed back verbatim so clients see the model they asked for, not the
+/// internal routing name. The response id is prefixed with `chatcmpl-` to
+/// match the OpenAI wire format.
+fn weft_to_openai(resp: weft_core::WeftResponse, request_model: String) -> OpenAiChatResponse {
     // Extract the last assistant/provider text message.
     let assistant_text = resp
         .messages
@@ -145,11 +142,18 @@ fn weft_to_openai(resp: weft_core::WeftResponse) -> OpenAiChatResponse {
         })
         .unwrap_or_default();
 
+    // Prefix id with "chatcmpl-" to match OpenAI wire format.
+    let id = if resp.id.starts_with("chatcmpl-") {
+        resp.id
+    } else {
+        format!("chatcmpl-{}", resp.id)
+    };
+
     OpenAiChatResponse {
-        id: resp.id,
+        id,
         object: "chat.completion".to_string(),
         created: unix_timestamp(),
-        model: resp.model,
+        model: request_model,
         choices: vec![OpenAiChoice {
             index: 0,
             message: OpenAiMessage {
@@ -185,14 +189,7 @@ fn unix_timestamp() -> u64 {
 /// Uses `tonic::service::Routes::into_axum_router()` to compose the gRPC server
 /// with axum on a single port. The tonic router handles `content-type: application/grpc`;
 /// axum handles everything else.
-pub fn build_router<H, R, M, P, C>(weft_service: Arc<WeftService<H, R, M, P, C>>) -> Router
-where
-    H: HookRunner + Send + Sync + 'static,
-    R: SemanticRouter + Send + Sync + 'static,
-    M: MemoryService,
-    P: ProviderService + Send + Sync + 'static,
-    C: CommandRegistry + Send + Sync + 'static,
-{
+pub fn build_router(weft_service: Arc<WeftService>) -> Router {
     // Build the gRPC router via tonic's axum integration.
     // tonic::service::Routes::new() wraps a NamedService + tower::Service.
     // into_axum_router() returns an axum Router that handles gRPC content-type requests.
@@ -203,11 +200,8 @@ where
 
     // Build the HTTP axum router for OpenAI compat + health.
     let http_router = Router::new()
-        .route(
-            "/v1/chat/completions",
-            post(chat_completions_handler::<H, R, M, P, C>),
-        )
-        .route("/health", get(health_handler::<H, R, M, P, C>))
+        .route("/v1/chat/completions", post(chat_completions_handler))
+        .route("/health", get(health_handler))
         .with_state(Arc::clone(&weft_service));
 
     // Merge: gRPC router handles application/grpc requests; HTTP router handles the rest.
@@ -269,18 +263,10 @@ async fn shutdown_signal() {
 /// chat completion response. Translates to/from `WeftRequest`/`WeftResponse`
 /// and calls `WeftService::handle_weft_request()` — the same code path as gRPC.
 /// Streaming is not supported in v1.
-#[allow(clippy::type_complexity)]
-async fn chat_completions_handler<H, R, M, P, C>(
-    State(weft_service): State<Arc<WeftService<H, R, M, P, C>>>,
+async fn chat_completions_handler(
+    State(weft_service): State<Arc<WeftService>>,
     Json(openai_req): Json<OpenAiChatRequest>,
-) -> Result<Json<OpenAiChatResponse>, ApiError>
-where
-    H: HookRunner + Send + Sync + 'static,
-    R: SemanticRouter + Send + Sync + 'static,
-    M: MemoryService,
-    P: ProviderService + Send + Sync + 'static,
-    C: CommandRegistry + Send + Sync + 'static,
-{
+) -> Result<Json<OpenAiChatResponse>, ApiError> {
     // Generate a request-scoped tracing span for observability.
     let request_id = uuid::Uuid::new_v4().to_string();
     let span = info_span!("chat_completion", request_id = %request_id);
@@ -309,12 +295,15 @@ where
         "handling chat completion request"
     );
 
+    // Capture request model before consuming openai_req (for echo in response).
+    let request_model = openai_req.model.clone();
+
     let weft_req = openai_to_weft(openai_req);
 
     // Call handle_weft_request — the same method the gRPC handler calls.
     // One code path to the engine regardless of entry point.
     match weft_service.handle_weft_request(weft_req).await {
-        Ok(weft_resp) => Ok(Json(weft_to_openai(weft_resp))),
+        Ok(weft_resp) => Ok(Json(weft_to_openai(weft_resp, request_model))),
         Err(e) => Err(ApiError::from_weft_error(e)),
     }
 }
@@ -322,17 +311,7 @@ where
 /// `GET /health`
 ///
 /// Returns gateway health status. Always 200 if the process is up.
-#[allow(clippy::type_complexity)]
-async fn health_handler<H, R, M, P, C>(
-    State(weft_service): State<Arc<WeftService<H, R, M, P, C>>>,
-) -> Json<HealthResponse>
-where
-    H: HookRunner + Send + Sync + 'static,
-    R: SemanticRouter + Send + Sync + 'static,
-    M: MemoryService,
-    P: ProviderService + Send + Sync + 'static,
-    C: CommandRegistry + Send + Sync + 'static,
-{
+async fn health_handler(State(weft_service): State<Arc<WeftService>>) -> Json<HealthResponse> {
     let config = weft_service.engine_config();
 
     // Classifier is considered loaded if it doesn't immediately fail a trivial classify.
@@ -502,18 +481,27 @@ mod tests {
     use weft_commands::{CommandError, CommandRegistry};
     use weft_core::{
         ClassifierConfig, CommandDescription, CommandInvocation, CommandResult, CommandStub,
-        ContentPart, DomainsConfig, GatewayConfig, ModelEntry, ProviderConfig, Role, RouterConfig,
-        ServerConfig, Source, WeftConfig, WeftMessage, WireFormat,
+        ContentPart, DomainsConfig, GatewayConfig, HookEvent, ModelEntry, ProviderConfig, Role,
+        RouterConfig, ServerConfig, Source, WeftConfig, WeftMessage, WireFormat,
     };
     use weft_llm::{
         Capability, Provider, ProviderError, ProviderRegistry, ProviderRequest, ProviderResponse,
         TokenUsage,
     };
+    use weft_reactor::{
+        ActivityRegistry, Reactor, ReactorConfig,
+        activities::{
+            AssemblePromptActivity, AssembleResponseActivity, ExecuteCommandActivity,
+            GenerateActivity, HookActivity, RouteActivity, ValidateActivity,
+        },
+        config::{ActivityRef, BudgetConfig, LoopHooks, PipelineConfig, RetryPolicy},
+        services::{ReactorHandle, Services},
+    };
     use weft_router::{
         RouterError, RoutingCandidate, RoutingDecision, RoutingDomainKind, SemanticRouter,
     };
 
-    // ── Test mocks (same as in engine.rs tests) ────────────────────────────
+    // ── Test mocks ─────────────────────────────────────────────────────────
 
     struct MockLlmProvider {
         response: String,
@@ -683,6 +671,7 @@ mod tests {
             hooks: vec![],
             max_pre_response_retries: 2,
             request_end_concurrency: 64,
+            event_log: None,
             gateway: GatewayConfig {
                 system_prompt: "You are a test assistant.".to_string(),
                 max_command_iterations: 10,
@@ -691,9 +680,12 @@ mod tests {
         })
     }
 
-    fn make_registry(llm: impl Provider + 'static) -> Arc<ProviderRegistry> {
+    fn make_provider_registry(llm: impl Provider + 'static) -> Arc<ProviderRegistry> {
         let mut providers = HashMap::new();
-        providers.insert("test-model".to_string(), Arc::new(llm) as Arc<dyn Provider>);
+        providers.insert(
+            "test-model".to_string(),
+            Arc::new(llm) as Arc<dyn weft_llm::Provider>,
+        );
         let mut model_ids = HashMap::new();
         model_ids.insert("test-model".to_string(), "claude-test".to_string());
         let mut max_tokens = HashMap::new();
@@ -714,26 +706,112 @@ mod tests {
         ))
     }
 
-    fn make_weft_service(
-        llm: impl Provider + 'static,
-    ) -> Arc<
-        WeftService<
-            weft_hooks::HookRegistry,
-            MockRouter,
-            weft_memory::NullMemoryService,
-            ProviderRegistry,
-            MockRegistry,
-        >,
-    > {
-        let engine = crate::engine::GatewayEngine::new(
-            test_config(),
-            make_registry(llm),
-            Arc::new(MockRouter),
-            Arc::new(MockRegistry),
-            None::<Arc<weft_memory::NullMemoryService>>,
-            std::sync::Arc::new(weft_hooks::HookRegistry::empty()),
+    fn build_test_activity_registry() -> ActivityRegistry {
+        let mut registry = ActivityRegistry::new();
+        registry.register(Arc::new(ValidateActivity)).unwrap();
+        registry.register(Arc::new(RouteActivity)).unwrap();
+        registry.register(Arc::new(AssemblePromptActivity)).unwrap();
+        registry.register(Arc::new(GenerateActivity)).unwrap();
+        registry.register(Arc::new(ExecuteCommandActivity)).unwrap();
+        registry
+            .register(Arc::new(AssembleResponseActivity))
+            .unwrap();
+        registry
+            .register(Arc::new(HookActivity::new(HookEvent::RequestStart)))
+            .unwrap();
+        registry
+            .register(Arc::new(HookActivity::new(HookEvent::RequestEnd)))
+            .unwrap();
+        registry
+            .register(Arc::new(HookActivity::new(HookEvent::PreResponse)))
+            .unwrap();
+        registry
+            .register(Arc::new(HookActivity::new(HookEvent::PreToolUse)))
+            .unwrap();
+        registry
+            .register(Arc::new(HookActivity::new(HookEvent::PostToolUse)))
+            .unwrap();
+        registry
+    }
+
+    fn build_test_reactor_config(config: &WeftConfig) -> ReactorConfig {
+        ReactorConfig {
+            pipelines: vec![PipelineConfig {
+                name: "default".to_string(),
+                pre_loop: vec![
+                    ActivityRef::Name("validate".to_string()),
+                    ActivityRef::Name("hook_request_start".to_string()),
+                    ActivityRef::Name("route".to_string()),
+                    ActivityRef::Name("assemble_prompt".to_string()),
+                ],
+                post_loop: vec![
+                    ActivityRef::Name("assemble_response".to_string()),
+                    ActivityRef::Name("hook_request_end".to_string()),
+                ],
+                generate: ActivityRef::WithConfig {
+                    name: "generate".to_string(),
+                    config: serde_json::Value::Null,
+                    // No retries in tests: retries add multi-second backoff delays
+                    // and are tested in weft_reactor unit tests, not here.
+                    retry: Some(RetryPolicy {
+                        max_retries: 0,
+                        initial_backoff_ms: 0,
+                        max_backoff_ms: 0,
+                        backoff_multiplier: 1.0,
+                    }),
+                    timeout_secs: Some(config.gateway.request_timeout_secs),
+                    heartbeat_interval_secs: Some(15),
+                },
+                execute_command: ActivityRef::Name("execute_command".to_string()),
+                loop_hooks: LoopHooks::default(),
+            }],
+            budget: BudgetConfig {
+                max_generation_calls: 20,
+                max_iterations: config.gateway.max_command_iterations as u32,
+                max_depth: 5,
+                timeout_secs: config.gateway.request_timeout_secs,
+                generation_timeout_secs: config.gateway.request_timeout_secs,
+                command_timeout_secs: 10,
+            },
+        }
+    }
+
+    fn make_weft_service(llm: impl Provider + 'static) -> Arc<WeftService> {
+        let config = test_config();
+
+        let provider_registry = make_provider_registry(llm);
+
+        let services = Arc::new(Services {
+            config: Arc::clone(&config),
+            providers: provider_registry as Arc<dyn weft_llm::ProviderService + Send + Sync>,
+            router: Arc::new(MockRouter) as Arc<dyn weft_router::SemanticRouter + Send + Sync>,
+            commands: Arc::new(MockRegistry)
+                as Arc<dyn weft_commands::CommandRegistry + Send + Sync>,
+            memory: None,
+            hooks: Arc::new(weft_hooks::HookRegistry::empty())
+                as Arc<dyn weft_hooks::HookRunner + Send + Sync>,
+            reactor_handle: std::sync::OnceLock::new(),
+            request_end_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+        });
+
+        let registry = Arc::new(build_test_activity_registry());
+        let event_log: Arc<dyn weft_reactor::event_log::EventLog> =
+            Arc::new(weft_eventlog_memory::InMemoryEventLog::new());
+        let reactor_config = build_test_reactor_config(&config);
+
+        let reactor = Arc::new(
+            Reactor::new(Arc::clone(&services), event_log, registry, &reactor_config)
+                .expect("test reactor must construct"),
         );
-        Arc::new(WeftService::new(engine))
+
+        // Wire ReactorHandle to break the circular dependency.
+        let handle = Arc::new(ReactorHandle::new(Arc::clone(&reactor)));
+        services
+            .reactor_handle
+            .set(handle)
+            .expect("OnceLock must be unset");
+
+        Arc::new(WeftService::new(reactor, config))
     }
 
     fn make_router(llm: impl Provider + 'static) -> Router {
@@ -1061,7 +1139,7 @@ mod tests {
             },
             timing: WeftTiming::default(),
         };
-        let openai_resp = weft_to_openai(resp);
+        let openai_resp = weft_to_openai(resp, "gpt-4".to_string());
         assert_eq!(openai_resp.choices[0].message.content, "Hello!");
         assert_eq!(openai_resp.usage.prompt_tokens, 10);
         assert_eq!(openai_resp.usage.completion_tokens, 5);
@@ -1079,7 +1157,7 @@ mod tests {
             usage: WeftUsage::default(),
             timing: WeftTiming::default(),
         };
-        let openai_resp = weft_to_openai(resp);
+        let openai_resp = weft_to_openai(resp, "auto".to_string());
         // No assistant message → empty content, not a panic
         assert_eq!(openai_resp.choices[0].message.content, "");
     }

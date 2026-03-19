@@ -1,0 +1,15 @@
+[package]
+name = "weft_eventlog_memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+weft_reactor = { path = "../weft_reactor" }
+async-trait = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
+uuid = { workspace = true }

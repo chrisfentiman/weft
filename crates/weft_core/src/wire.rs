@@ -14,7 +14,7 @@ use crate::routing::ModelRoutingInstruction;
 // ── Domain types ──────────────────────────────────────────────────────────────
 
 /// A validated chat request, ready for the engine.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WeftRequest {
     /// Conversation messages.
     pub messages: Vec<WeftMessage>,
@@ -25,7 +25,7 @@ pub struct WeftRequest {
 }
 
 /// Sampling and behavior options.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SamplingOptions {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
@@ -40,14 +40,14 @@ pub struct SamplingOptions {
     pub activity: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ResponseFormat {
     Text,
     JsonObject,
 }
 
 /// The engine's response, before wire-format conversion.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WeftResponse {
     pub id: String,
     /// Echoed routing instruction string.
@@ -58,7 +58,7 @@ pub struct WeftResponse {
     pub timing: WeftTiming,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct WeftUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -66,7 +66,7 @@ pub struct WeftUsage {
     pub llm_calls: u32,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct WeftTiming {
     pub total_ms: u64,
     pub routing_ms: u64,

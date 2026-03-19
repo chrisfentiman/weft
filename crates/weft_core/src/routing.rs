@@ -8,7 +8,7 @@ use crate::error::WeftError;
 // ── Routing Instruction ───────────────────────────────────────────────────────
 
 /// A parsed model routing instruction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelRoutingInstruction {
     /// The routing mode.
     pub mode: RoutingMode,
@@ -18,7 +18,7 @@ pub struct ModelRoutingInstruction {
     pub raw: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RoutingMode {
     /// Semantic router picks the best model.
     Auto,
@@ -73,7 +73,7 @@ impl ModelRoutingInstruction {
 // ── Filter Resolution ─────────────────────────────────────────────────────────
 
 /// Lightweight model info for filter resolution. Constructed from ProviderRegistry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelInfo {
     pub routing_name: String,
     pub provider_name: String,

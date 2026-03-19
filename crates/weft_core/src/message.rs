@@ -4,7 +4,7 @@
 //! Proto-generated types are wire types only — conversion happens at the gRPC boundary.
 
 /// A fully attributed message in the Weft protocol.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WeftMessage {
     pub role: Role,
     pub source: Source,
@@ -44,7 +44,8 @@ pub enum Role {
 }
 
 /// A typed content part within a message.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "data")]
 pub enum ContentPart {
     // --- General content ---
     Text(String),
@@ -99,33 +100,34 @@ impl ContentPart {
 }
 
 /// Media content that can be a URL or inline data.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MediaContent {
     pub source: MediaSource,
     pub media_type: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "value")]
 pub enum MediaSource {
     Url(String),
     Data(Vec<u8>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DocumentContent {
     pub source: MediaSource,
     pub media_type: Option<String>,
     pub filename: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RoutingActivity {
     pub model: String,
     pub score: f32,
     pub filters: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HookActivity {
     pub event: String,
     pub hook_name: String,
@@ -133,19 +135,19 @@ pub struct HookActivity {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CouncilStartActivity {
     pub models: Vec<String>,
     pub judge: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CommandCallContent {
     pub command: String,
     pub arguments_json: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CommandResultContent {
     pub command: String,
     pub success: bool,
@@ -153,13 +155,13 @@ pub struct CommandResultContent {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MemoryResultContent {
     pub store: String,
     pub entries: Vec<MemoryResultEntry>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MemoryResultEntry {
     pub id: String,
     pub content: String,
@@ -167,7 +169,7 @@ pub struct MemoryResultEntry {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MemoryStoredContent {
     pub store: String,
     pub id: String,
@@ -342,5 +344,102 @@ mod tests {
         assert_eq!(msg.content.len(), 1);
         assert!(!msg.delta);
         assert_eq!(msg.message_index, 0);
+    }
+
+    #[test]
+    fn test_weft_message_serde_round_trip() {
+        let msg = WeftMessage {
+            role: Role::Assistant,
+            source: Source::Provider,
+            model: Some("claude-3-opus".to_string()),
+            content: vec![
+                ContentPart::Text("Hello, world!".to_string()),
+                ContentPart::CommandCall(CommandCallContent {
+                    command: "web_search".to_string(),
+                    arguments_json: r#"{"query":"Rust"}"#.to_string(),
+                }),
+            ],
+            delta: false,
+            message_index: 2,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: WeftMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.role, Role::Assistant);
+        assert_eq!(back.source, Source::Provider);
+        assert_eq!(back.model.as_deref(), Some("claude-3-opus"));
+        assert_eq!(back.content.len(), 2);
+        assert_eq!(back.message_index, 2);
+        assert!(!back.delta);
+        // Verify first content part round-tripped as Text
+        assert!(matches!(&back.content[0], ContentPart::Text(s) if s == "Hello, world!"));
+    }
+
+    #[test]
+    fn test_content_part_text_serde_round_trip() {
+        let part = ContentPart::Text("round-trip text".to_string());
+        let json = serde_json::to_string(&part).unwrap();
+        // The tagged enum serializes with "type" and "data" fields
+        assert!(json.contains("\"type\""));
+        assert!(json.contains("\"Text\""));
+        let back: ContentPart = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, ContentPart::Text(s) if s == "round-trip text"));
+    }
+
+    #[test]
+    fn test_content_part_image_url_serde_round_trip() {
+        let part = ContentPart::Image(MediaContent {
+            source: MediaSource::Url("https://example.com/image.png".to_string()),
+            media_type: Some("image/png".to_string()),
+        });
+        let json = serde_json::to_string(&part).unwrap();
+        // Outer tag: "Image", inner MediaSource tag: "Url"
+        assert!(json.contains("\"Image\""));
+        assert!(json.contains("\"Url\""));
+        let back: ContentPart = serde_json::from_str(&json).unwrap();
+        match back {
+            ContentPart::Image(media) => {
+                assert_eq!(media.media_type.as_deref(), Some("image/png"));
+                assert!(
+                    matches!(media.source, MediaSource::Url(u) if u == "https://example.com/image.png")
+                );
+            }
+            other => panic!("expected ContentPart::Image, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_content_part_image_data_serde_round_trip() {
+        let bytes = vec![0u8, 1, 2, 3, 255];
+        let part = ContentPart::Image(MediaContent {
+            source: MediaSource::Data(bytes.clone()),
+            media_type: Some("image/jpeg".to_string()),
+        });
+        let json = serde_json::to_string(&part).unwrap();
+        assert!(json.contains("\"Data\""));
+        let back: ContentPart = serde_json::from_str(&json).unwrap();
+        match back {
+            ContentPart::Image(media) => {
+                assert!(matches!(media.source, MediaSource::Data(d) if d == bytes));
+            }
+            other => panic!("expected ContentPart::Image, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_content_part_document_serde_round_trip() {
+        let part = ContentPart::Document(DocumentContent {
+            source: MediaSource::Url("https://example.com/report.pdf".to_string()),
+            media_type: Some("application/pdf".to_string()),
+            filename: Some("report.pdf".to_string()),
+        });
+        let json = serde_json::to_string(&part).unwrap();
+        let back: ContentPart = serde_json::from_str(&json).unwrap();
+        match back {
+            ContentPart::Document(doc) => {
+                assert_eq!(doc.filename.as_deref(), Some("report.pdf"));
+                assert_eq!(doc.media_type.as_deref(), Some("application/pdf"));
+            }
+            other => panic!("expected ContentPart::Document, got {:?}", other),
+        }
     }
 }

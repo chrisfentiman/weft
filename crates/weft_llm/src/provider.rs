@@ -153,6 +153,55 @@ pub fn extract_text_messages(messages: &[WeftMessage]) -> Vec<(Role, String)> {
         .collect()
 }
 
+/// A chunk from a streaming provider response.
+///
+/// Providers that support true streaming yield one or more `Delta` chunks as tokens
+/// arrive from the API, followed by a final `Complete` chunk carrying the assembled
+/// `ProviderResponse` and usage data.
+///
+/// Providers that do not support streaming return a single `Complete` chunk via the
+/// default `execute_stream` implementation, which wraps `execute()`. The
+/// `GenerateActivity` handles both shapes through the same code path.
+#[derive(Debug, Clone)]
+pub enum ProviderChunk {
+    /// A content delta (partial text, partial tool call, etc.) from a streaming
+    /// provider. Multiple `Delta` chunks are assembled into the final response.
+    Delta(ContentDelta),
+    /// The complete response, either as the sole chunk (non-streaming providers)
+    /// or as the final chunk in a streaming sequence (after all deltas).
+    Complete(ProviderResponse),
+}
+
+/// A content delta yielded by a streaming provider.
+///
+/// Carries the incremental text token and/or partial tool call data from one
+/// chunk of a streaming API response. Either field may be absent if the chunk
+/// carries only the other content type.
+#[derive(Debug, Clone)]
+pub struct ContentDelta {
+    /// The incremental text token, if this chunk carries text content.
+    pub text: Option<String>,
+    /// Partial tool/command call data, if this chunk carries tool call content.
+    pub tool_call_delta: Option<ToolCallDelta>,
+}
+
+/// A partial tool call delta from a streaming provider.
+///
+/// Real streaming providers accumulate these deltas to reconstruct the full
+/// tool call name and arguments as tokens arrive. The `GenerateActivity` may
+/// use these to emit `CommandInvocation` events incrementally in the future;
+/// for now they are collected and parsed at stream completion via
+/// `parse_response_to_events`.
+#[derive(Debug, Clone)]
+pub struct ToolCallDelta {
+    /// Index into the tool call list (for parallel tool calls).
+    pub index: usize,
+    /// Partial tool/function name, accumulated across deltas.
+    pub name_fragment: Option<String>,
+    /// Partial arguments JSON fragment, accumulated across deltas.
+    pub arguments_fragment: Option<String>,
+}
+
 /// Error type for provider operations.
 ///
 /// Replaces `LlmError`. Variant names are more precise and include
