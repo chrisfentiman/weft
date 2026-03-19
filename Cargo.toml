@@ -12,6 +12,7 @@ license = "AGPL-3.0"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 async-trait = { version = "0.1" }
+futures = { version = "0.3" }
 
 # HTTP
 axum = { version = "0.8" }

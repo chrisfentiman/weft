@@ -17,6 +17,7 @@ weft_memory = { path = "../weft_memory" }
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = { workspace = true }
+futures = { workspace = true }
 
 # Serialization
 serde = { workspace = true }

@@ -1,19 +1,25 @@
 //! GenerateActivity: calls the generative source and streams tokens.
 //!
-//! Calls the LLM provider via `Services.providers`, buffers the response, and
-//! pushes `Generated(Content { .. })` events onto the channel one at a time to
-//! simulate streaming. Handles cancellation, heartbeat emission, and retryable
-//! error classification.
+//! Calls the LLM provider via `Services.providers` using `execute_stream`, which
+//! yields `ProviderChunk` values as they arrive. Delta chunks push
+//! `Generated(Content { .. })` events immediately; the final Complete chunk
+//! triggers `GenerationCompleted`. Providers without true streaming support use
+//! the default `execute_stream` implementation, which wraps `execute()` in a
+//! single-element stream — same code path, zero additional latency for those
+//! providers.
+//!
+//! Handles cancellation, heartbeat emission, and retryable error classification.
 
 use std::time::Instant;
 
+use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 #[cfg(test)]
 use weft_core::Role;
 use weft_core::{ContentPart, WeftMessage};
-use weft_llm::{ProviderError, ProviderRequest, ProviderResponse};
+use weft_llm::{ProviderChunk, ProviderError, ProviderRequest, ProviderResponse};
 
 use crate::activity::{Activity, ActivityInput};
 use crate::event::{GeneratedEvent, PipelineEvent};
@@ -188,14 +194,14 @@ impl Activity for GenerateActivity {
             options: input.request.options.clone(),
         };
 
-        // Get the provider and execute the request.
+        // Get the provider and open the streaming request.
         let provider = services.providers.get(&model);
 
-        // Use tokio::select! to support cancellation during the provider call.
-        let provider_result = tokio::select! {
-            result = provider.execute(provider_request) => result,
+        // Use tokio::select! to support cancellation while opening the stream.
+        let stream_result = tokio::select! {
+            result = provider.execute_stream(provider_request) => result,
             _ = cancel.cancelled() => {
-                // Cancellation during provider call.
+                // Cancellation before the stream opened.
                 heartbeat_cancel.cancel();
                 if let Some(handle) = heartbeat_handle {
                     let _ = handle.await;
@@ -217,22 +223,15 @@ impl Activity for GenerateActivity {
             }
         };
 
-        // Cancel heartbeat regardless of outcome.
-        heartbeat_cancel.cancel();
-        if let Some(handle) = heartbeat_handle {
-            let _ = handle.await;
-        }
-
-        // Handle provider result.
-        let (response_message, input_tokens, output_tokens) = match provider_result {
-            Ok(ProviderResponse::ChatCompletion { message, usage }) => {
-                let input_tokens = usage.as_ref().map(|u| u.prompt_tokens);
-                let output_tokens = usage.as_ref().map(|u| u.completion_tokens);
-                (message, input_tokens, output_tokens)
-            }
+        let mut stream = match stream_result {
+            Ok(s) => s,
             Err(e) => {
+                heartbeat_cancel.cancel();
+                if let Some(handle) = heartbeat_handle {
+                    let _ = handle.await;
+                }
                 let retryable = is_retryable(&e);
-                warn!(model = %model, error = %e, retryable, "generate: provider error");
+                warn!(model = %model, error = %e, retryable, "generate: provider error opening stream");
                 let _ = event_tx
                     .send(PipelineEvent::GenerationFailed {
                         model: model.clone(),
@@ -250,48 +249,181 @@ impl Activity for GenerateActivity {
             }
         };
 
-        // Parse the response into GeneratedEvent values.
-        // Buffer the complete response and push events one at a time.
-        let generated_events = parse_response_to_events(&response_message);
+        // Accumulate generated events for GenerationCompleted.
+        // Delta chunks push events immediately; the Complete chunk contributes the
+        // full response_message and usage data at stream end.
+        let mut all_generated_events: Vec<GeneratedEvent> = Vec::new();
+        let mut response_message_opt: Option<WeftMessage> = None;
+        let mut input_tokens: Option<u32> = None;
+        let mut output_tokens: Option<u32> = None;
+        // Accumulate delta text so we can reconstruct a complete response message
+        // when a streaming provider yields only deltas (no Complete chunk with a
+        // pre-assembled WeftMessage). Currently used as a fallback; full delta
+        // reconstruction is future work.
+        let mut accumulated_delta_text = String::new();
 
-        // Push each Generated event onto the channel.
-        for event in &generated_events {
-            let _ = event_tx.send(PipelineEvent::Generated(event.clone())).await;
+        // Consume the stream chunk by chunk. Use tokio::select! on each iteration
+        // so cancellation is detected between chunks without an extra task.
+        loop {
+            let chunk = tokio::select! {
+                item = stream.next() => item,
+                _ = cancel.cancelled() => {
+                    // Cancellation while consuming the stream.
+                    drop(stream);
+                    heartbeat_cancel.cancel();
+                    if let Some(handle) = heartbeat_handle {
+                        let _ = handle.await;
+                    }
+                    let _ = event_tx
+                        .send(PipelineEvent::GenerationFailed {
+                            model: model.clone(),
+                            error: "cancelled during streaming".to_string(),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(PipelineEvent::ActivityFailed {
+                            name: self.name().to_string(),
+                            error: "cancelled during streaming".to_string(),
+                            retryable: false,
+                        })
+                        .await;
+                    return;
+                }
+            };
 
-            // Check cancellation between events.
-            if cancel.is_cancelled() {
-                let _ = event_tx
-                    .send(PipelineEvent::GenerationFailed {
-                        model: model.clone(),
-                        error: "cancelled during streaming".to_string(),
-                    })
-                    .await;
-                let _ = event_tx
-                    .send(PipelineEvent::ActivityFailed {
-                        name: self.name().to_string(),
-                        error: "cancelled during streaming".to_string(),
-                        retryable: false,
-                    })
-                    .await;
-                return;
+            match chunk {
+                None => {
+                    // Stream ended without a Complete chunk (e.g., delta-only streaming
+                    // provider). Synthesise a response_message from accumulated text.
+                    if response_message_opt.is_none() && !accumulated_delta_text.is_empty() {
+                        response_message_opt = Some(WeftMessage {
+                            role: weft_core::Role::Assistant,
+                            source: weft_core::Source::Provider,
+                            model: Some(model.clone()),
+                            content: vec![ContentPart::Text(accumulated_delta_text.clone())],
+                            delta: false,
+                            message_index: 0,
+                        });
+                    }
+                    break;
+                }
+                Some(Err(e)) => {
+                    // Error mid-stream: cancel heartbeat, push failure events.
+                    drop(stream);
+                    heartbeat_cancel.cancel();
+                    if let Some(handle) = heartbeat_handle {
+                        let _ = handle.await;
+                    }
+                    let retryable = is_retryable(&e);
+                    warn!(model = %model, error = %e, retryable, "generate: provider stream error");
+                    let _ = event_tx
+                        .send(PipelineEvent::GenerationFailed {
+                            model: model.clone(),
+                            error: e.to_string(),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(PipelineEvent::ActivityFailed {
+                            name: self.name().to_string(),
+                            error: e.to_string(),
+                            retryable,
+                        })
+                        .await;
+                    return;
+                }
+                Some(Ok(ProviderChunk::Delta(delta))) => {
+                    // A real streaming chunk: push text immediately as it arrives.
+                    if let Some(text) = delta.text {
+                        accumulated_delta_text.push_str(&text);
+                        let event = GeneratedEvent::Content {
+                            part: ContentPart::Text(text),
+                        };
+                        all_generated_events.push(event.clone());
+                        let _ = event_tx.send(PipelineEvent::Generated(event)).await;
+                    }
+                    // Tool call deltas are accumulated for future streaming tool support.
+                    // For now they are carried through but not yet pushed as events
+                    // (tool calls are assembled by parse_response_to_events on Complete).
+                }
+                Some(Ok(ProviderChunk::Complete(response))) => {
+                    // The full response arrived (either as the sole chunk from a
+                    // non-streaming provider, or as the final chunk from a streaming
+                    // provider that assembles the message server-side).
+                    //
+                    // Parse the complete response into GeneratedEvent values (same
+                    // logic as before). For non-streaming providers this produces the
+                    // same events as the old buffered code path. For streaming providers
+                    // that yield deltas *before* this chunk, we skip re-emitting text
+                    // that was already sent as Delta events, but still parse command
+                    // invocations from the assembled response.
+                    let (msg, tok_in, tok_out) = match response {
+                        ProviderResponse::ChatCompletion { message, usage } => {
+                            let tok_in = usage.as_ref().map(|u| u.prompt_tokens);
+                            let tok_out = usage.as_ref().map(|u| u.completion_tokens);
+                            (message, tok_in, tok_out)
+                        }
+                    };
+                    input_tokens = tok_in;
+                    output_tokens = tok_out;
+
+                    // Determine if we already emitted content as deltas.
+                    // If no deltas were pushed yet (non-streaming provider), parse
+                    // and push all events now (same as old code path).
+                    // If deltas were already pushed, only extract command invocations
+                    // from the complete response to avoid duplicate text events.
+                    let events_from_complete = if accumulated_delta_text.is_empty() {
+                        // Non-streaming: no deltas sent yet. Full parse + push.
+                        parse_response_to_events(&msg)
+                    } else {
+                        // Streaming: deltas already sent. Only emit command invocations
+                        // that weren't captured via delta text, plus Done.
+                        parse_only_commands_and_done(&msg)
+                    };
+
+                    for event in &events_from_complete {
+                        all_generated_events.push(event.clone());
+                        let _ = event_tx.send(PipelineEvent::Generated(event.clone())).await;
+                    }
+
+                    response_message_opt = Some(msg);
+                    // Complete received; stream will end after this.
+                }
             }
         }
 
-        // Ensure Done is the last event if not already present.
-        if !generated_events
+        // Cancel heartbeat — stream consumption is done.
+        heartbeat_cancel.cancel();
+        if let Some(handle) = heartbeat_handle {
+            let _ = handle.await;
+        }
+
+        // Ensure Done is present.
+        if !all_generated_events
             .iter()
             .any(|e| matches!(e, GeneratedEvent::Done))
         {
-            let _ = event_tx
-                .send(PipelineEvent::Generated(GeneratedEvent::Done))
-                .await;
+            let done_event = GeneratedEvent::Done;
+            all_generated_events.push(done_event.clone());
+            let _ = event_tx.send(PipelineEvent::Generated(done_event)).await;
         }
+
+        // Build response_message for GenerationCompleted. If the provider yielded
+        // only deltas with no Complete chunk, we synthesised one above from the
+        // accumulated text. As a last resort, emit an empty assistant message.
+        let response_message = response_message_opt.unwrap_or_else(|| WeftMessage {
+            role: weft_core::Role::Assistant,
+            source: weft_core::Source::Provider,
+            model: Some(model.clone()),
+            content: vec![],
+            delta: false,
+            message_index: 0,
+        });
 
         let _ = event_tx
             .send(PipelineEvent::GenerationCompleted {
                 model: model.clone(),
                 response_message,
-                generated_events: generated_events.clone(),
+                generated_events: all_generated_events,
                 input_tokens,
                 output_tokens,
             })
@@ -333,6 +465,11 @@ fn extract_model_name(input: &ActivityInput, services: &Services) -> String {
 ///
 /// Content parts become `Content { part }` events. Slash-command patterns in
 /// text produce `CommandInvocation` events. A `Done` event is always appended.
+///
+/// Used by `GenerateActivity` for non-streaming providers (or as a fallback when
+/// the `Complete` chunk is the first and only chunk). For streaming providers that
+/// already emitted delta text events, use `parse_only_commands_and_done` instead
+/// to avoid duplicating text content.
 fn parse_response_to_events(message: &WeftMessage) -> Vec<GeneratedEvent> {
     let mut events = Vec::new();
     let mut full_text = String::new();
@@ -392,12 +529,73 @@ fn parse_response_to_events(message: &WeftMessage) -> Vec<GeneratedEvent> {
     events
 }
 
+/// Extract only command invocations and `Done` from a complete response message.
+///
+/// Used after a streaming provider has already pushed delta text events. The
+/// complete response is still parsed for `CommandCall` content parts and
+/// slash-command patterns — these cannot be emitted incrementally from delta
+/// chunks because a command invocation only becomes recognisable once its full
+/// name and arguments have arrived. Text parts are skipped since they were
+/// already pushed as `Delta` events.
+///
+/// A `Done` event is always appended.
+fn parse_only_commands_and_done(message: &WeftMessage) -> Vec<GeneratedEvent> {
+    let mut events = Vec::new();
+    let mut full_text = String::new();
+
+    for part in &message.content {
+        match part {
+            ContentPart::Text(text) => {
+                // Accumulate text for slash-command parsing but do NOT emit a
+                // Content event — delta text was already pushed.
+                full_text.push_str(text);
+            }
+            ContentPart::CommandCall(call) => {
+                let arguments: serde_json::Value =
+                    serde_json::from_str(&call.arguments_json).unwrap_or(serde_json::Value::Null);
+                let invocation = weft_core::CommandInvocation {
+                    name: call.command.clone(),
+                    action: weft_core::CommandAction::Execute,
+                    arguments,
+                };
+                events.push(GeneratedEvent::CommandInvocation(invocation));
+            }
+            other => {
+                // Non-text, non-command-call parts (images, etc.) were not
+                // streamed as deltas; emit them now.
+                events.push(GeneratedEvent::Content {
+                    part: other.clone(),
+                });
+            }
+        }
+    }
+
+    // Parse slash commands from accumulated text, deduplicating against already
+    // captured CommandCall-based invocations.
+    if !full_text.is_empty() {
+        let known_commands = std::collections::HashSet::new();
+        let parsed = weft_commands::parse_response(&full_text, &known_commands);
+        for cmd in parsed.invocations {
+            let already_added = events.iter().any(
+                |e| matches!(e, GeneratedEvent::CommandInvocation(inv) if inv.name == cmd.name),
+            );
+            if !already_added {
+                events.push(GeneratedEvent::CommandInvocation(cmd));
+            }
+        }
+    }
+
+    events.push(GeneratedEvent::Done);
+    events
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::NullEventLog;
     use crate::test_support::{
-        collect_events, make_test_input, make_test_services_with_response,
+        collect_events, make_test_input, make_test_services_with_chunk_stream,
+        make_test_services_with_mid_stream_error, make_test_services_with_response,
         make_test_services_with_slow_provider,
     };
     use tokio::sync::mpsc;
@@ -775,5 +973,240 @@ mod tests {
         assert!(!is_retryable(&ProviderError::Unsupported(
             "embeddings not supported".to_string()
         )));
+    }
+
+    // ── Streaming: multi-chunk provider pushes events incrementally ───────
+
+    /// Verify that `GenerateActivity` pushes one `Generated(Content)` event per
+    /// delta chunk, and that all three chunks arrive before `GenerationCompleted`.
+    ///
+    /// This is the core streaming correctness test: events must arrive as chunks
+    /// are yielded, not after buffering the whole response.
+    #[tokio::test]
+    async fn test_generate_streams_chunks_incrementally() {
+        let chunks = vec!["Hello".to_string(), ", ".to_string(), "world!".to_string()];
+        let services = make_test_services_with_chunk_stream(chunks.clone(), true);
+        let input = make_test_input();
+        let (tx, mut rx) = mpsc::channel(128);
+        let cancel = CancellationToken::new();
+        let event_log = NullEventLog;
+        let exec_id = crate::execution::ExecutionId::new();
+
+        let activity = GenerateActivity::new();
+        activity
+            .execute(&exec_id, input, &services, &event_log, tx, cancel)
+            .await;
+
+        let events = collect_events(&mut rx);
+
+        // Count distinct Generated(Content) events — there must be one per delta chunk.
+        let content_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, PipelineEvent::Generated(GeneratedEvent::Content { .. })))
+            .collect();
+
+        assert_eq!(
+            content_events.len(),
+            chunks.len(),
+            "expected one Content event per delta chunk; got {}",
+            content_events.len()
+        );
+
+        // Verify the text of each Content event matches the original chunk text.
+        for (i, (expected, event)) in chunks.iter().zip(content_events.iter()).enumerate() {
+            match event {
+                PipelineEvent::Generated(GeneratedEvent::Content {
+                    part: ContentPart::Text(text),
+                }) => {
+                    assert_eq!(
+                        text, expected,
+                        "chunk {i}: expected text {:?}, got {:?}",
+                        expected, text
+                    );
+                }
+                other => panic!("chunk {i}: expected Generated(Content(Text)), got {other:?}"),
+            }
+        }
+
+        // GenerationCompleted must be pushed.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::GenerationCompleted { .. })),
+            "expected GenerationCompleted after all chunks"
+        );
+
+        // Generated(Done) must be present.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::Generated(GeneratedEvent::Done))),
+            "expected Generated(Done)"
+        );
+
+        // ActivityCompleted must be present.
+        assert!(
+            events.iter().any(
+                |e| matches!(e, PipelineEvent::ActivityCompleted { name, .. } if name == "generate")
+            ),
+            "expected ActivityCompleted"
+        );
+    }
+
+    /// Verify that a provider implementing only `execute` (not `execute_stream`)
+    /// still works correctly via the default `execute_stream` wrapper.
+    ///
+    /// `StubProvider` (used by `make_test_services_with_response`) does not
+    /// override `execute_stream`, so this test exercises the default implementation.
+    #[tokio::test]
+    async fn test_generate_default_stream_wraps_execute() {
+        let response_text = "Default stream response.";
+        let services = make_test_services_with_response(response_text);
+        let input = make_test_input();
+        let (tx, mut rx) = mpsc::channel(128);
+        let cancel = CancellationToken::new();
+        let event_log = NullEventLog;
+        let exec_id = crate::execution::ExecutionId::new();
+
+        let activity = GenerateActivity::new();
+        activity
+            .execute(&exec_id, input, &services, &event_log, tx, cancel)
+            .await;
+
+        let events = collect_events(&mut rx);
+
+        // Must emit at least one Content event with the response text.
+        let has_content = events.iter().any(|e| {
+            matches!(e, PipelineEvent::Generated(GeneratedEvent::Content {
+                part: ContentPart::Text(t),
+            }) if t.contains(response_text))
+        });
+        assert!(
+            has_content,
+            "expected Generated(Content) with response text"
+        );
+
+        // Must emit GenerationCompleted.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::GenerationCompleted { .. })),
+            "expected GenerationCompleted"
+        );
+
+        // Must emit ActivityCompleted.
+        assert!(
+            events.iter().any(
+                |e| matches!(e, PipelineEvent::ActivityCompleted { name, .. } if name == "generate")
+            ),
+            "expected ActivityCompleted"
+        );
+    }
+
+    /// Verify that cancellation mid-stream causes `GenerationFailed` with
+    /// `retryable: false` and drops the stream.
+    ///
+    /// Uses a pre-cancelled token so the select! in the stream consumption loop
+    /// fires before the first chunk arrives.
+    #[tokio::test]
+    async fn test_generate_stream_cancellation_mid_stream() {
+        let chunks = vec!["chunk1".to_string(), "chunk2".to_string()];
+        let services = make_test_services_with_chunk_stream(chunks, true);
+        let input = make_test_input();
+        let (tx, mut rx) = mpsc::channel(128);
+        let cancel = CancellationToken::new();
+        // Pre-cancel so the stream loop is interrupted immediately.
+        cancel.cancel();
+        let event_log = NullEventLog;
+        let exec_id = crate::execution::ExecutionId::new();
+
+        let activity = GenerateActivity::new();
+        activity
+            .execute(&exec_id, input, &services, &event_log, tx, cancel)
+            .await;
+
+        let events = collect_events(&mut rx);
+
+        // Must push GenerationFailed.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::GenerationFailed { .. })),
+            "expected GenerationFailed on cancellation"
+        );
+
+        // Must push ActivityFailed with retryable: false.
+        let failed = events
+            .iter()
+            .find(|e| matches!(e, PipelineEvent::ActivityFailed { .. }))
+            .expect("expected ActivityFailed");
+        match failed {
+            PipelineEvent::ActivityFailed { retryable, .. } => {
+                assert!(!retryable, "cancellation should not be retryable");
+            }
+            _ => panic!("expected ActivityFailed"),
+        }
+    }
+
+    /// Verify that a mid-stream error (after one chunk was already delivered) causes
+    /// `GenerationFailed` and `ActivityFailed` with the correct `retryable` flag.
+    ///
+    /// The `MidStreamErrorProvider` yields one delta chunk then errors. The first
+    /// chunk must have been pushed as a `Generated(Content)` event, and the error
+    /// must trigger `GenerationFailed` + `ActivityFailed`.
+    #[tokio::test]
+    async fn test_generate_stream_error_mid_stream() {
+        let services = make_test_services_with_mid_stream_error(
+            "partial text",
+            ProviderError::RateLimited {
+                retry_after_ms: 5000,
+            },
+        );
+        let input = make_test_input();
+        let (tx, mut rx) = mpsc::channel(128);
+        let cancel = CancellationToken::new();
+        let event_log = NullEventLog;
+        let exec_id = crate::execution::ExecutionId::new();
+
+        let activity = GenerateActivity::new();
+        activity
+            .execute(&exec_id, input, &services, &event_log, tx, cancel)
+            .await;
+
+        let events = collect_events(&mut rx);
+
+        // The first chunk must have been pushed before the error.
+        let has_partial_content = events.iter().any(|e| {
+            matches!(e, PipelineEvent::Generated(GeneratedEvent::Content {
+                part: ContentPart::Text(t),
+            }) if t == "partial text")
+        });
+        assert!(
+            has_partial_content,
+            "expected Generated(Content) with 'partial text' before the mid-stream error"
+        );
+
+        // Must push GenerationFailed.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::GenerationFailed { .. })),
+            "expected GenerationFailed after mid-stream error"
+        );
+
+        // RateLimited is retryable — ActivityFailed must have retryable: true.
+        let failed = events
+            .iter()
+            .find(|e| matches!(e, PipelineEvent::ActivityFailed { .. }))
+            .expect("expected ActivityFailed");
+        match failed {
+            PipelineEvent::ActivityFailed { retryable, .. } => {
+                assert!(
+                    *retryable,
+                    "rate limit mid-stream error should be retryable"
+                );
+            }
+            _ => panic!("expected ActivityFailed"),
+        }
     }
 }

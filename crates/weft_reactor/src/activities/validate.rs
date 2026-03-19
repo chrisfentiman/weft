@@ -327,7 +327,11 @@ mod tests {
 
         match commands_events[0] {
             PipelineEvent::CommandsAvailable { commands } => {
-                assert_eq!(commands.len(), 1, "expected 1 command stub from the test registry");
+                assert_eq!(
+                    commands.len(),
+                    1,
+                    "expected 1 command stub from the test registry"
+                );
                 assert_eq!(commands[0].name, "test_command");
                 assert_eq!(commands[0].description, "A test command");
             }
@@ -370,7 +374,9 @@ mod tests {
 
         // Must still push ValidationPassed (fail-open).
         assert!(
-            events.iter().any(|e| matches!(e, PipelineEvent::ValidationPassed)),
+            events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::ValidationPassed)),
             "expected ValidationPassed even when list_commands fails"
         );
 
@@ -399,7 +405,9 @@ mod tests {
             "expected ActivityCompleted even when list_commands fails"
         );
         assert!(
-            !events.iter().any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
+            !events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
             "should not push ActivityFailed when list_commands fails (fail-open)"
         );
     }

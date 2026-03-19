@@ -22,8 +22,10 @@
 //! that circular dependency for activity tests.
 
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use std::sync::Arc;
 
+use futures::Stream;
 use tokio::sync::mpsc;
 use weft_core::{
     CommandDescription, CommandInvocation, CommandResult, CommandStub, ContentPart, HookEvent,
@@ -32,8 +34,8 @@ use weft_core::{
 };
 use weft_hooks::{HookChainResult, HookRunner};
 use weft_llm::{
-    Capability, Provider, ProviderError, ProviderRequest, ProviderResponse, ProviderService,
-    TokenUsage,
+    Capability, ContentDelta, Provider, ProviderChunk, ProviderError, ProviderRequest,
+    ProviderResponse, ProviderService, TokenUsage,
 };
 use weft_router::{
     RoutingCandidate, RoutingDecision, RoutingDomainKind, ScoredCandidate, SemanticRouter,
@@ -132,6 +134,142 @@ impl Provider for SlowProvider {
 
     fn name(&self) -> &str {
         "slow-provider"
+    }
+}
+
+/// A provider that yields a fixed sequence of text delta chunks, then a Complete.
+///
+/// Used in tests that verify `GenerateActivity` pushes `Generated(Content)` events
+/// as each chunk arrives rather than buffering the full response.
+pub struct ChunkStreamProvider {
+    /// Text chunks to yield as `ProviderChunk::Delta` before the `Complete`.
+    pub chunks: Vec<String>,
+    /// Whether to include a `Complete` chunk at the end.
+    ///
+    /// When `true`, the last chunk is `Complete` carrying the concatenated text
+    /// and usage data. When `false`, the stream ends after all delta chunks
+    /// (simulates a provider that yields only deltas).
+    pub include_complete: bool,
+}
+
+#[async_trait::async_trait]
+impl Provider for ChunkStreamProvider {
+    async fn execute(&self, _request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        // Assemble a response from all chunks for the non-streaming path.
+        let text: String = self.chunks.join("");
+        let message = WeftMessage {
+            role: Role::Assistant,
+            source: Source::Provider,
+            model: Some("chunk-stream-model".to_string()),
+            content: vec![ContentPart::Text(text)],
+            delta: false,
+            message_index: 0,
+        };
+        Ok(ProviderResponse::ChatCompletion {
+            message,
+            usage: Some(TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: self.chunks.len() as u32 * 2,
+            }),
+        })
+    }
+
+    async fn execute_stream(
+        &self,
+        _request: ProviderRequest,
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<ProviderChunk, ProviderError>> + Send>>,
+        ProviderError,
+    > {
+        let chunks = self.chunks.clone();
+        let include_complete = self.include_complete;
+
+        // Collect all items into a Vec upfront, then convert to a stream.
+        let mut items: Vec<Result<ProviderChunk, ProviderError>> = chunks
+            .iter()
+            .map(|text| {
+                Ok(ProviderChunk::Delta(ContentDelta {
+                    text: Some(text.clone()),
+                    tool_call_delta: None,
+                }))
+            })
+            .collect();
+
+        if include_complete {
+            let full_text: String = chunks.join("");
+            let message = WeftMessage {
+                role: Role::Assistant,
+                source: Source::Provider,
+                model: Some("chunk-stream-model".to_string()),
+                content: vec![ContentPart::Text(full_text)],
+                delta: false,
+                message_index: 0,
+            };
+            let response = ProviderResponse::ChatCompletion {
+                message,
+                usage: Some(TokenUsage {
+                    prompt_tokens: 10,
+                    completion_tokens: chunks.len() as u32 * 2,
+                }),
+            };
+            items.push(Ok(ProviderChunk::Complete(response)));
+        }
+
+        Ok(Box::pin(futures::stream::iter(items)))
+    }
+
+    fn name(&self) -> &str {
+        "chunk-stream-provider"
+    }
+}
+
+/// A provider whose stream yields one delta then errors.
+///
+/// Used in tests that verify `GenerateActivity` pushes `GenerationFailed` when
+/// a mid-stream error occurs after partial content was already emitted.
+pub struct MidStreamErrorProvider {
+    /// The text chunk to emit before the error.
+    pub first_chunk: String,
+    /// The error to return as the second item.
+    pub error: std::sync::Mutex<Option<ProviderError>>,
+    pub fallback_error_msg: String,
+}
+
+#[async_trait::async_trait]
+impl Provider for MidStreamErrorProvider {
+    async fn execute(&self, _request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        Err(ProviderError::Unsupported(
+            "mid-stream-error-provider: use execute_stream".to_string(),
+        ))
+    }
+
+    async fn execute_stream(
+        &self,
+        _request: ProviderRequest,
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<ProviderChunk, ProviderError>> + Send>>,
+        ProviderError,
+    > {
+        let first = self.first_chunk.clone();
+        let err = self
+            .error
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| ProviderError::Unsupported(self.fallback_error_msg.clone()));
+
+        let items: Vec<Result<ProviderChunk, ProviderError>> = vec![
+            Ok(ProviderChunk::Delta(ContentDelta {
+                text: Some(first),
+                tool_call_delta: None,
+            })),
+            Err(err),
+        ];
+        Ok(Box::pin(futures::stream::iter(items)))
+    }
+
+    fn name(&self) -> &str {
+        "mid-stream-error-provider"
     }
 }
 
@@ -690,7 +828,13 @@ fn build_services_full(
     failing_command: Option<(String, weft_commands::CommandError)>,
     failed_result_command: Option<(String, String)>,
 ) -> Services {
-    build_services_full_ext(provider, hooks, failing_command, failed_result_command, false)
+    build_services_full_ext(
+        provider,
+        hooks,
+        failing_command,
+        failed_result_command,
+        false,
+    )
 }
 
 /// Build `Services` with complete control including `list_commands` failure injection.
@@ -806,6 +950,38 @@ pub fn make_test_services_with_blocking_hook(event: HookEvent, reason: &str) -> 
         blocking_event: event,
         reason: reason.to_string(),
     });
+    build_services(provider, hooks, None)
+}
+
+/// Build test `Services` whose provider yields `chunks` as streaming delta chunks.
+///
+/// When `include_complete` is `true`, the stream ends with a `Complete` chunk
+/// containing the concatenated text and usage data. Use this to test that
+/// `GenerateActivity` pushes one `Generated(Content)` event per chunk.
+pub fn make_test_services_with_chunk_stream(
+    chunks: Vec<String>,
+    include_complete: bool,
+) -> Services {
+    let provider: Arc<dyn Provider> = Arc::new(ChunkStreamProvider {
+        chunks,
+        include_complete,
+    });
+    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(weft_hooks::NullHookRunner);
+    build_services(provider, hooks, None)
+}
+
+/// Build test `Services` whose provider stream errors after the first chunk.
+///
+/// The first chunk pushes one `Generated(Content)` event, then the stream yields
+/// an error. Use this to test `GenerateActivity` mid-stream error handling.
+pub fn make_test_services_with_mid_stream_error(first_chunk: &str, err: ProviderError) -> Services {
+    let error_msg = err.to_string();
+    let provider: Arc<dyn Provider> = Arc::new(MidStreamErrorProvider {
+        first_chunk: first_chunk.to_string(),
+        error: std::sync::Mutex::new(Some(err)),
+        fallback_error_msg: error_msg,
+    });
+    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(weft_hooks::NullHookRunner);
     build_services(provider, hooks, None)
 }
 
