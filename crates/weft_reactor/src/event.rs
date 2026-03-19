@@ -227,6 +227,47 @@ pub enum PipelineEvent {
     ResponseAssembled {
         response: weft_core::WeftResponse,
     },
+
+    // ── Message injection ────────────────────────────────────────
+    /// A message was added to the conversation context by the Reactor.
+    ///
+    /// Recorded every time the Reactor pushes a `WeftMessage` into `state.messages`
+    /// (command results, hook feedback, signal-injected context). This makes the
+    /// message list fully reconstructable from the event log: start with the original
+    /// request messages, then append each `MessageInjected` payload in sequence order.
+    MessageInjected {
+        message: weft_core::WeftMessage,
+        source: MessageInjectionSource,
+    },
+
+    // ── Commands availability ────────────────────────────────────
+    /// The available commands for this execution, as determined by the validate
+    /// activity querying the command registry.
+    ///
+    /// Pushed by `ValidateActivity` after loading commands from the registry.
+    /// The Reactor uses this to populate `state.available_commands`, which is
+    /// passed to subsequent activities via `ActivityInput`. Recording this event
+    /// makes the available command set reconstructable from the event log.
+    CommandsAvailable {
+        commands: Vec<weft_core::CommandStub>,
+    },
+}
+
+/// Why a message was injected into the conversation context.
+///
+/// Carried by `PipelineEvent::MessageInjected` to explain the origin of the
+/// injected message. This allows replay code to correctly categorize injected
+/// messages and observers to understand why the message list grew.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MessageInjectionSource {
+    /// Result from a completed command execution.
+    CommandResult { command_name: String },
+    /// Error from a failed command execution.
+    CommandError { command_name: String },
+    /// Feedback from a hook that blocked generation.
+    HookFeedback { hook_name: String },
+    /// Context injected by a `Signal::InjectContext`.
+    SignalInjection,
 }
 
 impl PipelineEvent {
@@ -266,6 +307,8 @@ impl PipelineEvent {
             PipelineEvent::ValidationPassed => "validation.passed",
             PipelineEvent::ValidationFailed { .. } => "validation.failed",
             PipelineEvent::ResponseAssembled { .. } => "response.assembled",
+            PipelineEvent::MessageInjected { .. } => "message.injected",
+            PipelineEvent::CommandsAvailable { .. } => "commands.available",
         }
     }
 }
@@ -498,6 +541,18 @@ mod tests {
                     timing: weft_core::WeftTiming::default(),
                 },
             },
+            PipelineEvent::MessageInjected {
+                message: make_message(),
+                source: crate::event::MessageInjectionSource::CommandResult {
+                    command_name: "search".to_string(),
+                },
+            },
+            PipelineEvent::CommandsAvailable {
+                commands: vec![weft_core::CommandStub {
+                    name: "search".to_string(),
+                    description: "Search the web".to_string(),
+                }],
+            },
         ];
 
         for event in &events {
@@ -707,5 +762,175 @@ mod tests {
         assert_eq!(back.sequence, 7);
         assert_eq!(back.event_type, "activity.retried");
         assert_eq!(back.execution_id, exec_id);
+    }
+
+    #[test]
+    fn test_message_injected_command_result_round_trip() {
+        let msg = make_message();
+        let event = PipelineEvent::MessageInjected {
+            message: msg.clone(),
+            source: crate::event::MessageInjectionSource::CommandResult {
+                command_name: "web_search".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "message.injected");
+        match back {
+            PipelineEvent::MessageInjected {
+                message,
+                source: crate::event::MessageInjectionSource::CommandResult { command_name },
+            } => {
+                assert_eq!(command_name, "web_search");
+                assert_eq!(message.model, msg.model);
+                assert_eq!(message.role, msg.role);
+            }
+            other => panic!(
+                "expected MessageInjected with CommandResult source, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_message_injected_signal_injection_round_trip() {
+        let msg = make_message();
+        let event = PipelineEvent::MessageInjected {
+            message: msg.clone(),
+            source: crate::event::MessageInjectionSource::SignalInjection,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "message.injected");
+        match back {
+            PipelineEvent::MessageInjected {
+                message,
+                source: crate::event::MessageInjectionSource::SignalInjection,
+            } => {
+                assert_eq!(message.model, msg.model);
+            }
+            other => panic!(
+                "expected MessageInjected with SignalInjection source, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_message_injected_hook_feedback_round_trip() {
+        let msg = WeftMessage {
+            role: Role::User,
+            source: Source::Client,
+            model: None,
+            content: vec![ContentPart::Text(
+                "please try again without profanity".to_string(),
+            )],
+            delta: false,
+            message_index: 1,
+        };
+        let event = PipelineEvent::MessageInjected {
+            message: msg,
+            source: crate::event::MessageInjectionSource::HookFeedback {
+                hook_name: "content-policy-hook".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "message.injected");
+        match back {
+            PipelineEvent::MessageInjected {
+                source: crate::event::MessageInjectionSource::HookFeedback { hook_name },
+                ..
+            } => {
+                assert_eq!(hook_name, "content-policy-hook");
+            }
+            other => panic!(
+                "expected MessageInjected with HookFeedback source, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_commands_available_round_trip() {
+        let commands = vec![
+            weft_core::CommandStub {
+                name: "web_search".to_string(),
+                description: "Search the web".to_string(),
+            },
+            weft_core::CommandStub {
+                name: "calculator".to_string(),
+                description: "Evaluate math expressions".to_string(),
+            },
+        ];
+        let event = PipelineEvent::CommandsAvailable {
+            commands: commands.clone(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "commands.available");
+        match back {
+            PipelineEvent::CommandsAvailable {
+                commands: back_cmds,
+            } => {
+                assert_eq!(back_cmds.len(), 2);
+                assert_eq!(back_cmds[0].name, "web_search");
+                assert_eq!(back_cmds[1].name, "calculator");
+                assert_eq!(back_cmds[0].description, "Search the web");
+            }
+            other => panic!("expected CommandsAvailable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_commands_available_empty_list_round_trip() {
+        let event = PipelineEvent::CommandsAvailable { commands: vec![] };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "commands.available");
+        match back {
+            PipelineEvent::CommandsAvailable { commands } => {
+                assert!(commands.is_empty());
+            }
+            other => panic!("expected CommandsAvailable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_event_type_string_new_variants() {
+        let msg = make_message();
+        assert_eq!(
+            PipelineEvent::MessageInjected {
+                message: msg,
+                source: crate::event::MessageInjectionSource::SignalInjection,
+            }
+            .event_type_string(),
+            "message.injected"
+        );
+        assert_eq!(
+            PipelineEvent::CommandsAvailable { commands: vec![] }.event_type_string(),
+            "commands.available"
+        );
+    }
+
+    #[test]
+    fn test_message_injection_source_all_variants_serialize() {
+        // Verify all MessageInjectionSource variants serialize without error.
+        let sources = vec![
+            crate::event::MessageInjectionSource::CommandResult {
+                command_name: "cmd".to_string(),
+            },
+            crate::event::MessageInjectionSource::CommandError {
+                command_name: "cmd".to_string(),
+            },
+            crate::event::MessageInjectionSource::HookFeedback {
+                hook_name: "hook".to_string(),
+            },
+            crate::event::MessageInjectionSource::SignalInjection,
+        ];
+        for source in &sources {
+            let json = serde_json::to_string(source).unwrap();
+            let _back: crate::event::MessageInjectionSource = serde_json::from_str(&json).unwrap();
+        }
     }
 }

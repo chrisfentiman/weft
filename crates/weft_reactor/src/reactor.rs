@@ -23,7 +23,9 @@ use crate::activity::{Activity, ActivityInput, RoutingSnapshot};
 use crate::budget::{Budget, BudgetCheck};
 use crate::config::{PipelineConfig, ReactorConfig, RetryPolicy};
 use crate::error::ReactorError;
-use crate::event::{EVENT_SCHEMA_VERSION, Event, GeneratedEvent, PipelineEvent};
+use crate::event::{
+    EVENT_SCHEMA_VERSION, Event, GeneratedEvent, MessageInjectionSource, PipelineEvent,
+};
 use crate::event_log::EventLog;
 use crate::execution::{Execution, ExecutionId, ExecutionStatus, RequestId, TenantId};
 use crate::registry::ActivityRegistry;
@@ -761,6 +763,19 @@ impl Reactor {
                                                 return Ok((result, event_tx));
                                             }
                                             Signal::InjectContext { messages } => {
+                                                // Record one MessageInjected event per message so
+                                                // the message list is fully reconstructable from
+                                                // the event log. Each message is logged individually
+                                                // (not as a batch) to preserve per-message ordering.
+                                                for msg in &messages {
+                                                    self.record_event(
+                                                        &execution_id,
+                                                        &PipelineEvent::MessageInjected {
+                                                            message: msg.clone(),
+                                                            source: MessageInjectionSource::SignalInjection,
+                                                        },
+                                                    ).await?;
+                                                }
                                                 state.messages.extend(messages);
                                             }
                                             Signal::UpdateBudget { changes } => {
@@ -989,8 +1004,9 @@ impl Reactor {
                         .await?;
                     if let Some(err) = terminate {
                         // Hook blocked with feedback: inject and retry generation.
-                        if let ReactorError::HookBlocked { reason, .. } = &err {
-                            // Inject feedback message and continue dispatch loop.
+                        if let ReactorError::HookBlocked { hook_name, reason } = &err {
+                            // Inject feedback message and record as MessageInjected so the
+                            // message list remains reconstructable from the event log.
                             let feedback_msg = weft_core::WeftMessage {
                                 role: weft_core::Role::User,
                                 source: weft_core::Source::Client,
@@ -999,7 +1015,17 @@ impl Reactor {
                                 delta: false,
                                 message_index: state.messages.len() as u32,
                             };
-                            state.messages.push(feedback_msg);
+                            state.messages.push(feedback_msg.clone());
+                            self.record_event(
+                                &execution_id,
+                                &PipelineEvent::MessageInjected {
+                                    message: feedback_msg,
+                                    source: MessageInjectionSource::HookFeedback {
+                                        hook_name: hook_name.clone(),
+                                    },
+                                },
+                            )
+                            .await?;
                             state.generate_retry_attempt = 0;
                             continue 'dispatch;
                         }
@@ -1218,7 +1244,20 @@ impl Reactor {
                             });
                         }
                         PipelineEvent::ValidationPassed => {
-                            // Available commands were set by the validate activity.
+                            // Commands are now communicated via CommandsAvailable events.
+                        }
+                        PipelineEvent::CommandsAvailable { commands } => {
+                            // Populate available_commands from the validate activity's event.
+                            // This makes available_commands reconstructable from the event log.
+                            state.available_commands = commands.clone();
+                        }
+                        PipelineEvent::MessageInjected { message, .. } => {
+                            // During replay scenarios where drain_pre_post_loop processes
+                            // a MessageInjected event, append the message to state.
+                            // In normal execution this variant is recorded by the Reactor
+                            // itself (not produced by activities), so this arm exists for
+                            // completeness and replay correctness.
+                            state.messages.push(message.clone());
                         }
                         PipelineEvent::ResponseAssembled { response } => {
                             state.response = Some(response.clone());
@@ -1364,7 +1403,9 @@ impl Reactor {
                                 self.record_event(execution_id, &event).await?;
                                 match &event {
                                     PipelineEvent::CommandCompleted { name, result } if name == &cmd_name => {
-                                        // Inject command result into messages.
+                                        // Inject command result into messages and record the injection
+                                        // as a MessageInjected event so the message list is fully
+                                        // reconstructable from the event log.
                                         let result_msg = weft_core::WeftMessage {
                                             role: weft_core::Role::User,
                                             source: weft_core::Source::Client,
@@ -1373,12 +1414,23 @@ impl Reactor {
                                             delta: false,
                                             message_index: state.messages.len() as u32,
                                         };
-                                        state.messages.push(result_msg);
+                                        state.messages.push(result_msg.clone());
+                                        self.record_event(
+                                            execution_id,
+                                            &PipelineEvent::MessageInjected {
+                                                message: result_msg,
+                                                source: MessageInjectionSource::CommandResult {
+                                                    command_name: name.clone(),
+                                                },
+                                            },
+                                        ).await?;
                                         state.commands_executed += 1;
                                         cmd_completed = true;
                                     }
                                     PipelineEvent::CommandFailed { name, error } if name == &cmd_name => {
-                                        // Inject error into messages.
+                                        // Inject error into messages and record the injection
+                                        // as a MessageInjected event so the message list is fully
+                                        // reconstructable from the event log.
                                         let err_msg = weft_core::WeftMessage {
                                             role: weft_core::Role::User,
                                             source: weft_core::Source::Client,
@@ -1387,7 +1439,16 @@ impl Reactor {
                                             delta: false,
                                             message_index: state.messages.len() as u32,
                                         };
-                                        state.messages.push(err_msg);
+                                        state.messages.push(err_msg.clone());
+                                        self.record_event(
+                                            execution_id,
+                                            &PipelineEvent::MessageInjected {
+                                                message: err_msg,
+                                                source: MessageInjectionSource::CommandError {
+                                                    command_name: name.clone(),
+                                                },
+                                            },
+                                        ).await?;
                                         state.commands_executed += 1;
                                         cmd_completed = true;
                                     }
