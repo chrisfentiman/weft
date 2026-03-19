@@ -9,6 +9,7 @@
 //! - [`make_test_services_with_error`] — Services whose provider returns a `ProviderError`
 //! - [`make_test_services_with_command_error`] — Services where a specific command returns a `CommandError`
 //! - [`make_test_services_with_blocking_hook`] — Services with a hook that blocks a specific event
+//! - [`make_test_services_with_failing_list_commands`] — Services where `list_commands` returns an error
 //! - [`make_test_input`] — Minimal valid `ActivityInput` for tests
 //! - [`collect_events`] — Drain an `mpsc::Receiver<PipelineEvent>` into a `Vec`
 //! - [`NullEventLog`] — No-op `EventLog` impl for use in activity tests
@@ -306,11 +307,18 @@ struct StubCommandRegistry {
     failing_command: Option<(String, weft_commands::CommandError)>,
     /// If set, `execute_command` for the matching name returns a failed result (success=false).
     failed_result_command: Option<(String, String)>,
+    /// If true, `list_commands` returns a `RegistryUnavailable` error.
+    fail_list_commands: bool,
 }
 
 #[async_trait::async_trait]
 impl weft_commands::CommandRegistry for StubCommandRegistry {
     async fn list_commands(&self) -> Result<Vec<CommandStub>, weft_commands::CommandError> {
+        if self.fail_list_commands {
+            return Err(weft_commands::CommandError::RegistryUnavailable(
+                "stub: registry unavailable".to_string(),
+            ));
+        }
         Ok(vec![CommandStub {
             name: "test_command".to_string(),
             description: "A test command".to_string(),
@@ -682,6 +690,17 @@ fn build_services_full(
     failing_command: Option<(String, weft_commands::CommandError)>,
     failed_result_command: Option<(String, String)>,
 ) -> Services {
+    build_services_full_ext(provider, hooks, failing_command, failed_result_command, false)
+}
+
+/// Build `Services` with complete control including `list_commands` failure injection.
+fn build_services_full_ext(
+    provider: Arc<dyn Provider>,
+    hooks: Arc<dyn HookRunner + Send + Sync>,
+    failing_command: Option<(String, weft_commands::CommandError)>,
+    failed_result_command: Option<(String, String)>,
+    fail_list_commands: bool,
+) -> Services {
     let config = Arc::new(make_test_config());
     let providers: Arc<dyn weft_llm::ProviderService + Send + Sync> =
         Arc::new(StubProviderServiceV2::new(provider));
@@ -690,6 +709,7 @@ fn build_services_full(
         Arc::new(StubCommandRegistry {
             failing_command,
             failed_result_command,
+            fail_list_commands,
         });
 
     Services {
@@ -787,6 +807,18 @@ pub fn make_test_services_with_blocking_hook(event: HookEvent, reason: &str) -> 
         reason: reason.to_string(),
     });
     build_services(provider, hooks, None)
+}
+
+/// Build test `Services` where `list_commands` returns a `RegistryUnavailable` error.
+///
+/// Use this when testing fail-open behaviour in activities that call
+/// `services.commands.list_commands()` (e.g. `ValidateActivity`).
+pub fn make_test_services_with_failing_list_commands() -> Services {
+    let provider: Arc<dyn Provider> = Arc::new(StubProvider {
+        response_text: "stub response".to_string(),
+    });
+    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(weft_hooks::NullHookRunner);
+    build_services_full_ext(provider, hooks, None, None, true)
 }
 
 // ── ActivityInput builder ─────────────────────────────────────────────────────
@@ -922,6 +954,7 @@ mod tests {
         let registry = StubCommandRegistry {
             failing_command: None,
             failed_result_command: None,
+            fail_list_commands: false,
         };
         let cmds = registry.list_commands().await.unwrap();
         assert!(!cmds.is_empty());
@@ -932,6 +965,7 @@ mod tests {
         let registry = StubCommandRegistry {
             failing_command: None,
             failed_result_command: None,
+            fail_list_commands: false,
         };
         let invocation = CommandInvocation {
             name: "test_command".to_string(),
@@ -950,6 +984,7 @@ mod tests {
                 weft_commands::CommandError::RegistryUnavailable("down".to_string()),
             )),
             failed_result_command: None,
+            fail_list_commands: false,
         };
         let invocation = CommandInvocation {
             name: "failing_cmd".to_string(),

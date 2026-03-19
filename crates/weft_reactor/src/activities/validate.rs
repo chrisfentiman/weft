@@ -1,7 +1,8 @@
 //! ValidateActivity: validates the incoming request.
 //!
 //! Checks that messages are non-empty and the request format is valid.
-//! Populates `ActivityInput.available_commands` from the command registry.
+//! Pushes a `CommandsAvailable` event carrying the loaded commands so that
+//! the Reactor can populate `state.available_commands` from the event channel.
 
 use std::time::Instant;
 
@@ -18,13 +19,16 @@ use crate::services::Services;
 /// Validates the incoming request.
 ///
 /// Checks that messages are non-empty, the request format is valid, and
-/// populates the list of available commands from the command registry.
+/// pushes the list of available commands from the command registry as a
+/// `CommandsAvailable` event. The Reactor handles that event to populate
+/// `state.available_commands` for subsequent activities.
 ///
 /// **Name:** `"validate"`
 ///
 /// **Events pushed:**
 /// - `ActivityStarted { name: "validate" }`
 /// - `ValidationPassed` — if validation succeeds
+/// - `CommandsAvailable { commands }` — always pushed after `ValidationPassed`
 /// - `ValidationFailed { reason }` — if validation fails
 /// - `ActivityCompleted { name: "validate", duration_ms, idempotency_key: None }`
 /// - `ActivityFailed { name: "validate", error, retryable: false }` — on internal error
@@ -113,25 +117,18 @@ impl Activity for ValidateActivity {
             }
         };
 
-        // Attach available commands to a ValidationPassed event so downstream
-        // activities (AssemblePrompt, Generate) can use them. The Reactor reads
-        // ValidationPassed from the channel and updates ExecutionState.
         let _ = event_tx.send(PipelineEvent::ValidationPassed).await;
 
-        // Publish the populated commands list via a separate event for state reconstruction.
-        // We reuse PromptAssembled as a proxy — but the actual mechanism is that the Reactor
-        // intercepts ValidationPassed and then updates state from the input's available_commands.
-        // Since activities cannot return values, we push a dummy event to carry the commands.
-        // NOTE: The Reactor reconstructs available_commands from the event log during replay.
-        // For now, the Reactor reads available_commands from the ValidateActivity's input after
-        // the channel drains. This is a known limitation of Phase 3 — the Reactor (Phase 4) will
-        // read the commands from the input snapshot it provides.
-        //
-        // To make commands available to the Reactor without a dedicated event type, we push a
-        // ValidationPassed event as a signal. The Reactor builds the input with available_commands
-        // already set (it calls list_commands before invoking this activity). The ValidationPassed
-        // event serves as the signal that commands are ready.
-        let _ = available_commands; // consumed above
+        // Push CommandsAvailable before ActivityCompleted so the Reactor can
+        // populate state.available_commands while draining the channel.
+        // On list_commands error the activity continues fail-open with an empty
+        // vec (the warn is already logged above); commands remain unavailable for
+        // this execution, which is preferable to failing the entire request.
+        let _ = event_tx
+            .send(PipelineEvent::CommandsAvailable {
+                commands: available_commands,
+            })
+            .await;
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
@@ -150,7 +147,10 @@ impl Activity for ValidateActivity {
 mod tests {
     use super::*;
     use crate::test_support::NullEventLog;
-    use crate::test_support::{collect_events, make_test_input, make_test_services};
+    use crate::test_support::{
+        collect_events, make_test_input, make_test_services,
+        make_test_services_with_failing_list_commands,
+    };
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
@@ -301,5 +301,106 @@ mod tests {
             }
             _ => panic!("expected ActivityFailed"),
         }
+    }
+
+    // ── CommandsAvailable event ───────────────────────────────────────────────
+
+    /// Verify that a successful run pushes `CommandsAvailable` with the stubs
+    /// returned by the command registry (one stub: "test_command").
+    #[tokio::test]
+    async fn test_validate_pushes_commands_available() {
+        let input = make_test_input();
+        let events = run_validate(input).await;
+
+        // Exactly one CommandsAvailable event must be present.
+        let commands_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, PipelineEvent::CommandsAvailable { .. }))
+            .collect();
+
+        assert_eq!(
+            commands_events.len(),
+            1,
+            "expected exactly one CommandsAvailable event, got {}",
+            commands_events.len()
+        );
+
+        match commands_events[0] {
+            PipelineEvent::CommandsAvailable { commands } => {
+                assert_eq!(commands.len(), 1, "expected 1 command stub from the test registry");
+                assert_eq!(commands[0].name, "test_command");
+                assert_eq!(commands[0].description, "A test command");
+            }
+            _ => panic!("expected CommandsAvailable"),
+        }
+
+        // CommandsAvailable must appear before ActivityCompleted.
+        let ca_pos = events
+            .iter()
+            .position(|e| matches!(e, PipelineEvent::CommandsAvailable { .. }))
+            .expect("CommandsAvailable not found");
+        let completed_pos = events
+            .iter()
+            .position(|e| matches!(e, PipelineEvent::ActivityCompleted { .. }))
+            .expect("ActivityCompleted not found");
+        assert!(
+            ca_pos < completed_pos,
+            "CommandsAvailable (pos {ca_pos}) must come before ActivityCompleted (pos {completed_pos})"
+        );
+    }
+
+    /// When `list_commands` returns an error, the activity must fail-open:
+    /// push `CommandsAvailable` with an empty vec and continue to `ActivityCompleted`.
+    #[tokio::test]
+    async fn test_validate_commands_available_empty_on_error() {
+        let input = make_test_input();
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let services = make_test_services_with_failing_list_commands();
+        let event_log = NullEventLog;
+        let exec_id = crate::execution::ExecutionId::new();
+
+        let activity = ValidateActivity::new();
+        activity
+            .execute(&exec_id, input, &services, &event_log, tx, cancel)
+            .await;
+
+        let events = collect_events(&mut rx);
+
+        // Must still push ValidationPassed (fail-open).
+        assert!(
+            events.iter().any(|e| matches!(e, PipelineEvent::ValidationPassed)),
+            "expected ValidationPassed even when list_commands fails"
+        );
+
+        // Must push CommandsAvailable with an empty commands vec.
+        let ca = events
+            .iter()
+            .find(|e| matches!(e, PipelineEvent::CommandsAvailable { .. }))
+            .expect("expected CommandsAvailable even on list_commands error");
+
+        match ca {
+            PipelineEvent::CommandsAvailable { commands } => {
+                assert!(
+                    commands.is_empty(),
+                    "expected empty commands vec on list_commands error, got {:?}",
+                    commands
+                );
+            }
+            _ => panic!("expected CommandsAvailable"),
+        }
+
+        // Must still reach ActivityCompleted (not ActivityFailed).
+        assert!(
+            events.iter().any(
+                |e| matches!(e, PipelineEvent::ActivityCompleted { name, .. } if name == "validate")
+            ),
+            "expected ActivityCompleted even when list_commands fails"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
+            "should not push ActivityFailed when list_commands fails (fail-open)"
+        );
     }
 }
