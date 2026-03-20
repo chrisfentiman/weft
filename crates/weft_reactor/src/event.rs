@@ -251,6 +251,92 @@ pub enum PipelineEvent {
     CommandsAvailable {
         commands: Vec<weft_core::CommandStub>,
     },
+
+    // ── Selection (replaces RouteCompleted for model) ────────────────
+    /// A model was selected via semantic routing.
+    ///
+    /// Emitted by `ModelSelectionActivity` after scoring all model candidates.
+    /// Includes all scored candidates for observability and replay.
+    ModelSelected {
+        /// The routing name of the selected model (e.g., "gpt-4-turbo").
+        model_name: String,
+        /// Routing score for the selected model (0.0–1.0).
+        score: f32,
+        /// All candidates and their scores, for observability.
+        all_scores: Vec<(String, f32)>,
+    },
+
+    /// Commands were selected via semantic routing.
+    ///
+    /// Emitted by `CommandSelectionActivity` after scoring and filtering.
+    /// Includes the filtered set and the number of candidates scored.
+    CommandsSelected {
+        /// Commands selected after threshold + max_commands filtering.
+        selected: Vec<weft_core::CommandStub>,
+        /// Number of candidates scored (before filtering).
+        candidates_scored: usize,
+    },
+
+    // ── Provider resolution ──────────────────────────────────────────
+    /// Provider and model capabilities were resolved for the selected model.
+    ///
+    /// Emitted by `ProviderResolutionActivity`. Carries all resolved data so
+    /// downstream activities can use it without re-querying the provider service.
+    ProviderResolved {
+        /// The model routing name (same as `ModelSelected.model_name`).
+        model_name: String,
+        /// The model API identifier sent to the provider (e.g., "claude-sonnet-4-20250514").
+        model_id: String,
+        /// Provider name from config (e.g., "anthropic").
+        provider_name: String,
+        /// Capabilities this model supports, as strings for serialization.
+        /// Converted from `HashSet<Capability>` via `cap.as_str().to_string()`.
+        /// e.g., `["chat_completions", "tool_calling"]`.
+        capabilities: Vec<String>,
+        /// Max tokens for this model.
+        max_tokens: u32,
+    },
+
+    // ── System prompt ────────────────────────────────────────────────
+    /// System prompt was assembled from gateway, agent, and caller layers.
+    ///
+    /// Emitted by `SystemPromptAssemblyActivity` after assembling the prompt.
+    /// The actual prompt content is carried by the preceding `MessageInjected`
+    /// event (source `SystemPromptAssembly`).
+    SystemPromptAssembled {
+        /// Length of the assembled system prompt in characters.
+        prompt_length: usize,
+        /// Number of layers that contributed (gateway, agent, caller).
+        layer_count: u32,
+        /// Total message count after system prompt insertion.
+        message_count: usize,
+    },
+
+    // ── Command formatting ──────────────────────────────────────────
+    /// Commands were formatted for the provider.
+    ///
+    /// Emitted by `CommandFormattingActivity`. The format indicates whether
+    /// commands were passed as structured tool definitions or injected as text.
+    CommandsFormatted {
+        /// How commands were formatted.
+        format: CommandFormat,
+        /// Number of commands formatted.
+        command_count: usize,
+    },
+
+    // ── Sampling update ─────────────────────────────────────────────
+    /// Sampling parameters were adjusted for the selected model.
+    ///
+    /// Emitted by `SamplingAdjustmentActivity`. Records current values
+    /// (after clamping) not the diff from originals.
+    SamplingUpdated {
+        /// Current max_tokens after clamping to model limit.
+        max_tokens: u32,
+        /// Current temperature. None means no temperature specified.
+        temperature: Option<f32>,
+        /// Current top_p. None means no top_p specified.
+        top_p: Option<f32>,
+    },
 }
 
 /// Why a message was injected into the conversation context.
@@ -268,6 +354,32 @@ pub enum MessageInjectionSource {
     HookFeedback { hook_name: String },
     /// Context injected by a `Signal::InjectContext`.
     SignalInjection,
+    /// System prompt assembled by `SystemPromptAssemblyActivity`.
+    ///
+    /// The reactor inserts this message at `messages[0]`, replacing any
+    /// existing system-role message. This ensures the provider always sees
+    /// the gateway-assembled prompt as the canonical system prompt.
+    SystemPromptAssembly,
+    /// Command descriptions injected into the prompt for providers without native tool support.
+    ///
+    /// Used by `CommandFormattingActivity` when the model does not support
+    /// `tool_calling`. The message is inserted after the system prompt.
+    CommandFormatInjection,
+}
+
+/// How commands were presented to the provider.
+///
+/// Carried by `PipelineEvent::CommandsFormatted` to indicate whether
+/// commands were passed as structured tool definitions (native provider
+/// support) or injected as text in the system prompt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum CommandFormat {
+    /// Native structured commands (provider supports tool_calling).
+    Structured,
+    /// Commands injected as text in the system prompt.
+    PromptInjected,
+    /// No commands (empty selection or commands not needed).
+    NoCommands,
 }
 
 impl PipelineEvent {
@@ -309,6 +421,12 @@ impl PipelineEvent {
             PipelineEvent::ResponseAssembled { .. } => "response.assembled",
             PipelineEvent::MessageInjected { .. } => "message.injected",
             PipelineEvent::CommandsAvailable { .. } => "commands.available",
+            PipelineEvent::ModelSelected { .. } => "model.selected",
+            PipelineEvent::CommandsSelected { .. } => "commands.selected",
+            PipelineEvent::ProviderResolved { .. } => "provider.resolved",
+            PipelineEvent::SystemPromptAssembled { .. } => "system_prompt.assembled",
+            PipelineEvent::CommandsFormatted { .. } => "commands.formatted",
+            PipelineEvent::SamplingUpdated { .. } => "sampling.updated",
         }
     }
 }
@@ -915,7 +1033,8 @@ mod tests {
 
     #[test]
     fn test_message_injection_source_all_variants_serialize() {
-        // Verify all MessageInjectionSource variants serialize without error.
+        // Verify all MessageInjectionSource variants serialize without error,
+        // including the new Phase 1 variants.
         let sources = vec![
             crate::event::MessageInjectionSource::CommandResult {
                 command_name: "cmd".to_string(),
@@ -927,10 +1046,498 @@ mod tests {
                 hook_name: "hook".to_string(),
             },
             crate::event::MessageInjectionSource::SignalInjection,
+            crate::event::MessageInjectionSource::SystemPromptAssembly,
+            crate::event::MessageInjectionSource::CommandFormatInjection,
         ];
         for source in &sources {
             let json = serde_json::to_string(source).unwrap();
             let _back: crate::event::MessageInjectionSource = serde_json::from_str(&json).unwrap();
+        }
+    }
+
+    // ── Phase 1: New variant tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_model_selected_round_trip() {
+        let event = PipelineEvent::ModelSelected {
+            model_name: "gpt-4-turbo".to_string(),
+            score: 0.87,
+            all_scores: vec![
+                ("gpt-4-turbo".to_string(), 0.87),
+                ("claude-3-opus".to_string(), 0.72),
+            ],
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "model.selected");
+        match back {
+            PipelineEvent::ModelSelected {
+                model_name,
+                score,
+                all_scores,
+            } => {
+                assert_eq!(model_name, "gpt-4-turbo");
+                assert!((score - 0.87_f32).abs() < 1e-5);
+                assert_eq!(all_scores.len(), 2);
+                assert_eq!(all_scores[0].0, "gpt-4-turbo");
+                assert_eq!(all_scores[1].0, "claude-3-opus");
+            }
+            other => panic!("expected ModelSelected, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_model_selected_empty_all_scores_round_trip() {
+        // Edge case: direct routing with a single model — all_scores may be empty.
+        let event = PipelineEvent::ModelSelected {
+            model_name: "direct-model".to_string(),
+            score: 1.0,
+            all_scores: vec![],
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "model.selected");
+        match back {
+            PipelineEvent::ModelSelected {
+                model_name,
+                score,
+                all_scores,
+            } => {
+                assert_eq!(model_name, "direct-model");
+                assert!((score - 1.0_f32).abs() < 1e-5);
+                assert!(all_scores.is_empty());
+            }
+            other => panic!("expected ModelSelected, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_commands_selected_round_trip() {
+        let stubs = vec![
+            weft_core::CommandStub {
+                name: "web_search".to_string(),
+                description: "Search the web".to_string(),
+            },
+            weft_core::CommandStub {
+                name: "calculator".to_string(),
+                description: "Evaluate math".to_string(),
+            },
+        ];
+        let event = PipelineEvent::CommandsSelected {
+            selected: stubs.clone(),
+            candidates_scored: 5,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "commands.selected");
+        match back {
+            PipelineEvent::CommandsSelected {
+                selected,
+                candidates_scored,
+            } => {
+                assert_eq!(selected.len(), 2);
+                assert_eq!(selected[0].name, "web_search");
+                assert_eq!(selected[1].name, "calculator");
+                assert_eq!(candidates_scored, 5);
+            }
+            other => panic!("expected CommandsSelected, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_commands_selected_empty_round_trip() {
+        // Edge case: no commands selected (below threshold).
+        let event = PipelineEvent::CommandsSelected {
+            selected: vec![],
+            candidates_scored: 3,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "commands.selected");
+        match back {
+            PipelineEvent::CommandsSelected {
+                selected,
+                candidates_scored,
+            } => {
+                assert!(selected.is_empty());
+                assert_eq!(candidates_scored, 3);
+            }
+            other => panic!("expected CommandsSelected, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_provider_resolved_round_trip() {
+        let event = PipelineEvent::ProviderResolved {
+            model_name: "gpt-4-turbo".to_string(),
+            model_id: "gpt-4-turbo-2024-04-09".to_string(),
+            provider_name: "openai".to_string(),
+            capabilities: vec!["chat_completions".to_string(), "tool_calling".to_string()],
+            max_tokens: 128_000,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "provider.resolved");
+        match back {
+            PipelineEvent::ProviderResolved {
+                model_name,
+                model_id,
+                provider_name,
+                capabilities,
+                max_tokens,
+            } => {
+                assert_eq!(model_name, "gpt-4-turbo");
+                assert_eq!(model_id, "gpt-4-turbo-2024-04-09");
+                assert_eq!(provider_name, "openai");
+                assert_eq!(capabilities, vec!["chat_completions", "tool_calling"]);
+                assert_eq!(max_tokens, 128_000);
+            }
+            other => panic!("expected ProviderResolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_provider_resolved_default_capabilities_round_trip() {
+        // Edge case: default capabilities when none registered.
+        let event = PipelineEvent::ProviderResolved {
+            model_name: "unknown-model".to_string(),
+            model_id: "unknown-model-v1".to_string(),
+            provider_name: "unknown".to_string(),
+            capabilities: vec!["chat_completions".to_string()],
+            max_tokens: 4096,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "provider.resolved");
+        match back {
+            PipelineEvent::ProviderResolved {
+                capabilities,
+                max_tokens,
+                ..
+            } => {
+                assert_eq!(capabilities, vec!["chat_completions"]);
+                assert_eq!(max_tokens, 4096);
+            }
+            other => panic!("expected ProviderResolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_system_prompt_assembled_round_trip() {
+        let event = PipelineEvent::SystemPromptAssembled {
+            prompt_length: 512,
+            layer_count: 2,
+            message_count: 5,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "system_prompt.assembled");
+        match back {
+            PipelineEvent::SystemPromptAssembled {
+                prompt_length,
+                layer_count,
+                message_count,
+            } => {
+                assert_eq!(prompt_length, 512);
+                assert_eq!(layer_count, 2);
+                assert_eq!(message_count, 5);
+            }
+            other => panic!("expected SystemPromptAssembled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_system_prompt_assembled_empty_prompt_round_trip() {
+        // Edge case: empty gateway prompt, no caller system prompt.
+        let event = PipelineEvent::SystemPromptAssembled {
+            prompt_length: 0,
+            layer_count: 0,
+            message_count: 1,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "system_prompt.assembled");
+        match back {
+            PipelineEvent::SystemPromptAssembled { prompt_length, .. } => {
+                assert_eq!(prompt_length, 0);
+            }
+            other => panic!("expected SystemPromptAssembled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_commands_formatted_structured_round_trip() {
+        let event = PipelineEvent::CommandsFormatted {
+            format: CommandFormat::Structured,
+            command_count: 3,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "commands.formatted");
+        match back {
+            PipelineEvent::CommandsFormatted {
+                format,
+                command_count,
+            } => {
+                assert_eq!(format, CommandFormat::Structured);
+                assert_eq!(command_count, 3);
+            }
+            other => panic!("expected CommandsFormatted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_commands_formatted_prompt_injected_round_trip() {
+        let event = PipelineEvent::CommandsFormatted {
+            format: CommandFormat::PromptInjected,
+            command_count: 2,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "commands.formatted");
+        match back {
+            PipelineEvent::CommandsFormatted { format, .. } => {
+                assert_eq!(format, CommandFormat::PromptInjected);
+            }
+            other => panic!("expected CommandsFormatted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_commands_formatted_no_commands_round_trip() {
+        let event = PipelineEvent::CommandsFormatted {
+            format: CommandFormat::NoCommands,
+            command_count: 0,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "commands.formatted");
+        match back {
+            PipelineEvent::CommandsFormatted {
+                format,
+                command_count,
+            } => {
+                assert_eq!(format, CommandFormat::NoCommands);
+                assert_eq!(command_count, 0);
+            }
+            other => panic!("expected CommandsFormatted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sampling_updated_full_round_trip() {
+        let event = PipelineEvent::SamplingUpdated {
+            max_tokens: 4096,
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "sampling.updated");
+        match back {
+            PipelineEvent::SamplingUpdated {
+                max_tokens,
+                temperature,
+                top_p,
+            } => {
+                assert_eq!(max_tokens, 4096);
+                assert!((temperature.unwrap() - 0.7_f32).abs() < 1e-5);
+                assert!((top_p.unwrap() - 0.9_f32).abs() < 1e-5);
+            }
+            other => panic!("expected SamplingUpdated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sampling_updated_no_temperature_top_p_round_trip() {
+        // Edge case: request specified no temperature or top_p.
+        let event = PipelineEvent::SamplingUpdated {
+            max_tokens: 2048,
+            temperature: None,
+            top_p: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "sampling.updated");
+        match back {
+            PipelineEvent::SamplingUpdated {
+                max_tokens,
+                temperature,
+                top_p,
+            } => {
+                assert_eq!(max_tokens, 2048);
+                assert!(temperature.is_none());
+                assert!(top_p.is_none());
+            }
+            other => panic!("expected SamplingUpdated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_command_format_all_variants_serialize() {
+        // Verify all CommandFormat variants serialize and deserialize without error.
+        let formats = vec![
+            CommandFormat::Structured,
+            CommandFormat::PromptInjected,
+            CommandFormat::NoCommands,
+        ];
+        for format in &formats {
+            let json = serde_json::to_string(format).unwrap();
+            let back: CommandFormat = serde_json::from_str(&json).unwrap();
+            assert_eq!(&back, format);
+        }
+    }
+
+    #[test]
+    fn test_event_type_string_phase1_variants() {
+        // Verify all Phase 1 variants produce the correct event_type strings.
+        assert_eq!(
+            PipelineEvent::ModelSelected {
+                model_name: "m".to_string(),
+                score: 0.9,
+                all_scores: vec![],
+            }
+            .event_type_string(),
+            "model.selected"
+        );
+        assert_eq!(
+            PipelineEvent::CommandsSelected {
+                selected: vec![],
+                candidates_scored: 0,
+            }
+            .event_type_string(),
+            "commands.selected"
+        );
+        assert_eq!(
+            PipelineEvent::ProviderResolved {
+                model_name: "m".to_string(),
+                model_id: "m-v1".to_string(),
+                provider_name: "p".to_string(),
+                capabilities: vec![],
+                max_tokens: 4096,
+            }
+            .event_type_string(),
+            "provider.resolved"
+        );
+        assert_eq!(
+            PipelineEvent::SystemPromptAssembled {
+                prompt_length: 0,
+                layer_count: 0,
+                message_count: 0,
+            }
+            .event_type_string(),
+            "system_prompt.assembled"
+        );
+        assert_eq!(
+            PipelineEvent::CommandsFormatted {
+                format: CommandFormat::NoCommands,
+                command_count: 0,
+            }
+            .event_type_string(),
+            "commands.formatted"
+        );
+        assert_eq!(
+            PipelineEvent::SamplingUpdated {
+                max_tokens: 4096,
+                temperature: None,
+                top_p: None,
+            }
+            .event_type_string(),
+            "sampling.updated"
+        );
+    }
+
+    #[test]
+    fn test_message_injected_system_prompt_assembly_round_trip() {
+        let msg = make_message();
+        let event = PipelineEvent::MessageInjected {
+            message: msg.clone(),
+            source: crate::event::MessageInjectionSource::SystemPromptAssembly,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "message.injected");
+        match back {
+            PipelineEvent::MessageInjected {
+                source: crate::event::MessageInjectionSource::SystemPromptAssembly,
+                ..
+            } => {}
+            other => panic!(
+                "expected MessageInjected with SystemPromptAssembly source, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_message_injected_command_format_injection_round_trip() {
+        let msg = make_message();
+        let event = PipelineEvent::MessageInjected {
+            message: msg.clone(),
+            source: crate::event::MessageInjectionSource::CommandFormatInjection,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event_type_string(), "message.injected");
+        match back {
+            PipelineEvent::MessageInjected {
+                source: crate::event::MessageInjectionSource::CommandFormatInjection,
+                ..
+            } => {}
+            other => panic!(
+                "expected MessageInjected with CommandFormatInjection source, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Verify that the existing event_type_string_all_variants test still covers every variant.
+    /// This test builds the new Phase 1 variants to ensure they can be constructed
+    /// and produce non-empty type strings.
+    #[test]
+    fn test_event_type_string_phase1_variants_nonempty() {
+        let phase1_events: Vec<PipelineEvent> = vec![
+            PipelineEvent::ModelSelected {
+                model_name: "gpt-4".to_string(),
+                score: 0.9,
+                all_scores: vec![("gpt-4".to_string(), 0.9)],
+            },
+            PipelineEvent::CommandsSelected {
+                selected: vec![weft_core::CommandStub {
+                    name: "search".to_string(),
+                    description: "Search".to_string(),
+                }],
+                candidates_scored: 3,
+            },
+            PipelineEvent::ProviderResolved {
+                model_name: "gpt-4".to_string(),
+                model_id: "gpt-4-turbo-2024".to_string(),
+                provider_name: "openai".to_string(),
+                capabilities: vec!["chat_completions".to_string(), "tool_calling".to_string()],
+                max_tokens: 128_000,
+            },
+            PipelineEvent::SystemPromptAssembled {
+                prompt_length: 200,
+                layer_count: 2,
+                message_count: 4,
+            },
+            PipelineEvent::CommandsFormatted {
+                format: CommandFormat::Structured,
+                command_count: 1,
+            },
+            PipelineEvent::SamplingUpdated {
+                max_tokens: 4096,
+                temperature: Some(0.5),
+                top_p: None,
+            },
+        ];
+        for event in &phase1_events {
+            let type_str = event.event_type_string();
+            assert!(
+                !type_str.is_empty(),
+                "event_type_string should not be empty for {:?}",
+                event
+            );
         }
     }
 }
