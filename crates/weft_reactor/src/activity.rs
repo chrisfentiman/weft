@@ -113,6 +113,36 @@ pub struct RoutingSnapshot {
     pub tool_necessity_score: Option<f32>,
 }
 
+/// An Activity that performs semantic selection: scoring input against candidates.
+///
+/// Activities 1–2 (ModelSelection, CommandSelection) implement this trait.
+/// The reactor fires PreRoute/PostRoute hooks around any activity that
+/// implements `SemanticSelection`, using [`SemanticSelection::selection_domain`]
+/// as the matcher target. Existing hook configs keyed on `matcher = "model"` or
+/// `matcher = "commands"` therefore work without changes.
+///
+/// This trait extends [`Activity`]. It is a separate trait (rather than an
+/// optional method on `Activity`) so that the compiler enforces the contract
+/// and non-selection activities are not required to implement it.
+///
+/// # Object safety and downcasting
+///
+/// The trait is object-safe. However, downcasting `Arc<dyn Activity>` to check
+/// whether an activity implements `SemanticSelection` requires `Any`. The
+/// reactor avoids this by wiring selection activities explicitly — it knows at
+/// wiring time which activities are selection activities. The trait exists for
+/// documentation, type-level correctness, and future dynamic registration.
+pub trait SemanticSelection: Activity {
+    /// The routing domain this selection covers.
+    ///
+    /// Used as the hook matcher target for PreRoute/PostRoute hooks fired
+    /// around this activity. Returns a `'static` str so no allocation
+    /// is needed when passing it to `services.hooks.run_chain()`.
+    ///
+    /// Current values: `"model"` (ModelSelection), `"commands"` (CommandSelection).
+    fn selection_domain(&self) -> &'static str;
+}
+
 /// Activity execution error.
 ///
 /// Used internally by activities. Activities push `ActivityFailed`
