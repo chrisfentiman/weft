@@ -18,6 +18,7 @@ use weft_core::{CommandStub, HookEvent};
 use weft_hooks::HookChainResult;
 use weft_router::{RoutingCandidate, RoutingDomainKind, filter_by_threshold, take_top};
 
+use super::selection_util::extract_user_message;
 use crate::activity::{Activity, ActivityInput, SemanticSelection};
 use crate::event::PipelineEvent;
 use crate::event_log::EventLog;
@@ -303,27 +304,6 @@ impl Activity for CommandSelectionActivity {
             })
             .await;
     }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Extract the text of the last user-role message. Returns `""` if none found.
-fn extract_user_message(input: &ActivityInput) -> &str {
-    input
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == weft_core::Role::User)
-        .and_then(|m| {
-            m.content.iter().find_map(|p| {
-                if let weft_core::ContentPart::Text(t) = p {
-                    Some(t.as_str())
-                } else {
-                    None
-                }
-            })
-        })
-        .unwrap_or("")
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -688,6 +668,74 @@ mod tests {
         assert_eq!(
             candidates_scored.expect("CommandsSelected must be present"),
             3
+        );
+    }
+
+    // ── Router error falls back to all commands capped by max_commands ────────
+
+    #[tokio::test]
+    async fn command_selection_router_error_falls_back_to_all_commands_capped() {
+        // When the router errors, command_selection falls back to all commands
+        // sorted alphabetically and truncated to max_commands. This is fail-open:
+        // no ActivityFailed, CommandsSelected is still pushed.
+        let mut input = make_test_input();
+        input.available_commands = vec![
+            CommandStub {
+                name: "z_command".to_string(),
+                description: "Z command (last alphabetically)".to_string(),
+            },
+            CommandStub {
+                name: "a_command".to_string(),
+                description: "A command (first alphabetically)".to_string(),
+            },
+            CommandStub {
+                name: "m_command".to_string(),
+                description: "M command (middle)".to_string(),
+            },
+        ];
+
+        let services = crate::test_support::make_test_services_with_failing_router();
+
+        let events = run_command_selection(input, services).await;
+
+        // Fail-open: no ActivityFailed.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
+            "router error must be fail-open (no ActivityFailed)"
+        );
+
+        // CommandsSelected must be present.
+        let selected = events.iter().find_map(|e| {
+            if let PipelineEvent::CommandsSelected { selected, .. } = e {
+                Some(selected.clone())
+            } else {
+                None
+            }
+        });
+        let selected = selected.expect("CommandsSelected must be present on router error");
+
+        // Fallback includes all commands (capped by max_commands, sorted alphabetically).
+        // The test config has max_commands = 10 (classifier default), so all 3 appear.
+        assert!(
+            !selected.is_empty(),
+            "fallback must include commands when router errors"
+        );
+        // Alphabetical order: a_command < m_command < z_command.
+        assert_eq!(
+            selected[0].name, "a_command",
+            "fallback must be sorted alphabetically"
+        );
+        assert_eq!(selected[1].name, "m_command");
+        assert_eq!(selected[2].name, "z_command");
+
+        // ActivityCompleted must be present.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::ActivityCompleted { .. })),
+            "expected ActivityCompleted (fail-open)"
         );
     }
 

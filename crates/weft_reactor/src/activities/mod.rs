@@ -26,6 +26,7 @@ pub mod hooks;
 pub mod model_selection;
 pub mod provider_resolution;
 pub mod route;
+mod selection_util;
 pub mod validate;
 
 pub use assemble_prompt::AssemblePromptActivity;

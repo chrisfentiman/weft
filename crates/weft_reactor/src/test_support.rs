@@ -435,6 +435,36 @@ impl SemanticRouter for StubRouter {
     }
 }
 
+// ── Error Router ─────────────────────────────────────────────────────────────
+
+/// A stub router that always returns an error.
+struct ErrorRouter {
+    reason: String,
+}
+
+#[async_trait::async_trait]
+impl SemanticRouter for ErrorRouter {
+    async fn route(
+        &self,
+        _user_message: &str,
+        _domains: &[(RoutingDomainKind, Vec<RoutingCandidate>)],
+    ) -> Result<RoutingDecision, weft_router::RouterError> {
+        Err(weft_router::RouterError::InferenceFailed(
+            self.reason.clone(),
+        ))
+    }
+
+    async fn score_memory_candidates(
+        &self,
+        _text: &str,
+        _candidates: &[RoutingCandidate],
+    ) -> Result<Vec<ScoredCandidate>, weft_router::RouterError> {
+        Err(weft_router::RouterError::InferenceFailed(
+            self.reason.clone(),
+        ))
+    }
+}
+
 // ── Stub CommandRegistry ──────────────────────────────────────────────────────
 
 /// A stub command registry. By default, all commands succeed.
@@ -985,10 +1015,43 @@ pub fn make_test_services_with_mid_stream_error(first_chunk: &str, err: Provider
     build_services(provider, hooks, None)
 }
 
-/// Build test `Services` where `list_commands` returns a `RegistryUnavailable` error.
+/// Build test `Services` whose semantic router always returns an error.
 ///
-/// Use this when testing fail-open behaviour in activities that call
-/// `services.commands.list_commands()` (e.g. `ValidateActivity`).
+/// Use this when testing error-fallback paths in selection activities:
+/// - `ModelSelectionActivity` falls back to the default model on router error.
+/// - `CommandSelectionActivity` falls back to all commands capped by `max_commands`.
+pub fn make_test_services_with_failing_router() -> Services {
+    let provider: Arc<dyn Provider> = Arc::new(StubProvider {
+        response_text: "stub response".to_string(),
+    });
+    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(weft_hooks::NullHookRunner);
+
+    let config = Arc::new(make_test_config());
+    let providers: Arc<dyn weft_llm::ProviderService + Send + Sync> =
+        Arc::new(StubProviderServiceV2::new(provider));
+    let router: Arc<dyn weft_router::SemanticRouter + Send + Sync> = Arc::new(ErrorRouter {
+        reason: "test router failure".to_string(),
+    });
+    let commands: Arc<dyn weft_commands::CommandRegistry + Send + Sync> =
+        Arc::new(StubCommandRegistry {
+            failing_command: None,
+            failed_result_command: None,
+            fail_list_commands: false,
+        });
+
+    Services {
+        config,
+        providers,
+        router,
+        commands,
+        memory: None,
+        hooks,
+        reactor_handle: std::sync::OnceLock::new(),
+        request_end_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+    }
+}
+
+/// Build test `Services` whose semantic router always returns a `RegistryUnavailable` error.
 pub fn make_test_services_with_failing_list_commands() -> Services {
     let provider: Arc<dyn Provider> = Arc::new(StubProvider {
         response_text: "stub response".to_string(),

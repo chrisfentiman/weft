@@ -20,6 +20,7 @@ use weft_core::{HookEvent, ModelInfo, RoutingMode};
 use weft_hooks::HookChainResult;
 use weft_router::{RoutingCandidate, RoutingDomainKind, build_model_candidates};
 
+use super::selection_util::extract_user_message;
 use crate::activity::{Activity, ActivityInput, SemanticSelection};
 use crate::event::PipelineEvent;
 use crate::event_log::EventLog;
@@ -172,7 +173,10 @@ impl Activity for ModelSelectionActivity {
 
                 if surviving_names.len() == 1 {
                     // Exactly one survivor: use directly, score 1.0. No scoring needed.
-                    let model_name = surviving_names.into_iter().next().unwrap();
+                    let model_name = surviving_names
+                        .into_iter()
+                        .next()
+                        .expect("surviving_names.len() == 1 checked above");
                     (model_name, 1.0_f32, vec![])
                 } else {
                     // Multiple survivors: score them semantically.
@@ -317,25 +321,6 @@ impl Activity for ModelSelectionActivity {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Extract the text of the last user-role message. Returns `""` if none found.
-fn extract_user_message(input: &ActivityInput) -> &str {
-    input
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == weft_core::Role::User)
-        .and_then(|m| {
-            m.content.iter().find_map(|p| {
-                if let weft_core::ContentPart::Text(t) = p {
-                    Some(t.as_str())
-                } else {
-                    None
-                }
-            })
-        })
-        .unwrap_or("")
-}
-
 /// Build `ModelInfo` list from config for filter resolution.
 fn build_model_infos(config: &weft_core::WeftConfig) -> Vec<ModelInfo> {
     config
@@ -427,7 +412,13 @@ async fn semantic_score(
 }
 
 /// Build the `all_scores` vec: the winning model gets `winner_score`; all other
-/// candidates get 0.0 (the router only returns the winner, not all scores).
+/// candidates get 0.0.
+///
+/// **Non-winner scores are 0.0 due to a router limitation:** the semantic router
+/// returns only the top-scored candidate per domain, not a ranked list of all
+/// candidates. We assign 0.0 to non-winners rather than omitting them so that
+/// observability tools can see the full candidate set alongside the winner's score.
+/// Consumers should treat 0.0 as "not selected / score unknown", not "zero relevance".
 fn build_all_scores(
     candidates: &[RoutingCandidate],
     winner_id: &str,
@@ -761,5 +752,203 @@ mod tests {
         } else {
             panic!("expected ActivityFailed");
         }
+    }
+
+    // ── Router error falls back to default model ──────────────────────────────
+
+    #[tokio::test]
+    async fn model_selection_router_error_falls_back_to_default_model() {
+        let input = make_test_input();
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        // Use a router that always errors — model_selection should fall back to
+        // the default model ("stub-model") rather than pushing ActivityFailed.
+        let services = crate::test_support::make_test_services_with_failing_router();
+        let event_log = NullEventLog;
+        let exec_id = ExecutionId::new();
+
+        ModelSelectionActivity::new()
+            .execute(&exec_id, input, &services, &event_log, tx, cancel)
+            .await;
+
+        let events = collect_events(&mut rx);
+
+        // ModelSelected must be present (fallback, not failure).
+        let selected = events.iter().find_map(|e| {
+            if let PipelineEvent::ModelSelected {
+                model_name, score, ..
+            } = e
+            {
+                Some((model_name.clone(), *score))
+            } else {
+                None
+            }
+        });
+        let (model_name, score) = selected.expect("ModelSelected must be present on router error");
+        assert_eq!(
+            model_name,
+            services.providers.default_name(),
+            "router error must fall back to default model"
+        );
+        assert!(
+            (score - 0.0_f32).abs() < 1e-5,
+            "fallback model score must be 0.0"
+        );
+
+        // No ActivityFailed (router error is a soft fallback).
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
+            "router error must not push ActivityFailed (fallback mode)"
+        );
+    }
+
+    // ── Threshold filtering falls back to default when score is below threshold ─
+
+    #[tokio::test]
+    async fn model_selection_score_below_threshold_uses_default_model() {
+        // The stub router always scores at 0.9. We set the model domain threshold
+        // above 0.9 (e.g. 0.95) so the selected model's score fails the threshold
+        // and the activity should fall back to the default model.
+        let input = make_test_input();
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+
+        // Build services with a model domain threshold of 0.95.
+        // The stub router will return 0.9, which is below the threshold.
+        let services = {
+            use std::sync::Arc;
+            use weft_core::WeftConfig;
+
+            let toml = r#"
+[server]
+bind_address = "0.0.0.0:8080"
+
+[gateway]
+system_prompt = "You are helpful."
+
+[router]
+
+[router.classifier]
+model_path = "m.onnx"
+tokenizer_path = "t.json"
+
+[router.domains.model]
+threshold = 0.95
+
+[[router.providers]]
+name = "anthropic"
+wire_format = "anthropic"
+api_key = "sk-test"
+
+  [[router.providers.models]]
+  name = "stub-model"
+  model = "stub-model-v1"
+  examples = ["example query"]
+"#;
+            let config: WeftConfig =
+                toml::from_str(toml).expect("threshold test config must parse");
+            // Reuse test_support internals via make_test_services, then swap config.
+            let base = crate::test_support::make_test_services();
+            crate::services::Services {
+                config: Arc::new(config),
+                providers: base.providers,
+                router: base.router,
+                commands: base.commands,
+                memory: None,
+                hooks: base.hooks,
+                reactor_handle: std::sync::OnceLock::new(),
+                request_end_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            }
+        };
+
+        let event_log = NullEventLog;
+        let exec_id = ExecutionId::new();
+
+        ModelSelectionActivity::new()
+            .execute(&exec_id, input, &services, &event_log, tx, cancel)
+            .await;
+
+        let events = collect_events(&mut rx);
+
+        // ModelSelected must be present.
+        let selected = events.iter().find_map(|e| {
+            if let PipelineEvent::ModelSelected {
+                model_name, score, ..
+            } = e
+            {
+                Some((model_name.clone(), *score))
+            } else {
+                None
+            }
+        });
+        let (model_name, score) = selected.expect("ModelSelected must be present");
+        assert_eq!(
+            model_name,
+            services.providers.default_name(),
+            "score below threshold must fall back to default model"
+        );
+        assert!(
+            (score - 0.0_f32).abs() < 1e-5,
+            "fallback score must be 0.0 when threshold not met"
+        );
+    }
+
+    // ── Auto mode: empty candidates after filter falls back to default ─────────
+
+    #[tokio::test]
+    async fn model_selection_auto_mode_empty_candidates_after_filter_uses_default() {
+        // Auto mode with a filter that matches no models: falls back to default
+        // (unlike Direct mode which fails closed).
+        let mut input = make_test_input();
+        // Use Auto routing mode with a filter that won't match any configured model.
+        // "auto/nonexistent-provider" parses to Auto mode with filter "nonexistent-provider".
+        input.request.routing =
+            weft_core::ModelRoutingInstruction::parse("auto/nonexistent-provider-xyz");
+        assert_eq!(input.request.routing.mode, weft_core::RoutingMode::Auto);
+        assert!(!input.request.routing.filters.is_empty());
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let services = make_test_services();
+        let event_log = NullEventLog;
+        let exec_id = ExecutionId::new();
+
+        ModelSelectionActivity::new()
+            .execute(&exec_id, input, &services, &event_log, tx, cancel)
+            .await;
+
+        let events = collect_events(&mut rx);
+
+        // Fail-open: ModelSelected must be present (no ActivityFailed).
+        let selected = events.iter().find_map(|e| {
+            if let PipelineEvent::ModelSelected {
+                model_name, score, ..
+            } = e
+            {
+                Some((model_name.clone(), *score))
+            } else {
+                None
+            }
+        });
+        let (model_name, score) = selected.expect("ModelSelected must be present (fail-open)");
+        assert_eq!(
+            model_name,
+            services.providers.default_name(),
+            "empty candidates after Auto filter must fall back to default model"
+        );
+        assert!(
+            (score - 0.0_f32).abs() < 1e-5,
+            "fallback score must be 0.0 when no candidates after filter"
+        );
+
+        // No ActivityFailed (Auto mode is fail-open for empty candidates).
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
+            "Auto mode empty candidates must not push ActivityFailed"
+        );
     }
 }
