@@ -10,6 +10,9 @@
 //! - [`ModelSelectionActivity`] — selects the model via semantic routing (pre-loop)
 //! - [`CommandSelectionActivity`] — selects relevant commands via semantic routing (pre-loop)
 //! - [`ProviderResolutionActivity`] — resolves provider and capabilities for the selected model (pre-loop)
+//! - [`SystemPromptAssemblyActivity`] — layers the system prompt from gateway config and caller (pre-loop)
+//! - [`CommandFormattingActivity`] — formats selected commands for the provider (pre-loop)
+//! - [`SamplingAdjustmentActivity`] — clamps sampling parameters to model constraints (pre-loop)
 //! - [`RouteActivity`] — performs semantic routing across all configured domains (legacy)
 //! - [`AssemblePromptActivity`] — builds the system prompt and message list (legacy)
 //! - [`GenerateActivity`] — calls the generative source and streams tokens
@@ -19,6 +22,7 @@
 
 pub mod assemble_prompt;
 pub mod assemble_response;
+pub mod command_formatting;
 pub mod command_selection;
 pub mod execute_command;
 pub mod generate;
@@ -26,11 +30,14 @@ pub mod hooks;
 pub mod model_selection;
 pub mod provider_resolution;
 pub mod route;
+pub mod sampling_adjustment;
 mod selection_util;
+pub mod system_prompt_assembly;
 pub mod validate;
 
 pub use assemble_prompt::AssemblePromptActivity;
 pub use assemble_response::AssembleResponseActivity;
+pub use command_formatting::CommandFormattingActivity;
 pub use command_selection::CommandSelectionActivity;
 pub use execute_command::ExecuteCommandActivity;
 pub use generate::GenerateActivity;
@@ -38,4 +45,6 @@ pub use hooks::HookActivity;
 pub use model_selection::ModelSelectionActivity;
 pub use provider_resolution::ProviderResolutionActivity;
 pub use route::RouteActivity;
+pub use sampling_adjustment::SamplingAdjustmentActivity;
+pub use system_prompt_assembly::SystemPromptAssemblyActivity;
 pub use validate::ValidateActivity;
