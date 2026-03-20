@@ -401,8 +401,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_activity_messages_not_sent() {
-        // Gateway activity messages (Role::System, Source::Gateway) beyond messages[0]
-        // are filtered out and not sent to OpenAI.
+        // Gateway activity messages (Role::System, Source::Gateway) with non-text content
+        // only are filtered out and not sent to OpenAI.
+        // Activity telemetry (routing events, hook results) carries no text parts.
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("POST", "/")
@@ -427,12 +428,21 @@ mod tests {
             .create_async()
             .await;
 
+        // Activity telemetry message: System+Gateway with NO text content parts.
+        let activity_msg = WeftMessage {
+            role: Role::System,
+            source: Source::Gateway,
+            model: None,
+            content: vec![], // no text -- pure telemetry, must be filtered
+            delta: false,
+            message_index: 0,
+        };
+
         let provider = make_provider(&server.url());
         let request = ProviderRequest::ChatCompletion {
             messages: vec![
                 make_weft_message(Role::System, Source::Gateway, "sys prompt"),
-                // This gateway activity message should be filtered
-                make_weft_message(Role::System, Source::Gateway, "routing activity"),
+                activity_msg,
                 make_weft_message(Role::User, Source::Client, "Hello"),
             ],
             model: "gpt-test".to_string(),

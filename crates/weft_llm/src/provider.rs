@@ -115,10 +115,13 @@ pub struct TokenUsage {
 
 /// Extract text content from WeftMessages for provider wire format conversion.
 ///
-/// Filters out activity messages (source: Gateway, role: System) since those
-/// are gateway-internal activity content (routing events, hook results), not
-/// conversational content for the LLM. This is a behavioral change from the
-/// pre-migration code where ALL Role::System messages were forwarded to providers.
+/// Filters out gateway activity messages (source: Gateway, role: System) that contain
+/// NO text content -- these are gateway-internal telemetry (routing events, hook results)
+/// that carry only non-text ContentParts and must not reach the LLM.
+///
+/// Gateway system messages WITH text content (e.g. command descriptions injected by
+/// `CommandFormattingActivity` for providers that use `CommandFormat::PromptInjected`)
+/// are conversational content and are kept.
 ///
 /// Concatenates all Text content parts within each message, separated by newlines.
 /// Messages with no text content after extraction are omitted.
@@ -128,9 +131,14 @@ pub struct TokenUsage {
 pub fn extract_text_messages(messages: &[WeftMessage]) -> Vec<(Role, String)> {
     messages
         .iter()
-        // Activity messages (source: Gateway, role: System) are gateway-internal
-        // telemetry -- routing events, hook results. Not conversational content.
-        .filter(|m| !(m.role == Role::System && m.source == Source::Gateway))
+        // Filter out gateway system messages that carry ONLY non-text parts (telemetry).
+        // Gateway system messages with text content (command descriptions, injected
+        // instructions) are conversational and must pass through to the provider.
+        .filter(|m| {
+            !(m.role == Role::System
+                && m.source == Source::Gateway
+                && !m.content.iter().any(|p| matches!(p, ContentPart::Text(_))))
+        })
         .map(|m| {
             let text: String = m
                 .content
@@ -441,27 +449,58 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_text_messages_filters_gateway_system() {
-        // System + Gateway messages (activity messages) must be filtered out.
+    fn test_extract_text_messages_gateway_system_with_text_passes_through() {
+        // System+Gateway messages that CONTAIN text (e.g. command descriptions injected
+        // by CommandFormattingActivity) must NOT be filtered -- they carry conversational
+        // content the LLM needs to see.
         let messages = vec![
-            make_weft_message(Role::System, Source::Gateway, "You are helpful."),
+            make_weft_message(
+                Role::System,
+                Source::Gateway,
+                "Available commands: search, write",
+            ),
             make_weft_message(Role::User, Source::Client, "Hello"),
         ];
         let pairs = extract_text_messages(&messages);
-        // System+Gateway is filtered, only User remains
-        assert_eq!(pairs.len(), 1);
-        assert_eq!(pairs[0].0, Role::User);
+        // Both the gateway text injection and the user message pass through.
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, Role::System);
+        assert_eq!(pairs[0].1, "Available commands: search, write");
+        assert_eq!(pairs[1].0, Role::User);
     }
 
     #[test]
-    fn test_extract_text_messages_system_prompt_filtered_out() {
-        // The system prompt at messages[0] is Role::System, Source::Gateway.
-        // extract_text_messages filters it out -- providers handle it separately.
-        let system_msg = make_weft_message(Role::System, Source::Gateway, "System prompt here.");
-        let pairs = extract_text_messages(&[system_msg]);
+    fn test_extract_text_messages_gateway_nontext_filtered() {
+        // System+Gateway messages with ONLY non-text content parts are gateway-internal
+        // telemetry (routing events, hook results) and must be filtered out.
+        use weft_core::{MediaContent, MediaSource};
+        let telemetry_msg = WeftMessage {
+            role: Role::System,
+            source: Source::Gateway,
+            model: None,
+            // Non-text only -- this is what actual telemetry looks like
+            content: vec![ContentPart::Image(MediaContent {
+                source: MediaSource::Url("internal://hook-result".to_string()),
+                media_type: None,
+            })],
+            delta: false,
+            message_index: 0,
+        };
+        let pairs = extract_text_messages(&[telemetry_msg]);
         assert!(
             pairs.is_empty(),
-            "system+gateway message should be filtered"
+            "System+Gateway with no text content must be filtered"
+        );
+    }
+
+    #[test]
+    fn test_extract_text_messages_gateway_empty_content_filtered() {
+        // System+Gateway messages with empty content (no parts at all) are filtered.
+        let empty_msg = make_weft_message_no_content(Role::System, Source::Gateway);
+        let pairs = extract_text_messages(&[empty_msg]);
+        assert!(
+            pairs.is_empty(),
+            "System+Gateway with empty content must be filtered"
         );
     }
 

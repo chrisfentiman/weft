@@ -442,8 +442,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_activity_messages_not_in_system_field() {
-        // Gateway activity messages (Role::System, Source::Gateway) beyond messages[0]
-        // are filtered out by extract_text_messages and do NOT pollute system field.
+        // Gateway activity messages (Role::System, Source::Gateway) with non-text content
+        // only are filtered out by extract_text_messages and do NOT pollute system field.
+        // Activity telemetry (routing events, hook results) carries no text parts.
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("POST", "/")
@@ -465,10 +466,20 @@ mod tests {
             .create_async()
             .await;
 
+        // Activity telemetry message: System+Gateway with NO text content parts.
+        let activity_msg = WeftMessage {
+            role: Role::System,
+            source: Source::Gateway,
+            model: None,
+            content: vec![], // no text -- pure telemetry, must be filtered
+            delta: false,
+            message_index: 0,
+        };
+
         let messages = vec![
             make_weft_message(Role::System, Source::Gateway, "sys prompt"),
-            // This gateway activity message should NOT appear in system field
-            make_weft_message(Role::System, Source::Gateway, "routing: model=fast"),
+            // This gateway activity message (no text) must NOT appear in system field
+            activity_msg,
             make_weft_message(Role::User, Source::Client, "Hello"),
         ];
 
