@@ -9,6 +9,7 @@
 //! - [`ValidateActivity`] — validates the request and populates available commands
 //! - [`ModelSelectionActivity`] — selects the model via semantic routing (pre-loop)
 //! - [`CommandSelectionActivity`] — selects relevant commands via semantic routing (pre-loop)
+//! - [`ProviderResolutionActivity`] — resolves provider and capabilities for the selected model (pre-loop)
 //! - [`RouteActivity`] — performs semantic routing across all configured domains (legacy)
 //! - [`AssemblePromptActivity`] — builds the system prompt and message list (legacy)
 //! - [`GenerateActivity`] — calls the generative source and streams tokens
@@ -23,6 +24,7 @@ pub mod execute_command;
 pub mod generate;
 pub mod hooks;
 pub mod model_selection;
+pub mod provider_resolution;
 pub mod route;
 pub mod validate;
 
@@ -33,5 +35,6 @@ pub use execute_command::ExecuteCommandActivity;
 pub use generate::GenerateActivity;
 pub use hooks::HookActivity;
 pub use model_selection::ModelSelectionActivity;
+pub use provider_resolution::ProviderResolutionActivity;
 pub use route::RouteActivity;
 pub use validate::ValidateActivity;
