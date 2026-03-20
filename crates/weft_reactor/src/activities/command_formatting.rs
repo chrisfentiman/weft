@@ -459,10 +459,9 @@ mod tests {
                 message,
                 source: MessageInjectionSource::CommandFormatInjection,
             } = e
+                && let Some(weft_core::ContentPart::Text(t)) = message.content.first()
             {
-                if let Some(weft_core::ContentPart::Text(t)) = message.content.first() {
-                    return Some(t.clone());
-                }
+                return Some(t.clone());
             }
             None
         });
@@ -544,7 +543,7 @@ mod tests {
 
     #[test]
     fn build_command_text_formats_commands() {
-        let cmds = vec![
+        let cmds = [
             CommandStub {
                 name: "search".to_string(),
                 description: "Search the web".to_string(),

@@ -48,3 +48,4 @@ weft_hooks = { path = "../weft_hooks", features = ["test-support"] }
 tower = { version = "0.5", features = ["util"] }
 mockito = { workspace = true }
 tempfile = { version = "3" }
+pretty_assertions.workspace = true

@@ -787,7 +787,7 @@ mod tests {
             }],
             budget: BudgetConfig {
                 max_generation_calls: 20,
-                max_iterations: config.gateway.max_command_iterations as u32,
+                max_iterations: config.gateway.max_command_iterations,
                 max_depth: 5,
                 timeout_secs: config.gateway.request_timeout_secs,
                 generation_timeout_secs: config.gateway.request_timeout_secs,

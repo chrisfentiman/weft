@@ -53,3 +53,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 mockito = { version = "1" }
 regex = { version = "1" }
 rhai = { version = "1", features = ["sync", "serde"] }
+
+# Testing
+rstest = { version = "0.24" }
+pretty_assertions = { version = "1" }

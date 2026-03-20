@@ -275,10 +275,9 @@ mod tests {
                 message,
                 source: MessageInjectionSource::SystemPromptAssembly,
             } = e
+                && let Some(ContentPart::Text(text)) = message.content.first()
             {
-                if let Some(ContentPart::Text(text)) = message.content.first() {
-                    return Some(text.clone());
-                }
+                return Some(text.clone());
             }
             None
         });
@@ -326,10 +325,9 @@ mod tests {
                 message,
                 source: MessageInjectionSource::SystemPromptAssembly,
             } = e
+                && let Some(ContentPart::Text(text)) = message.content.first()
             {
-                if let Some(ContentPart::Text(text)) = message.content.first() {
-                    return Some(text.clone());
-                }
+                return Some(text.clone());
             }
             None
         });

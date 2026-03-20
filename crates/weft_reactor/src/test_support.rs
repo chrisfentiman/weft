@@ -510,24 +510,24 @@ impl weft_commands::CommandRegistry for StubCommandRegistry {
         invocation: &CommandInvocation,
     ) -> Result<CommandResult, weft_commands::CommandError> {
         // Check if this command is configured to fail with an infrastructure error.
-        if let Some((ref failing_name, ref err)) = self.failing_command {
-            if invocation.name == *failing_name {
-                // We need to return the error. Since CommandError doesn't implement Clone,
-                // we match on the stored error to construct a matching one.
-                return Err(reconstruct_command_error(err));
-            }
+        if let Some((ref failing_name, ref err)) = self.failing_command
+            && invocation.name == *failing_name
+        {
+            // We need to return the error. Since CommandError doesn't implement Clone,
+            // we match on the stored error to construct a matching one.
+            return Err(reconstruct_command_error(err));
         }
 
         // Check if this command is configured to return a failed result (success=false).
-        if let Some((ref failing_name, ref error_msg)) = self.failed_result_command {
-            if invocation.name == *failing_name {
-                return Ok(CommandResult {
-                    command_name: invocation.name.clone(),
-                    success: false,
-                    output: String::new(),
-                    error: Some(error_msg.clone()),
-                });
-            }
+        if let Some((ref failing_name, ref error_msg)) = self.failed_result_command
+            && invocation.name == *failing_name
+        {
+            return Ok(CommandResult {
+                command_name: invocation.name.clone(),
+                success: false,
+                output: String::new(),
+                error: Some(error_msg.clone()),
+            });
         }
 
         // Default: return a successful result.

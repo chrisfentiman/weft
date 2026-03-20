@@ -36,3 +36,5 @@ rand = "0.8"
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 weft_eventlog_memory = { path = "../weft_eventlog_memory" }
+rstest.workspace = true
+pretty_assertions.workspace = true
