@@ -491,8 +491,10 @@ mod tests {
     use weft_reactor::{
         ActivityRegistry, Reactor, ReactorConfig,
         activities::{
-            AssemblePromptActivity, AssembleResponseActivity, ExecuteCommandActivity,
-            GenerateActivity, HookActivity, RouteActivity, ValidateActivity,
+            AssembleResponseActivity, CommandFormattingActivity, CommandSelectionActivity,
+            ExecuteCommandActivity, GenerateActivity, HookActivity, ModelSelectionActivity,
+            ProviderResolutionActivity, SamplingAdjustmentActivity, SystemPromptAssemblyActivity,
+            ValidateActivity,
         },
         config::{ActivityRef, BudgetConfig, LoopHooks, PipelineConfig, RetryPolicy},
         services::{ReactorHandle, Services},
@@ -709,8 +711,22 @@ mod tests {
     fn build_test_activity_registry() -> ActivityRegistry {
         let mut registry = ActivityRegistry::new();
         registry.register(Arc::new(ValidateActivity)).unwrap();
-        registry.register(Arc::new(RouteActivity)).unwrap();
-        registry.register(Arc::new(AssemblePromptActivity)).unwrap();
+        registry.register(Arc::new(ModelSelectionActivity)).unwrap();
+        registry
+            .register(Arc::new(CommandSelectionActivity))
+            .unwrap();
+        registry
+            .register(Arc::new(ProviderResolutionActivity))
+            .unwrap();
+        registry
+            .register(Arc::new(SystemPromptAssemblyActivity))
+            .unwrap();
+        registry
+            .register(Arc::new(CommandFormattingActivity))
+            .unwrap();
+        registry
+            .register(Arc::new(SamplingAdjustmentActivity))
+            .unwrap();
         registry.register(Arc::new(GenerateActivity)).unwrap();
         registry.register(Arc::new(ExecuteCommandActivity)).unwrap();
         registry
@@ -741,8 +757,12 @@ mod tests {
                 pre_loop: vec![
                     ActivityRef::Name("validate".to_string()),
                     ActivityRef::Name("hook_request_start".to_string()),
-                    ActivityRef::Name("route".to_string()),
-                    ActivityRef::Name("assemble_prompt".to_string()),
+                    ActivityRef::Name("model_selection".to_string()),
+                    ActivityRef::Name("command_selection".to_string()),
+                    ActivityRef::Name("provider_resolution".to_string()),
+                    ActivityRef::Name("system_prompt_assembly".to_string()),
+                    ActivityRef::Name("command_formatting".to_string()),
+                    ActivityRef::Name("sampling_adjustment".to_string()),
                 ],
                 post_loop: vec![
                     ActivityRef::Name("assemble_response".to_string()),
@@ -841,7 +861,7 @@ mod tests {
     async fn test_valid_request_returns_200() {
         let router = make_router(MockLlmProvider::ok("Hello there!"));
         let body = json!({
-            "model": "gpt-4",
+            "model": "auto",
             "messages": [{"role": "user", "content": "Hi"}]
         });
         let (status, resp) = post_json(router, body).await;
@@ -911,7 +931,7 @@ mod tests {
     async fn test_llm_error_returns_500() {
         let router = make_router(FailingLlm);
         let body = json!({
-            "model": "gpt-4",
+            "model": "auto",
             "messages": [{"role": "user", "content": "Hello"}]
         });
         let (status, _) = post_json(router, body).await;
@@ -922,7 +942,7 @@ mod tests {
     async fn test_rate_limited_returns_429_with_retry_after() {
         let router = make_router(RateLimitedLlm);
         let body = json!({
-            "model": "gpt-4",
+            "model": "auto",
             "messages": [{"role": "user", "content": "Hello"}]
         });
 
@@ -948,7 +968,7 @@ mod tests {
     async fn test_response_contains_usage() {
         let router = make_router(MockLlmProvider::ok("Done"));
         let body = json!({
-            "model": "my-model",
+            "model": "auto",
             "messages": [{"role": "user", "content": "Hi"}]
         });
         let (status, resp) = post_json(router, body).await;
@@ -987,21 +1007,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_response_model_preserved_from_request() {
+        // The model field from the request is echoed back verbatim in the response,
+        // regardless of which internal model handled the request.
+        // Use "test-model" which matches the test config so routing succeeds.
         let router = make_router(MockLlmProvider::ok("Hi"));
         let body = json!({
-            "model": "my-custom-model",
+            "model": "test-model",
             "messages": [{"role": "user", "content": "Hello"}]
         });
         let (status, resp) = post_json(router, body).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(resp["model"], "my-custom-model");
+        assert_eq!(resp["model"], "test-model");
     }
 
     #[tokio::test]
     async fn test_error_body_format() {
         let router = make_router(FailingLlm);
         let body = json!({
-            "model": "gpt-4",
+            "model": "auto",
             "messages": [{"role": "user", "content": "Hello"}]
         });
         let (_, resp) = post_json(router, body).await;
@@ -1222,7 +1245,7 @@ mod tests {
         let router = build_router(Arc::clone(&weft_service));
 
         let body = json!({
-            "model": "gpt-4",
+            "model": "auto",
             "messages": [{"role": "user", "content": "test single code path"}]
         });
         let (status, resp) = post_json(router, body).await;

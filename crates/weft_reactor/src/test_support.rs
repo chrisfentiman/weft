@@ -970,8 +970,7 @@ pub fn make_test_services_with_failed_command(command_name: &str, error_msg: &st
 
 /// Build test `Services` with a hook runner that blocks the specified event.
 ///
-/// All other events are allowed. Use this when testing `HookActivity` block behavior
-/// or `RouteActivity` pre/post hook blocking.
+/// All other events are allowed. Use this when testing `HookActivity` block behavior.
 pub fn make_test_services_with_blocking_hook(event: HookEvent, reason: &str) -> Services {
     let provider: Arc<dyn Provider> = Arc::new(StubProvider {
         response_text: "stub response".to_string(),

@@ -100,7 +100,7 @@ pub struct ActivityInput {
     pub accumulated_usage: weft_core::WeftUsage,
 }
 
-/// Snapshot of routing decisions. Populated by RouteActivity.
+/// Snapshot of routing decisions. Populated by ModelSelectionActivity.
 ///
 /// Uses `RoutingActivity` from Weft Wire for the model routing result.
 /// Additional routing domains (tool_necessity, memory) are carried as

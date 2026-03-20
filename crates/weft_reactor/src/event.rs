@@ -170,6 +170,8 @@ pub enum PipelineEvent {
     },
 
     // ── Prompt assembly ─────────────────────────────────────────
+    /// Deprecated: replaced by SystemPromptAssembled. Retained for backward
+    /// compatibility with serialized event logs.
     PromptAssembled {
         message_count: usize,
     },

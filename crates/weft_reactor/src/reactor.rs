@@ -3,7 +3,8 @@
 //! The Reactor is the execution engine for the Weft pipeline. It is NOT a
 //! step-by-step executor. It is an event dispatch loop:
 //!
-//! 1. Run pre-loop activities sequentially (validate, route, assemble_prompt).
+//! 1. Run pre-loop activities sequentially (validate, model_selection, command_selection,
+//!    provider_resolution, system_prompt_assembly, command_formatting, sampling_adjustment).
 //! 2. Enter the dispatch loop:
 //!    a. Spawn the generate activity as an event producer.
 //!    b. Receive events from the channel via `tokio::select!`.
@@ -398,7 +399,33 @@ impl Reactor {
                 break;
             }
 
-            let input = self.build_input(&execution_id, &state, &request, resolved, None);
+            let mut input = self.build_input(&execution_id, &state, &request, resolved, None);
+            // Per spec Section 6.3: inject per-activity metadata so downstream
+            // activities receive the state accumulated by prior pre-loop activities.
+            match resolved.activity.name() {
+                "provider_resolution" => {
+                    input.metadata = serde_json::json!({
+                        "selected_model": state.selected_model.as_deref().unwrap_or("")
+                    });
+                }
+                "command_formatting" => {
+                    let cmd_names: Vec<&str> = state
+                        .selected_commands
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect();
+                    input.metadata = serde_json::json!({
+                        "capabilities": state.model_capabilities,
+                        "selected_commands": cmd_names,
+                    });
+                }
+                "sampling_adjustment" => {
+                    input.metadata = serde_json::json!({
+                        "max_tokens": state.model_max_tokens.unwrap_or(4096)
+                    });
+                }
+                _ => {}
+            }
             resolved
                 .activity
                 .execute(
@@ -1234,7 +1261,7 @@ impl Reactor {
             })
             .or_else(|| {
                 // Backward compat: if selected_model not yet set (e.g., pre-loop not complete),
-                // fall back to routing snapshot populated by legacy RouteActivity.
+                // fall back to routing snapshot for serialized event log replay.
                 state
                     .routing
                     .as_ref()

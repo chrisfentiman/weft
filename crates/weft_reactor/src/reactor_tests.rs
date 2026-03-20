@@ -2946,4 +2946,394 @@ mod tests {
             "backoff should not exceed cap + 25% jitter"
         );
     }
+
+    // ── Phase 5: Pre-loop activity wiring integration tests ───────────────────
+    //
+    // These tests verify the full 6-activity pre-loop sequence using the real
+    // activity implementations and stub services. They assert that:
+    // - All 6 new event types appear in the event log in the correct order
+    // - The system prompt message is at position 0 in the message list
+    // - The generation config reflects the sampling parameters from SamplingAdjustmentActivity
+
+    use crate::activities::{
+        CommandFormattingActivity, CommandSelectionActivity, ModelSelectionActivity,
+        ProviderResolutionActivity, SamplingAdjustmentActivity, SystemPromptAssemblyActivity,
+        ValidateActivity,
+    };
+
+    /// Build a registry with all 6 new pre-loop activities plus the standard
+    /// generate, execute_command, and assemble_response stubs for integration tests.
+    fn build_new_preloop_registry(generate_name: &str) -> Arc<ActivityRegistry> {
+        build_registry(vec![
+            Arc::new(ValidateActivity),
+            Arc::new(ModelSelectionActivity),
+            Arc::new(CommandSelectionActivity),
+            Arc::new(ProviderResolutionActivity),
+            Arc::new(SystemPromptAssemblyActivity),
+            Arc::new(CommandFormattingActivity),
+            Arc::new(SamplingAdjustmentActivity),
+            Arc::new(ImmediateDoneActivity {
+                name: generate_name.to_string(),
+            }),
+            Arc::new(StubAssembleResponse {
+                name: "assemble_response".to_string(),
+            }),
+            Arc::new(StubExecuteCommand {
+                name: "execute_command".to_string(),
+            }),
+        ])
+    }
+
+    /// Build a pipeline config with all 6 new pre-loop activities.
+    fn new_preloop_pipeline_config(generate_name: &str) -> PipelineConfig {
+        PipelineConfig {
+            name: "default".to_string(),
+            pre_loop: vec![
+                ActivityRef::Name("validate".to_string()),
+                ActivityRef::Name("model_selection".to_string()),
+                ActivityRef::Name("command_selection".to_string()),
+                ActivityRef::Name("provider_resolution".to_string()),
+                ActivityRef::Name("system_prompt_assembly".to_string()),
+                ActivityRef::Name("command_formatting".to_string()),
+                ActivityRef::Name("sampling_adjustment".to_string()),
+            ],
+            post_loop: vec![ActivityRef::Name("assemble_response".to_string())],
+            generate: ActivityRef::Name(generate_name.to_string()),
+            execute_command: ActivityRef::Name("execute_command".to_string()),
+            loop_hooks: LoopHooks::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_loop_all_six_activities_produce_expected_events() {
+        // Verify the event log contains all 6 new event types from the new
+        // pre-loop activities, in the correct order.
+        let services = Arc::new(make_test_services());
+        let event_log = test_event_log();
+        let registry = build_new_preloop_registry("generate");
+        let config = reactor_config(new_preloop_pipeline_config("generate"));
+
+        let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+            .expect("reactor should construct");
+
+        let (result, _) = reactor
+            .execute(
+                test_request(),
+                TenantId("tenant1".to_string()),
+                RequestId("req1".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("execution should succeed");
+
+        let events = event_log.read(&result.execution_id, None).await.unwrap();
+        let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+
+        // All 6 new event types must be present.
+        assert!(
+            event_types.contains(&"model.selected"),
+            "missing model.selected event; got: {event_types:?}"
+        );
+        assert!(
+            event_types.contains(&"commands.selected"),
+            "missing commands.selected event; got: {event_types:?}"
+        );
+        assert!(
+            event_types.contains(&"provider.resolved"),
+            "missing provider.resolved event; got: {event_types:?}"
+        );
+        assert!(
+            event_types.contains(&"system_prompt.assembled"),
+            "missing system_prompt.assembled event; got: {event_types:?}"
+        );
+        assert!(
+            event_types.contains(&"commands.formatted"),
+            "missing commands.formatted event; got: {event_types:?}"
+        );
+        assert!(
+            event_types.contains(&"sampling.updated"),
+            "missing sampling.updated event; got: {event_types:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_loop_events_appear_in_correct_order() {
+        // Verify the 6 new activity events appear in the activity order
+        // (model_selection before commands_selected, etc.).
+        let services = Arc::new(make_test_services());
+        let event_log = test_event_log();
+        let registry = build_new_preloop_registry("generate");
+        let config = reactor_config(new_preloop_pipeline_config("generate"));
+
+        let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+            .expect("reactor should construct");
+
+        let (result, _) = reactor
+            .execute(
+                test_request(),
+                TenantId("tenant1".to_string()),
+                RequestId("req1".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("execution should succeed");
+
+        let events = event_log.read(&result.execution_id, None).await.unwrap();
+
+        // Find sequence numbers for each event type.
+        let seq_of = |event_type: &str| -> u64 {
+            events
+                .iter()
+                .find(|e| e.event_type == event_type)
+                .map(|e| e.sequence)
+                .unwrap_or(0)
+        };
+
+        let model_seq = seq_of("model.selected");
+        let commands_seq = seq_of("commands.selected");
+        let provider_seq = seq_of("provider.resolved");
+        let sys_prompt_seq = seq_of("system_prompt.assembled");
+        let cmd_fmt_seq = seq_of("commands.formatted");
+        let sampling_seq = seq_of("sampling.updated");
+
+        assert!(model_seq > 0, "model.selected must be present (seq > 0)");
+        assert!(
+            model_seq < commands_seq,
+            "model.selected ({model_seq}) must precede commands.selected ({commands_seq})"
+        );
+        assert!(
+            commands_seq < provider_seq,
+            "commands.selected ({commands_seq}) must precede provider.resolved ({provider_seq})"
+        );
+        assert!(
+            provider_seq < sys_prompt_seq,
+            "provider.resolved ({provider_seq}) must precede system_prompt.assembled ({sys_prompt_seq})"
+        );
+        assert!(
+            sys_prompt_seq < cmd_fmt_seq,
+            "system_prompt.assembled ({sys_prompt_seq}) must precede commands.formatted ({cmd_fmt_seq})"
+        );
+        assert!(
+            cmd_fmt_seq < sampling_seq,
+            "commands.formatted ({cmd_fmt_seq}) must precede sampling.updated ({sampling_seq})"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_loop_system_prompt_at_index_zero() {
+        // Verify that after the pre-loop, the system prompt message is at
+        // messages[0] (inserted by SystemPromptAssemblyActivity via MessageInjected).
+        let services = Arc::new(make_test_services());
+        let event_log = test_event_log();
+        let registry = build_new_preloop_registry("generate");
+        let config = reactor_config(new_preloop_pipeline_config("generate"));
+
+        let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+            .expect("reactor should construct");
+
+        let (result, _) = reactor
+            .execute(
+                test_request(),
+                TenantId("tenant1".to_string()),
+                RequestId("req1".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("execution should succeed");
+
+        let events = event_log.read(&result.execution_id, None).await.unwrap();
+
+        // The MessageInjected event with SystemPromptAssembly source must be present.
+        // PipelineEvent serializes with external tagging: {"MessageInjected": {"message": ..., "source": "SystemPromptAssembly"}}.
+        // The "source" field is nested under the "MessageInjected" key, not at the top level.
+        let system_prompt_injected = events.iter().any(|e| {
+            if e.event_type != "message.injected" {
+                return false;
+            }
+            // External-tagged enum: outer key is "MessageInjected", fields are nested beneath it.
+            e.payload
+                .get("MessageInjected")
+                .and_then(|v| v.get("source"))
+                .and_then(|s| s.as_str())
+                .map(|s| s == "SystemPromptAssembly")
+                .unwrap_or(false)
+        });
+        assert!(
+            system_prompt_injected,
+            "expected MessageInjected with SystemPromptAssembly source in event log"
+        );
+
+        // The system_prompt.assembled event must be present.
+        let has_sys_prompt = events
+            .iter()
+            .any(|e| e.event_type == "system_prompt.assembled");
+        assert!(
+            has_sys_prompt,
+            "expected system_prompt.assembled event in event log"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_loop_generation_config_includes_model() {
+        // Verify that a successful execution produces a generation config
+        // that includes the model selected by ModelSelectionActivity.
+        // The ImmediateDoneActivity doesn't check generation_config, but we can
+        // verify the event log shows model.selected and then a generation attempt.
+        let services = Arc::new(make_test_services());
+        let event_log = test_event_log();
+        let registry = build_new_preloop_registry("generate");
+        let config = reactor_config(new_preloop_pipeline_config("generate"));
+
+        let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+            .expect("reactor should construct");
+
+        let (result, _) = reactor
+            .execute(
+                test_request(),
+                TenantId("tenant1".to_string()),
+                RequestId("req1".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("execution should succeed");
+
+        let events = event_log.read(&result.execution_id, None).await.unwrap();
+
+        // Find the ModelSelected event and verify the model_name field is non-empty.
+        let model_selected = events
+            .iter()
+            .find(|e| e.event_type == "model.selected")
+            .expect("model.selected must be in event log");
+
+        // PipelineEvent serializes with external tagging: {"ModelSelected": {"model_name": ..., ...}}.
+        // The "model_name" field is nested under the "ModelSelected" key.
+        let model_name = model_selected
+            .payload
+            .get("ModelSelected")
+            .and_then(|v| v.get("model_name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            !model_name.is_empty(),
+            "model_name in model.selected must be non-empty"
+        );
+
+        // Find the SamplingUpdated event and verify max_tokens > 0.
+        let sampling_updated = events
+            .iter()
+            .find(|e| e.event_type == "sampling.updated")
+            .expect("sampling.updated must be in event log");
+
+        // PipelineEvent serializes with external tagging: {"SamplingUpdated": {"max_tokens": ..., ...}}.
+        // The "max_tokens" field is nested under the "SamplingUpdated" key.
+        let max_tokens = sampling_updated
+            .payload
+            .get("SamplingUpdated")
+            .and_then(|v| v.get("max_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        assert!(
+            max_tokens > 0,
+            "max_tokens in sampling.updated must be > 0, got {max_tokens}"
+        );
+
+        // Verify the execution completed successfully (not failed).
+        assert!(
+            events.iter().any(|e| e.event_type == "execution.completed"),
+            "execution must complete successfully"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_loop_activity_failure_terminates_execution() {
+        // Verify that if a pre-loop activity fails (ActivityFailed), the execution
+        // returns an error and records ExecutionFailed in the event log.
+        // Use a stub that immediately fails in place of model_selection.
+        struct FailingModelSelection;
+
+        #[async_trait::async_trait]
+        impl Activity for FailingModelSelection {
+            fn name(&self) -> &str {
+                "model_selection"
+            }
+
+            async fn execute(
+                &self,
+                _execution_id: &ExecutionId,
+                _input: ActivityInput,
+                _services: &crate::services::Services,
+                _event_log: &dyn crate::event_log::EventLog,
+                event_tx: mpsc::Sender<PipelineEvent>,
+                _cancel: CancellationToken,
+            ) {
+                let _ = event_tx
+                    .send(PipelineEvent::ActivityStarted {
+                        name: self.name().to_string(),
+                    })
+                    .await;
+                let _ = event_tx
+                    .send(PipelineEvent::ActivityFailed {
+                        name: self.name().to_string(),
+                        error: "model_selection: no eligible models".to_string(),
+                        retryable: false,
+                    })
+                    .await;
+            }
+        }
+
+        let services = Arc::new(make_test_services());
+        let event_log = test_event_log();
+        let registry = build_registry(vec![
+            Arc::new(ValidateActivity),
+            Arc::new(FailingModelSelection),
+            Arc::new(CommandSelectionActivity),
+            Arc::new(ProviderResolutionActivity),
+            Arc::new(SystemPromptAssemblyActivity),
+            Arc::new(CommandFormattingActivity),
+            Arc::new(SamplingAdjustmentActivity),
+            Arc::new(ImmediateDoneActivity {
+                name: "generate".to_string(),
+            }),
+            Arc::new(StubAssembleResponse {
+                name: "assemble_response".to_string(),
+            }),
+            Arc::new(StubExecuteCommand {
+                name: "execute_command".to_string(),
+            }),
+        ]);
+
+        let config = reactor_config(new_preloop_pipeline_config("generate"));
+        let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+            .expect("reactor should construct");
+
+        let result = reactor
+            .execute(
+                test_request(),
+                TenantId("tenant1".to_string()),
+                RequestId("req1".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        // Execution must fail.
+        assert!(
+            result.is_err(),
+            "execution should fail when model_selection activity fails"
+        );
+    }
 }
