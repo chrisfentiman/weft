@@ -2869,7 +2869,7 @@ fn backoff_ms_respects_cap() {
 
 // ── Phase 5: Pre-loop activity wiring integration tests ───────────────────
 
-use weft_reactor::activities::{
+use weft_activities::{
     CommandFormattingActivity, CommandSelectionActivity, ModelSelectionActivity,
     ProviderResolutionActivity, SamplingAdjustmentActivity, SystemPromptAssemblyActivity,
     ValidateActivity,

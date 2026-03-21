@@ -17,11 +17,10 @@ use weft_hooks::HookChainResult;
 use weft_router::{RoutingCandidate, RoutingDomainKind, filter_by_threshold, take_top};
 
 use super::selection_util::extract_user_message;
-use crate::activity::{Activity, ActivityInput, SemanticSelection};
-use crate::event::{ActivityEvent, HookOutcome, PipelineEvent, SelectionEvent};
-use crate::event_log::EventLog;
-use crate::execution::ExecutionId;
-use weft_reactor_trait::ServiceLocator;
+use weft_reactor_trait::{
+    Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, HookOutcome, PipelineEvent,
+    SelectionEvent, SemanticSelection, ServiceLocator,
+};
 
 /// Selects the commands relevant to the current turn via semantic routing.
 ///
@@ -57,7 +56,7 @@ impl SemanticSelection for CommandSelectionActivity {
     }
 }
 
-/// Stub stubs for /recall and /remember memory commands.
+/// Stub names for /recall and /remember memory commands.
 const RECALL_NAME: &str = "/recall";
 const RECALL_DESC: &str = "Recall information from memory stores";
 const REMEMBER_NAME: &str = "/remember";
@@ -104,7 +103,6 @@ impl Activity for CommandSelectionActivity {
         let user_message = extract_user_message(&input);
 
         // Build the full candidate list.
-        // Start with ValidateActivity's available_commands, then add memory commands if configured.
         let mut full_candidates: Vec<CommandStub> = input.available_commands.clone();
 
         // Include /recall and /remember if memory has at least one store.
@@ -115,7 +113,6 @@ impl Activity for CommandSelectionActivity {
             .is_some_and(|m| !m.stores.is_empty());
 
         if has_memory {
-            // Add memory commands if not already present.
             if !full_candidates.iter().any(|c| c.name == RECALL_NAME) {
                 full_candidates.push(CommandStub {
                     name: RECALL_NAME.to_string(),
@@ -206,7 +203,7 @@ impl Activity for CommandSelectionActivity {
         let selected = match services.router().route(user_message, &domains).await {
             Err(e) => {
                 // Fail-open: router error → include all commands capped by max_commands,
-                // sorted alphabetically (matching route_domains fallback behaviour).
+                // sorted alphabetically.
                 warn!(error = %e, "command_selection: router error, including all commands");
                 let max_commands = services.config().router.classifier.max_commands;
                 let mut fallback = full_candidates.clone();
@@ -215,15 +212,12 @@ impl Activity for CommandSelectionActivity {
                 fallback
             }
             Ok(decision) => {
-                // Apply threshold and max_commands filtering.
                 let threshold = services.config().router.classifier.threshold;
                 let max_commands = services.config().router.classifier.max_commands;
 
                 let filtered = filter_by_threshold(decision.commands, threshold);
                 let top = take_top(filtered, max_commands);
 
-                // Map scored IDs back to CommandStub from full_candidates.
-                // Preserve descending-score order from take_top.
                 top.iter()
                     .filter_map(|sc| full_candidates.iter().find(|c| c.name == sc.id).cloned())
                     .collect()
@@ -290,8 +284,9 @@ impl Activity for CommandSelectionActivity {
 mod tests {
     use super::*;
     use crate::test_support::{
-        NullEventLog, collect_events, make_test_input, make_test_services,
-        make_test_services_with_blocking_hook,
+        MockServiceLocator, NullEventLog, collect_events, make_test_input, make_test_services,
+        make_test_services_with_blocking_hook, make_test_services_with_failing_router,
+        make_test_services_with_memory,
     };
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
@@ -299,7 +294,7 @@ mod tests {
 
     async fn run_command_selection(
         input: ActivityInput,
-        services: crate::services::Services,
+        services: MockServiceLocator,
     ) -> Vec<PipelineEvent> {
         let (tx, mut rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
@@ -363,7 +358,6 @@ mod tests {
             "expected Activity(Completed)"
         );
 
-        // Fail-open: no Activity(Failed).
         assert!(
             !events
                 .iter()
@@ -377,10 +371,9 @@ mod tests {
     #[tokio::test]
     async fn command_selection_empty_commands_produces_empty_selection() {
         let mut input = make_test_input();
-        input.available_commands = vec![]; // no commands from ValidateActivity
+        input.available_commands = vec![];
 
         let services = make_test_services();
-        // Verify no memory configured in test services.
         assert!(services.config.memory.is_none());
 
         let events = run_command_selection(input, services).await;
@@ -407,7 +400,6 @@ mod tests {
             description: "Search the web".to_string(),
         }];
 
-        // Build services with memory configured.
         let services = make_test_services_with_memory();
 
         let events = run_command_selection(input, services).await;
@@ -422,8 +414,6 @@ mod tests {
 
         let selected = selected.expect("Selection(CommandsSelected) must be present");
 
-        // /recall and /remember should be in the selected set (since stub router scores
-        // all candidates above threshold).
         let has_recall = selected.iter().any(|c| c.name == RECALL_NAME);
         let has_remember = selected.iter().any(|c| c.name == REMEMBER_NAME);
         assert!(
@@ -446,7 +436,7 @@ mod tests {
             description: "Search the web".to_string(),
         }];
 
-        let services = make_test_services(); // memory is None
+        let services = make_test_services();
 
         let events = run_command_selection(input, services).await;
 
@@ -484,7 +474,6 @@ mod tests {
 
         let events = run_command_selection(input, services).await;
 
-        // Must NOT have Activity(Failed) (fail-open).
         assert!(
             !events
                 .iter()
@@ -492,7 +481,6 @@ mod tests {
             "hook blocking must be fail-open (no Activity(Failed))"
         );
 
-        // Must have Hook(Blocked).
         assert!(
             events
                 .iter()
@@ -500,7 +488,6 @@ mod tests {
             "expected Hook(Blocked) event"
         );
 
-        // Must have Selection(CommandsSelected) with empty selection.
         let selected = events.iter().find_map(|e| {
             if let PipelineEvent::Selection(SelectionEvent::CommandsSelected { selected, .. }) = e {
                 Some(selected.clone())
@@ -515,7 +502,6 @@ mod tests {
             "commands must be empty when pre_route hook blocks"
         );
 
-        // Activity(Completed) must be present (not Activity(Failed)).
         assert!(
             events
                 .iter()
@@ -539,7 +525,6 @@ mod tests {
 
         let events = run_command_selection(input, services).await;
 
-        // Must NOT have Activity(Failed).
         assert!(
             !events
                 .iter()
@@ -547,7 +532,6 @@ mod tests {
             "post_route hook blocking must be fail-open"
         );
 
-        // Must have Selection(CommandsSelected) with empty selection (cleared by block).
         let selected = events.iter().find_map(|e| {
             if let PipelineEvent::Selection(SelectionEvent::CommandsSelected { selected, .. }) = e {
                 Some(selected.clone())
@@ -561,7 +545,6 @@ mod tests {
             "commands must be empty when post_route hook blocks"
         );
 
-        // Activity(Completed) must be present.
         assert!(
             events
                 .iter()
@@ -577,7 +560,7 @@ mod tests {
         let input = make_test_input();
         let (tx, mut rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
-        cancel.cancel(); // pre-cancel
+        cancel.cancel();
 
         let services = make_test_services();
         let event_log = NullEventLog;
@@ -589,7 +572,6 @@ mod tests {
 
         let events = collect_events(&mut rx);
 
-        // No Activity(Failed).
         assert!(
             !events
                 .iter()
@@ -597,7 +579,6 @@ mod tests {
             "cancellation must be fail-open (no Activity(Failed))"
         );
 
-        // Activity(Completed) present.
         assert!(
             events
                 .iter()
@@ -636,7 +617,6 @@ mod tests {
             }
         });
 
-        // Stub router scores all candidates above threshold → all 3 are selected.
         let selected = selected.expect("Selection(CommandsSelected) must be present");
         assert_eq!(
             selected.len(),
@@ -649,9 +629,6 @@ mod tests {
 
     #[tokio::test]
     async fn command_selection_router_error_falls_back_to_all_commands_capped() {
-        // When the router errors, command_selection falls back to all commands
-        // sorted alphabetically and truncated to max_commands. This is fail-open:
-        // no Activity(Failed), Selection(CommandsSelected) is still pushed.
         let mut input = make_test_input();
         input.available_commands = vec![
             CommandStub {
@@ -668,11 +645,10 @@ mod tests {
             },
         ];
 
-        let services = crate::test_support::make_test_services_with_failing_router();
+        let services = make_test_services_with_failing_router();
 
         let events = run_command_selection(input, services).await;
 
-        // Fail-open: no Activity(Failed).
         assert!(
             !events
                 .iter()
@@ -680,7 +656,6 @@ mod tests {
             "router error must be fail-open (no Activity(Failed))"
         );
 
-        // Selection(CommandsSelected) must be present.
         let selected = events.iter().find_map(|e| {
             if let PipelineEvent::Selection(SelectionEvent::CommandsSelected { selected, .. }) = e {
                 Some(selected.clone())
@@ -691,13 +666,10 @@ mod tests {
         let selected =
             selected.expect("Selection(CommandsSelected) must be present on router error");
 
-        // Fallback includes all commands (capped by max_commands, sorted alphabetically).
-        // The test config has max_commands = 10 (classifier default), so all 3 appear.
         assert!(
             !selected.is_empty(),
             "fallback must include commands when router errors"
         );
-        // Alphabetical order: a_command < m_command < z_command.
         assert_eq!(
             selected[0].name, "a_command",
             "fallback must be sorted alphabetically"
@@ -705,274 +677,11 @@ mod tests {
         assert_eq!(selected[1].name, "m_command");
         assert_eq!(selected[2].name, "z_command");
 
-        // Activity(Completed) must be present.
         assert!(
             events
                 .iter()
                 .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { .. }))),
             "expected Activity(Completed) (fail-open)"
         );
-    }
-
-    // ── Test helpers ──────────────────────────────────────────────────────────
-
-    /// Build test Services with a minimal memory configuration containing one store.
-    fn make_test_services_with_memory() -> crate::services::Services {
-        use std::sync::Arc;
-        use weft_core::WeftConfig;
-
-        let toml = r#"
-[server]
-bind_address = "0.0.0.0:8080"
-
-[gateway]
-system_prompt = "You are helpful."
-
-[router]
-
-[router.classifier]
-model_path = "m.onnx"
-tokenizer_path = "t.json"
-
-[[router.providers]]
-name = "anthropic"
-wire_format = "anthropic"
-api_key = "sk-test"
-
-  [[router.providers.models]]
-  name = "stub-model"
-  model = "stub-model-v1"
-  examples = ["example query"]
-
-[[memory.stores]]
-name = "conversations"
-endpoint = "http://localhost:50052"
-capabilities = ["read", "write"]
-examples = ["conversation history"]
-"#;
-        let config: WeftConfig = toml::from_str(toml).expect("test config with memory must parse");
-
-        let provider: Arc<dyn weft_llm::Provider> = Arc::new(StubProviderForTest);
-        let hooks: Arc<dyn weft_hooks::HookRunner + Send + Sync> =
-            Arc::new(weft_hooks::NullHookRunner);
-
-        let providers: Arc<dyn weft_llm::ProviderService + Send + Sync> =
-            Arc::new(StubProviderServiceForTest::new(provider));
-        let router: Arc<dyn weft_router::SemanticRouter + Send + Sync> =
-            Arc::new(StubRouterForTest);
-        let commands: Arc<dyn weft_commands::CommandRegistry + Send + Sync> =
-            Arc::new(StubCommandRegistryForTest);
-
-        crate::services::Services {
-            config: Arc::new(config),
-            providers,
-            router,
-            commands,
-            memory: None, // memory service not needed — config presence is what matters
-            hooks,
-            reactor_handle: std::sync::OnceLock::new(),
-            request_end_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
-        }
-    }
-
-    // ── Local stubs for memory test ───────────────────────────────────────────
-    // (Can't reuse test_support directly since its stub types are private.)
-
-    pub struct StubProviderForTest;
-
-    #[async_trait::async_trait]
-    impl weft_llm::Provider for StubProviderForTest {
-        async fn execute(
-            &self,
-            _request: weft_llm::ProviderRequest,
-        ) -> Result<weft_llm::ProviderResponse, weft_llm::ProviderError> {
-            let message = weft_core::WeftMessage {
-                role: weft_core::Role::Assistant,
-                source: weft_core::Source::Provider,
-                model: Some("stub-model".to_string()),
-                content: vec![weft_core::ContentPart::Text("stub".to_string())],
-                delta: false,
-                message_index: 0,
-            };
-            Ok(weft_llm::ProviderResponse::ChatCompletion {
-                message,
-                usage: None,
-            })
-        }
-
-        fn name(&self) -> &str {
-            "stub-provider"
-        }
-    }
-
-    struct StubProviderServiceForTest {
-        provider: std::sync::Arc<dyn weft_llm::Provider>,
-        capabilities:
-            std::collections::HashMap<String, std::collections::HashSet<weft_llm::Capability>>,
-        capability_index:
-            std::collections::HashMap<weft_llm::Capability, std::collections::HashSet<String>>,
-        empty_string_set: std::collections::HashSet<String>,
-    }
-
-    impl StubProviderServiceForTest {
-        fn new(provider: std::sync::Arc<dyn weft_llm::Provider>) -> Self {
-            use std::collections::{HashMap, HashSet};
-            let default = "stub-model".to_string();
-            let chat_cap = weft_llm::Capability::new(weft_llm::Capability::CHAT_COMPLETIONS);
-
-            let mut capabilities = HashMap::new();
-            let mut cap_set = HashSet::new();
-            cap_set.insert(chat_cap.clone());
-            capabilities.insert(default.clone(), cap_set);
-
-            let mut capability_index: HashMap<weft_llm::Capability, HashSet<String>> =
-                HashMap::new();
-            let mut model_set = HashSet::new();
-            model_set.insert(default.clone());
-            capability_index.insert(chat_cap, model_set);
-
-            Self {
-                provider,
-                capabilities,
-                capability_index,
-                empty_string_set: HashSet::new(),
-            }
-        }
-    }
-
-    impl weft_llm::ProviderService for StubProviderServiceForTest {
-        fn get(&self, _name: &str) -> &std::sync::Arc<dyn weft_llm::Provider> {
-            &self.provider
-        }
-        fn model_id(&self, name: &str) -> Option<&str> {
-            if name == "stub-model" {
-                Some("stub-model-v1")
-            } else {
-                None
-            }
-        }
-        fn max_tokens_for(&self, name: &str) -> Option<u32> {
-            if name == "stub-model" {
-                Some(4096)
-            } else {
-                None
-            }
-        }
-        fn default_provider(&self) -> &std::sync::Arc<dyn weft_llm::Provider> {
-            &self.provider
-        }
-        fn default_name(&self) -> &str {
-            "stub-model"
-        }
-        fn models_with_capability(
-            &self,
-            capability: &weft_llm::Capability,
-        ) -> &std::collections::HashSet<String> {
-            self.capability_index
-                .get(capability)
-                .unwrap_or(&self.empty_string_set)
-        }
-        fn model_has_capability(
-            &self,
-            model_name: &str,
-            capability: &weft_llm::Capability,
-        ) -> bool {
-            self.capabilities
-                .get(model_name)
-                .map(|caps| caps.contains(capability))
-                .unwrap_or(false)
-        }
-        fn model_capabilities(
-            &self,
-            model_name: &str,
-        ) -> Option<&std::collections::HashSet<weft_llm::Capability>> {
-            self.capabilities.get(model_name)
-        }
-    }
-
-    struct StubRouterForTest;
-
-    #[async_trait::async_trait]
-    impl weft_router::SemanticRouter for StubRouterForTest {
-        async fn route(
-            &self,
-            _user_message: &str,
-            domains: &[(
-                weft_router::RoutingDomainKind,
-                Vec<weft_router::RoutingCandidate>,
-            )],
-        ) -> Result<weft_router::RoutingDecision, weft_router::RouterError> {
-            let mut decision = weft_router::RoutingDecision::empty();
-            for (kind, candidates) in domains {
-                match kind {
-                    weft_router::RoutingDomainKind::Model => {
-                        if let Some(first) = candidates.first() {
-                            decision.model = Some(weft_router::ScoredCandidate {
-                                id: first.id.clone(),
-                                score: 0.9,
-                            });
-                        }
-                    }
-                    weft_router::RoutingDomainKind::Commands => {
-                        decision.commands = candidates
-                            .iter()
-                            .map(|c| weft_router::ScoredCandidate {
-                                id: c.id.clone(),
-                                score: 0.9,
-                            })
-                            .collect();
-                    }
-                    _ => {}
-                }
-            }
-            Ok(decision)
-        }
-
-        async fn score_memory_candidates(
-            &self,
-            _text: &str,
-            candidates: &[weft_router::RoutingCandidate],
-        ) -> Result<Vec<weft_router::ScoredCandidate>, weft_router::RouterError> {
-            Ok(candidates
-                .iter()
-                .map(|c| weft_router::ScoredCandidate {
-                    id: c.id.clone(),
-                    score: 0.9,
-                })
-                .collect())
-        }
-    }
-
-    struct StubCommandRegistryForTest;
-
-    #[async_trait::async_trait]
-    impl weft_commands::CommandRegistry for StubCommandRegistryForTest {
-        async fn list_commands(
-            &self,
-        ) -> Result<Vec<weft_core::CommandStub>, weft_commands::CommandError> {
-            Ok(vec![])
-        }
-        async fn describe_command(
-            &self,
-            name: &str,
-        ) -> Result<weft_core::CommandDescription, weft_commands::CommandError> {
-            Ok(weft_core::CommandDescription {
-                name: name.to_string(),
-                description: format!("{name}: stub"),
-                usage: format!("/{name}"),
-                parameters_schema: None,
-            })
-        }
-        async fn execute_command(
-            &self,
-            invocation: &weft_core::CommandInvocation,
-        ) -> Result<weft_core::CommandResult, weft_commands::CommandError> {
-            Ok(weft_core::CommandResult {
-                command_name: invocation.name.clone(),
-                success: true,
-                output: "stub".to_string(),
-                error: None,
-            })
-        }
     }
 }

@@ -18,7 +18,6 @@
 //! - `weft_eventlog_memory` -- for tests and local dev
 //! - `weft_eventlog_postgres` -- for production
 
-pub mod activities;
 pub mod activity;
 pub mod budget;
 pub mod config;

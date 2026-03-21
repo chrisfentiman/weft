@@ -9,12 +9,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use weft_core::{ContentPart, Role, Source, WeftMessage, WeftResponse, WeftTiming};
-use weft_reactor_trait::ServiceLocator;
-
-use crate::activity::{Activity, ActivityInput};
-use crate::event::{ActivityEvent, ContextEvent, PipelineEvent};
-use crate::event_log::EventLog;
-use crate::execution::ExecutionId;
+use weft_reactor_trait::{
+    Activity, ActivityEvent, ActivityInput, ContextEvent, EventLog, ExecutionId, PipelineEvent,
+    ServiceLocator,
+};
 
 /// Constructs the final WeftResponse from accumulated execution state.
 ///
@@ -127,8 +125,7 @@ impl Activity for AssembleResponseActivity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::NullEventLog;
-    use crate::test_support::{collect_events, make_test_input, make_test_services};
+    use crate::test_support::{NullEventLog, collect_events, make_test_input, make_test_services};
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
@@ -137,7 +134,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let services = make_test_services();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = AssembleResponseActivity::new();
         activity
@@ -207,7 +204,6 @@ mod tests {
 
         match assembled {
             PipelineEvent::Context(ContextEvent::ResponseAssembled { response }) => {
-                // The response messages should contain the accumulated text.
                 let has_text = response.messages.iter().any(|m| {
                     m.content.iter().any(|p| {
                         matches!(p, ContentPart::Text(t) if t.contains("This is the final response."))
@@ -228,7 +224,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let services = make_test_services();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
         let exec_id_str = exec_id.to_string();
 
         let activity = AssembleResponseActivity::new();
@@ -266,7 +262,7 @@ mod tests {
 
         let services = make_test_services();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = AssembleResponseActivity::new();
         activity

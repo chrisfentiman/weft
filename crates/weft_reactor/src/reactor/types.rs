@@ -198,4 +198,3 @@ pub(super) struct CommandContext<'a> {
     pub(super) cancel: &'a CancellationToken,
     pub(super) default_timeout_secs: u64,
 }
-

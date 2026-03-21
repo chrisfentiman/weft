@@ -14,12 +14,10 @@
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use weft_reactor_trait::ServiceLocator;
-
-use crate::activity::{Activity, ActivityInput};
-use crate::event::{ActivityEvent, ContextEvent, MessageInjectionSource, PipelineEvent};
-use crate::event_log::EventLog;
-use crate::execution::ExecutionId;
+use weft_reactor_trait::{
+    Activity, ActivityEvent, ActivityInput, ContextEvent, EventLog, ExecutionId,
+    MessageInjectionSource, PipelineEvent, ServiceLocator,
+};
 
 /// Assembles the system prompt from gateway config and caller-provided layers.
 ///
@@ -155,7 +153,10 @@ impl Activity for SystemPromptAssemblyActivity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{NullEventLog, collect_events, make_test_input, make_test_services};
+    use crate::test_support::{
+        MockServiceLocator, NullEventLog, collect_events, make_test_input, make_test_services,
+    };
+    use std::sync::Arc;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
     use weft_core::{ContentPart, Role, Source, WeftMessage};
@@ -347,8 +348,6 @@ mod tests {
 
     #[tokio::test]
     async fn empty_gateway_prompt_assembles_empty_prompt() {
-        use std::sync::Arc;
-
         let input = make_test_input();
 
         // Build services with an empty gateway system prompt.
@@ -379,9 +378,15 @@ api_key = "sk-test"
         )
         .expect("test config must parse");
 
-        let services = crate::services::Services {
+        let base = make_test_services();
+        let services = MockServiceLocator {
             config: Arc::new(config),
-            ..make_test_services()
+            providers: base.providers,
+            router: base.router,
+            commands: base.commands,
+            hooks: base.hooks,
+            memory: None,
+            request_end_semaphore: base.request_end_semaphore,
         };
 
         let (tx, mut rx) = mpsc::channel(64);

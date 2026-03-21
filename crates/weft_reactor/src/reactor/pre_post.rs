@@ -9,8 +9,8 @@ use crate::error::ReactorError;
 use crate::event::{ExecutionEvent, PipelineEvent};
 use crate::execution::ExecutionStatus;
 
-use super::types::LoopContext;
 use super::Reactor;
+use super::types::LoopContext;
 
 impl Reactor {
     /// Run the pre-loop activities sequentially.
@@ -70,12 +70,7 @@ impl Reactor {
 
             // Drain and dispatch all events the activity pushed.
             let terminate = self
-                .drain_pre_post_loop(
-                    lctx.execution_id,
-                    lctx.event_rx,
-                    lctx.state,
-                    lctx.cancel,
-                )
+                .drain_pre_post_loop(lctx.execution_id, lctx.event_rx, lctx.state, lctx.cancel)
                 .await?;
             if let Some(err) = terminate {
                 self.record_event(
@@ -122,12 +117,7 @@ impl Reactor {
                 )
                 .await;
             let terminate = self
-                .drain_pre_post_loop(
-                    lctx.execution_id,
-                    lctx.event_rx,
-                    lctx.state,
-                    lctx.cancel,
-                )
+                .drain_pre_post_loop(lctx.execution_id, lctx.event_rx, lctx.state, lctx.cancel)
                 .await?;
             if let Some(err) = terminate {
                 // Post-loop failure: record but still return partial results.

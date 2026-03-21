@@ -12,11 +12,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::activity::{Activity, ActivityInput};
-use crate::event::{ActivityEvent, PipelineEvent, SelectionEvent};
-use crate::event_log::EventLog;
-use crate::execution::ExecutionId;
-use weft_reactor_trait::ServiceLocator;
+use weft_reactor_trait::{
+    Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, PipelineEvent, SelectionEvent,
+    ServiceLocator,
+};
 
 /// Resolves provider and model capabilities for the model selected by `ModelSelectionActivity`.
 ///
@@ -531,10 +530,11 @@ api_key = "sk-test"
 
     #[tokio::test]
     async fn provider_resolved_default_capabilities_when_none_registered() {
+        use crate::test_support::MockServiceLocator;
         use std::collections::HashSet;
         use std::sync::Arc;
 
-        // Build a custom Services where the model has no capabilities registered.
+        // Build a custom provider service where the model has no capabilities registered.
         struct NoCapProviderService {
             provider: Arc<dyn weft_llm::Provider>,
         }
@@ -635,15 +635,15 @@ api_key = "sk-test"
             provider: provider_arc,
         };
 
-        let services = crate::services::Services {
+        let base = make_test_services();
+        let services = MockServiceLocator {
             config: Arc::new(config),
             providers: Arc::new(svc_impl),
-            router: Arc::new(StubRouterNoCap),
-            commands: Arc::new(StubCmdNoCap),
+            router: base.router,
+            commands: base.commands,
+            hooks: base.hooks,
             memory: None,
-            hooks: Arc::new(weft_hooks::NullHookRunner),
-            reactor_handle: std::sync::OnceLock::new(),
-            request_end_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            request_end_semaphore: base.request_end_semaphore,
         };
 
         let input = make_input_with_metadata(serde_json::json!({ "selected_model": "stub-model" }));
@@ -675,64 +675,5 @@ api_key = "sk-test"
             vec!["chat_completions".to_string()],
             "should default to chat_completions when no capabilities registered"
         );
-    }
-
-    // Minimal stubs for the no-cap test above.
-
-    struct StubRouterNoCap;
-    #[async_trait::async_trait]
-    impl weft_router::SemanticRouter for StubRouterNoCap {
-        async fn route(
-            &self,
-            _user_message: &str,
-            _domains: &[(
-                weft_router::RoutingDomainKind,
-                Vec<weft_router::RoutingCandidate>,
-            )],
-        ) -> Result<weft_router::RoutingDecision, weft_router::RouterError> {
-            Ok(weft_router::RoutingDecision::empty())
-        }
-
-        async fn score_memory_candidates(
-            &self,
-            _text: &str,
-            _candidates: &[weft_router::RoutingCandidate],
-        ) -> Result<Vec<weft_router::ScoredCandidate>, weft_router::RouterError> {
-            Ok(vec![])
-        }
-    }
-
-    struct StubCmdNoCap;
-    #[async_trait::async_trait]
-    impl weft_commands::CommandRegistry for StubCmdNoCap {
-        async fn list_commands(
-            &self,
-        ) -> Result<Vec<weft_core::CommandStub>, weft_commands::CommandError> {
-            Ok(vec![])
-        }
-
-        async fn describe_command(
-            &self,
-            name: &str,
-        ) -> Result<weft_core::CommandDescription, weft_commands::CommandError> {
-            Ok(weft_core::CommandDescription {
-                name: name.to_string(),
-                description: String::new(),
-                usage: String::new(),
-                parameters_schema: None,
-            })
-        }
-
-        async fn execute_command(
-            &self,
-            invocation: &weft_core::CommandInvocation,
-        ) -> Result<weft_core::CommandResult, weft_commands::CommandError> {
-            Ok(weft_core::CommandResult {
-                command_name: invocation.name.clone(),
-                success: true,
-                output: String::new(),
-                error: None,
-            })
-        }
     }
 }

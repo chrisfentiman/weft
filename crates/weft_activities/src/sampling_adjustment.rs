@@ -16,11 +16,10 @@
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::activity::{Activity, ActivityInput};
-use crate::event::{ActivityEvent, ContextEvent, PipelineEvent};
-use crate::event_log::EventLog;
-use crate::execution::ExecutionId;
-use weft_reactor_trait::ServiceLocator;
+use weft_reactor_trait::{
+    Activity, ActivityEvent, ActivityInput, ContextEvent, EventLog, ExecutionId, PipelineEvent,
+    ServiceLocator,
+};
 
 /// The default model max_tokens when the metadata value is missing.
 const DEFAULT_MODEL_MAX_TOKENS: u32 = 4096;

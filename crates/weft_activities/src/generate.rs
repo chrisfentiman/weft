@@ -19,11 +19,10 @@ use weft_core::Role;
 use weft_core::{ContentPart, WeftMessage};
 use weft_llm::{ProviderChunk, ProviderError, ProviderRequest, ProviderResponse};
 
-use crate::activity::{Activity, ActivityInput};
-use crate::event::{ActivityEvent, GeneratedEvent, GenerationEvent, PipelineEvent};
-use crate::event_log::EventLog;
-use crate::execution::ExecutionId;
-use weft_reactor_trait::ServiceLocator;
+use weft_reactor_trait::{
+    Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, GeneratedEvent, GenerationEvent,
+    PipelineEvent, ServiceLocator,
+};
 
 /// Calls the generative source (LLM provider) and streams the response.
 ///
@@ -238,7 +237,12 @@ impl Activity for GenerateActivity {
             }
         };
 
-        let mut stream = match stream_result {
+        let mut stream: std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<weft_llm::ProviderChunk, weft_llm::ProviderError>>
+                    + Send,
+            >,
+        > = match stream_result {
             Ok(s) => s,
             Err(e) => {
                 heartbeat_cancel.cancel();
@@ -615,9 +619,8 @@ fn parse_only_commands_and_done(message: &WeftMessage) -> Vec<GeneratedEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::NullEventLog;
     use crate::test_support::{
-        collect_events, make_test_input, make_test_services_with_chunk_stream,
+        NullEventLog, collect_events, make_test_input, make_test_services_with_chunk_stream,
         make_test_services_with_mid_stream_error, make_test_services_with_response,
         make_test_services_with_slow_provider,
     };
@@ -641,7 +644,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = GenerateActivity::new();
         activity
@@ -713,7 +716,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = GenerateActivity::new();
         activity
@@ -763,7 +766,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = GenerateActivity::new();
         activity
@@ -802,7 +805,7 @@ mod tests {
         cancel.cancel(); // Pre-cancelled
 
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = GenerateActivity::new();
         activity
@@ -844,7 +847,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = GenerateActivity::new();
         activity
@@ -878,7 +881,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = GenerateActivity::new();
         activity
@@ -914,7 +917,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         // Pause the Tokio clock so we control time advancement.
         tokio::time::pause();
@@ -1022,7 +1025,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = GenerateActivity::new();
         activity
@@ -1109,7 +1112,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = GenerateActivity::new();
         activity
@@ -1162,7 +1165,7 @@ mod tests {
         // Pre-cancel so the stream loop is interrupted immediately.
         cancel.cancel();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = GenerateActivity::new();
         activity
@@ -1210,7 +1213,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = GenerateActivity::new();
         activity

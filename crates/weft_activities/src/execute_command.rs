@@ -9,11 +9,10 @@ use tracing::debug;
 use weft_commands::CommandError;
 use weft_core::CommandInvocation;
 
-use crate::activity::{Activity, ActivityInput};
-use crate::event::{ActivityEvent, CommandEvent, PipelineEvent};
-use crate::event_log::EventLog;
-use crate::execution::ExecutionId;
-use weft_reactor_trait::ServiceLocator;
+use weft_reactor_trait::{
+    Activity, ActivityEvent, ActivityInput, CommandEvent, EventLog, ExecutionId, PipelineEvent,
+    ServiceLocator,
+};
 
 /// Executes a single command invocation via the command registry.
 ///
@@ -209,9 +208,9 @@ fn extract_invocation(input: &ActivityInput) -> Result<CommandInvocation, String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::NullEventLog;
     use crate::test_support::{
-        collect_events, make_test_input, make_test_services, make_test_services_with_failed_command,
+        NullEventLog, collect_events, make_test_input, make_test_services,
+        make_test_services_with_failed_command,
     };
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
@@ -236,7 +235,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let services = make_test_services();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = ExecuteCommandActivity::new();
         activity
@@ -344,7 +343,7 @@ mod tests {
 
         let services = make_test_services();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = ExecuteCommandActivity::new();
         activity
@@ -372,7 +371,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = ExecuteCommandActivity::new();
         activity
@@ -429,7 +428,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = ExecuteCommandActivity::new();
         activity

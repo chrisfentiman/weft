@@ -43,6 +43,12 @@ use axum::{Router, body::Body, http::Request};
 use serde_json::Value;
 use weft::WeftService;
 use weft::server::build_router;
+use weft_activities::{
+    AssembleResponseActivity, CommandFormattingActivity, CommandSelectionActivity,
+    ExecuteCommandActivity, GenerateActivity, HookActivity, ModelSelectionActivity,
+    ProviderResolutionActivity, SamplingAdjustmentActivity, SystemPromptAssemblyActivity,
+    ValidateActivity,
+};
 use weft_commands::{CommandError, CommandRegistry};
 use weft_core::{
     ClassifierConfig, CommandCallContent, CommandDescription, CommandInvocation, CommandResult,
@@ -55,12 +61,6 @@ use weft_llm::{
 };
 use weft_reactor::{
     ActivityRegistry, Reactor, ReactorConfig,
-    activities::{
-        AssembleResponseActivity, CommandFormattingActivity, CommandSelectionActivity,
-        ExecuteCommandActivity, GenerateActivity, HookActivity, ModelSelectionActivity,
-        ProviderResolutionActivity, SamplingAdjustmentActivity, SystemPromptAssemblyActivity,
-        ValidateActivity,
-    },
     config::{ActivityRef, BudgetConfig, LoopHooks, PipelineConfig, RetryPolicy},
     services::{ReactorHandle, Services},
 };

@@ -15,9 +15,9 @@ use crate::error::ReactorError;
 use crate::event::{ExecutionEvent, PipelineEvent};
 use crate::execution::{Execution, ExecutionId, ExecutionStatus};
 
+use super::Reactor;
 use super::helpers::empty_response;
 use super::types::{BudgetUsage, ExecutionContext, ExecutionResult, ExecutionState, LoopContext};
-use super::Reactor;
 
 // Channel buffer size. Spec mandates 256; the deadlock analysis in the spec
 // is based on this value (pre-loop activities bounded, generate runs async).

@@ -13,9 +13,9 @@ use crate::event::{
     ActivityEvent, CommandEvent, ContextEvent, MessageInjectionSource, PipelineEvent,
 };
 
+use super::Reactor;
 use super::retry::should_retry;
 use super::types::CommandContext;
-use super::Reactor;
 
 impl Reactor {
     /// Execute all queued commands sequentially.
@@ -110,8 +110,7 @@ impl Reactor {
             let cmd_event_tx = cmd_ctx.event_tx.clone();
             let cmd_exec_id = cmd_ctx.execution_id.clone();
             let cmd_services = Arc::clone(&self.services);
-            let cmd_event_log: Arc<dyn crate::event_log::EventLog> =
-                Arc::clone(&self.event_log);
+            let cmd_event_log: Arc<dyn crate::event_log::EventLog> = Arc::clone(&self.event_log);
             let cmd_cancel = cmd_ctx.cancel.clone();
 
             let cmd_handle = tokio::spawn(async move {

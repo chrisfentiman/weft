@@ -13,8 +13,8 @@ use crate::event_log::EventLog;
 use crate::registry::ActivityRegistry;
 use crate::services::Services;
 
-use super::types::{CompiledLoopHooks, CompiledPipeline, ResolvedActivity};
 use super::Reactor;
+use super::types::{CompiledLoopHooks, CompiledPipeline, ResolvedActivity};
 
 impl Reactor {
     /// Build a Reactor from config.

@@ -15,8 +15,8 @@ use crate::event::{
 use crate::execution::ExecutionId;
 use crate::signal::Signal;
 
-use super::types::ExecutionState;
 use super::Reactor;
+use super::types::ExecutionState;
 
 impl Reactor {
     /// Drain the channel after a synchronous pre/post-loop activity completes.
@@ -44,9 +44,7 @@ impl Reactor {
                             )));
                         }
                         PipelineEvent::Hook(HookOutcome::Blocked {
-                            hook_name,
-                            reason,
-                            ..
+                            hook_name, reason, ..
                         }) => {
                             return Ok(Some(ReactorError::HookBlocked {
                                 hook_name: hook_name.clone(),
@@ -105,9 +103,7 @@ impl Reactor {
                         PipelineEvent::Context(ContextEvent::ResponseAssembled { response }) => {
                             state.response = Some(response.clone());
                         }
-                        PipelineEvent::Signal(SignalEvent::Received(Signal::Cancel {
-                            reason,
-                        })) => {
+                        PipelineEvent::Signal(SignalEvent::Received(Signal::Cancel { reason })) => {
                             cancel.cancel();
                             return Ok(Some(ReactorError::Cancelled {
                                 reason: reason.clone(),

@@ -15,13 +15,10 @@
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::activity::{Activity, ActivityInput};
-use crate::event::{
-    ActivityEvent, CommandFormat, ContextEvent, MessageInjectionSource, PipelineEvent,
+use weft_reactor_trait::{
+    Activity, ActivityEvent, ActivityInput, CommandFormat, ContextEvent, EventLog, ExecutionId,
+    MessageInjectionSource, PipelineEvent, ServiceLocator,
 };
-use crate::event_log::EventLog;
-use crate::execution::ExecutionId;
-use weft_reactor_trait::ServiceLocator;
 
 /// Formats selected commands for the target provider based on its capabilities.
 ///
@@ -94,7 +91,6 @@ impl Activity for CommandFormattingActivity {
             .unwrap_or_default();
 
         // Filter available_commands to only those that were selected.
-        // If a selected name doesn't match any available command, skip it silently.
         let selected_commands: Vec<&weft_core::CommandStub> = input
             .available_commands
             .iter()
@@ -102,7 +98,6 @@ impl Activity for CommandFormattingActivity {
             .collect();
 
         if selected_commands.is_empty() {
-            // No commands selected — nothing to format.
             let _ = event_tx
                 .send(PipelineEvent::Context(ContextEvent::CommandsFormatted {
                     format: CommandFormat::NoCommands,
@@ -270,12 +265,7 @@ mod tests {
 
     #[tokio::test]
     async fn selected_commands_not_in_available_produces_no_commands() {
-        // Selected names reference commands that don't exist in available_commands.
-        let input = make_input_with_commands(
-            &["tool_calling"],
-            &["nonexistent_cmd"],
-            vec![], // no available commands
-        );
+        let input = make_input_with_commands(&["tool_calling"], &["nonexistent_cmd"], vec![]);
         let events = run_formatting(input).await;
 
         let format = events.iter().find_map(|e| {
@@ -372,8 +362,6 @@ mod tests {
             "no tool_calling → PromptInjected"
         );
     }
-
-    // ── MessageInjected with CommandFormatInjection source for prompt-injected ──
 
     #[tokio::test]
     async fn prompt_injected_emits_message_injected_with_correct_source() {
@@ -486,7 +474,6 @@ mod tests {
         }];
         let mut input = make_test_input();
         input.available_commands = cmds;
-        // Metadata has selected_commands but no capabilities key.
         input.metadata = serde_json::json!({ "selected_commands": ["search"] });
 
         let events = run_formatting(input).await;

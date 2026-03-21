@@ -8,8 +8,8 @@ use crate::error::ReactorError;
 use crate::event::{ActivityEvent, EVENT_SCHEMA_VERSION, Event, ExecutionEvent, PipelineEvent};
 use crate::execution::{ExecutionId, ExecutionStatus};
 
-use super::types::{ExecutionState, ResolvedActivity};
 use super::Reactor;
+use super::types::{ExecutionState, ResolvedActivity};
 
 impl Reactor {
     /// Build an ActivityInput snapshot from current ExecutionState.

@@ -16,14 +16,13 @@ use tracing::{debug, warn};
 use weft_core::routing::resolve_filters;
 use weft_core::{HookEvent, ModelInfo, RoutingMode};
 use weft_hooks::HookChainResult;
-use weft_reactor_trait::ServiceLocator;
+use weft_reactor_trait::{
+    Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, HookOutcome, PipelineEvent,
+    SelectionEvent, SemanticSelection, ServiceLocator,
+};
 use weft_router::{RoutingCandidate, RoutingDomainKind, build_model_candidates};
 
 use super::selection_util::extract_user_message;
-use crate::activity::{Activity, ActivityInput, SemanticSelection};
-use crate::event::{ActivityEvent, HookOutcome, PipelineEvent, SelectionEvent};
-use crate::event_log::EventLog;
-use crate::execution::ExecutionId;
 
 /// Selects the model to use for the current execution via semantic routing.
 ///
@@ -431,6 +430,7 @@ mod tests {
         NullEventLog, collect_events, make_test_input, make_test_services,
         make_test_services_with_blocking_hook,
     };
+    use std::sync::Arc;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
     use weft_core::HookEvent;
@@ -806,7 +806,7 @@ mod tests {
         // Build services with a model domain threshold of 0.95.
         // The stub router will return 0.9, which is below the threshold.
         let services = {
-            use std::sync::Arc;
+            use crate::test_support::MockServiceLocator;
             use weft_core::WeftConfig;
 
             let toml = r#"
@@ -837,16 +837,15 @@ api_key = "sk-test"
 "#;
             let config: WeftConfig =
                 toml::from_str(toml).expect("threshold test config must parse");
-            // Reuse test_support internals via make_test_services, then swap config.
-            let base = crate::test_support::make_test_services();
-            crate::services::Services {
+
+            let base = make_test_services();
+            MockServiceLocator {
                 config: Arc::new(config),
                 providers: base.providers,
                 router: base.router,
                 commands: base.commands,
-                memory: None,
                 hooks: base.hooks,
-                reactor_handle: std::sync::OnceLock::new(),
+                memory: None,
                 request_end_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
             }
         };

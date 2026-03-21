@@ -10,11 +10,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-use crate::activity::{Activity, ActivityInput};
-use crate::event::{ActivityEvent, CommandEvent, ExecutionEvent, PipelineEvent};
-use crate::event_log::EventLog;
-use crate::execution::ExecutionId;
-use weft_reactor_trait::ServiceLocator;
+use weft_reactor_trait::{
+    Activity, ActivityEvent, ActivityInput, CommandEvent, EventLog, ExecutionEvent, ExecutionId,
+    PipelineEvent, ServiceLocator,
+};
 
 /// Validates the incoming request.
 ///
@@ -146,9 +145,8 @@ impl Activity for ValidateActivity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::NullEventLog;
     use crate::test_support::{
-        collect_events, make_test_input, make_test_services,
+        NullEventLog, collect_events, make_test_input, make_test_services,
         make_test_services_with_failing_list_commands,
     };
     use tokio::sync::mpsc;
@@ -160,7 +158,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let services = make_test_services();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = ValidateActivity::new();
         activity
@@ -260,7 +258,7 @@ mod tests {
 
         let services = make_test_services();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = ValidateActivity::new();
         activity
@@ -367,7 +365,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let services = make_test_services_with_failing_list_commands();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = ValidateActivity::new();
         activity

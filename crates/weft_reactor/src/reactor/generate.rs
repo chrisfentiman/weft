@@ -18,9 +18,9 @@ use crate::event::{
 use crate::execution::ExecutionStatus;
 use crate::signal::Signal;
 
+use super::Reactor;
 use super::helpers::empty_response;
 use super::types::{BudgetUsage, ExecutionResult, LoopContext};
-use super::Reactor;
 
 /// Outcome of running the `'generate` inner loop.
 pub(super) enum GenerateOutcome {

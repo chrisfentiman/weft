@@ -18,11 +18,11 @@ use crate::event::{
 };
 use crate::execution::ExecutionStatus;
 
+use super::Reactor;
 use super::generate::GenerateOutcome;
 use super::helpers::empty_response;
 use super::retry::{backoff_ms, should_retry};
 use super::types::{BudgetUsage, CommandContext, ExecutionResult, LoopContext};
-use super::Reactor;
 
 impl Reactor {
     /// Run the dispatch loop (Phase 2 of execution).
@@ -87,12 +87,7 @@ impl Reactor {
                     )
                     .await;
                 let terminate = self
-                    .drain_pre_post_loop(
-                        lctx.execution_id,
-                        lctx.event_rx,
-                        lctx.state,
-                        lctx.cancel,
-                    )
+                    .drain_pre_post_loop(lctx.execution_id, lctx.event_rx, lctx.state, lctx.cancel)
                     .await?;
                 if let Some(err) = terminate {
                     self.record_event(
@@ -100,9 +95,7 @@ impl Reactor {
                         &PipelineEvent::Execution(ExecutionEvent::Failed {
                             error: err.to_string(),
                         }),
-                        Some(
-                            &serde_json::json!({ "partial_text": lctx.state.accumulated_text }),
-                        ),
+                        Some(&serde_json::json!({ "partial_text": lctx.state.accumulated_text })),
                     )
                     .await?;
                     self.event_log
@@ -210,12 +203,11 @@ impl Reactor {
                         ) {
                             let backoff =
                                 backoff_ms(policy.unwrap(), lctx.state.generate_retry_attempt);
-                            let retry_event =
-                                PipelineEvent::Activity(ActivityEvent::Retried {
-                                    name: lctx.pipeline.generate.activity.name().to_string(),
-                                    attempt: lctx.state.generate_retry_attempt + 1,
-                                    error: error.clone(),
-                                });
+                            let retry_event = PipelineEvent::Activity(ActivityEvent::Retried {
+                                name: lctx.pipeline.generate.activity.name().to_string(),
+                                attempt: lctx.state.generate_retry_attempt + 1,
+                                error: error.clone(),
+                            });
                             self.record_event(
                                 lctx.execution_id,
                                 &retry_event,
@@ -322,9 +314,7 @@ impl Reactor {
                                         role: weft_core::Role::User,
                                         source: weft_core::Source::Client,
                                         model: None,
-                                        content: vec![weft_core::ContentPart::Text(
-                                            reason.clone(),
-                                        )],
+                                        content: vec![weft_core::ContentPart::Text(reason.clone())],
                                         delta: false,
                                         message_index: lctx.state.messages.len() as u32,
                                     };

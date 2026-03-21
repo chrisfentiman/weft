@@ -477,6 +477,12 @@ mod tests {
     use serde_json::{Value, json};
     use std::collections::{HashMap, HashSet};
     use tower::ServiceExt;
+    use weft_activities::{
+        AssembleResponseActivity, CommandFormattingActivity, CommandSelectionActivity,
+        ExecuteCommandActivity, GenerateActivity, HookActivity, ModelSelectionActivity,
+        ProviderResolutionActivity, SamplingAdjustmentActivity, SystemPromptAssemblyActivity,
+        ValidateActivity,
+    };
     use weft_core::{
         ClassifierConfig, DomainsConfig, GatewayConfig, HookEvent, ModelEntry, ProviderConfig,
         RouterConfig, ServerConfig, WeftConfig, WireFormat,
@@ -484,12 +490,6 @@ mod tests {
     use weft_llm::{Capability, Provider, ProviderRegistry};
     use weft_reactor::{
         ActivityRegistry, Reactor, ReactorConfig,
-        activities::{
-            AssembleResponseActivity, CommandFormattingActivity, CommandSelectionActivity,
-            ExecuteCommandActivity, GenerateActivity, HookActivity, ModelSelectionActivity,
-            ProviderResolutionActivity, SamplingAdjustmentActivity, SystemPromptAssemblyActivity,
-            ValidateActivity,
-        },
         config::{ActivityRef, BudgetConfig, LoopHooks, PipelineConfig, RetryPolicy},
         services::{ReactorHandle, Services},
     };

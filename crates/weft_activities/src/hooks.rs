@@ -13,12 +13,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use weft_core::HookEvent;
 use weft_hooks::HookChainResult;
-use weft_reactor_trait::ServiceLocator;
-
-use crate::activity::{Activity, ActivityInput};
-use crate::event::{ActivityEvent, HookOutcome, PipelineEvent};
-use crate::event_log::EventLog;
-use crate::execution::ExecutionId;
+use weft_reactor_trait::{
+    Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, HookOutcome, PipelineEvent,
+    ServiceLocator,
+};
 
 /// Wraps the `HookRunner` to fire hooks at a specific lifecycle point.
 ///
@@ -226,8 +224,9 @@ fn build_hook_payload(input: &ActivityInput) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::NullEventLog;
-    use crate::test_support::{collect_events, make_test_input, make_test_services};
+    use crate::test_support::{
+        MockServiceLocator, NullEventLog, collect_events, make_test_input, make_test_services,
+    };
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
@@ -242,7 +241,7 @@ mod tests {
 
     fn make_hook_activity_with_services(
         event: HookEvent,
-        services: &crate::services::Services,
+        services: &MockServiceLocator,
     ) -> HookActivity {
         HookActivity::new(
             event,
@@ -256,7 +255,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let services = make_test_services();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = make_hook_activity(event);
         activity
@@ -335,7 +334,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         // Use a services with a blocking hook runner for RequestStart.
         let services = crate::test_support::make_test_services_with_blocking_hook(
@@ -408,7 +407,7 @@ mod tests {
 
         let services = make_test_services();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = make_hook_activity(HookEvent::PreResponse);
         activity
@@ -432,7 +431,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         // PostToolUse cannot block per HookEvent::can_block() contract.
         let services = crate::test_support::make_test_services_with_blocking_hook(

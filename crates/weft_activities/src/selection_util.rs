@@ -2,7 +2,7 @@
 //!
 //! Used by [`super::model_selection`] and [`super::command_selection`].
 
-use crate::activity::ActivityInput;
+use weft_reactor_trait::ActivityInput;
 
 /// Extract the text of the last user-role message. Returns `""` if none found.
 pub(super) fn extract_user_message(input: &ActivityInput) -> &str {
