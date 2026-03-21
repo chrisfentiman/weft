@@ -1,7 +1,7 @@
 //! SystemPromptAssembly activity: layer the system prompt from gateway config and caller request.
 //!
 //! Assembles the final system prompt by combining:
-//! - Layer 1: gateway foundational prompt from `services.config().gateway.system_prompt`
+//! - Layer 1: gateway foundational prompt from `input.config.system_prompt`
 //! - Layer 2: caller-provided system prompt, if `input.messages[0]` has `Role::System`
 //!
 //! Agent instructions (a future layer 2) are deferred until agent config exists in the schema.
@@ -53,7 +53,7 @@ impl Activity for SystemPromptAssemblyActivity {
         &self,
         _execution_id: &ExecutionId,
         input: ActivityInput,
-        services: &dyn ServiceLocator,
+        _services: &dyn ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         _cancel: CancellationToken,
@@ -64,8 +64,8 @@ impl Activity for SystemPromptAssemblyActivity {
             }))
             .await;
 
-        // Layer 1: gateway foundational prompt.
-        let gateway_prompt = services.config().gateway.system_prompt.clone();
+        // Layer 1: gateway foundational prompt from per-request config snapshot.
+        let gateway_prompt = input.config.system_prompt.clone();
 
         // Layer 2: caller-provided system prompt.
         // Present when messages[0] has Role::System and Source::Client.
@@ -153,9 +153,7 @@ impl Activity for SystemPromptAssemblyActivity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{
-        MockServiceLocator, NullEventLog, collect_events, make_test_input, make_test_services,
-    };
+    use crate::test_support::{NullEventLog, collect_events, make_test_input, make_test_services};
     use pretty_assertions::assert_eq;
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -349,10 +347,10 @@ mod tests {
 
     #[tokio::test]
     async fn empty_gateway_prompt_assembles_empty_prompt() {
-        let input = make_test_input();
-
-        // Build services with an empty gateway system prompt.
-        let config: weft_core::WeftConfig = toml::from_str(
+        // Override input.config with a ResolvedConfig that has an empty system prompt.
+        // system_prompt_assembly reads the gateway prompt from input.config, not services.
+        let mut input = make_test_input();
+        let empty_prompt_config: weft_core::WeftConfig = toml::from_str(
             r#"
 [server]
 bind_address = "0.0.0.0:8080"
@@ -378,18 +376,11 @@ api_key = "sk-test"
 "#,
         )
         .expect("test config must parse");
+        input.config = Arc::new(weft_core::ResolvedConfig::from_operator(
+            &empty_prompt_config,
+        ));
 
-        let base = make_test_services();
-        let services = MockServiceLocator {
-            config: Arc::new(config),
-            providers: base.providers,
-            router: base.router,
-            commands: base.commands,
-            hooks: base.hooks,
-            memory: None,
-            request_end_semaphore: base.request_end_semaphore,
-        };
-
+        let services = make_test_services();
         let (tx, mut rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;

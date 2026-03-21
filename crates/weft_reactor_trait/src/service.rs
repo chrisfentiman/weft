@@ -7,7 +7,7 @@
 //! `Services` in `weft_reactor` implements `ServiceLocator`.
 //! `ReactorChildSpawner` in `weft_reactor` implements `ChildSpawner`.
 
-use std::sync::Arc;
+use weft_core::ResolvedConfig;
 
 use crate::budget::Budget;
 use crate::event::PipelineEvent;
@@ -39,8 +39,13 @@ pub trait ServiceLocator: Send + Sync {
     /// Hook runner: execute hook chains at lifecycle points.
     fn hooks(&self) -> &dyn weft_hooks_trait::HookRunner;
 
-    /// Gateway configuration (model entries, routing config, system prompt layers).
-    fn config(&self) -> &Arc<weft_core::WeftConfig>;
+    /// Resolved configuration for request processing.
+    ///
+    /// Returns the fully-resolved, pre-computed config snapshot. Activities
+    /// access hot config (system prompt, thresholds, pre-computed provider data)
+    /// via this method. For per-request consistency, prefer `ActivityInput.config`
+    /// which is snapshotted once at request entry.
+    fn resolved_config(&self) -> &ResolvedConfig;
 
     /// Memory service. `None` when memory is disabled in config.
     fn memory(&self) -> Option<&dyn weft_memory_trait::MemoryService>;
@@ -223,7 +228,7 @@ mod tests {
         commands: MockCommands,
         hooks: MockHooks,
         memory: Option<MockMemory>,
-        config: Arc<weft_core::WeftConfig>,
+        resolved_config: weft_core::ResolvedConfig,
     }
 
     impl MockServiceLocator {
@@ -267,7 +272,7 @@ api_key = "sk-test"
                 commands: MockCommands,
                 hooks: MockHooks,
                 memory: if with_memory { Some(MockMemory) } else { None },
-                config: Arc::new(config),
+                resolved_config: weft_core::ResolvedConfig::from_operator(&config),
             }
         }
     }
@@ -289,8 +294,8 @@ api_key = "sk-test"
             &self.hooks
         }
 
-        fn config(&self) -> &Arc<weft_core::WeftConfig> {
-            &self.config
+        fn resolved_config(&self) -> &weft_core::ResolvedConfig {
+            &self.resolved_config
         }
 
         fn memory(&self) -> Option<&dyn weft_memory_trait::MemoryService> {

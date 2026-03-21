@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use weft_core::{
-    ContentPart, HookEvent, ModelRoutingInstruction, Role, RoutingActivity, SamplingOptions,
-    Source, WeftMessage, WeftRequest,
+    ContentPart, HookEvent, ModelRoutingInstruction, ResolvedConfig, Role, RoutingActivity,
+    SamplingOptions, Source, WeftMessage, WeftRequest,
 };
 use weft_hooks_trait::{HookChainResult, HookRunner};
 use weft_reactor_trait::{
@@ -155,7 +155,7 @@ impl HookRunner for BlockingHookRunner {
 /// Used in `weft_activities` tests to provide a fully typed service locator
 /// without depending on `weft_reactor::services::Services`.
 pub struct MockServiceLocator {
-    pub config: Arc<weft_core::WeftConfig>,
+    pub resolved_config: Arc<ResolvedConfig>,
     pub providers: Arc<dyn weft_llm_trait::ProviderService + Send + Sync>,
     pub router: Arc<dyn weft_router_trait::SemanticRouter + Send + Sync>,
     pub commands: Arc<dyn weft_commands_trait::CommandRegistry + Send + Sync>,
@@ -182,8 +182,8 @@ impl ServiceLocator for MockServiceLocator {
         self.hooks.as_ref()
     }
 
-    fn config(&self) -> &Arc<weft_core::WeftConfig> {
-        &self.config
+    fn resolved_config(&self) -> &ResolvedConfig {
+        &self.resolved_config
     }
 
     fn memory(&self) -> Option<&dyn weft_memory_trait::MemoryService> {
@@ -270,7 +270,7 @@ fn build_mock(
     failed_result_command: Option<(String, String)>,
     fail_list_commands: bool,
 ) -> MockServiceLocator {
-    let config = Arc::new(make_test_config());
+    let resolved_config = Arc::new(ResolvedConfig::from_operator(&make_test_config()));
     let providers: Arc<dyn weft_llm_trait::ProviderService + Send + Sync> =
         Arc::new(StubProviderService::new(provider));
     let router: Arc<dyn weft_router_trait::SemanticRouter + Send + Sync> = Arc::new(StubRouter);
@@ -282,7 +282,7 @@ fn build_mock(
         });
 
     MockServiceLocator {
-        config,
+        resolved_config,
         providers,
         router,
         commands,
@@ -392,7 +392,7 @@ pub fn make_test_services_with_failing_router() -> MockServiceLocator {
     let provider: Arc<dyn Provider> = Arc::new(StubProvider::new("stub response"));
     let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(NullHookRunner);
 
-    let config = Arc::new(make_test_config());
+    let resolved_config = Arc::new(ResolvedConfig::from_operator(&make_test_config()));
     let providers: Arc<dyn weft_llm_trait::ProviderService + Send + Sync> =
         Arc::new(StubProviderService::new(provider));
     let router: Arc<dyn weft_router_trait::SemanticRouter + Send + Sync> =
@@ -401,7 +401,7 @@ pub fn make_test_services_with_failing_router() -> MockServiceLocator {
         Arc::new(StubCommandRegistry::new());
 
     MockServiceLocator {
-        config,
+        resolved_config,
         providers,
         router,
         commands,
@@ -432,15 +432,16 @@ pub fn make_test_services_with_slow_provider(
 
 /// Build test `MockServiceLocator` with memory stores configured.
 ///
-/// The config includes `[[memory.stores]]` so `services.config().memory` is Some.
-/// The actual memory service field remains None — only the config matters for the
-/// command_selection activity's `has_memory` check.
+/// The resolved config has `has_memory_stores = true`, which is what
+/// `command_selection` checks. The actual memory service field remains None.
 #[cfg(test)]
 pub fn make_test_services_with_memory() -> MockServiceLocator {
     let provider: Arc<dyn Provider> = Arc::new(StubProvider::new("stub response"));
     let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(NullHookRunner);
 
-    let config = Arc::new(make_test_config_with_memory());
+    let resolved_config = Arc::new(ResolvedConfig::from_operator(
+        &make_test_config_with_memory(),
+    ));
     let providers: Arc<dyn weft_llm_trait::ProviderService + Send + Sync> =
         Arc::new(StubProviderService::new(provider));
     let router: Arc<dyn weft_router_trait::SemanticRouter + Send + Sync> = Arc::new(StubRouter);
@@ -448,12 +449,12 @@ pub fn make_test_services_with_memory() -> MockServiceLocator {
         Arc::new(StubCommandRegistry::new());
 
     MockServiceLocator {
-        config,
+        resolved_config,
         providers,
         router,
         commands,
         hooks,
-        memory: None, // config presence is what matters, not the service
+        memory: None,
         request_end_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
     }
 }
@@ -463,9 +464,37 @@ pub fn make_test_services_with_memory() -> MockServiceLocator {
 /// Build a minimal valid `ActivityInput` for use in tests.
 ///
 /// Contains one user message with text "hello", an auto routing instruction,
-/// a stub routing result for "stub-model", a default budget, and null metadata.
+/// a stub routing result for "stub-model", a default budget, null metadata,
+/// and a `ResolvedConfig` built from the standard test config.
 pub fn make_test_input() -> ActivityInput {
     use chrono::Utc;
+
+    let config = Arc::new(ResolvedConfig::from_operator(&{
+        let toml = r#"
+[server]
+bind_address = "0.0.0.0:8080"
+
+[gateway]
+system_prompt = "You are helpful."
+
+[router]
+
+[router.classifier]
+model_path = "m.onnx"
+tokenizer_path = "t.json"
+
+[[router.providers]]
+name = "anthropic"
+wire_format = "anthropic"
+api_key = "sk-test"
+
+  [[router.providers.models]]
+  name = "stub-model"
+  model = "stub-model-v1"
+  examples = ["example query"]
+"#;
+        toml::from_str(toml).expect("make_test_input: config must parse")
+    }));
 
     ActivityInput {
         messages: vec![WeftMessage {
@@ -498,6 +527,7 @@ pub fn make_test_input() -> ActivityInput {
         idempotency_key: None,
         accumulated_usage: weft_core::WeftUsage::default(),
         child_spawner: None,
+        config,
     }
 }
 
@@ -536,14 +566,21 @@ mod tests {
     }
 
     #[test]
+    fn make_test_input_has_resolved_config() {
+        let input = make_test_input();
+        assert_eq!(
+            input.config.system_prompt, "You are helpful.",
+            "make_test_input config must carry gateway system prompt"
+        );
+    }
+
+    #[test]
     fn make_test_services_with_memory_has_memory_config() {
         let services = make_test_services_with_memory();
-        let has_memory = services
-            .config()
-            .memory
-            .as_ref()
-            .is_some_and(|m| !m.stores.is_empty());
-        assert!(has_memory, "memory config must have at least one store");
+        assert!(
+            services.resolved_config.has_memory_stores,
+            "resolved config must have has_memory_stores = true"
+        );
     }
 
     #[tokio::test]

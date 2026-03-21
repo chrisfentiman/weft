@@ -6,8 +6,10 @@
 
 pub mod command;
 pub mod config;
+pub mod config_store;
 pub mod error;
 pub mod message;
+pub mod resolved_config;
 pub mod routing;
 pub mod toon;
 pub mod wire;
@@ -22,12 +24,14 @@ pub use config::{
     ProviderConfig, ResolvedModel, RouterConfig, RoutingTrigger, ServerConfig, StoreCapability,
     ToolRegistryConfig, WeftConfig, WireFormat,
 };
+pub use config_store::{ConfigSnapshot, ConfigStore};
 pub use error::WeftError;
 pub use message::{
     CommandCallContent, CommandResultContent, ContentPart, CouncilStartActivity, DocumentContent,
     HookActivity, MediaContent, MediaSource, MemoryResultContent, MemoryResultEntry,
     MemoryStoredContent, Role, RoutingActivity, Source, WeftMessage,
 };
+pub use resolved_config::{ModelCandidate, ResolvedConfig, ResolvedConfigError, TenantOverrides};
 pub use routing::{ModelInfo, ModelRoutingInstruction, RoutingMode};
 pub use wire::{
     ConversionError, ResponseFormat, SamplingOptions, SourceValidationError, WeftRequest,

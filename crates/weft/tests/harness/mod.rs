@@ -284,8 +284,11 @@ pub fn make_weft_service(llm: impl Provider + 'static) -> Arc<WeftService> {
 
     let provider_registry = make_provider_registry(llm);
 
+    let config_store = Arc::new(weft_core::ConfigStore::new((*config).clone()));
+    let resolved_config = config_store.snapshot();
     let services = Arc::new(Services {
-        config: Arc::clone(&config),
+        config_store,
+        resolved_config,
         providers: provider_registry as Arc<dyn weft_llm::ProviderService + Send + Sync>,
         router: Arc::new(StubRouter) as Arc<dyn weft_router::SemanticRouter + Send + Sync>,
         commands: Arc::new(weft_commands::test_support::StubCommandRegistry::new())
@@ -777,8 +780,11 @@ pub fn make_weft_service_with_config(
     let event_log = Arc::new(weft_eventlog_memory::InMemoryEventLog::new());
     let event_log_dyn: Arc<dyn weft_reactor::event_log::EventLog> = Arc::clone(&event_log) as _;
 
+    let config_store = Arc::new(weft_core::ConfigStore::new((*config).clone()));
+    let resolved_config = config_store.snapshot();
     let services = Arc::new(Services {
-        config: Arc::clone(&config),
+        config_store,
+        resolved_config,
         providers: provider_registry as Arc<dyn weft_llm::ProviderService + Send + Sync>,
         router: Arc::new(StubRouter) as Arc<dyn weft_router::SemanticRouter + Send + Sync>,
         commands: Arc::new(commands) as Arc<dyn CommandRegistry + Send + Sync>,

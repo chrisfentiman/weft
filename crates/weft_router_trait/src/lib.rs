@@ -8,7 +8,7 @@
 //! `weft_reactor_trait`, `weft_activities`) depend on this crate directly.
 
 use async_trait::async_trait;
-use weft_core::WeftConfig;
+use weft_core::ProviderConfig;
 
 // ── Domain types ───────────────────────────────────────────────────────────
 
@@ -140,17 +140,15 @@ pub fn take_top(mut results: Vec<ScoredCandidate>, n: usize) -> Vec<ScoredCandid
 
 // ── Candidate builders ─────────────────────────────────────────────────────
 
-/// Build Model domain routing candidates from config.
+/// Build Model domain routing candidates from provider config.
 ///
 /// Each `ModelEntry` across all configured providers becomes a `RoutingCandidate`
 /// with the model routing name as `id` and its examples array.
 ///
 /// The engine further filters by capability (chat_completions) before including
 /// model candidates in `RoutingInput.domains`.
-pub fn build_model_candidates(config: &WeftConfig) -> Vec<RoutingCandidate> {
-    config
-        .router
-        .providers
+pub fn build_model_candidates(providers: &[ProviderConfig]) -> Vec<RoutingCandidate> {
+    providers
         .iter()
         .flat_map(|p| {
             p.models.iter().map(|m| RoutingCandidate {

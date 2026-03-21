@@ -137,9 +137,18 @@ impl Activity for ProviderResolutionActivity {
             }
         };
 
-        // Step 5: Look up provider_name from config.
-        // Config is the source of truth: iterate providers to find which one owns this model.
-        let provider_name = find_provider_name(services.config(), &selected_model);
+        // Step 5: Look up provider_name from the per-request config snapshot.
+        // provider_name_for searches the pre-computed provider_names mapping.
+        let provider_name = {
+            let name = input.config.provider_name_for(&selected_model);
+            if name == "unknown" {
+                warn!(
+                    model = %selected_model,
+                    "provider_resolution: no provider found in config for model, using 'unknown'"
+                );
+            }
+            name.to_string()
+        };
 
         // Step 6: Push ProviderResolved.
         let _ = event_tx
@@ -159,26 +168,6 @@ impl Activity for ProviderResolutionActivity {
             }))
             .await;
     }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Find the provider name for a model routing name by scanning config.
-///
-/// Iterates `config.router.providers` and returns the provider `name` for the
-/// first entry containing a model whose `name` matches `selected_model`.
-/// Returns `"unknown"` if no match found (config/wiring error).
-fn find_provider_name(config: &weft_core::WeftConfig, selected_model: &str) -> String {
-    for provider in &config.router.providers {
-        if provider.models.iter().any(|m| m.name == selected_model) {
-            return provider.name.clone();
-        }
-    }
-    warn!(
-        model = %selected_model,
-        "provider_resolution: no provider found in config for model, using 'unknown'"
-    );
-    "unknown".to_string()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -458,11 +447,11 @@ mod tests {
         assert_eq!(back, caps);
     }
 
-    // ── find_provider_name helper ─────────────────────────────────────────────
+    // ── provider_name_for via ResolvedConfig ──────────────────────────────────
 
     #[test]
-    fn find_provider_name_returns_provider_for_known_model() {
-        // The test config has provider "anthropic" with model "stub-model".
+    fn resolved_config_provider_name_for_known_model() {
+        // Verify the pre-computed provider_names mapping finds the correct provider.
         let config: weft_core::WeftConfig = toml::from_str(
             r#"
 [server]
@@ -490,12 +479,12 @@ api_key = "sk-test"
         )
         .expect("test config must parse");
 
-        let name = find_provider_name(&config, "claude-opus");
-        assert_eq!(name, "anthropic");
+        let resolved = weft_core::ResolvedConfig::from_operator(&config);
+        assert_eq!(resolved.provider_name_for("claude-opus"), "anthropic");
     }
 
     #[test]
-    fn find_provider_name_returns_unknown_for_missing_model() {
+    fn resolved_config_provider_name_for_missing_model_returns_unknown() {
         let config: weft_core::WeftConfig = toml::from_str(
             r#"
 [server]
@@ -523,8 +512,8 @@ api_key = "sk-test"
         )
         .expect("test config must parse");
 
-        let name = find_provider_name(&config, "nonexistent-model");
-        assert_eq!(name, "unknown");
+        let resolved = weft_core::ResolvedConfig::from_operator(&config);
+        assert_eq!(resolved.provider_name_for("nonexistent-model"), "unknown");
     }
 
     // ── Default capabilities when none registered ─────────────────────────────
@@ -638,7 +627,7 @@ api_key = "sk-test"
 
         let base = make_test_services();
         let services = MockServiceLocator {
-            config: Arc::new(config),
+            resolved_config: Arc::new(weft_core::ResolvedConfig::from_operator(&config)),
             providers: Arc::new(svc_impl),
             router: base.router,
             commands: base.commands,

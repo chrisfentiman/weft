@@ -32,6 +32,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use weft_core::{ConfigStore, ResolvedConfig};
 use weft_reactor_trait::{
     Budget, ChildSpawner, ExecutionId, PipelineEvent, RequestId, ServiceLocator, TenantId,
 };
@@ -60,8 +61,19 @@ pub struct SpawnRequest {
 /// All fields are Arc-wrapped trait objects. The Services struct itself
 /// is shared via `Arc<Services>`.
 pub struct Services {
-    /// Weft configuration (model entries, routing config, etc.).
-    pub config: Arc<weft_core::WeftConfig>,
+    /// Config store for operator-level access (startup only) and per-request snapshots.
+    ///
+    /// The reactor calls `config_store.snapshot()` once at request entry and places
+    /// the resulting `Arc<ResolvedConfig>` in `ActivityInput.config`. Activities should
+    /// prefer `input.config` for per-request consistency.
+    pub config_store: Arc<ConfigStore>,
+
+    /// Resolved config snapshot (latest). Returned by `ServiceLocator::resolved_config()`.
+    ///
+    /// This reflects the latest config at Services construction time (startup).
+    /// For per-request consistency, use `ActivityInput.config` (snapshotted once at
+    /// request entry). This field is only for `ServiceLocator::resolved_config()` fallback.
+    pub resolved_config: Arc<ResolvedConfig>,
 
     /// LLM provider service: routes model names to provider implementations.
     pub providers: Arc<dyn weft_llm_trait::ProviderService + Send + Sync>,
@@ -115,8 +127,8 @@ impl ServiceLocator for Services {
         self.hooks.as_ref()
     }
 
-    fn config(&self) -> &Arc<weft_core::WeftConfig> {
-        &self.config
+    fn resolved_config(&self) -> &ResolvedConfig {
+        &self.resolved_config
     }
 
     fn memory(&self) -> Option<&dyn weft_memory_trait::MemoryService> {
@@ -297,6 +309,7 @@ impl std::fmt::Debug for Services {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Services")
             .field("has_memory", &self.memory.is_some())
+            .field("has_config_store", &true)
             .finish()
     }
 }
@@ -381,7 +394,7 @@ mod tests {
             }
         }
 
-        let config: weft_core::WeftConfig = toml::from_str(
+        let weft_config: weft_core::WeftConfig = toml::from_str(
             r#"
 [server]
 bind_address = "0.0.0.0:8080"
@@ -429,8 +442,11 @@ api_key = "sk-test"
             "stub".to_string(),
         );
 
+        let config_store = Arc::new(weft_core::ConfigStore::new(weft_config.clone()));
+        let resolved_config = config_store.snapshot();
         let services = Services {
-            config: Arc::new(config),
+            config_store,
+            resolved_config,
             providers: Arc::new(registry),
             router: Arc::new(PanicRouter),
             commands: Arc::new(PanicCommands),
