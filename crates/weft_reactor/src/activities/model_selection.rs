@@ -9,8 +9,6 @@
 //! **Fail mode: CLOSED.** If no model can be determined, pushes `ActivityFailed`.
 //! Generation requires a model — proceeding without one is undefined behaviour.
 
-use std::time::Instant;
-
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -34,8 +32,8 @@ use crate::execution::ExecutionId;
 /// **Events pushed:**
 /// - `Activity(ActivityEvent::Started { name: "model_selection" })`
 /// - `Hook(HookOutcome::Evaluated)` / `Hook(HookOutcome::Blocked)` — for PreRoute / PostRoute hooks
-/// - `Selection(SelectionEvent::ModelSelected { model_name, score, all_scores })` — on success
-/// - `Activity(ActivityEvent::Completed { name: "model_selection", duration_ms, idempotency_key: None })`
+/// - `Selection(SelectionEvent::ModelSelected { model_name, score })` — on success (`all_scores` stored via enrichment)
+/// - `Activity(ActivityEvent::Completed { name: "model_selection", idempotency_key: None })`
 /// - `Activity(ActivityEvent::Failed { name: "model_selection", error, retryable: false })` — on failure
 pub struct ModelSelectionActivity;
 
@@ -73,8 +71,6 @@ impl Activity for ModelSelectionActivity {
         event_tx: mpsc::Sender<PipelineEvent>,
         cancel: CancellationToken,
     ) {
-        let start = Instant::now();
-
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name().to_string(),
@@ -109,12 +105,10 @@ impl Activity for ModelSelectionActivity {
             "domain": "model",
             "user_message": user_message,
         });
-        let hook_start = Instant::now();
         let pre_result = services
             .hooks()
             .run_chain(HookEvent::PreRoute, pre_payload, Some("model"))
             .await;
-        let hook_duration = hook_start.elapsed().as_millis() as u64;
 
         match pre_result {
             HookChainResult::Blocked { reason, hook_name } => {
@@ -141,14 +135,14 @@ impl Activity for ModelSelectionActivity {
                         hook_event: "pre_route".to_string(),
                         hook_name: "pre_route".to_string(),
                         decision: "allow".to_string(),
-                        duration_ms: hook_duration,
                     }))
                     .await;
             }
         }
 
         // Determine the working candidate set based on routing mode and filters.
-        let (selected_model, score, all_scores) = match instruction.mode {
+        // _all_scores is no longer in the event payload (observability-only, moved to enrichment).
+        let (selected_model, score, _all_scores) = match instruction.mode {
             RoutingMode::Direct => {
                 // Apply filters to narrow candidates.
                 let surviving_names = if instruction.filters.is_empty() {
@@ -253,12 +247,12 @@ impl Activity for ModelSelectionActivity {
             (selected_model, score)
         };
 
-        // Push ModelSelected event.
+        // Push ModelSelected event. all_scores is observability-only; the event log
+        // enrichment mechanism preserves it as _obs_all_scores (Phase 2 slimming).
         let _ = event_tx
             .send(PipelineEvent::Selection(SelectionEvent::ModelSelected {
                 model_name: final_model.clone(),
                 score: final_score,
-                all_scores: all_scores.clone(),
             }))
             .await;
 
@@ -270,12 +264,10 @@ impl Activity for ModelSelectionActivity {
             "model": final_model,
             "score": final_score,
         });
-        let hook_start = Instant::now();
         let post_result = services
             .hooks()
             .run_chain(HookEvent::PostRoute, post_payload, Some("model"))
             .await;
-        let hook_duration = hook_start.elapsed().as_millis() as u64;
 
         match post_result {
             HookChainResult::Blocked { reason, hook_name } => {
@@ -302,17 +294,14 @@ impl Activity for ModelSelectionActivity {
                         hook_event: "post_route".to_string(),
                         hook_name: "post_route".to_string(),
                         decision: "allow".to_string(),
-                        duration_ms: hook_duration,
                     }))
                     .await;
             }
         }
 
-        let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
-                duration_ms,
                 idempotency_key: None,
             }))
             .await;
@@ -511,32 +500,26 @@ mod tests {
         );
     }
 
-    // ── ModelSelected carries model name and all_scores ───────────────────────
+    // ── ModelSelected carries model name and score ────────────────────────────
+    // (all_scores was observability-only and moved to enrichment in Phase 2)
 
     #[tokio::test]
-    async fn model_selected_has_model_name_and_all_scores() {
+    async fn model_selected_has_model_name_and_score() {
         let input = make_test_input();
         let events = run_model_selection(input).await;
 
         let selected = events.iter().find_map(|e| {
-            if let PipelineEvent::Selection(SelectionEvent::ModelSelected {
-                model_name,
-                score,
-                all_scores,
-            }) = e
+            if let PipelineEvent::Selection(SelectionEvent::ModelSelected { model_name, score }) = e
             {
-                Some((model_name.clone(), *score, all_scores.clone()))
+                Some((model_name.clone(), *score))
             } else {
                 None
             }
         });
 
-        let (model_name, score, all_scores) =
-            selected.expect("Selection(ModelSelected) must be present");
+        let (model_name, score) = selected.expect("Selection(ModelSelected) must be present");
         assert!(!model_name.is_empty(), "model_name must not be empty");
         assert!(score >= 0.0, "score must be non-negative");
-        // all_scores may be empty for direct single-model routing; just verify it serializes.
-        let _ = serde_json::to_string(&all_scores).expect("all_scores must serialize");
     }
 
     // ── Cancellation ─────────────────────────────────────────────────────────
@@ -665,28 +648,20 @@ mod tests {
         let events = run_model_selection(input).await;
 
         let selected = events.iter().find_map(|e| {
-            if let PipelineEvent::Selection(SelectionEvent::ModelSelected {
-                model_name,
-                score,
-                all_scores,
-            }) = e
+            if let PipelineEvent::Selection(SelectionEvent::ModelSelected { model_name, score }) = e
             {
-                Some((model_name.clone(), *score, all_scores.clone()))
+                Some((model_name.clone(), *score))
             } else {
                 None
             }
         });
 
-        let (_model_name, score, all_scores) =
-            selected.expect("Selection(ModelSelected) must be present");
+        let (_model_name, score) = selected.expect("Selection(ModelSelected) must be present");
         assert!(
             (score - 1.0_f32).abs() < 1e-5,
             "direct single-model routing should have score 1.0"
         );
-        assert!(
-            all_scores.is_empty(),
-            "direct single-model routing should have empty all_scores"
-        );
+        // all_scores is now observability-only (moved to enrichment in Phase 2).
     }
 
     #[tokio::test]

@@ -12,8 +12,6 @@
 //! **Fail mode: OPEN.** On any error (missing metadata, empty commands), the activity completes
 //! with `CommandFormat::NoCommands`. The model can still generate text.
 
-use std::time::Instant;
-
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -33,7 +31,7 @@ use weft_reactor_trait::ServiceLocator;
 /// - `Activity(ActivityEvent::Started { name: "command_formatting" })`
 /// - `Context(ContextEvent::MessageInjected { message, source: CommandFormatInjection })` — only for `PromptInjected` format
 /// - `Context(ContextEvent::CommandsFormatted { format, command_count })`
-/// - `Activity(ActivityEvent::Completed { name: "command_formatting", duration_ms, idempotency_key: None })`
+/// - `Activity(ActivityEvent::Completed { name: "command_formatting", idempotency_key: None })`
 pub struct CommandFormattingActivity;
 
 impl CommandFormattingActivity {
@@ -64,8 +62,6 @@ impl Activity for CommandFormattingActivity {
         event_tx: mpsc::Sender<PipelineEvent>,
         _cancel: CancellationToken,
     ) {
-        let start = Instant::now();
-
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name().to_string(),
@@ -114,11 +110,9 @@ impl Activity for CommandFormattingActivity {
                 }))
                 .await;
 
-            let duration_ms = start.elapsed().as_millis() as u64;
             let _ = event_tx
                 .send(PipelineEvent::Activity(ActivityEvent::Completed {
                     name: self.name().to_string(),
-                    duration_ms,
                     idempotency_key: None,
                 }))
                 .await;
@@ -164,11 +158,9 @@ impl Activity for CommandFormattingActivity {
                 .await;
         }
 
-        let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
-                duration_ms,
                 idempotency_key: None,
             }))
             .await;

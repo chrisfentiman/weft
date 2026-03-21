@@ -4,8 +4,6 @@
 //! `ActivityInput.accumulated_text`, routing information, and token usage
 //! derived from the event log.
 
-use std::time::Instant;
-
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -28,7 +26,7 @@ use crate::execution::ExecutionId;
 /// **Events pushed:**
 /// - `Activity(ActivityEvent::Started { name: "assemble_response" })`
 /// - `Context(ContextEvent::ResponseAssembled { response })` — with the constructed WeftResponse
-/// - `Activity(ActivityEvent::Completed { name: "assemble_response", duration_ms, idempotency_key: None })`
+/// - `Activity(ActivityEvent::Completed { name: "assemble_response", idempotency_key: None })`
 /// - `Activity(ActivityEvent::Failed { name: "assemble_response", error, retryable: false })` — on error
 pub struct AssembleResponseActivity;
 
@@ -60,8 +58,6 @@ impl Activity for AssembleResponseActivity {
         event_tx: mpsc::Sender<PipelineEvent>,
         cancel: CancellationToken,
     ) {
-        let start = Instant::now();
-
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name().to_string(),
@@ -117,16 +113,14 @@ impl Activity for AssembleResponseActivity {
             }))
             .await;
 
-        let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
-                duration_ms,
                 idempotency_key: None,
             }))
             .await;
 
-        debug!(duration_ms, "assemble_response: completed");
+        debug!("assemble_response: completed");
     }
 }
 

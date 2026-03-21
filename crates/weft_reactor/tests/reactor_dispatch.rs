@@ -104,7 +104,6 @@ impl Activity for ImmediateDoneActivity {
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name.clone(),
-                duration_ms: 1,
                 idempotency_key: input.idempotency_key.clone(),
             }))
             .await;
@@ -185,7 +184,6 @@ impl Activity for TextGenerateActivity {
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name.clone(),
-                duration_ms: 1,
                 idempotency_key: input.idempotency_key.clone(),
             }))
             .await;
@@ -309,7 +307,6 @@ impl Activity for FailThenSucceedActivity {
             let _ = event_tx
                 .send(PipelineEvent::Activity(ActivityEvent::Completed {
                     name: self.name.clone(),
-                    duration_ms: 1,
                     idempotency_key: input.idempotency_key.clone(),
                 }))
                 .await;
@@ -348,7 +345,6 @@ impl Activity for NoOpActivity {
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name.clone(),
-                duration_ms: 0,
                 idempotency_key: None,
             }))
             .await;
@@ -404,7 +400,6 @@ impl Activity for StubAssembleResponse {
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name.clone(),
-                duration_ms: 0,
                 idempotency_key: None,
             }))
             .await;
@@ -458,7 +453,6 @@ impl Activity for StubExecuteCommand {
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name.clone(),
-                duration_ms: 1,
                 idempotency_key: input.idempotency_key.clone(),
             }))
             .await;
@@ -1053,7 +1047,6 @@ async fn hook_block_in_pre_loop_returns_hook_blocked_error() {
                     let _ = event_tx
                         .send(PipelineEvent::Activity(ActivityEvent::Completed {
                             name: self.name().to_string(),
-                            duration_ms: 0,
                             idempotency_key: None,
                         }))
                         .await;
@@ -2262,7 +2255,6 @@ async fn command_iteration_loop_executes_command_then_calls_generate_again() {
             let _ = event_tx
                 .send(PipelineEvent::Activity(ActivityEvent::Completed {
                     name: "generate".to_string(),
-                    duration_ms: 1,
                     idempotency_key: input.idempotency_key.clone(),
                 }))
                 .await;
@@ -2389,7 +2381,6 @@ async fn pre_response_hook_block_injects_feedback_and_retries_generation() {
             let _ = event_tx
                 .send(PipelineEvent::Activity(ActivityEvent::Completed {
                     name: self.name.clone(),
-                    duration_ms: 1,
                     idempotency_key: input.idempotency_key.clone(),
                 }))
                 .await;
@@ -2439,7 +2430,6 @@ async fn pre_response_hook_block_injects_feedback_and_retries_generation() {
                 let _ = event_tx
                     .send(PipelineEvent::Activity(ActivityEvent::Completed {
                         name: self.name.clone(),
-                        duration_ms: 0,
                         idempotency_key: input.idempotency_key.clone(),
                     }))
                     .await;

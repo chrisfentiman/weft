@@ -30,7 +30,7 @@ use weft_reactor_trait::ServiceLocator;
 /// - `Execution(ExecutionEvent::ValidationPassed)` — if validation succeeds
 /// - `Command(CommandEvent::Available { commands })` — always pushed after ValidationPassed
 /// - `Execution(ExecutionEvent::ValidationFailed { reason })` — if validation fails
-/// - `Activity(ActivityEvent::Completed { name: "validate", duration_ms, idempotency_key: None })`
+/// - `Activity(ActivityEvent::Completed { name: "validate", idempotency_key: None })`
 /// - `Activity(ActivityEvent::Failed { name: "validate", error, retryable: false })` — on internal error
 pub struct ValidateActivity;
 
@@ -132,16 +132,14 @@ impl Activity for ValidateActivity {
             }))
             .await;
 
-        let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
-                duration_ms,
                 idempotency_key: None,
             }))
             .await;
 
-        debug!(duration_ms, "validate: completed");
+        debug!("validate: completed");
     }
 }
 

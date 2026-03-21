@@ -3,8 +3,6 @@
 //! Calls `services.commands().execute_command()` with the `CommandInvocation` from
 //! `ActivityInput.metadata`. Pushes CommandStarted and CommandCompleted events.
 
-use std::time::Instant;
-
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -35,7 +33,7 @@ use weft_reactor_trait::ServiceLocator;
 /// - `Command(CommandEvent::Started { invocation })` — the full CommandInvocation
 /// - `Command(CommandEvent::Completed { name, result })` — with full CommandResult (success or failure)
 /// - `Command(CommandEvent::Failed { name, error })` — if the command failed (in addition to Completed)
-/// - `Activity(ActivityEvent::Completed { name: "execute_command", duration_ms, idempotency_key })` — always
+/// - `Activity(ActivityEvent::Completed { name: "execute_command", idempotency_key })` — always
 /// - `Activity(ActivityEvent::Failed { name: "execute_command", error, retryable })` — only on infrastructure error
 pub struct ExecuteCommandActivity;
 
@@ -75,8 +73,6 @@ impl Activity for ExecuteCommandActivity {
         event_tx: mpsc::Sender<PipelineEvent>,
         cancel: CancellationToken,
     ) {
-        let start = Instant::now();
-
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name().to_string(),
@@ -186,16 +182,14 @@ impl Activity for ExecuteCommandActivity {
             }
         }
 
-        let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
-                duration_ms,
                 idempotency_key: input.idempotency_key.clone(),
             }))
             .await;
 
-        debug!(duration_ms, command = %command_name, "execute_command: activity completed");
+        debug!(command = %command_name, "execute_command: activity completed");
     }
 }
 

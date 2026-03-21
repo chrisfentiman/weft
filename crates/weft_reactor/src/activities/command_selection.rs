@@ -8,8 +8,6 @@
 //! hook block), the activity pushes `Selection(CommandsSelected { selected: vec![], ... })`
 //! and completes normally. The model can still generate without commands.
 
-use std::time::Instant;
-
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -36,8 +34,8 @@ use weft_reactor_trait::ServiceLocator;
 /// **Events pushed:**
 /// - `Activity(ActivityEvent::Started { name: "command_selection" })`
 /// - `Hook(HookOutcome::Evaluated)` / `Hook(HookOutcome::Blocked)` — for PreRoute / PostRoute hooks
-/// - `Selection(SelectionEvent::CommandsSelected { selected, candidates_scored })` — always (fail-open)
-/// - `Activity(ActivityEvent::Completed { name: "command_selection", duration_ms, idempotency_key: None })`
+/// - `Selection(SelectionEvent::CommandsSelected { selected })` — always (fail-open)
+/// - `Activity(ActivityEvent::Completed { name: "command_selection", idempotency_key: None })`
 pub struct CommandSelectionActivity;
 
 impl CommandSelectionActivity {
@@ -80,8 +78,6 @@ impl Activity for CommandSelectionActivity {
         event_tx: mpsc::Sender<PipelineEvent>,
         cancel: CancellationToken,
     ) {
-        let start = Instant::now();
-
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name().to_string(),
@@ -93,14 +89,11 @@ impl Activity for CommandSelectionActivity {
             let _ = event_tx
                 .send(PipelineEvent::Selection(SelectionEvent::CommandsSelected {
                     selected: vec![],
-                    candidates_scored: 0,
                 }))
                 .await;
-            let duration_ms = start.elapsed().as_millis() as u64;
             let _ = event_tx
                 .send(PipelineEvent::Activity(ActivityEvent::Completed {
                     name: self.name().to_string(),
-                    duration_ms,
                     idempotency_key: None,
                 }))
                 .await;
@@ -142,14 +135,11 @@ impl Activity for CommandSelectionActivity {
             let _ = event_tx
                 .send(PipelineEvent::Selection(SelectionEvent::CommandsSelected {
                     selected: vec![],
-                    candidates_scored: 0,
                 }))
                 .await;
-            let duration_ms = start.elapsed().as_millis() as u64;
             let _ = event_tx
                 .send(PipelineEvent::Activity(ActivityEvent::Completed {
                     name: self.name().to_string(),
-                    duration_ms,
                     idempotency_key: None,
                 }))
                 .await;
@@ -172,12 +162,10 @@ impl Activity for CommandSelectionActivity {
             "domain": "commands",
             "user_message": user_message,
         });
-        let hook_start = Instant::now();
         let pre_result = services
             .hooks()
             .run_chain(HookEvent::PreRoute, pre_payload, Some("commands"))
             .await;
-        let hook_duration = hook_start.elapsed().as_millis() as u64;
 
         match pre_result {
             HookChainResult::Blocked { reason, hook_name } => {
@@ -192,14 +180,11 @@ impl Activity for CommandSelectionActivity {
                 let _ = event_tx
                     .send(PipelineEvent::Selection(SelectionEvent::CommandsSelected {
                         selected: vec![],
-                        candidates_scored: 0,
                     }))
                     .await;
-                let duration_ms = start.elapsed().as_millis() as u64;
                 let _ = event_tx
                     .send(PipelineEvent::Activity(ActivityEvent::Completed {
                         name: self.name().to_string(),
-                        duration_ms,
                         idempotency_key: None,
                     }))
                     .await;
@@ -211,7 +196,6 @@ impl Activity for CommandSelectionActivity {
                         hook_event: "pre_route".to_string(),
                         hook_name: "pre_route".to_string(),
                         decision: "allow".to_string(),
-                        duration_ms: hook_duration,
                     }))
                     .await;
             }
@@ -251,12 +235,10 @@ impl Activity for CommandSelectionActivity {
             "domain": "commands",
             "selected_count": selected.len(),
         });
-        let hook_start = Instant::now();
         let post_result = services
             .hooks()
             .run_chain(HookEvent::PostRoute, post_payload, Some("commands"))
             .await;
-        let hook_duration = hook_start.elapsed().as_millis() as u64;
 
         let final_selected = match post_result {
             HookChainResult::Blocked { reason, hook_name } => {
@@ -276,7 +258,6 @@ impl Activity for CommandSelectionActivity {
                         hook_event: "post_route".to_string(),
                         hook_name: "post_route".to_string(),
                         decision: "allow".to_string(),
-                        duration_ms: hook_duration,
                     }))
                     .await;
                 selected
@@ -291,15 +272,12 @@ impl Activity for CommandSelectionActivity {
         let _ = event_tx
             .send(PipelineEvent::Selection(SelectionEvent::CommandsSelected {
                 selected: final_selected,
-                candidates_scored,
             }))
             .await;
 
-        let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
-                duration_ms,
                 idempotency_key: None,
             }))
             .await;
@@ -408,21 +386,15 @@ mod tests {
         let events = run_command_selection(input, services).await;
 
         let selected = events.iter().find_map(|e| {
-            if let PipelineEvent::Selection(SelectionEvent::CommandsSelected {
-                selected,
-                candidates_scored,
-            }) = e
-            {
-                Some((selected.clone(), *candidates_scored))
+            if let PipelineEvent::Selection(SelectionEvent::CommandsSelected { selected }) = e {
+                Some(selected.clone())
             } else {
                 None
             }
         });
 
-        let (selected, candidates_scored) =
-            selected.expect("Selection(CommandsSelected) must be present");
+        let selected = selected.expect("Selection(CommandsSelected) must be present");
         assert!(selected.is_empty(), "expected empty selection");
-        assert_eq!(candidates_scored, 0, "expected zero candidates scored");
     }
 
     // ── Memory configured: includes /recall and /remember ─────────────────────
@@ -634,10 +606,10 @@ mod tests {
         );
     }
 
-    // ── Candidates_scored reflects pre-filtering count ─────────────────────────
+    // ── Multiple candidates are all selected by stub router ───────────────────
 
     #[tokio::test]
-    async fn command_selection_candidates_scored_is_pre_filter_count() {
+    async fn command_selection_multiple_candidates_all_selected_by_stub_router() {
         let mut input = make_test_input();
         input.available_commands = vec![
             CommandStub {
@@ -656,22 +628,20 @@ mod tests {
 
         let events = run_command_selection(input, make_test_services()).await;
 
-        let candidates_scored = events.iter().find_map(|e| {
-            if let PipelineEvent::Selection(SelectionEvent::CommandsSelected {
-                candidates_scored,
-                ..
-            }) = e
-            {
-                Some(*candidates_scored)
+        let selected = events.iter().find_map(|e| {
+            if let PipelineEvent::Selection(SelectionEvent::CommandsSelected { selected }) = e {
+                Some(selected.clone())
             } else {
                 None
             }
         });
 
-        // 3 commands were passed, no memory configured → 3 candidates scored.
+        // Stub router scores all candidates above threshold → all 3 are selected.
+        let selected = selected.expect("Selection(CommandsSelected) must be present");
         assert_eq!(
-            candidates_scored.expect("Selection(CommandsSelected) must be present"),
-            3
+            selected.len(),
+            3,
+            "stub router selects all 3 candidates above threshold"
         );
     }
 

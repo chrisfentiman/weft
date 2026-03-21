@@ -8,8 +8,6 @@
 //! **Fail mode: CLOSED.** If no model_id can be resolved, pushes `ActivityFailed`.
 //! Generation requires a resolved provider — proceeding without one is undefined behaviour.
 
-use std::time::Instant;
-
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -27,7 +25,7 @@ use weft_reactor_trait::ServiceLocator;
 /// **Events pushed:**
 /// - `Activity(ActivityEvent::Started { name: "provider_resolution" })`
 /// - `Selection(SelectionEvent::ProviderResolved { model_name, model_id, provider_name, capabilities, max_tokens })` — on success
-/// - `Activity(ActivityEvent::Completed { name: "provider_resolution", duration_ms, idempotency_key: None })`
+/// - `Activity(ActivityEvent::Completed { name: "provider_resolution", idempotency_key: None })`
 /// - `Activity(ActivityEvent::Failed { name: "provider_resolution", error, retryable: false })` — on failure
 pub struct ProviderResolutionActivity;
 
@@ -59,8 +57,6 @@ impl Activity for ProviderResolutionActivity {
         event_tx: mpsc::Sender<PipelineEvent>,
         cancel: CancellationToken,
     ) {
-        let start = Instant::now();
-
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name().to_string(),
@@ -157,11 +153,9 @@ impl Activity for ProviderResolutionActivity {
             }))
             .await;
 
-        let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
-                duration_ms,
                 idempotency_key: None,
             }))
             .await;

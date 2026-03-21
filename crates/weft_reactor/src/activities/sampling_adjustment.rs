@@ -13,8 +13,6 @@
 //! **Fail mode: OPEN.** If metadata is missing, defaults to 4096 for max_tokens.
 //! The model can still generate with default sampling parameters.
 
-use std::time::Instant;
-
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -34,7 +32,7 @@ const DEFAULT_MODEL_MAX_TOKENS: u32 = 4096;
 /// **Events pushed:**
 /// - `Activity(ActivityEvent::Started { name: "sampling_adjustment" })`
 /// - `Context(ContextEvent::SamplingUpdated { max_tokens, temperature, top_p })`
-/// - `Activity(ActivityEvent::Completed { name: "sampling_adjustment", duration_ms, idempotency_key: None })`
+/// - `Activity(ActivityEvent::Completed { name: "sampling_adjustment", idempotency_key: None })`
 pub struct SamplingAdjustmentActivity;
 
 impl SamplingAdjustmentActivity {
@@ -65,8 +63,6 @@ impl Activity for SamplingAdjustmentActivity {
         event_tx: mpsc::Sender<PipelineEvent>,
         _cancel: CancellationToken,
     ) {
-        let start = Instant::now();
-
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name().to_string(),
@@ -101,11 +97,9 @@ impl Activity for SamplingAdjustmentActivity {
             }))
             .await;
 
-        let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
-                duration_ms,
                 idempotency_key: None,
             }))
             .await;

@@ -117,23 +117,24 @@ pub enum ExecutionEvent {
         depth: u32,
         budget: BudgetSnapshot,
     },
-    Completed {
-        generation_calls: u32,
-        commands_executed: u32,
-        iterations: u32,
-        duration_ms: u64,
-    },
+    /// Execution completed successfully. Observability fields (generation_calls,
+    /// commands_executed, iterations, duration_ms) are merged as `_obs_*` fields
+    /// into the stored event payload via `record_event` enrichment.
+    Completed,
+    /// Execution failed. `partial_text` is available via `record_event` enrichment
+    /// as `_obs_partial_text` in the stored payload.
     Failed {
         error: String,
-        partial_text: Option<String>,
     },
+    /// Execution cancelled. `partial_text` is available via `record_event` enrichment
+    /// as `_obs_partial_text` in the stored payload.
     Cancelled {
         reason: String,
-        partial_text: Option<String>,
     },
+    /// One dispatch loop iteration completed. `commands_executed_this_iteration`
+    /// is available via `record_event` enrichment as `_obs_commands_executed_this_iteration`.
     IterationCompleted {
         iteration: u32,
-        commands_executed_this_iteration: u32,
     },
     ValidationPassed,
     ValidationFailed {
@@ -163,10 +164,11 @@ pub enum GenerationEvent {
         model: String,
         error: String,
     },
+    /// Generation timed out. `chunks_received` is available via enrichment as
+    /// `_obs_chunks_received` in the stored payload.
     TimedOut {
         model: String,
         timeout_secs: u64,
-        chunks_received: u32,
     },
 }
 
@@ -201,9 +203,10 @@ pub enum ActivityEvent {
     Started {
         name: String,
     },
+    /// Activity completed. `duration_ms` is available via enrichment as
+    /// `_obs_duration_ms` in the stored payload.
     Completed {
         name: String,
-        duration_ms: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         idempotency_key: Option<String>,
     },
@@ -212,10 +215,11 @@ pub enum ActivityEvent {
         error: String,
         retryable: bool,
     },
+    /// Activity is being retried after failure. `backoff_ms` is available via
+    /// enrichment as `_obs_backoff_ms` in the stored payload.
     Retried {
         name: String,
         attempt: u32,
-        backoff_ms: u64,
         error: String,
     },
     Heartbeat {
@@ -231,11 +235,12 @@ pub enum ActivityEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum HookOutcome {
+    /// Hook evaluated and allowed. `duration_ms` is available via enrichment as
+    /// `_obs_duration_ms` in the stored payload.
     Evaluated {
         hook_event: String,
         hook_name: String,
         decision: String,
-        duration_ms: u64,
     },
     Blocked {
         hook_event: String,
@@ -250,14 +255,13 @@ pub enum HookOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SelectionEvent {
-    ModelSelected {
-        model_name: String,
-        score: f32,
-        all_scores: Vec<(String, f32)>,
-    },
+    /// Model selected. `all_scores` is available via enrichment as
+    /// `_obs_all_scores` in the stored payload.
+    ModelSelected { model_name: String, score: f32 },
+    /// Commands selected. `candidates_scored` is available via enrichment as
+    /// `_obs_candidates_scored` in the stored payload.
     CommandsSelected {
         selected: Vec<weft_core::CommandStub>,
-        candidates_scored: usize,
     },
     ProviderResolved {
         model_name: String,
@@ -279,9 +283,10 @@ pub enum SelectionEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContextEvent {
+    /// System prompt assembled. `prompt_length` and `layer_count` are available
+    /// via enrichment as `_obs_prompt_length` and `_obs_layer_count` in the
+    /// stored payload.
     SystemPromptAssembled {
-        prompt_length: usize,
-        layer_count: u32,
         message_count: usize,
     },
     CommandsFormatted {
@@ -334,10 +339,11 @@ pub enum ChildEvent {
         pipeline_name: String,
         reason: String,
     },
+    /// Child execution completed. `result_summary` is available via enrichment as
+    /// `_obs_result_summary` in the stored payload.
     Completed {
         child_id: ExecutionId,
         status: String,
-        result_summary: serde_json::Value,
     },
 }
 
@@ -362,7 +368,7 @@ impl PipelineEvent {
         match self {
             PipelineEvent::Execution(e) => match e {
                 ExecutionEvent::Started { .. } => "execution.started",
-                ExecutionEvent::Completed { .. } => "execution.completed",
+                ExecutionEvent::Completed => "execution.completed",
                 ExecutionEvent::Failed { .. } => "execution.failed",
                 ExecutionEvent::Cancelled { .. } => "execution.cancelled",
                 ExecutionEvent::IterationCompleted { .. } => "execution.iteration_completed",
@@ -557,24 +563,19 @@ mod tests {
         "Started",
     )]
     #[case::execution_completed(
-        PipelineEvent::Execution(ExecutionEvent::Completed {
-            generation_calls: 1,
-            commands_executed: 0,
-            iterations: 1,
-            duration_ms: 500,
-        }),
+        PipelineEvent::Execution(ExecutionEvent::Completed),
         "execution.completed",
         "Execution",
-        "Completed",
+        "Completed"
     )]
     #[case::execution_failed(
-        PipelineEvent::Execution(ExecutionEvent::Failed { error: "err".to_string(), partial_text: None }),
+        PipelineEvent::Execution(ExecutionEvent::Failed { error: "err".to_string() }),
         "execution.failed",
         "Execution",
         "Failed",
     )]
     #[case::execution_cancelled(
-        PipelineEvent::Execution(ExecutionEvent::Cancelled { reason: "user".to_string(), partial_text: None }),
+        PipelineEvent::Execution(ExecutionEvent::Cancelled { reason: "user".to_string() }),
         "execution.cancelled",
         "Execution",
         "Cancelled",
@@ -582,7 +583,6 @@ mod tests {
     #[case::execution_iteration_completed(
         PipelineEvent::Execution(ExecutionEvent::IterationCompleted {
             iteration: 1,
-            commands_executed_this_iteration: 2,
         }),
         "execution.iteration_completed",
         "Execution",
@@ -642,7 +642,6 @@ mod tests {
         PipelineEvent::Generation(GenerationEvent::TimedOut {
             model: "gpt-4".to_string(),
             timeout_secs: 30,
-            chunks_received: 5,
         }),
         "generation.timed_out",
         "Generation",
@@ -697,7 +696,6 @@ mod tests {
     #[case::activity_completed(
         PipelineEvent::Activity(ActivityEvent::Completed {
             name: "generate".to_string(),
-            duration_ms: 200,
             idempotency_key: Some("exec-1:generate:0".to_string()),
         }),
         "activity.completed",
@@ -718,7 +716,6 @@ mod tests {
         PipelineEvent::Activity(ActivityEvent::Retried {
             name: "generate".to_string(),
             attempt: 1,
-            backoff_ms: 500,
             error: "transient".to_string(),
         }),
         "activity.retried",
@@ -737,7 +734,6 @@ mod tests {
             hook_event: "pre_request".to_string(),
             hook_name: "auth".to_string(),
             decision: "allow".to_string(),
-            duration_ms: 10,
         }),
         "hook.evaluated",
         "Hook",
@@ -758,14 +754,13 @@ mod tests {
         PipelineEvent::Selection(SelectionEvent::ModelSelected {
             model_name: "gpt-4".to_string(),
             score: 0.9,
-            all_scores: vec![("gpt-4".to_string(), 0.9)],
         }),
         "selection.model_selected",
         "Selection",
         "ModelSelected",
     )]
     #[case::selection_commands_selected(
-        PipelineEvent::Selection(SelectionEvent::CommandsSelected { selected: vec![], candidates_scored: 0 }),
+        PipelineEvent::Selection(SelectionEvent::CommandsSelected { selected: vec![] }),
         "selection.commands_selected",
         "Selection",
         "CommandsSelected",
@@ -798,8 +793,6 @@ mod tests {
     // Context (6 variants)
     #[case::context_system_prompt_assembled(
         PipelineEvent::Context(ContextEvent::SystemPromptAssembled {
-            prompt_length: 100,
-            layer_count: 1,
             message_count: 3,
         }),
         "context.system_prompt_assembled",
@@ -885,7 +878,6 @@ mod tests {
         PipelineEvent::Child(ChildEvent::Completed {
             child_id: ExecutionId::default(),
             status: "completed".to_string(),
-            result_summary: serde_json::Value::Null,
         }),
         "child.completed",
         "Child",
@@ -939,7 +931,6 @@ mod tests {
     fn activity_completed_serde_format() {
         let event = PipelineEvent::Activity(ActivityEvent::Completed {
             name: "generate".to_string(),
-            duration_ms: 1234,
             idempotency_key: Some("exec-1:generate:0".to_string()),
         });
         let json = serde_json::to_string(&event).expect("must serialize");
@@ -947,7 +938,8 @@ mod tests {
         assert_eq!(v["category"], "Activity");
         assert_eq!(v["event"]["type"], "Completed");
         assert_eq!(v["event"]["name"], "generate");
-        assert_eq!(v["event"]["duration_ms"], 1234);
+        // duration_ms is no longer in the typed payload — it lives in enrichment only.
+        assert!(v["event"].get("duration_ms").is_none());
         assert_eq!(v["event"]["idempotency_key"], "exec-1:generate:0");
     }
 
@@ -955,7 +947,6 @@ mod tests {
     fn activity_completed_idempotency_key_absent_when_none() {
         let event = PipelineEvent::Activity(ActivityEvent::Completed {
             name: "validate".to_string(),
-            duration_ms: 10,
             idempotency_key: None,
         });
         let json = serde_json::to_string(&event).expect("must serialize");
@@ -1143,31 +1134,234 @@ mod tests {
         }
     }
 
-    // ── ModelSelected scores ───────────────────────────────────────────────
+    // ── ModelSelected score preserved (all_scores moved to enrichment) ────────
 
     #[test]
-    fn model_selected_preserves_scores() {
+    fn model_selected_preserves_score_and_model() {
         let event = PipelineEvent::Selection(SelectionEvent::ModelSelected {
             model_name: "gpt-4-turbo".to_string(),
             score: 0.87,
-            all_scores: vec![
-                ("gpt-4-turbo".to_string(), 0.87),
-                ("claude-3-opus".to_string(), 0.72),
-            ],
         });
         let json = serde_json::to_string(&event).expect("must serialize");
         let back: PipelineEvent = serde_json::from_str(&json).expect("must deserialize");
         match back {
-            PipelineEvent::Selection(SelectionEvent::ModelSelected {
-                model_name,
-                score,
-                all_scores,
-            }) => {
+            PipelineEvent::Selection(SelectionEvent::ModelSelected { model_name, score }) => {
                 assert_eq!(model_name, "gpt-4-turbo");
                 assert!((score - 0.87_f32).abs() < 1e-5);
-                assert_eq!(all_scores.len(), 2);
+                // all_scores is now in enrichment only — not present in typed payload.
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    // ── Phase 2: Slimmed variant serde round-trips ─────────────────────────
+    //
+    // Verify that slimmed variants round-trip correctly and that removed fields
+    // are not present in the serialized JSON.
+
+    #[rstest]
+    #[case::execution_completed_is_unit(PipelineEvent::Execution(ExecutionEvent::Completed))]
+    #[case::execution_failed_no_partial_text(
+        PipelineEvent::Execution(ExecutionEvent::Failed { error: "bad".to_string() })
+    )]
+    #[case::execution_cancelled_no_partial_text(
+        PipelineEvent::Execution(ExecutionEvent::Cancelled { reason: "user".to_string() })
+    )]
+    #[case::execution_iteration_completed_no_cmd_count(
+        PipelineEvent::Execution(ExecutionEvent::IterationCompleted { iteration: 2 })
+    )]
+    #[case::generation_timed_out_no_chunks(
+        PipelineEvent::Generation(GenerationEvent::TimedOut { model: "gpt-4".to_string(), timeout_secs: 30 })
+    )]
+    #[case::activity_completed_no_duration(
+        PipelineEvent::Activity(ActivityEvent::Completed {
+            name: "generate".to_string(),
+            idempotency_key: None,
+        })
+    )]
+    #[case::activity_retried_no_backoff(
+        PipelineEvent::Activity(ActivityEvent::Retried {
+            name: "generate".to_string(),
+            attempt: 1,
+            error: "timeout".to_string(),
+        })
+    )]
+    #[case::hook_evaluated_no_duration(
+        PipelineEvent::Hook(HookOutcome::Evaluated {
+            hook_event: "pre_request".to_string(),
+            hook_name: "auth".to_string(),
+            decision: "allow".to_string(),
+        })
+    )]
+    #[case::selection_model_selected_no_all_scores(
+        PipelineEvent::Selection(SelectionEvent::ModelSelected {
+            model_name: "gpt-4".to_string(),
+            score: 0.9,
+        })
+    )]
+    #[case::selection_commands_selected_no_candidates_count(
+        PipelineEvent::Selection(SelectionEvent::CommandsSelected { selected: vec![] })
+    )]
+    #[case::context_system_prompt_assembled_no_sizes(
+        PipelineEvent::Context(ContextEvent::SystemPromptAssembled { message_count: 5 })
+    )]
+    #[case::child_completed_no_result_summary(
+        PipelineEvent::Child(ChildEvent::Completed {
+            child_id: ExecutionId::default(),
+            status: "completed".to_string(),
+        })
+    )]
+    fn slimmed_variants_round_trip(#[case] event: PipelineEvent) {
+        let json = serde_json::to_string(&event).expect("must serialize");
+        let back: PipelineEvent = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(back.event_type_string(), event.event_type_string());
+    }
+
+    // Verify that removed fields are absent from serialized JSON.
+    #[test]
+    fn execution_completed_has_no_observability_fields() {
+        let event = PipelineEvent::Execution(ExecutionEvent::Completed);
+        let v: serde_json::Value = serde_json::to_value(&event).expect("must serialize");
+        // The event object should be empty (unit variant serializes as just the type tag).
+        let event_obj = &v["event"];
+        assert!(event_obj.get("generation_calls").is_none());
+        assert!(event_obj.get("commands_executed").is_none());
+        assert!(event_obj.get("iterations").is_none());
+        assert!(event_obj.get("duration_ms").is_none());
+    }
+
+    #[test]
+    fn execution_failed_has_no_partial_text() {
+        let event = PipelineEvent::Execution(ExecutionEvent::Failed {
+            error: "err".to_string(),
+        });
+        let v: serde_json::Value = serde_json::to_value(&event).expect("must serialize");
+        assert!(v["event"].get("partial_text").is_none());
+        assert_eq!(v["event"]["error"], "err");
+    }
+
+    #[test]
+    fn generation_timed_out_has_no_chunks_received() {
+        let event = PipelineEvent::Generation(GenerationEvent::TimedOut {
+            model: "gpt-4".to_string(),
+            timeout_secs: 30,
+        });
+        let v: serde_json::Value = serde_json::to_value(&event).expect("must serialize");
+        assert!(v["event"].get("chunks_received").is_none());
+        assert_eq!(v["event"]["timeout_secs"], 30);
+    }
+
+    #[test]
+    fn hook_evaluated_has_no_duration_ms() {
+        let event = PipelineEvent::Hook(HookOutcome::Evaluated {
+            hook_event: "pre_request".to_string(),
+            hook_name: "auth".to_string(),
+            decision: "allow".to_string(),
+        });
+        let v: serde_json::Value = serde_json::to_value(&event).expect("must serialize");
+        assert!(v["event"].get("duration_ms").is_none());
+        assert_eq!(v["event"]["decision"], "allow");
+    }
+
+    #[test]
+    fn system_prompt_assembled_has_no_prompt_length_or_layer_count() {
+        let event =
+            PipelineEvent::Context(ContextEvent::SystemPromptAssembled { message_count: 7 });
+        let v: serde_json::Value = serde_json::to_value(&event).expect("must serialize");
+        assert!(v["event"].get("prompt_length").is_none());
+        assert!(v["event"].get("layer_count").is_none());
+        assert_eq!(v["event"]["message_count"], 7);
+    }
+
+    // ── Phase 2: Enrichment mechanism ─────────────────────────────────────
+    //
+    // Verify that _obs_* fields added via enrichment appear in stored JSON but
+    // are silently ignored when deserializing back to PipelineEvent.
+
+    /// Simulate the enrichment logic from record_event:
+    /// serialize event, merge _obs_* fields into the event sub-object.
+    fn apply_enrichment(
+        event: &PipelineEvent,
+        enrichment: &serde_json::Value,
+    ) -> serde_json::Value {
+        let mut payload = serde_json::to_value(event).expect("must serialize");
+        if let (Some(obj), Some(enrich_obj)) = (payload.as_object_mut(), enrichment.as_object())
+            && let Some(event_obj) = obj.get_mut("event").and_then(|v| v.as_object_mut())
+        {
+            for (k, v) in enrich_obj {
+                event_obj.insert(format!("_obs_{k}"), v.clone());
+            }
+        }
+        payload
+    }
+
+    #[test]
+    fn enrichment_obs_fields_appear_in_stored_json() {
+        let event = PipelineEvent::Activity(ActivityEvent::Completed {
+            name: "generate".to_string(),
+            idempotency_key: Some("key-1".to_string()),
+        });
+        let enrichment = serde_json::json!({ "duration_ms": 1234_u64 });
+        let stored = apply_enrichment(&event, &enrichment);
+
+        // _obs_duration_ms must appear in the event sub-object.
+        assert_eq!(stored["event"]["_obs_duration_ms"], 1234);
+        // Original fields are preserved.
+        assert_eq!(stored["event"]["name"], "generate");
+        assert_eq!(stored["category"], "Activity");
+    }
+
+    #[test]
+    fn enrichment_obs_fields_silently_dropped_on_deserialization() {
+        let event = PipelineEvent::Activity(ActivityEvent::Completed {
+            name: "generate".to_string(),
+            idempotency_key: None,
+        });
+        let enrichment = serde_json::json!({ "duration_ms": 999_u64 });
+        let stored = apply_enrichment(&event, &enrichment);
+
+        // The stored JSON contains _obs_duration_ms.
+        assert!(stored["event"].get("_obs_duration_ms").is_some());
+
+        // Deserializing back to PipelineEvent silently drops unknown fields.
+        let back: PipelineEvent =
+            serde_json::from_value(stored).expect("must deserialize despite _obs_ fields");
+        assert_eq!(back.event_type_string(), "activity.completed");
+    }
+
+    #[test]
+    fn enrichment_targets_event_sub_object_not_top_level() {
+        // Per spec Section 10.1: adjacently-tagged produces {"category":"...", "event":{...}}.
+        // Enrichment must target the event sub-object, not the top level.
+        let event = PipelineEvent::Execution(ExecutionEvent::Completed);
+        let enrichment = serde_json::json!({
+            "generation_calls": 3_u32,
+            "duration_ms": 500_u64,
+        });
+        let stored = apply_enrichment(&event, &enrichment);
+
+        // Top level has only category and event.
+        assert!(stored.get("_obs_generation_calls").is_none());
+        assert!(stored.get("_obs_duration_ms").is_none());
+
+        // _obs_* appear inside the event sub-object.
+        assert_eq!(stored["event"]["_obs_generation_calls"], 3);
+        assert_eq!(stored["event"]["_obs_duration_ms"], 500);
+    }
+
+    #[test]
+    fn enrichment_multiple_obs_fields() {
+        let event = PipelineEvent::Execution(ExecutionEvent::Cancelled {
+            reason: "user requested".to_string(),
+        });
+        let enrichment = serde_json::json!({
+            "partial_text": "hello world",
+            "chars_produced": 11_u64,
+        });
+        let stored = apply_enrichment(&event, &enrichment);
+
+        assert_eq!(stored["event"]["_obs_partial_text"], "hello world");
+        assert_eq!(stored["event"]["_obs_chars_produced"], 11);
+        assert_eq!(stored["event"]["reason"], "user requested");
     }
 }

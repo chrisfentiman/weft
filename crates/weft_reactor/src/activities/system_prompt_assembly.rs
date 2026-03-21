@@ -12,8 +12,6 @@
 //! **Fail mode: OPEN.** If assembly encounters an error (should not happen with current inputs),
 //! the activity completes with an empty prompt. The model can still generate without a system prompt.
 
-use std::time::Instant;
-
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use weft_reactor_trait::ServiceLocator;
@@ -30,8 +28,8 @@ use crate::execution::ExecutionId;
 /// **Events pushed:**
 /// - `Activity(ActivityEvent::Started { name: "system_prompt_assembly" })`
 /// - `Context(ContextEvent::MessageInjected { message, source: SystemPromptAssembly })` — the assembled system prompt
-/// - `Context(ContextEvent::SystemPromptAssembled { prompt_length, layer_count, message_count })`
-/// - `Activity(ActivityEvent::Completed { name: "system_prompt_assembly", duration_ms, idempotency_key: None })`
+/// - `Context(ContextEvent::SystemPromptAssembled { message_count })`
+/// - `Activity(ActivityEvent::Completed { name: "system_prompt_assembly", idempotency_key: None })`
 pub struct SystemPromptAssemblyActivity;
 
 impl SystemPromptAssemblyActivity {
@@ -62,8 +60,6 @@ impl Activity for SystemPromptAssemblyActivity {
         event_tx: mpsc::Sender<PipelineEvent>,
         _cancel: CancellationToken,
     ) {
-        let start = Instant::now();
-
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name().to_string(),
@@ -101,9 +97,7 @@ impl Activity for SystemPromptAssemblyActivity {
             layers.push(caller);
         }
 
-        let layer_count = layers.len() as u32;
         let assembled_prompt = layers.join("\n\n");
-        let prompt_length = assembled_prompt.len();
 
         // Build the WeftMessage to inject at messages[0].
         let injected_message = weft_core::WeftMessage {
@@ -143,19 +137,13 @@ impl Activity for SystemPromptAssemblyActivity {
 
         let _ = event_tx
             .send(PipelineEvent::Context(
-                ContextEvent::SystemPromptAssembled {
-                    prompt_length,
-                    layer_count,
-                    message_count,
-                },
+                ContextEvent::SystemPromptAssembled { message_count },
             ))
             .await;
 
-        let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
-                duration_ms,
                 idempotency_key: None,
             }))
             .await;
@@ -345,21 +333,13 @@ mod tests {
             "expected caller prompt in assembled text"
         );
 
-        // layer_count should be 2 (gateway + caller).
-        let assembled = events.iter().find_map(|e| {
-            if let PipelineEvent::Context(ContextEvent::SystemPromptAssembled {
-                layer_count, ..
-            }) = e
-            {
-                Some(*layer_count)
-            } else {
-                None
-            }
-        });
-        assert_eq!(
-            assembled.expect("Context(SystemPromptAssembled) must be present"),
-            2,
-            "expected layer_count = 2"
+        // SystemPromptAssembled event must be present.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Context(ContextEvent::SystemPromptAssembled { .. })
+            )),
+            "expected Context(SystemPromptAssembled)"
         );
     }
 
@@ -415,25 +395,29 @@ api_key = "sk-test"
             .await;
         let events = collect_events(&mut rx);
 
-        let assembled = events.iter().find_map(|e| {
-            if let PipelineEvent::Context(ContextEvent::SystemPromptAssembled {
-                prompt_length,
-                layer_count,
-                ..
-            }) = e
-            {
-                Some((*prompt_length, *layer_count))
-            } else {
-                None
-            }
-        });
-
-        let (length, count) = assembled.expect("Context(SystemPromptAssembled) must be present");
-        assert_eq!(length, 0, "empty gateway prompt → prompt_length = 0");
-        assert_eq!(
-            count, 0,
-            "empty gateway prompt, no caller prompt → layer_count = 0"
+        // SystemPromptAssembled event must be present.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Context(ContextEvent::SystemPromptAssembled { .. })
+            )),
+            "expected Context(SystemPromptAssembled)"
         );
+
+        // Injected message content must be empty when gateway prompt is empty.
+        let injected_text = events.iter().find_map(|e| {
+            if let PipelineEvent::Context(ContextEvent::MessageInjected {
+                message,
+                source: MessageInjectionSource::SystemPromptAssembly,
+            }) = e
+                && let Some(ContentPart::Text(text)) = message.content.first()
+            {
+                return Some(text.clone());
+            }
+            None
+        });
+        let text = injected_text.expect("Context(MessageInjected) must be present");
+        assert_eq!(text, "", "empty gateway prompt → injected content is empty");
     }
 
     // ── MessageInjected source is SystemPromptAssembly ────────────────────────
@@ -591,23 +575,27 @@ api_key = "sk-test"
 
         let events = run_assembly(input).await;
 
-        let assembled = events.iter().find_map(|e| {
-            if let PipelineEvent::Context(ContextEvent::SystemPromptAssembled {
-                layer_count, ..
+        // Only the gateway config prompt contributes. The Source::Gateway message at [0]
+        // is NOT treated as a caller layer — injected text must not include "gateway injected".
+        let injected_text = events.iter().find_map(|e| {
+            if let PipelineEvent::Context(ContextEvent::MessageInjected {
+                message,
+                source: MessageInjectionSource::SystemPromptAssembly,
             }) = e
+                && let Some(ContentPart::Text(text)) = message.content.first()
             {
-                Some(*layer_count)
-            } else {
-                None
+                return Some(text.clone());
             }
+            None
         });
-
-        // Only the gateway prompt from config contributes — source=Gateway message at [0] is NOT
-        // treated as a caller layer, so layer_count = 1 (gateway only).
-        assert_eq!(
-            assembled.expect("Context(SystemPromptAssembled) must be present"),
-            1,
-            "non-Client system message must not be counted as a caller layer"
+        let text = injected_text.expect("Context(MessageInjected) must be present");
+        assert!(
+            !text.contains("gateway injected"),
+            "Source::Gateway system message must not be included as a caller layer"
+        );
+        assert!(
+            text.contains("You are helpful"),
+            "gateway config prompt must be included"
         );
     }
 }

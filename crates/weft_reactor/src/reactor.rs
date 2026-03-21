@@ -387,6 +387,7 @@ impl Reactor {
                 depth,
                 budget: budget_snapshot,
             }),
+            None,
         )
         .await?;
 
@@ -448,8 +449,8 @@ impl Reactor {
                     &execution_id,
                     &PipelineEvent::Execution(ExecutionEvent::Failed {
                         error: err.to_string(),
-                        partial_text: Some(state.accumulated_text.clone()),
                     }),
+                    Some(&serde_json::json!({ "partial_text": state.accumulated_text })),
                 )
                 .await?;
                 self.event_log
@@ -473,6 +474,7 @@ impl Reactor {
                         &PipelineEvent::Budget(BudgetEvent::Exhausted {
                             resource: resource.clone(),
                         }),
+                        None,
                     )
                     .await?;
                     debug!("budget exhausted: {resource}");
@@ -485,6 +487,7 @@ impl Reactor {
                             resource: info.resource.clone(),
                             remaining: info.remaining,
                         }),
+                        None,
                     )
                     .await?;
                 }
@@ -515,8 +518,8 @@ impl Reactor {
                         &execution_id,
                         &PipelineEvent::Execution(ExecutionEvent::Failed {
                             error: err.to_string(),
-                            partial_text: Some(state.accumulated_text.clone()),
                         }),
+                        Some(&serde_json::json!({ "partial_text": state.accumulated_text })),
                     )
                     .await?;
                     self.event_log
@@ -533,6 +536,7 @@ impl Reactor {
                     &PipelineEvent::Budget(BudgetEvent::Exhausted {
                         resource: reason.to_string(),
                     }),
+                    None,
                 )
                 .await?;
                 break 'dispatch;
@@ -604,6 +608,7 @@ impl Reactor {
                         &PipelineEvent::Budget(BudgetEvent::Exhausted {
                             resource: reason.to_string(),
                         }),
+                        None,
                     )
                     .await?;
                     break 'dispatch;
@@ -612,8 +617,10 @@ impl Reactor {
                     &execution_id,
                     &PipelineEvent::Execution(ExecutionEvent::IterationCompleted {
                         iteration: state.iteration,
-                        commands_executed_this_iteration: cmds_this_iter,
                     }),
+                    Some(
+                        &serde_json::json!({ "commands_executed_this_iteration": cmds_this_iter }),
+                    ),
                 )
                 .await?;
                 state.iteration += 1;
@@ -699,8 +706,8 @@ impl Reactor {
                             &execution_id,
                             &PipelineEvent::Execution(ExecutionEvent::Cancelled {
                                 reason: "Signal::Cancel received".to_string(),
-                                partial_text: Some(state.accumulated_text.clone()),
                             }),
+                            Some(&serde_json::json!({ "partial_text": state.accumulated_text })),
                         ).await?;
                         self.event_log
                             .update_execution_status(&execution_id, ExecutionStatus::Cancelled)
@@ -729,7 +736,7 @@ impl Reactor {
                             }
                             Some(event) => {
                                 // Record every event to the log.
-                                self.record_event(&execution_id, &event).await?;
+                                self.record_event(&execution_id, &event, None).await?;
 
                                 // Update heartbeat/chunk timers on any event from generate.
                                 match &event {
@@ -792,6 +799,7 @@ impl Reactor {
                                                 signal_type,
                                                 payload,
                                             }),
+                                            None,
                                         ).await?;
                                         match signal.clone() {
                                             Signal::Cancel { reason } => {
@@ -802,8 +810,8 @@ impl Reactor {
                                                     &execution_id,
                                                     &PipelineEvent::Execution(ExecutionEvent::Cancelled {
                                                         reason: reason.clone(),
-                                                        partial_text: Some(state.accumulated_text.clone()),
                                                     }),
+                                                    Some(&serde_json::json!({ "partial_text": state.accumulated_text })),
                                                 ).await?;
                                                 self.event_log
                                                     .update_execution_status(&execution_id, ExecutionStatus::Cancelled)
@@ -835,6 +843,7 @@ impl Reactor {
                                                             message: msg.clone(),
                                                             source: MessageInjectionSource::SignalInjection,
                                                         }),
+                                                        None,
                                                     ).await?;
                                                 }
                                                 state.messages.extend(messages);
@@ -857,8 +866,8 @@ impl Reactor {
                                                                 &execution_id,
                                                                 &PipelineEvent::Execution(ExecutionEvent::Cancelled {
                                                                     reason: reason.clone(),
-                                                                    partial_text: Some(state.accumulated_text.clone()),
                                                                 }),
+                                                                Some(&serde_json::json!({ "partial_text": state.accumulated_text })),
                                                             ).await?;
                                                             self.event_log
                                                                 .update_execution_status(&execution_id, ExecutionStatus::Cancelled)
@@ -947,13 +956,17 @@ impl Reactor {
                         gen_handle.abort();
                         let _ = gen_handle.await;
 
-                        // Push GenerationTimedOut event.
+                        // Push GenerationTimedOut event. chunks_received is stored as
+                        // _obs_chunks_received enrichment (slimmed in Phase 2).
                         let timed_out_event = PipelineEvent::Generation(GenerationEvent::TimedOut {
                             model: current_model.clone(),
                             timeout_secs: chunk_timeout.as_secs(),
-                            chunks_received: chunks_this_generation,
                         });
-                        self.record_event(&execution_id, &timed_out_event).await?;
+                        self.record_event(
+                            &execution_id,
+                            &timed_out_event,
+                            Some(&serde_json::json!({ "chunks_received": chunks_this_generation })),
+                        ).await?;
 
                         // Treat timeout as a retryable failure.
                         activity_failed = true;
@@ -979,13 +992,18 @@ impl Reactor {
                     let policy = pipeline.generate.retry_policy.as_ref();
                     if should_retry(policy, state.generate_retry_attempt, &state.budget, &cancel) {
                         let backoff = backoff_ms(policy.unwrap(), state.generate_retry_attempt);
+                        // backoff_ms is stored as _obs_backoff_ms enrichment (slimmed in Phase 2).
                         let retry_event = PipelineEvent::Activity(ActivityEvent::Retried {
                             name: pipeline.generate.activity.name().to_string(),
                             attempt: state.generate_retry_attempt + 1,
-                            backoff_ms: backoff,
                             error: failed_error.clone(),
                         });
-                        self.record_event(&execution_id, &retry_event).await?;
+                        self.record_event(
+                            &execution_id,
+                            &retry_event,
+                            Some(&serde_json::json!({ "backoff_ms": backoff })),
+                        )
+                        .await?;
                         state.generate_retry_attempt += 1;
 
                         // Backoff with cancellation check.
@@ -997,8 +1015,8 @@ impl Reactor {
                                     &execution_id,
                                     &PipelineEvent::Execution(ExecutionEvent::Cancelled {
                                         reason: "cancelled during retry backoff".to_string(),
-                                        partial_text: Some(state.accumulated_text.clone()),
                                     }),
+                                    Some(&serde_json::json!({ "partial_text": state.accumulated_text })),
                                 ).await?;
                                 self.event_log
                                     .update_execution_status(&execution_id, ExecutionStatus::Cancelled)
@@ -1028,9 +1046,13 @@ impl Reactor {
                 // Not retryable or exhausted retries.
                 let err_event = PipelineEvent::Execution(ExecutionEvent::Failed {
                     error: failed_error.clone(),
-                    partial_text: Some(state.accumulated_text.clone()),
                 });
-                self.record_event(&execution_id, &err_event).await?;
+                self.record_event(
+                    &execution_id,
+                    &err_event,
+                    Some(&serde_json::json!({ "partial_text": state.accumulated_text })),
+                )
+                .await?;
                 self.event_log
                     .update_execution_status(&execution_id, ExecutionStatus::Failed)
                     .await?;
@@ -1085,6 +1107,7 @@ impl Reactor {
                                         hook_name: hook_name.clone(),
                                     },
                                 }),
+                                None,
                             )
                             .await?;
                             state.generate_retry_attempt = 0;
@@ -1138,6 +1161,7 @@ impl Reactor {
                     &PipelineEvent::Budget(BudgetEvent::Exhausted {
                         resource: reason.to_string(),
                     }),
+                    None,
                 )
                 .await?;
                 break 'dispatch;
@@ -1146,8 +1170,8 @@ impl Reactor {
                 &execution_id,
                 &PipelineEvent::Execution(ExecutionEvent::IterationCompleted {
                     iteration: state.iteration,
-                    commands_executed_this_iteration: cmds_this_iter,
                 }),
+                Some(&serde_json::json!({ "commands_executed_this_iteration": cmds_this_iter })),
             )
             .await?;
             state.iteration += 1;
@@ -1186,14 +1210,17 @@ impl Reactor {
         let generation_calls_used =
             state.budget.max_generation_calls - state.budget.remaining_generation_calls;
 
+        // ExecutionEvent::Completed is now a unit variant (Phase 2 slimming).
+        // Observability fields are preserved as _obs_* enrichment in the stored payload.
         self.record_event(
             &execution_id,
-            &PipelineEvent::Execution(ExecutionEvent::Completed {
-                generation_calls: generation_calls_used,
-                commands_executed: state.commands_executed,
-                iterations: state.iteration,
-                duration_ms,
-            }),
+            &PipelineEvent::Execution(ExecutionEvent::Completed),
+            Some(&serde_json::json!({
+                "generation_calls": generation_calls_used,
+                "commands_executed": state.commands_executed,
+                "iterations": state.iteration,
+                "duration_ms": duration_ms,
+            })),
         )
         .await?;
         self.event_log
@@ -1312,7 +1339,7 @@ impl Reactor {
         loop {
             match event_rx.try_recv() {
                 Ok(event) => {
-                    self.record_event(execution_id, &event).await?;
+                    self.record_event(execution_id, &event, None).await?;
                     match &event {
                         PipelineEvent::Activity(ActivityEvent::Failed { name, error, .. }) => {
                             return Ok(Some(ReactorError::ActivityFailed(
@@ -1578,7 +1605,7 @@ impl Reactor {
                         match event_opt {
                             None => return Err(ReactorError::ChannelClosed),
                             Some(event) => {
-                                self.record_event(execution_id, &event).await?;
+                                self.record_event(execution_id, &event, None).await?;
                                 match &event {
                                     PipelineEvent::Command(CommandEvent::Completed { name, result }) if name == &cmd_name => {
                                         // Inject command result into messages and record the injection
@@ -1601,6 +1628,7 @@ impl Reactor {
                                                     command_name: name.clone(),
                                                 },
                                             }),
+                                            None,
                                         ).await?;
                                         state.commands_executed += 1;
                                         cmd_completed = true;
@@ -1626,6 +1654,7 @@ impl Reactor {
                                                     command_name: name.clone(),
                                                 },
                                             }),
+                                            None,
                                         ).await?;
                                         state.commands_executed += 1;
                                         cmd_completed = true;
@@ -1750,13 +1779,29 @@ impl Reactor {
     /// Derives event_type string from variant, serializes to JSON,
     /// and passes EVENT_SCHEMA_VERSION. Extracts idempotency_key from
     /// ActivityCompleted events if present.
+    ///
+    /// If `enrichment` is Some, its key-value pairs are merged into the
+    /// `event` sub-object of the serialized payload with `_obs_` prefix.
+    /// This preserves observability data that was removed from the typed
+    /// variant (see spec Section 5.2). The `_obs_*` fields are silently
+    /// dropped when deserializing stored JSON back to PipelineEvent.
     async fn record_event(
         &self,
         execution_id: &ExecutionId,
         event: &PipelineEvent,
+        enrichment: Option<&serde_json::Value>,
     ) -> Result<u64, ReactorError> {
         let event_type = event.event_type_string();
-        let payload = serde_json::to_value(event)?;
+        let mut payload = serde_json::to_value(event)?;
+        // Merge _obs_* enrichment fields into the event sub-object.
+        if let (Some(enrichment), Some(obj)) = (enrichment, payload.as_object_mut())
+            && let Some(event_obj) = obj.get_mut("event").and_then(|v| v.as_object_mut())
+            && let Some(enrich_obj) = enrichment.as_object()
+        {
+            for (k, v) in enrich_obj {
+                event_obj.insert(format!("_obs_{k}"), v.clone());
+            }
+        }
         let idempotency_key = match event {
             PipelineEvent::Activity(ActivityEvent::Completed {
                 idempotency_key: Some(key),
@@ -1850,8 +1895,8 @@ impl Reactor {
             execution_id,
             &PipelineEvent::Execution(ExecutionEvent::Failed {
                 error: err.to_string(),
-                partial_text: Some(state.accumulated_text.clone()),
             }),
+            Some(&serde_json::json!({ "partial_text": state.accumulated_text })),
         )
         .await?;
         self.event_log

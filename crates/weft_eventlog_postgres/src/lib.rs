@@ -161,9 +161,9 @@ async fn signal_poller(
 
             // Push onto the event channel. If the channel is closed, stop polling.
             if event_tx
-                .send(PipelineEvent::Signal(weft_reactor_trait::SignalEvent::Received(
-                    signal,
-                )))
+                .send(PipelineEvent::Signal(
+                    weft_reactor_trait::SignalEvent::Received(signal),
+                ))
                 .await
                 .is_err()
             {

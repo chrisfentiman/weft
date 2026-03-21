@@ -146,7 +146,7 @@ async fn test_pre_loop_activities_produce_events_in_order() {
 ///
 /// The test verifies:
 /// - Response is 200 OK.
-/// - `system_prompt.assembled` event is present and carries `layer_count >= 1`.
+/// - `system_prompt.assembled` event is present and carries `message_count >= 1`.
 /// - The `message.injected` event with `source: SystemPromptAssembly` carries the gateway
 ///   prompt text ("You are a test assistant.") in its content.
 ///
@@ -164,7 +164,8 @@ async fn test_system_prompt_layers_gateway_and_caller() {
 
     // Request with caller-supplied system message.
     // Via HTTP, this gets Source::Gateway (see openai_to_weft), so it is NOT treated as
-    // a second caller layer by SystemPromptAssemblyActivity. layer_count will be 1.
+    // a second caller layer by SystemPromptAssemblyActivity. Only the gateway config prompt
+    // is assembled; message_count reflects the post-injection state.
     let body = json!({
         "model": "auto",
         "messages": [
@@ -183,19 +184,21 @@ async fn test_system_prompt_layers_gateway_and_caller() {
 
     // context.system_prompt_assembled must be present.
     // PipelineEvent is adjacently tagged: outer has {"category": "Context", "event": {...}},
-    // inner event has {"type": "SystemPromptAssembled", "layer_count": N, ...}
+    // inner event has {"type": "SystemPromptAssembled", "message_count": N}.
+    // Note: prompt_length and layer_count are observability-only and removed from the variant
+    // per Phase 2 slimming; they are no longer stored in the event payload.
     let assembled_event = sorted
         .iter()
         .find(|e| e.event_type == "context.system_prompt_assembled")
         .expect("expected context.system_prompt_assembled event in log");
 
-    // Gateway prompt is always present → layer_count >= 1.
-    let layer_count = assembled_event.payload["event"]["layer_count"]
+    // message_count must be >= 1 (at minimum the injected system message is counted).
+    let message_count = assembled_event.payload["event"]["message_count"]
         .as_u64()
-        .expect("context.system_prompt_assembled payload must have event.layer_count field");
+        .expect("context.system_prompt_assembled payload must have event.message_count field");
     assert!(
-        layer_count >= 1,
-        "expected layer_count >= 1 (at least the gateway prompt), got {layer_count}"
+        message_count >= 1,
+        "expected message_count >= 1, got {message_count}"
     );
 
     // Find the context.message_injected event with source = SystemPromptAssembly.

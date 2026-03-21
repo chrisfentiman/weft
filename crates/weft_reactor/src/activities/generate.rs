@@ -10,8 +10,6 @@
 //!
 //! Handles cancellation, heartbeat emission, and retryable error classification.
 
-use std::time::Instant;
-
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -58,7 +56,7 @@ use weft_reactor_trait::ServiceLocator;
 /// - `Generation(GenerationEvent::Chunk(Reasoning { content }))` — for thinking tokens (if any)
 /// - `Generation(GenerationEvent::Chunk(Done))` — when generation is complete
 /// - `Generation(GenerationEvent::Completed { model, response_message, generated_events, input_tokens, output_tokens })`
-/// - `Activity(ActivityEvent::Completed { name: "generate", duration_ms, idempotency_key })`
+/// - `Activity(ActivityEvent::Completed { name: "generate", idempotency_key })`
 /// - `Generation(GenerationEvent::Failed { model, error })` + `Activity(ActivityEvent::Failed { retryable })` — on error
 pub struct GenerateActivity;
 
@@ -111,8 +109,6 @@ impl Activity for GenerateActivity {
         event_tx: mpsc::Sender<PipelineEvent>,
         cancel: CancellationToken,
     ) {
-        let start = Instant::now();
-
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name().to_string(),
@@ -458,16 +454,14 @@ impl Activity for GenerateActivity {
             }))
             .await;
 
-        let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
-                duration_ms,
                 idempotency_key: input.idempotency_key.clone(),
             }))
             .await;
 
-        debug!(duration_ms, model = %model, "generate: completed");
+        debug!(model = %model, "generate: completed");
     }
 }
 

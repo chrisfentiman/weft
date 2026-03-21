@@ -270,7 +270,6 @@ impl ReactorHandle {
                 weft_reactor_trait::ChildEvent::Completed {
                     child_id: result.execution_id.clone(),
                     status: "completed".to_string(),
-                    result_summary: serde_json::to_value(&result.budget_used).unwrap_or_default(),
                 },
             ))
             .await;

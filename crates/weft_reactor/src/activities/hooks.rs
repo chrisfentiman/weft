@@ -35,9 +35,9 @@ use crate::execution::ExecutionId;
 ///
 /// **Events pushed:**
 /// - `Activity(ActivityEvent::Started { name })`
-/// - `Hook(HookOutcome::Evaluated { hook_event, hook_name, decision, duration_ms })` (for each hook)
+/// - `Hook(HookOutcome::Evaluated { hook_event, hook_name, decision })` (for each hook; `duration_ms` stored via enrichment)
 /// - `Hook(HookOutcome::Blocked { hook_event, hook_name, reason })` (if a hook blocks)
-/// - `Activity(ActivityEvent::Completed { name, duration_ms, idempotency_key: None })`
+/// - `Activity(ActivityEvent::Completed { name, idempotency_key: None })` (`duration_ms` stored via enrichment)
 /// - `Activity(ActivityEvent::Failed { name, error, retryable: false })` — if hook blocks and event can_block()
 pub struct HookActivity {
     /// The lifecycle event this activity handles.
@@ -144,7 +144,6 @@ impl Activity for HookActivity {
             let _ = event_tx
                 .send(PipelineEvent::Activity(ActivityEvent::Completed {
                     name: self.name().to_string(),
-                    duration_ms,
                     idempotency_key: None,
                 }))
                 .await;
@@ -153,12 +152,10 @@ impl Activity for HookActivity {
         }
 
         // For all other hook events: run synchronously via ServiceLocator.
-        let hook_start = Instant::now();
         let result = services
             .hooks()
             .run_chain(hook_event, hook_payload, None)
             .await;
-        let hook_duration = hook_start.elapsed().as_millis() as u64;
 
         match result {
             HookChainResult::Allowed { .. } => {
@@ -167,7 +164,6 @@ impl Activity for HookActivity {
                         hook_event: hook_event_name_slug(hook_event).to_string(),
                         hook_name: self.name().to_string(),
                         decision: "allow".to_string(),
-                        duration_ms: hook_duration,
                     }))
                     .await;
             }
@@ -211,7 +207,6 @@ impl Activity for HookActivity {
         let _ = event_tx
             .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
-                duration_ms,
                 idempotency_key: None,
             }))
             .await;
