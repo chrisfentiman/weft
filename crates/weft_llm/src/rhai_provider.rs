@@ -83,7 +83,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rhai::Dynamic;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, info_span, warn};
 use weft_core::{ContentPart, Role, Source, WeftMessage};
 use weft_rhai::{CompiledScript, EngineBuilder, SandboxLimits, ScriptError, safe_call_fn};
 
@@ -652,13 +652,27 @@ impl Provider for RhaiProvider {
 
         req_builder = req_builder.body(spec.body);
 
-        let http_response = req_builder
-            .send()
-            .await
-            .map_err(|e| ProviderError::RequestFailed(format!("{}: {}", self.provider_name, e)))?;
+        // Step 4b: Wrap the HTTP round-trip in a `provider_call` span.
+        let provider_call_span = info_span!(
+            "provider_call",
+            http.request.method = %spec.method,
+            url.full = %url,
+            otel.kind = "client",
+            http.response.status_code = tracing::field::Empty,
+        );
+
+        let http_response = async {
+            req_builder
+                .send()
+                .await
+                .map_err(|e| ProviderError::RequestFailed(format!("{}: {}", self.provider_name, e)))
+        }
+        .instrument(provider_call_span.clone())
+        .await?;
 
         // Step 5: Collect the HTTP response.
         let status = http_response.status().as_u16();
+        provider_call_span.record("http.response.status_code", status as i64);
         let resp_headers: Vec<(String, String)> = http_response
             .headers()
             .iter()

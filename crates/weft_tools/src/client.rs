@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use tokio::sync::OnceCell;
-use tracing::{debug, warn};
+use tracing::{Instrument, debug, info_span, warn};
 
 use crate::{
     ToolDescription, ToolExecutionResult, ToolInfo, ToolRegistryClient, ToolRegistryError,
@@ -140,20 +140,35 @@ impl ToolRegistryClient for GrpcToolRegistryClient {
             ToolRegistryError::GrpcError(format!("argument serialization failed: {e}"))
         })?;
 
-        let response = client
-            .execute_tool(proto::ExecuteToolRequest {
-                name: name.to_string(),
-                arguments_json,
-            })
-            .await
-            .map_err(|e| {
-                let status = e.code();
-                if status == tonic::Code::NotFound {
-                    ToolRegistryError::ToolNotFound(name.to_string())
-                } else {
-                    ToolRegistryError::ExecutionFailed(e.to_string())
-                }
-            })?;
+        // Wrap the gRPC execute call in a `command_call` span so downstream
+        // telemetry can observe command dispatch latency and outcomes.
+        let command_call_span = info_span!(
+            "command_call",
+            rpc.system = "grpc",
+            rpc.service = "weft.tool_registry.v1.ToolRegistry",
+            rpc.method = "ExecuteTool",
+            otel.kind = "client",
+            command.name = %name,
+        );
+
+        let response = async {
+            client
+                .execute_tool(proto::ExecuteToolRequest {
+                    name: name.to_string(),
+                    arguments_json,
+                })
+                .await
+                .map_err(|e| {
+                    let status = e.code();
+                    if status == tonic::Code::NotFound {
+                        ToolRegistryError::ToolNotFound(name.to_string())
+                    } else {
+                        ToolRegistryError::ExecutionFailed(e.to_string())
+                    }
+                })
+        }
+        .instrument(command_call_span)
+        .await?;
 
         let r = response.into_inner();
         let error = if r.error.is_empty() {

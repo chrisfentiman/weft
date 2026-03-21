@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::warn;
+use tracing::{Instrument, info_span, warn};
 
 use crate::error::ReactorError;
 use crate::event::{
@@ -48,7 +48,7 @@ impl Reactor {
                 continue;
             }
 
-            // Run pre_tool_use hooks.
+            // Run pre_tool_use hooks wrapped in `activity` spans.
             for hook in &cmd_ctx.pipeline.loop_hooks.pre_tool_use {
                 if cmd_ctx.cancel.is_cancelled() {
                     break;
@@ -60,26 +60,42 @@ impl Reactor {
                     hook,
                     None,
                 );
-                hook.activity
-                    .execute(
-                        cmd_ctx.execution_id,
-                        input,
-                        self.services.as_ref(),
-                        self.event_log.as_ref(),
-                        cmd_ctx.event_tx.clone(),
-                        cmd_ctx.cancel.clone(),
-                    )
-                    .await;
-                let terminate = self
-                    .drain_pre_post_loop(
+
+                let hook_name = hook.activity.name().to_string();
+                let activity_span = info_span!(
+                    "activity",
+                    activity.name = %hook_name,
+                    activity.phase = "dispatch",
+                    activity.status = tracing::field::Empty,
+                );
+
+                let terminate = async {
+                    hook.activity
+                        .execute(
+                            cmd_ctx.execution_id,
+                            input,
+                            self.services.as_ref(),
+                            self.event_log.as_ref(),
+                            cmd_ctx.event_tx.clone(),
+                            cmd_ctx.cancel.clone(),
+                        )
+                        .await;
+                    self.drain_pre_post_loop(
                         cmd_ctx.execution_id,
                         cmd_ctx.event_rx,
                         cmd_ctx.state,
                         cmd_ctx.cancel,
                     )
-                    .await?;
+                    .await
+                }
+                .instrument(activity_span.clone())
+                .await?;
+
                 if let Some(err) = terminate {
+                    activity_span.record("activity.status", "error");
                     return Ok(Some(err));
+                } else {
+                    activity_span.record("activity.status", "ok");
                 }
             }
 
@@ -105,7 +121,17 @@ impl Reactor {
                     .unwrap_or(cmd_ctx.default_timeout_secs),
             );
 
-            // Execute command with timeout.
+            // `execute_command` span brackets the command execution including
+            // the spawned task lifecycle. Status is recorded at close.
+            let cmd_name = invocation.name.clone();
+            let execute_cmd_span = info_span!(
+                "execute_command",
+                command.name = %cmd_name,
+                command.index = cmd_index as u32,
+                command.status = tracing::field::Empty,
+            );
+
+            // Execute command with timeout, inside the execute_command span.
             let cmd_activity = Arc::clone(&cmd_ctx.pipeline.execute_command.activity);
             let cmd_event_tx = cmd_ctx.event_tx.clone();
             let cmd_exec_id = cmd_ctx.execution_id.clone();
@@ -113,18 +139,21 @@ impl Reactor {
             let cmd_event_log: Arc<dyn crate::event_log::EventLog> = Arc::clone(&self.event_log);
             let cmd_cancel = cmd_ctx.cancel.clone();
 
-            let cmd_handle = tokio::spawn(async move {
-                cmd_activity
-                    .execute(
-                        &cmd_exec_id,
-                        cmd_input,
-                        cmd_services.as_ref(),
-                        cmd_event_log.as_ref(),
-                        cmd_event_tx,
-                        cmd_cancel,
-                    )
-                    .await;
-            });
+            let cmd_handle = tokio::spawn(
+                async move {
+                    cmd_activity
+                        .execute(
+                            &cmd_exec_id,
+                            cmd_input,
+                            cmd_services.as_ref(),
+                            cmd_event_log.as_ref(),
+                            cmd_event_tx,
+                            cmd_cancel,
+                        )
+                        .await;
+                }
+                .instrument(execute_cmd_span.clone()),
+            );
 
             // Drain events until the command completes.
             let cmd_deadline = tokio::time::Instant::now() + cmd_timeout;
@@ -132,7 +161,6 @@ impl Reactor {
             let mut cmd_failed = false;
             let mut cmd_failed_error = String::new();
             let mut cmd_failed_retryable = false;
-            let cmd_name = invocation.name.clone();
 
             'cmd: loop {
                 tokio::select! {
@@ -242,6 +270,7 @@ impl Reactor {
                         cmd_name, cmd_failed_error
                     );
                 }
+                execute_cmd_span.record("command.status", "error");
                 return Ok(Some(ReactorError::ActivityFailed(
                     crate::activity::ActivityError::Failed {
                         name: cmd_name,
@@ -250,7 +279,9 @@ impl Reactor {
                 )));
             }
 
-            // Run post_tool_use hooks.
+            execute_cmd_span.record("command.status", "ok");
+
+            // Run post_tool_use hooks wrapped in `activity` spans.
             for hook in &cmd_ctx.pipeline.loop_hooks.post_tool_use {
                 if cmd_ctx.cancel.is_cancelled() {
                     break;
@@ -262,26 +293,42 @@ impl Reactor {
                     hook,
                     None,
                 );
-                hook.activity
-                    .execute(
-                        cmd_ctx.execution_id,
-                        input,
-                        self.services.as_ref(),
-                        self.event_log.as_ref(),
-                        cmd_ctx.event_tx.clone(),
-                        cmd_ctx.cancel.clone(),
-                    )
-                    .await;
-                let terminate = self
-                    .drain_pre_post_loop(
+
+                let hook_name = hook.activity.name().to_string();
+                let activity_span = info_span!(
+                    "activity",
+                    activity.name = %hook_name,
+                    activity.phase = "dispatch",
+                    activity.status = tracing::field::Empty,
+                );
+
+                let terminate = async {
+                    hook.activity
+                        .execute(
+                            cmd_ctx.execution_id,
+                            input,
+                            self.services.as_ref(),
+                            self.event_log.as_ref(),
+                            cmd_ctx.event_tx.clone(),
+                            cmd_ctx.cancel.clone(),
+                        )
+                        .await;
+                    self.drain_pre_post_loop(
                         cmd_ctx.execution_id,
                         cmd_ctx.event_rx,
                         cmd_ctx.state,
                         cmd_ctx.cancel,
                     )
-                    .await?;
+                    .await
+                }
+                .instrument(activity_span.clone())
+                .await?;
+
                 if let Some(err) = terminate {
+                    activity_span.record("activity.status", "error");
                     return Ok(Some(err));
+                } else {
+                    activity_span.record("activity.status", "ok");
                 }
             }
         }

@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{Instrument, debug, info_span};
 
 use crate::budget::BudgetCheck;
 use crate::error::ReactorError;
@@ -39,9 +39,57 @@ impl Reactor {
         default_generation_timeout: u64,
         default_command_timeout: u64,
     ) -> Result<Option<ExecutionResult>, ReactorError> {
+        // The `dispatch_loop` span brackets the entire dispatch phase. Wrapping
+        // the body with .instrument() correctly propagates the span across awaits.
+        let dispatch_loop_span = info_span!("dispatch_loop");
+        self.dispatch_loop_body(
+            lctx,
+            client_tx,
+            default_generation_timeout,
+            default_command_timeout,
+        )
+        .instrument(dispatch_loop_span)
+        .await
+    }
+
+    /// Inner dispatch loop body, run inside the `dispatch_loop` span.
+    async fn dispatch_loop_body(
+        &self,
+        lctx: &mut LoopContext<'_>,
+        client_tx: &Option<mpsc::Sender<PipelineEvent>>,
+        default_generation_timeout: u64,
+        default_command_timeout: u64,
+    ) -> Result<Option<ExecutionResult>, ReactorError> {
         'dispatch: loop {
+            // Create the `iteration` span for this loop pass.
+            // The span records iteration.number at creation and iteration.commands
+            // at the end of each pass (via Span::current().record()).
+            // We enter it synchronously here since the span must be a child of
+            // the ambient `dispatch_loop` span, and tracing automatically parents
+            // new spans to the current span in context.
+            let iteration_number = lctx.state.iteration;
+            let iteration_span = info_span!(
+                "iteration",
+                iteration.number = iteration_number,
+                iteration.commands = tracing::field::Empty,
+            );
+            // Enter the iteration span. It will be active until dropped at the
+            // end of this loop pass (or early-returned). All async work in this
+            // iteration correctly inherits this span as parent via task-local storage,
+            // because dispatch_loop_body is already .instrument()-ed under dispatch_loop,
+            // so the task-local span stack has dispatch_loop as current. The iteration
+            // span entered here extends the span stack for the synchronous portions.
+            // Note: guards must not be held across await points in multi-threaded runtimes.
+            // We only use this guard to set the span as current so child spans are parented
+            // correctly. The guard is dropped before the first await.
+            let iteration_span_guard = iteration_span.clone().entered();
+
             // 2a. Budget check.
-            match lctx.state.budget.check() {
+            let budget_check = lctx.state.budget.check();
+            // Drop the guard before the first await.
+            drop(iteration_span_guard);
+
+            match budget_check {
                 BudgetCheck::Exhausted(reason) => {
                     let resource = reason.to_string();
                     self.record_event(
@@ -76,20 +124,39 @@ impl Reactor {
                 }
                 let input =
                     self.build_input(lctx.execution_id, lctx.state, lctx.request, hook, None);
-                hook.activity
-                    .execute(
+
+                let hook_name = hook.activity.name().to_string();
+                let activity_span = info_span!(
+                    "activity",
+                    activity.name = %hook_name,
+                    activity.phase = "dispatch",
+                    activity.status = tracing::field::Empty,
+                );
+
+                let terminate = async {
+                    hook.activity
+                        .execute(
+                            lctx.execution_id,
+                            input,
+                            self.services.as_ref(),
+                            self.event_log.as_ref(),
+                            lctx.event_tx.clone(),
+                            lctx.cancel.clone(),
+                        )
+                        .await;
+                    self.drain_pre_post_loop(
                         lctx.execution_id,
-                        input,
-                        self.services.as_ref(),
-                        self.event_log.as_ref(),
-                        lctx.event_tx.clone(),
-                        lctx.cancel.clone(),
+                        lctx.event_rx,
+                        lctx.state,
+                        lctx.cancel,
                     )
-                    .await;
-                let terminate = self
-                    .drain_pre_post_loop(lctx.execution_id, lctx.event_rx, lctx.state, lctx.cancel)
-                    .await?;
+                    .await
+                }
+                .instrument(activity_span.clone())
+                .await?;
+
                 if let Some(err) = terminate {
+                    activity_span.record("activity.status", "error");
                     self.record_event(
                         lctx.execution_id,
                         &PipelineEvent::Execution(ExecutionEvent::Failed {
@@ -102,6 +169,8 @@ impl Reactor {
                         .update_execution_status(lctx.execution_id, ExecutionStatus::Failed)
                         .await?;
                     return Err(err);
+                } else {
+                    activity_span.record("activity.status", "ok");
                 }
             }
 
@@ -159,12 +228,15 @@ impl Reactor {
                     }
                 }
 
+                let cmds_this_iter = commands_queued.len() as u32;
                 if commands_queued.is_empty() {
+                    iteration_span.record("iteration.commands", 0u32);
                     break 'dispatch;
                 }
                 let terminate = self
                     .run_commands_with_ctx(lctx, &mut commands_queued, default_command_timeout)
                     .await?;
+                iteration_span.record("iteration.commands", cmds_this_iter);
                 if let Some(err) = terminate {
                     self.finalize_failed(lctx.execution_id, lctx.state, err)
                         .await?;
@@ -172,8 +244,7 @@ impl Reactor {
                         reason: "command failed".to_string(),
                     });
                 }
-                self.record_iteration(lctx, lctx.state.commands_executed)
-                    .await?;
+                self.record_iteration(lctx, cmds_this_iter).await?;
                 continue 'dispatch;
             }
 
@@ -188,9 +259,18 @@ impl Reactor {
                 .await?;
 
             match outcome {
-                GenerateOutcome::Cancelled(result) => return Ok(Some(result)),
-                GenerateOutcome::ChannelClosed => return Err(ReactorError::ChannelClosed),
-                GenerateOutcome::BudgetExhausted => break 'dispatch,
+                GenerateOutcome::Cancelled(result) => {
+                    iteration_span.record("iteration.commands", 0u32);
+                    return Ok(Some(result));
+                }
+                GenerateOutcome::ChannelClosed => {
+                    iteration_span.record("iteration.commands", 0u32);
+                    return Err(ReactorError::ChannelClosed);
+                }
+                GenerateOutcome::BudgetExhausted => {
+                    iteration_span.record("iteration.commands", 0u32);
+                    break 'dispatch;
+                }
 
                 GenerateOutcome::ActivityFailed { retryable, error } => {
                     if retryable {
@@ -244,6 +324,7 @@ impl Reactor {
                                         },
                                         final_budget: lctx.state.budget.clone(),
                                     };
+                                    iteration_span.record("iteration.commands", 0u32);
                                     return Ok(Some(result));
                                 }
                             }
@@ -252,6 +333,7 @@ impl Reactor {
                     }
 
                     // Not retryable or exhausted retries.
+                    iteration_span.record("iteration.commands", 0u32);
                     self.record_event(
                         lctx.execution_id,
                         &PipelineEvent::Execution(ExecutionEvent::Failed {
@@ -289,27 +371,41 @@ impl Reactor {
                                 hook,
                                 None,
                             );
-                            hook.activity
-                                .execute(
-                                    lctx.execution_id,
-                                    input,
-                                    self.services.as_ref(),
-                                    self.event_log.as_ref(),
-                                    lctx.event_tx.clone(),
-                                    lctx.cancel.clone(),
-                                )
-                                .await;
-                            let terminate = self
-                                .drain_pre_post_loop(
+
+                            let hook_name = hook.activity.name().to_string();
+                            let activity_span = info_span!(
+                                "activity",
+                                activity.name = %hook_name,
+                                activity.phase = "dispatch",
+                                activity.status = tracing::field::Empty,
+                            );
+
+                            let terminate = async {
+                                hook.activity
+                                    .execute(
+                                        lctx.execution_id,
+                                        input,
+                                        self.services.as_ref(),
+                                        self.event_log.as_ref(),
+                                        lctx.event_tx.clone(),
+                                        lctx.cancel.clone(),
+                                    )
+                                    .await;
+                                self.drain_pre_post_loop(
                                     lctx.execution_id,
                                     lctx.event_rx,
                                     lctx.state,
                                     lctx.cancel,
                                 )
-                                .await?;
+                                .await
+                            }
+                            .instrument(activity_span.clone())
+                            .await?;
+
                             if let Some(err) = terminate {
                                 // Hook blocked with feedback: inject and retry generation.
                                 if let ReactorError::HookBlocked { hook_name, reason } = &err {
+                                    activity_span.record("activity.status", "ok");
                                     let feedback_msg = weft_core::WeftMessage {
                                         role: weft_core::Role::User,
                                         source: weft_core::Source::Client,
@@ -334,20 +430,26 @@ impl Reactor {
                                     continue 'dispatch;
                                 }
                                 // Any other error terminates.
+                                activity_span.record("activity.status", "error");
                                 self.finalize_failed(lctx.execution_id, lctx.state, err)
                                     .await?;
                                 return Err(ReactorError::Cancelled {
                                     reason: "pre_response hook failed".to_string(),
                                 });
+                            } else {
+                                activity_span.record("activity.status", "ok");
                             }
                         }
 
                         if commands_queued.is_empty() {
+                            iteration_span.record("iteration.commands", 0u32);
                             break 'dispatch;
                         }
                     }
 
                     // 2h. Execute commands sequentially.
+                    // Capture count before drain (execute_commands drains the vec).
+                    let cmds_this_iter = commands_queued.len() as u32;
                     if !commands_queued.is_empty() {
                         let terminate = self
                             .run_commands_with_ctx(
@@ -357,6 +459,7 @@ impl Reactor {
                             )
                             .await?;
                         if let Some(err) = terminate {
+                            iteration_span.record("iteration.commands", cmds_this_iter);
                             self.finalize_failed(lctx.execution_id, lctx.state, err)
                                 .await?;
                             return Err(ReactorError::ActivityFailed(
@@ -369,7 +472,7 @@ impl Reactor {
                     }
 
                     // 2i. Record iteration.
-                    let cmds_this_iter = commands_queued.len() as u32;
+                    iteration_span.record("iteration.commands", cmds_this_iter);
                     self.record_iteration(lctx, cmds_this_iter).await?;
                 }
             }

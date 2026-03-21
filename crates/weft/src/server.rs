@@ -18,7 +18,8 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use tracing::{info, info_span, warn};
+use tower_http::trace::TraceLayer;
+use tracing::{info, warn};
 use weft_core::{
     ContentPart, ModelRoutingInstruction, Role, SamplingOptions, Source, WeftError, WeftMessage,
     WeftRequest,
@@ -206,7 +207,10 @@ pub fn build_router(weft_service: Arc<WeftService>) -> Router {
 
     // Merge: gRPC router handles application/grpc requests; HTTP router handles the rest.
     // axum's `merge` composes two routers — tonic's router takes priority for gRPC paths.
-    grpc_router.merge(http_router)
+    // TraceLayer adds transport-level spans wrapping all request handling.
+    grpc_router
+        .merge(http_router)
+        .layer(TraceLayer::new_for_http())
 }
 
 /// Start the HTTP+gRPC server and block until shutdown.
@@ -267,11 +271,6 @@ async fn chat_completions_handler(
     State(weft_service): State<Arc<WeftService>>,
     Json(openai_req): Json<OpenAiChatRequest>,
 ) -> Result<Json<OpenAiChatResponse>, ApiError> {
-    // Generate a request-scoped tracing span for observability.
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let span = info_span!("chat_completion", request_id = %request_id);
-    let _guard = span.enter();
-
     // Validate: must have at least one message.
     if openai_req.messages.is_empty() {
         return Err(ApiError::bad_request("messages array must not be empty"));

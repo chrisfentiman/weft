@@ -32,6 +32,7 @@ use weft_tools::GrpcToolRegistryClient;
 use weft::config_loading::load_and_build_store;
 use weft::grpc::WeftService;
 use weft::server::build_router;
+use weft::telemetry::TelemetryConfig;
 use weft::types::BinaryCommandRegistry;
 
 /// Weft — AI orchestration gateway
@@ -52,13 +53,10 @@ struct Cli {
 async fn main() {
     let cli = Cli::parse();
 
-    // Initialize tracing from RUST_LOG environment variable.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Initialize the tracing subscriber. The guard must be held for the entire
+    // program lifetime to ensure buffers are flushed on exit.
+    let telemetry_config = TelemetryConfig::from_env();
+    let _telemetry_guard = weft::telemetry::init(&telemetry_config);
 
     // Load, resolve, validate, and build ConfigStore.
     //

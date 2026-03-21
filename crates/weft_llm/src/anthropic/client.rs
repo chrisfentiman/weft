@@ -1,4 +1,4 @@
-use tracing::{debug, warn};
+use tracing::{Instrument, debug, info_span, warn};
 use weft_core::{ContentPart, Role, SamplingOptions, Source, WeftMessage};
 
 use super::wire::{AnthropicMessage, AnthropicRequest, AnthropicResponse};
@@ -98,18 +98,32 @@ impl AnthropicProvider {
 
         debug!(model = %model, max_tokens, "sending Anthropic request");
 
-        let response = self
-            .client
-            .post(&self.base_url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
+        // Wrap the HTTP round-trip in a `provider_call` span so downstream
+        // telemetry can observe provider latency independently of generation logic.
+        let provider_call_span = info_span!(
+            "provider_call",
+            http.request.method = "POST",
+            url.full = %self.base_url,
+            otel.kind = "client",
+            http.response.status_code = tracing::field::Empty,
+        );
+
+        let response = async {
+            self.client
+                .post(&self.base_url)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .header("content-type", "application/json")
+                .json(&request)
+                .send()
+                .await
+                .map_err(|e| ProviderError::RequestFailed(e.to_string()))
+        }
+        .instrument(provider_call_span.clone())
+        .await?;
 
         let status = response.status().as_u16();
+        provider_call_span.record("http.response.status_code", status as i64);
 
         if status == 429 {
             // Extract Retry-After header if present

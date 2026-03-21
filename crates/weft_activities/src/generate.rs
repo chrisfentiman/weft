@@ -13,7 +13,7 @@
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info_span, warn};
 #[cfg(test)]
 use weft_core::Role;
 use weft_core::{ContentPart, WeftMessage};
@@ -157,6 +157,29 @@ impl Activity for GenerateActivity {
             .await;
 
         debug!(model = %model, message_count, "generate: starting");
+
+        // Create the `generate` span. This span brackets the LLM provider call and the
+        // full stream consumption. Attributes known at span creation are set immediately;
+        // token counts and stop reason are recorded via Span::current().record() at close.
+        //
+        // `llm.attempt` is the retry attempt counter. GenerateActivity does not track
+        // retries internally (the reactor handles retry orchestration), so we read it
+        // from metadata if available, defaulting to 0.
+        let llm_attempt: u32 = input
+            .metadata
+            .get("generate_retry_attempt")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+
+        let generate_span = info_span!(
+            "generate",
+            llm.model = %model,
+            llm.provider = tracing::field::Empty,
+            llm.attempt = llm_attempt,
+            llm.input_tokens = tracing::field::Empty,
+            llm.output_tokens = tracing::field::Empty,
+            llm.stop_reason = tracing::field::Empty,
+        );
 
         // Spawn heartbeat task if configured.
         let heartbeat_cancel = cancel.child_token();
@@ -448,6 +471,25 @@ impl Activity for GenerateActivity {
             delta: false,
             message_index: 0,
         });
+
+        // Record token counts and stop reason on the generate span at close.
+        // These are known only after the stream is fully consumed.
+        let stop_reason = if all_generated_events
+            .iter()
+            .any(|e| matches!(e, GeneratedEvent::Refused { .. }))
+        {
+            "refusal"
+        } else if all_generated_events
+            .iter()
+            .any(|e| matches!(e, GeneratedEvent::CommandInvocation(_)))
+        {
+            "tool_use"
+        } else {
+            "end_turn"
+        };
+        generate_span.record("llm.input_tokens", input_tokens.unwrap_or(0));
+        generate_span.record("llm.output_tokens", output_tokens.unwrap_or(0));
+        generate_span.record("llm.stop_reason", stop_reason);
 
         let _ = event_tx
             .send(PipelineEvent::Generation(GenerationEvent::Completed {
