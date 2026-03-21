@@ -510,6 +510,63 @@ impl Provider for SequencedProvider {
 // ProviderRequest must be Clone for last_request storage.
 // It already derives Clone per its definition in weft_llm::provider.
 
+// ── SharedSequencedProvider ────────────────────────────────────────────────────
+//
+// Tests that assert on `call_count()` or `last_request()` after the request
+// completes need to share ownership of the `SequencedProvider` with the harness.
+// The orphan rule prevents `impl Provider for Arc<SequencedProvider>`, so we
+// use a thin newtype wrapper that implements `Provider` by delegating to the
+// inner `Arc`.
+//
+// # Usage
+//
+// ```ignore
+// let shared = SharedSequencedProvider::new(SequencedProvider::new(responses));
+// let handle = shared.clone(); // keep for assertions
+// let (svc, log) = make_weft_service_with_event_log(shared, commands);
+// // … run request …
+// assert_eq!(handle.call_count(), 2);
+// ```
+
+/// A newtype that wraps `Arc<SequencedProvider>` and implements `Provider`.
+///
+/// Needed because the orphan rule prevents implementing an external trait
+/// (`Provider`) for an external generic type (`Arc<_>`). The newtype is local
+/// to the test harness, so the impl is legal.
+///
+/// Use `SharedSequencedProvider::clone()` to retain a handle for post-call
+/// assertions on `call_count()` and `last_request()`.
+#[derive(Clone)]
+pub struct SharedSequencedProvider(Arc<SequencedProvider>);
+
+impl SharedSequencedProvider {
+    /// Wrap a `SequencedProvider` in a shared handle.
+    pub fn new(inner: SequencedProvider) -> Self {
+        Self(Arc::new(inner))
+    }
+
+    /// Return the number of times `execute` has been called.
+    pub fn call_count(&self) -> u32 {
+        self.0.call_count()
+    }
+
+    /// Return the last `ProviderRequest` received, if any.
+    pub fn last_request(&self) -> Option<ProviderRequest> {
+        self.0.last_request()
+    }
+}
+
+#[async_trait]
+impl Provider for SharedSequencedProvider {
+    async fn execute(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        self.0.execute(request).await
+    }
+
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+}
+
 // ── ScriptedCommandRegistry ───────────────────────────────────────────────────
 
 /// A single command entry in a [`ScriptedCommandRegistry`].

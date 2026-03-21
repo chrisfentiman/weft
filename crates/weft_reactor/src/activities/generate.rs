@@ -187,11 +187,29 @@ impl Activity for GenerateActivity {
             None
         };
 
-        // Build the provider request.
+        // Build the provider request, merging clamped sampling parameters from
+        // generation_config over the original request options.
+        //
+        // SamplingAdjustmentActivity writes the clamped max_tokens (and optionally
+        // temperature/top_p) into generation_config so that downstream activities use
+        // the provider-safe values. We must read them here rather than from
+        // input.request.options, which carries the original unclamped client values.
+        let mut options = input.request.options.clone();
+        if let Some(ref cfg) = input.generation_config {
+            if let Some(max_tokens) = cfg.get("max_tokens").and_then(|v| v.as_u64()) {
+                options.max_tokens = Some(max_tokens as u32);
+            }
+            if let Some(temperature) = cfg.get("temperature").and_then(|v| v.as_f64()) {
+                options.temperature = Some(temperature as f32);
+            }
+            if let Some(top_p) = cfg.get("top_p").and_then(|v| v.as_f64()) {
+                options.top_p = Some(top_p as f32);
+            }
+        }
         let provider_request = ProviderRequest::ChatCompletion {
             messages: input.messages.clone(),
             model: model_id.clone(),
-            options: input.request.options.clone(),
+            options,
         };
 
         // Get the provider and open the streaming request.

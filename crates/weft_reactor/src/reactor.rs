@@ -1511,7 +1511,10 @@ impl Reactor {
                 Some(cmd_key),
             );
             // Inject the specific invocation into metadata so the activity knows which command to run.
-            cmd_input.metadata = serde_json::to_value(&invocation).unwrap_or_default();
+            // ExecuteCommandActivity::extract_invocation reads metadata["invocation"], so wrap it.
+            cmd_input.metadata = serde_json::json!({
+                "invocation": serde_json::to_value(&invocation).unwrap_or_default()
+            });
 
             let cmd_timeout = Duration::from_secs(
                 pipeline
