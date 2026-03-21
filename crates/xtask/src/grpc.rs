@@ -8,6 +8,7 @@ pub(crate) fn run(sh: &Shell, args: GrpcArgs) -> Result<()> {
     match args.command {
         GrpcCommand::Chat(chat_args) => run_chat(sh, chat_args),
         GrpcCommand::Health(health_args) => run_health(sh, health_args),
+        GrpcCommand::Ls => run_ls(sh),
     }
 }
 
@@ -53,5 +54,16 @@ fn run_chat(sh: &Shell, args: crate::GrpcChatArgs) -> Result<()> {
 fn run_health(sh: &Shell, args: crate::GrpcHealthArgs) -> Result<()> {
     let addr = args.addr.as_str();
     cmd!(sh, "curl -s http://{addr}/health").run()?;
+    Ok(())
+}
+
+/// Run `cargo xtask grpc ls`: list available RPC methods from the proto definition.
+///
+/// Full implementation is in Phase 2. This stub notifies the user.
+fn run_ls(_sh: &Shell) -> Result<()> {
+    eprintln!(
+        "[xtask] grpc ls not yet implemented (Phase 2). \
+         Proto method discovery is coming in the next phase."
+    );
     Ok(())
 }

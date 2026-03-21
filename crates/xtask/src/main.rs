@@ -6,6 +6,9 @@ mod run;
 mod setup;
 mod test;
 mod util;
+mod workspace;
+
+use std::ffi::OsString;
 
 use clap::{Parser, Subcommand};
 
@@ -54,43 +57,90 @@ enum Command {
 
     /// Install development tools (nextest, mutants).
     Setup,
+
+    /// Generate shell completions.
+    ///
+    /// Examples:
+    ///   cargo xtask completions bash >> ~/.bashrc
+    ///   cargo xtask completions zsh > ~/.zfunc/_cargo-xtask
+    ///   cargo xtask completions fish > ~/.config/fish/completions/cargo-xtask.fish
+    ///
+    /// After generating, restart your shell or source the file.
+    Completions(CompletionsArgs),
 }
 
 /// Arguments for `cargo xtask build`.
 #[derive(Debug, clap::Args)]
 pub(crate) struct BuildArgs {
-    /// Build in release mode.
-    #[arg(long)]
-    pub(crate) release: bool,
+    #[command(subcommand)]
+    pub(crate) command: Option<BuildCommand>,
 
     /// Enable the Postgres event log feature.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub(crate) postgres: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum BuildCommand {
+    /// Build in release mode.
+    Release,
+
+    /// List workspace crates.
+    Ls,
 }
 
 /// Arguments for `cargo xtask test`.
 #[derive(Debug, clap::Args)]
+#[command(
+    after_help = "Run `cargo xtask test <crate-name>` to test a specific crate.\nReserved names: unit, integration, ls (cannot be used as bare crate names)."
+)]
 pub(crate) struct TestArgs {
-    /// Test a specific crate instead of the whole workspace.
-    #[arg(long = "crate", value_name = "CRATE")]
-    pub(crate) crate_name: Option<String>,
-
-    /// Run only integration tests (tests/ directory).
-    ///
-    /// When used without --crate, defaults to -p weft (integration tests live there).
-    #[arg(long, conflicts_with = "unit")]
-    pub(crate) integration: bool,
-
-    /// Run only unit tests (lib tests).
-    #[arg(long, conflicts_with = "integration")]
-    pub(crate) unit: bool,
+    #[command(subcommand)]
+    pub(crate) command: Option<TestCommand>,
 
     /// Enable the Postgres event log feature.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub(crate) postgres: bool,
 }
 
+#[derive(Debug, Subcommand)]
+pub(crate) enum TestCommand {
+    /// Run unit tests only (lib tests).
+    Unit(TestScope),
+
+    /// Run integration tests only (tests/ directory).
+    Integration(TestScope),
+
+    /// List crates with tests, or test targets for a specific crate.
+    Ls(LsScope),
+
+    /// Run all tests for a specific crate.
+    ///
+    /// Catches bare crate names: `cargo xtask test weft_reactor`.
+    #[command(external_subcommand)]
+    Crate(Vec<OsString>),
+}
+
+/// Optional crate scope for unit/integration subcommands.
+#[derive(Debug, clap::Args)]
+pub(crate) struct TestScope {
+    /// Crate to test. If omitted, tests the whole workspace.
+    pub(crate) crate_name: Option<String>,
+}
+
+/// Optional crate scope for the ls subcommand.
+#[derive(Debug, clap::Args)]
+pub(crate) struct LsScope {
+    /// Crate to inspect. If omitted, lists all crates with tests.
+    pub(crate) crate_name: Option<String>,
+}
+
 /// Arguments for `cargo xtask run`.
+///
+/// The run command keeps flags because `--release` and `--postgres` are genuine
+/// modifiers, not distinct modes. `cargo xtask run --release --postgres` is
+/// natural; `cargo xtask run release postgres` would imply they are independent
+/// modes, which they are not.
 #[derive(Debug, clap::Args)]
 pub(crate) struct RunArgs {
     /// Path to the config file.
@@ -125,6 +175,9 @@ pub(crate) enum GrpcCommand {
 
     /// Check weft health via HTTP.
     Health(GrpcHealthArgs),
+
+    /// List available RPC methods from the proto definition.
+    Ls,
 }
 
 /// Arguments for `cargo xtask grpc chat`.
@@ -146,6 +199,13 @@ pub(crate) struct GrpcHealthArgs {
     pub(crate) addr: String,
 }
 
+/// Arguments for `cargo xtask completions`.
+#[derive(Debug, clap::Args)]
+pub(crate) struct CompletionsArgs {
+    /// Shell to generate completions for.
+    pub(crate) shell: String,
+}
+
 fn main() -> util::Result<()> {
     let cli = Cli::parse();
 
@@ -163,5 +223,13 @@ fn main() -> util::Result<()> {
         Command::Ci => ci::run(&sh),
         Command::Grpc(args) => grpc::run(&sh, args),
         Command::Setup => setup::run(&sh),
+        Command::Completions(args) => {
+            eprintln!(
+                "[xtask] completions for '{}' not yet implemented (Phase 2). \
+                 Shell completion generation is coming in the next phase.",
+                args.shell
+            );
+            Ok(())
+        }
     }
 }
