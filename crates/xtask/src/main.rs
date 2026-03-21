@@ -72,7 +72,7 @@ pub(crate) struct BuildArgs {
 #[derive(Debug, clap::Args)]
 pub(crate) struct TestArgs {
     /// Test a specific crate instead of the whole workspace.
-    #[arg(long, value_name = "CRATE")]
+    #[arg(long = "crate", value_name = "CRATE")]
     pub(crate) crate_name: Option<String>,
 
     /// Run only integration tests (tests/ directory).
