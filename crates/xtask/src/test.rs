@@ -55,11 +55,7 @@ fn run_tests(sh: &Shell, args: &TestArgs, nextest: bool, postgres: bool) -> Resu
         // Integration tests live in crates/weft/tests/; scope to -p weft.
         vec!["-p".to_owned(), "weft".to_owned()]
     } else {
-        vec![
-            "--workspace".to_owned(),
-            "--exclude".to_owned(),
-            "xtask".to_owned(),
-        ]
+        vec!["--workspace".to_owned()]
     };
     let package_scope: Vec<&str> = package_scope_owned.iter().map(String::as_str).collect();
 

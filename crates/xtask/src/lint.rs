@@ -8,7 +8,7 @@ use crate::util::Result;
 /// clippy errors, there is no point checking formatting.
 pub(crate) fn run_lint(sh: &Shell) -> Result<()> {
     eprintln!("[xtask] running clippy...");
-    cmd!(sh, "cargo clippy --workspace --exclude xtask --all-targets -- -D warnings").run()?;
+    cmd!(sh, "cargo clippy --workspace --all-targets -- -D warnings").run()?;
 
     eprintln!("[xtask] checking formatting...");
     cmd!(sh, "cargo fmt --check").run()?;

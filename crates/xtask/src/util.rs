@@ -7,11 +7,14 @@ use std::path::PathBuf;
 pub(crate) type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// Find the workspace root by walking up from `CARGO_MANIFEST_DIR` until a
-/// `Cargo.toml` containing `[workspace]` is found.
+/// `Cargo.toml` containing `[workspace]` with a `members` key is found.
 ///
 /// When invoked via `cargo xtask`, `CARGO_MANIFEST_DIR` is set to the xtask
-/// crate directory (`crates/xtask/`). The walk reaches the repo root, which
-/// contains the workspace manifest.
+/// crate directory (`crates/xtask/`). The xtask Cargo.toml also has a bare
+/// `[workspace]` section (to prevent cargo from including it in the parent
+/// workspace when built directly), so we must skip bare `[workspace]`
+/// declarations that lack `members`. The walk continues to the repo root,
+/// which contains the real workspace manifest with `members`.
 ///
 /// Falls back to the current working directory if `CARGO_MANIFEST_DIR` is
 /// not set (e.g., direct binary invocation outside of cargo).
@@ -26,13 +29,16 @@ pub(crate) fn workspace_root() -> Result<PathBuf> {
         if cargo_toml.exists() {
             let contents = std::fs::read_to_string(&cargo_toml)
                 .map_err(|e| format!("failed to read {}: {e}", cargo_toml.display()))?;
-            if contents.contains("[workspace]") {
+            // A real workspace root has `[workspace]` AND defines `members`.
+            // Skip standalone `[workspace]` declarations (like xtask's) that
+            // only prevent cargo from walking further up.
+            if contents.contains("[workspace]") && contents.contains("members") {
                 return Ok(dir.to_path_buf());
             }
         }
-        dir = dir
-            .parent()
-            .ok_or("cannot find workspace root: no Cargo.toml with [workspace] found")?;
+        dir = dir.parent().ok_or(
+            "cannot find workspace root: no Cargo.toml with [workspace] and members found",
+        )?;
     }
 }
 

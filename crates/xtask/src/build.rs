@@ -21,9 +21,9 @@ pub(crate) fn run(sh: &Shell, args: BuildArgs) -> Result<()> {
     } else {
         eprintln!("[xtask] building workspace...");
         if args.release {
-            cmd!(sh, "cargo build --workspace --exclude xtask --release").run()?;
+            cmd!(sh, "cargo build --workspace --release").run()?;
         } else {
-            cmd!(sh, "cargo build --workspace --exclude xtask").run()?;
+            cmd!(sh, "cargo build --workspace").run()?;
         }
     }
     Ok(())
