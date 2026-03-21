@@ -12,20 +12,50 @@ use weft_core::{
     ContentPart, HookEvent, ModelRoutingInstruction, Role, RoutingActivity, SamplingOptions,
     Source, WeftMessage, WeftRequest,
 };
-use weft_hooks::{HookChainResult, HookRunner};
-use weft_llm::{Provider, ProviderError};
+use weft_hooks_trait::{HookChainResult, HookRunner};
 use weft_reactor_trait::{
     ActivityInput, Budget, EventLog, EventLogError, Execution, ExecutionId, ExecutionStatus,
     PipelineEvent, RoutingSnapshot, ServiceLocator,
 };
 
-// Re-export stub types from trait crates.
+// Imports only needed by test-only builder functions (depend on dev-dep concrete crates).
+#[cfg(test)]
+use weft_llm_trait::{Provider, ProviderError};
+
+// Re-export stub types from concrete crates (available as dev-dependencies only).
+// These are gated behind #[cfg(test)] because dev-dependencies are only linked
+// when compiling this crate's own test binary. When test_support is compiled as
+// a library dependency (even in cfg(test) mode for a downstream crate), dev-deps
+// are not available and these pub use statements would fail to resolve.
+#[cfg(test)]
 pub use weft_commands::test_support::{StubCommandRegistry, reconstruct_command_error};
+#[cfg(test)]
 pub use weft_llm::test_support::{
     ChunkStreamProvider, MidStreamErrorProvider, SingleUseErrorProvider, SlowProvider,
     StubProvider, StubProviderService,
 };
+#[cfg(test)]
 pub use weft_router::test_support::{ErrorRouter, StubRouter};
+
+// ── NullHookRunner ────────────────────────────────────────────────────────────
+
+/// A no-op `HookRunner` that always returns `Allowed`.
+///
+/// Defined locally so `weft_activities` tests do not need `weft_hooks` as a
+/// compile-time dependency (only as a dev-dependency for re-exported stubs).
+pub struct NullHookRunner;
+
+#[async_trait::async_trait]
+impl HookRunner for NullHookRunner {
+    async fn run_chain(
+        &self,
+        _event: HookEvent,
+        payload: serde_json::Value,
+        _matcher_target: Option<&str>,
+    ) -> HookChainResult {
+        HookChainResult::allow(payload)
+    }
+}
 
 // ── NullEventLog ─────────────────────────────────────────────────────────────
 
@@ -89,11 +119,13 @@ impl EventLog for NullEventLog {
 /// A hook runner that blocks a specific event with a fixed reason.
 ///
 /// All other events return `Allowed`.
+#[cfg(test)]
 struct BlockingHookRunner {
     blocking_event: HookEvent,
     reason: String,
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl HookRunner for BlockingHookRunner {
     async fn run_chain(
@@ -164,6 +196,7 @@ impl ServiceLocator for MockServiceLocator {
 // ── Config builders ───────────────────────────────────────────────────────────
 
 /// Build minimal test `WeftConfig`.
+#[cfg(test)]
 fn make_test_config() -> weft_core::WeftConfig {
     let toml = r#"
 [server]
@@ -192,6 +225,7 @@ api_key = "sk-test"
 }
 
 /// Build minimal test `WeftConfig` with memory configured.
+#[cfg(test)]
 fn make_test_config_with_memory() -> weft_core::WeftConfig {
     let toml = r#"
 [server]
@@ -228,10 +262,11 @@ examples = ["conversation history"]
 // ── Services builders ─────────────────────────────────────────────────────────
 
 /// Build `MockServiceLocator` using the given provider and hook runner.
+#[cfg(test)]
 fn build_mock(
     provider: Arc<dyn Provider>,
     hooks: Arc<dyn HookRunner + Send + Sync>,
-    failing_command: Option<(String, weft_commands::CommandError)>,
+    failing_command: Option<(String, weft_commands_trait::CommandError)>,
     failed_result_command: Option<(String, String)>,
     fail_list_commands: bool,
 ) -> MockServiceLocator {
@@ -261,33 +296,37 @@ fn build_mock(
 ///
 /// The provider returns "stub response" text. The hook runner allows all events.
 /// The command registry returns a single stub command.
+#[cfg(test)]
 pub fn make_test_services() -> MockServiceLocator {
     let provider: Arc<dyn Provider> = Arc::new(StubProvider::new("stub response"));
-    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(weft_hooks::NullHookRunner);
+    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(NullHookRunner);
     build_mock(provider, hooks, None, None, false)
 }
 
 /// Build test `MockServiceLocator` whose provider returns a fixed text response.
+#[cfg(test)]
 pub fn make_test_services_with_response(response_text: &str) -> MockServiceLocator {
     let provider: Arc<dyn Provider> = Arc::new(StubProvider::new(response_text));
-    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(weft_hooks::NullHookRunner);
+    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(NullHookRunner);
     build_mock(provider, hooks, None, None, false)
 }
 
 /// Build test `MockServiceLocator` whose provider returns a `ProviderError`.
+#[cfg(test)]
 pub fn make_test_services_with_error(err: ProviderError) -> MockServiceLocator {
     let provider: Arc<dyn Provider> = Arc::new(SingleUseErrorProvider::new(err));
-    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(weft_hooks::NullHookRunner);
+    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(NullHookRunner);
     build_mock(provider, hooks, None, None, false)
 }
 
 /// Build test `MockServiceLocator` where executing a specific command returns a `CommandError`.
+#[cfg(test)]
 pub fn make_test_services_with_command_error(
     command_name: &str,
-    err: weft_commands::CommandError,
+    err: weft_commands_trait::CommandError,
 ) -> MockServiceLocator {
     let provider: Arc<dyn Provider> = Arc::new(StubProvider::new("stub response"));
-    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(weft_hooks::NullHookRunner);
+    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(NullHookRunner);
     build_mock(
         provider,
         hooks,
@@ -298,12 +337,13 @@ pub fn make_test_services_with_command_error(
 }
 
 /// Build test `MockServiceLocator` where a specific command returns `CommandResult { success: false }`.
+#[cfg(test)]
 pub fn make_test_services_with_failed_command(
     command_name: &str,
     error_msg: &str,
 ) -> MockServiceLocator {
     let provider: Arc<dyn Provider> = Arc::new(StubProvider::new("stub response"));
-    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(weft_hooks::NullHookRunner);
+    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(NullHookRunner);
     build_mock(
         provider,
         hooks,
@@ -314,6 +354,7 @@ pub fn make_test_services_with_failed_command(
 }
 
 /// Build test `MockServiceLocator` with a hook runner that blocks the specified event.
+#[cfg(test)]
 pub fn make_test_services_with_blocking_hook(event: HookEvent, reason: &str) -> MockServiceLocator {
     let provider: Arc<dyn Provider> = Arc::new(StubProvider::new("stub response"));
     let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(BlockingHookRunner {
@@ -324,29 +365,32 @@ pub fn make_test_services_with_blocking_hook(event: HookEvent, reason: &str) -> 
 }
 
 /// Build test `MockServiceLocator` whose provider yields delta chunks.
+#[cfg(test)]
 pub fn make_test_services_with_chunk_stream(
     chunks: Vec<String>,
     include_complete: bool,
 ) -> MockServiceLocator {
     let provider: Arc<dyn Provider> = Arc::new(ChunkStreamProvider::new(chunks, include_complete));
-    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(weft_hooks::NullHookRunner);
+    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(NullHookRunner);
     build_mock(provider, hooks, None, None, false)
 }
 
 /// Build test `MockServiceLocator` whose provider stream errors after the first chunk.
+#[cfg(test)]
 pub fn make_test_services_with_mid_stream_error(
     first_chunk: &str,
     err: ProviderError,
 ) -> MockServiceLocator {
     let provider: Arc<dyn Provider> = Arc::new(MidStreamErrorProvider::new(first_chunk, err));
-    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(weft_hooks::NullHookRunner);
+    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(NullHookRunner);
     build_mock(provider, hooks, None, None, false)
 }
 
 /// Build test `MockServiceLocator` whose semantic router always returns an error.
+#[cfg(test)]
 pub fn make_test_services_with_failing_router() -> MockServiceLocator {
     let provider: Arc<dyn Provider> = Arc::new(StubProvider::new("stub response"));
-    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(weft_hooks::NullHookRunner);
+    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(NullHookRunner);
 
     let config = Arc::new(make_test_config());
     let providers: Arc<dyn weft_llm_trait::ProviderService + Send + Sync> =
@@ -368,19 +412,21 @@ pub fn make_test_services_with_failing_router() -> MockServiceLocator {
 }
 
 /// Build test `MockServiceLocator` where `list_commands` returns an error.
+#[cfg(test)]
 pub fn make_test_services_with_failing_list_commands() -> MockServiceLocator {
     let provider: Arc<dyn Provider> = Arc::new(StubProvider::new("stub response"));
-    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(weft_hooks::NullHookRunner);
+    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(NullHookRunner);
     build_mock(provider, hooks, None, None, true)
 }
 
 /// Build test `MockServiceLocator` whose provider delays before responding.
+#[cfg(test)]
 pub fn make_test_services_with_slow_provider(
     delay_secs: u64,
     response_text: &str,
 ) -> MockServiceLocator {
     let provider: Arc<dyn Provider> = Arc::new(SlowProvider::new(delay_secs, response_text));
-    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(weft_hooks::NullHookRunner);
+    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(NullHookRunner);
     build_mock(provider, hooks, None, None, false)
 }
 
@@ -389,9 +435,10 @@ pub fn make_test_services_with_slow_provider(
 /// The config includes `[[memory.stores]]` so `services.config().memory` is Some.
 /// The actual memory service field remains None — only the config matters for the
 /// command_selection activity's `has_memory` check.
+#[cfg(test)]
 pub fn make_test_services_with_memory() -> MockServiceLocator {
     let provider: Arc<dyn Provider> = Arc::new(StubProvider::new("stub response"));
-    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(weft_hooks::NullHookRunner);
+    let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(NullHookRunner);
 
     let config = Arc::new(make_test_config_with_memory());
     let providers: Arc<dyn weft_llm_trait::ProviderService + Send + Sync> =
@@ -471,7 +518,7 @@ pub fn collect_events(rx: &mut mpsc::Receiver<PipelineEvent>) -> Vec<PipelineEve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weft_commands::CommandRegistry as _;
+    use weft_commands_trait::CommandRegistry as _;
 
     #[test]
     fn make_test_services_returns_mock_service_locator() {

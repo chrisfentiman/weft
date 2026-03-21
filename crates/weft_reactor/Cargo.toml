@@ -45,7 +45,7 @@ test-support = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-weft_activities = { path = "../weft_activities", features = ["test-support"] }
+weft_activities = { path = "../weft_activities" }
 weft_eventlog_memory = { path = "../weft_eventlog_memory" }
 weft_llm = { path = "../weft_llm", features = ["test-support"] }
 weft_router = { path = "../weft_router", features = ["test-support"] }

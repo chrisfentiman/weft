@@ -15,12 +15,12 @@ use tracing::{debug, warn};
 
 use weft_core::routing::resolve_filters;
 use weft_core::{HookEvent, ModelInfo, RoutingMode};
-use weft_hooks::HookChainResult;
+use weft_hooks_trait::HookChainResult;
 use weft_reactor_trait::{
     Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, HookOutcome, PipelineEvent,
     SelectionEvent, SemanticSelection, ServiceLocator,
 };
-use weft_router::{RoutingCandidate, RoutingDomainKind, build_model_candidates};
+use weft_router_trait::{RoutingCandidate, RoutingDomainKind, build_model_candidates};
 
 use super::selection_util::extract_user_message;
 

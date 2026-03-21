@@ -1,12 +1,14 @@
-//! `weft_router_trait` — Semantic router trait and domain types.
+//! `weft_router_trait` — Semantic router trait, domain types, and pure utility functions.
 //!
-//! Contains the `SemanticRouter` trait and associated types. The implementation
-//! lives in `weft_router`, which depends on this crate.
+//! Contains the `SemanticRouter` trait, associated types, and utility functions that
+//! operate only on trait-crate types. The implementation lives in `weft_router`,
+//! which depends on this crate.
 //!
 //! Consumers that need the trait boundary without the implementation (e.g.
-//! `weft_reactor_trait`) depend on this crate directly.
+//! `weft_reactor_trait`, `weft_activities`) depend on this crate directly.
 
 use async_trait::async_trait;
+use weft_core::WeftConfig;
 
 // ── Domain types ───────────────────────────────────────────────────────────
 
@@ -108,6 +110,55 @@ pub enum RouterError {
     TokenizationFailed(String),
     #[error("model not loaded")]
     ModelNotLoaded,
+}
+
+// ── Score filter helpers ───────────────────────────────────────────────────
+
+/// Filter scored candidates to those scoring at or above `threshold`.
+///
+/// Does not sort — ordering is preserved from the input.
+pub fn filter_by_threshold(results: Vec<ScoredCandidate>, threshold: f32) -> Vec<ScoredCandidate> {
+    results
+        .into_iter()
+        .filter(|r| r.score >= threshold)
+        .collect()
+}
+
+/// Take the top `n` candidates by score (highest first).
+///
+/// If `results` has fewer than `n` elements, all are returned.
+pub fn take_top(mut results: Vec<ScoredCandidate>, n: usize) -> Vec<ScoredCandidate> {
+    // Sort descending by score. NaN scores sort last (treated as 0).
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results.truncate(n);
+    results
+}
+
+// ── Candidate builders ─────────────────────────────────────────────────────
+
+/// Build Model domain routing candidates from config.
+///
+/// Each `ModelEntry` across all configured providers becomes a `RoutingCandidate`
+/// with the model routing name as `id` and its examples array.
+///
+/// The engine further filters by capability (chat_completions) before including
+/// model candidates in `RoutingInput.domains`.
+pub fn build_model_candidates(config: &WeftConfig) -> Vec<RoutingCandidate> {
+    config
+        .router
+        .providers
+        .iter()
+        .flat_map(|p| {
+            p.models.iter().map(|m| RoutingCandidate {
+                id: m.name.clone(),
+                examples: m.examples.clone(),
+            })
+        })
+        .collect()
 }
 
 // ── SemanticRouter trait ───────────────────────────────────────────────────

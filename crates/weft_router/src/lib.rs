@@ -20,34 +20,12 @@ pub use bert::ModernBertRouter;
 pub use domain::{RoutingCandidate, RoutingDecision, RoutingDomainKind, ScoredCandidate};
 pub use routing_service::{
     MemoryCandidates, MemoryStoreRef, RoutingInput, RoutingResult, build_memory_candidates,
-    build_model_candidates, route_domains, tool_necessity_candidates,
+    route_domains, tool_necessity_candidates,
 };
 // Re-export trait and error from weft_router_trait so existing import paths work.
-pub use weft_router_trait::{RouterError, SemanticRouter};
-
-/// Filter scored candidates to those scoring at or above `threshold`.
-///
-/// Does not sort — ordering is preserved from the input.
-pub fn filter_by_threshold(results: Vec<ScoredCandidate>, threshold: f32) -> Vec<ScoredCandidate> {
-    results
-        .into_iter()
-        .filter(|r| r.score >= threshold)
-        .collect()
-}
-
-/// Take the top `n` candidates by score (highest first).
-///
-/// If `results` has fewer than `n` elements, all are returned.
-pub fn take_top(mut results: Vec<ScoredCandidate>, n: usize) -> Vec<ScoredCandidate> {
-    // Sort descending by score. NaN scores sort last (treated as 0).
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    results.truncate(n);
-    results
-}
+pub use weft_router_trait::{
+    RouterError, SemanticRouter, build_model_candidates, filter_by_threshold, take_top,
+};
 
 #[cfg(test)]
 mod tests {

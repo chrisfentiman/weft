@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 #[cfg(test)]
 use weft_core::Role;
 use weft_core::{ContentPart, WeftMessage};
-use weft_llm::{ProviderChunk, ProviderError, ProviderRequest, ProviderResponse};
+use weft_llm_trait::{ProviderChunk, ProviderError, ProviderRequest, ProviderResponse};
 
 use weft_reactor_trait::{
     Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, GeneratedEvent, GenerationEvent,
@@ -239,8 +239,9 @@ impl Activity for GenerateActivity {
 
         let mut stream: std::pin::Pin<
             Box<
-                dyn futures::Stream<Item = Result<weft_llm::ProviderChunk, weft_llm::ProviderError>>
-                    + Send,
+                dyn futures::Stream<
+                        Item = Result<weft_llm_trait::ProviderChunk, weft_llm_trait::ProviderError>,
+                    > + Send,
             >,
         > = match stream_result {
             Ok(s) => s,
@@ -539,7 +540,7 @@ fn parse_response_to_events(message: &WeftMessage) -> Vec<GeneratedEvent> {
     // the Reactor (Phase 4) will provide the known command set via ActivityInput.
     if !full_text.is_empty() {
         let known_commands = std::collections::HashSet::new();
-        let parsed = weft_commands::parse_response(&full_text, &known_commands);
+        let parsed = weft_commands_trait::parse_response(&full_text, &known_commands);
         for cmd in parsed.invocations {
             // Avoid duplicating CommandInvocations that were already added from CommandCall parts.
             let already_added = events.iter().any(
@@ -601,7 +602,7 @@ fn parse_only_commands_and_done(message: &WeftMessage) -> Vec<GeneratedEvent> {
     // captured CommandCall-based invocations.
     if !full_text.is_empty() {
         let known_commands = std::collections::HashSet::new();
-        let parsed = weft_commands::parse_response(&full_text, &known_commands);
+        let parsed = weft_commands_trait::parse_response(&full_text, &known_commands);
         for cmd in parsed.invocations {
             let already_added = events.iter().any(
                 |e| matches!(e, GeneratedEvent::CommandInvocation(inv) if inv.name == cmd.name),

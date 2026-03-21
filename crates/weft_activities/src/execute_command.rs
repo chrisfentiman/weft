@@ -6,7 +6,7 @@
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
-use weft_commands::CommandError;
+use weft_commands_trait::CommandError;
 use weft_core::CommandInvocation;
 
 use weft_reactor_trait::{

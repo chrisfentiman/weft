@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+weft_core = { path = "../weft_core" }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

@@ -16,10 +16,9 @@ pub mod parser;
 pub mod test_support;
 
 pub use adapter::ToolRegistryCommandAdapter;
-pub use parser::{ParsedResponse, parse_response};
 
-// Re-export trait and error from weft_commands_trait so existing import paths work.
-pub use weft_commands_trait::{CommandError, CommandRegistry};
+// Re-export trait, error, and parser from weft_commands_trait so existing import paths work.
+pub use weft_commands_trait::{CommandError, CommandRegistry, ParsedResponse, parse_response};
 
 // Re-export tool types from weft_tools for consumers that import via weft_commands.
 pub use weft_tools::{

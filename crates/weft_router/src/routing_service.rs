@@ -12,7 +12,7 @@
 //! - `weft_router` does NOT depend on `weft_memory` or `weft_hooks` — pure domain crate.
 //! - `MemoryStoreRef` provides store metadata without a `weft_memory` import.
 
-use weft_core::{CommandStub, RoutingActivity, WeftConfig};
+use weft_core::{CommandStub, RoutingActivity};
 
 use crate::{
     RouterError, RoutingCandidate, RoutingDomainKind, ScoredCandidate, filter_by_threshold,
@@ -97,27 +97,6 @@ pub struct MemoryStoreRef {
 }
 
 // ── Candidate builders ───────────────────────────────────────────────────────
-
-/// Build Model domain routing candidates from config.
-///
-/// Each `ModelEntry` across all configured providers becomes a `RoutingCandidate`
-/// with the model routing name as `id` and its examples array.
-///
-/// The engine further filters by capability (chat_completions) before including
-/// model candidates in `RoutingInput.domains`.
-pub fn build_model_candidates(config: &WeftConfig) -> Vec<RoutingCandidate> {
-    config
-        .router
-        .providers
-        .iter()
-        .flat_map(|p| {
-            p.models.iter().map(|m| RoutingCandidate {
-                id: m.name.clone(),
-                examples: m.examples.clone(),
-            })
-        })
-        .collect()
-}
 
 /// Build memory store routing candidates grouped by capability.
 ///

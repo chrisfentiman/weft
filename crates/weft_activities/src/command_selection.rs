@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use weft_core::{CommandStub, HookEvent};
-use weft_hooks::HookChainResult;
-use weft_router::{RoutingCandidate, RoutingDomainKind, filter_by_threshold, take_top};
+use weft_hooks_trait::HookChainResult;
+use weft_router_trait::{RoutingCandidate, RoutingDomainKind, filter_by_threshold, take_top};
 
 use super::selection_util::extract_user_message;
 use weft_reactor_trait::{

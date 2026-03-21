@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use weft_core::HookEvent;
-use weft_hooks::HookChainResult;
+use weft_hooks_trait::HookChainResult;
 use weft_reactor_trait::{
     Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, HookOutcome, PipelineEvent,
     ServiceLocator,

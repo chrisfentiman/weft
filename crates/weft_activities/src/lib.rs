@@ -20,9 +20,9 @@
 //!
 //! # Dependencies
 //!
-//! This crate depends only on trait crates for the reactor contract, plus
-//! concrete crates that activities directly call (weft_commands for
-//! parse_response, weft_router for routing utilities, etc.).
+//! This crate depends only on trait crates (`weft_llm_trait`, `weft_router_trait`,
+//! `weft_commands_trait`, `weft_hooks_trait`, `weft_memory_trait`). Concrete
+//! implementation crates are dev-dependencies only, used in test stubs.
 
 pub mod assemble_response;
 pub mod command_formatting;
