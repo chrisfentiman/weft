@@ -1883,7 +1883,7 @@ fn empty_response(execution_id: &ExecutionId) -> weft_core::WeftResponse {
 
 // ── Test hooks (unit test access to private free functions) ───────────────────
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_hooks {
     use super::*;
 

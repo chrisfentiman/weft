@@ -3,11 +3,6 @@
 //! Loads configuration, constructs concrete implementations of all components,
 //! wires them into the Reactor, and starts the axum HTTP server.
 
-mod event_log;
-mod grpc;
-mod server;
-mod types;
-
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -34,9 +29,9 @@ use weft_router::{
 };
 use weft_tools::GrpcToolRegistryClient;
 
-use crate::grpc::WeftService;
-use crate::server::build_router;
-use crate::types::BinaryCommandRegistry;
+use weft::grpc::WeftService;
+use weft::server::build_router;
+use weft::types::BinaryCommandRegistry;
 
 /// Weft — AI orchestration gateway
 #[derive(Debug, Parser)]
@@ -460,7 +455,7 @@ async fn main() {
     // Selects InMemoryEventLog or PostgresEventLog based on [event_log] config.
     // Defaults to InMemoryEventLog when the section is absent.
 
-    let event_log = event_log::build_event_log(config.event_log.as_ref())
+    let event_log = weft::event_log::build_event_log(config.event_log.as_ref())
         .await
         .unwrap_or_else(|e| {
             eprintln!("error: event log initialization failed: {e}");
@@ -672,7 +667,7 @@ async fn main() {
     let router = build_router(Arc::clone(&weft_service));
     let bind_address = &config.server.bind_address;
 
-    if let Err(e) = server::serve(router, bind_address).await {
+    if let Err(e) = weft::server::serve(router, bind_address).await {
         eprintln!("error: server failed: {e}");
         std::process::exit(1);
     }

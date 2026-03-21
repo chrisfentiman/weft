@@ -470,7 +470,6 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use axum::{
         body::Body,
         http::{Request, StatusCode},
@@ -478,16 +477,11 @@ mod tests {
     use serde_json::{Value, json};
     use std::collections::{HashMap, HashSet};
     use tower::ServiceExt;
-    use weft_commands::{CommandError, CommandRegistry};
     use weft_core::{
-        ClassifierConfig, CommandDescription, CommandInvocation, CommandResult, CommandStub,
-        ContentPart, DomainsConfig, GatewayConfig, HookEvent, ModelEntry, ProviderConfig, Role,
-        RouterConfig, ServerConfig, Source, WeftConfig, WeftMessage, WireFormat,
+        ClassifierConfig, DomainsConfig, GatewayConfig, HookEvent, ModelEntry, ProviderConfig,
+        RouterConfig, ServerConfig, WeftConfig, WireFormat,
     };
-    use weft_llm::{
-        Capability, Provider, ProviderError, ProviderRegistry, ProviderRequest, ProviderResponse,
-        TokenUsage,
-    };
+    use weft_llm::{Capability, Provider, ProviderRegistry};
     use weft_reactor::{
         ActivityRegistry, Reactor, ReactorConfig,
         activities::{
@@ -499,144 +493,13 @@ mod tests {
         config::{ActivityRef, BudgetConfig, LoopHooks, PipelineConfig, RetryPolicy},
         services::{ReactorHandle, Services},
     };
-    use weft_router::{
-        RouterError, RoutingCandidate, RoutingDecision, RoutingDomainKind, SemanticRouter,
-    };
+    use weft_router::test_support::StubRouter;
 
-    // ── Test mocks ─────────────────────────────────────────────────────────
-
-    struct MockLlmProvider {
-        response: String,
-    }
-
-    impl MockLlmProvider {
-        fn ok(s: &str) -> Self {
-            Self {
-                response: s.to_string(),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Provider for MockLlmProvider {
-        async fn execute(
-            &self,
-            _request: ProviderRequest,
-        ) -> Result<ProviderResponse, ProviderError> {
-            Ok(ProviderResponse::ChatCompletion {
-                message: WeftMessage {
-                    role: Role::Assistant,
-                    source: Source::Provider,
-                    model: None,
-                    content: vec![ContentPart::Text(self.response.clone())],
-                    delta: false,
-                    message_index: 0,
-                },
-                usage: Some(TokenUsage {
-                    prompt_tokens: 5,
-                    completion_tokens: 3,
-                }),
-            })
-        }
-
-        fn name(&self) -> &str {
-            "mock"
-        }
-    }
-
-    struct RateLimitedLlm;
-
-    #[async_trait]
-    impl Provider for RateLimitedLlm {
-        async fn execute(
-            &self,
-            _request: ProviderRequest,
-        ) -> Result<ProviderResponse, ProviderError> {
-            Err(ProviderError::RateLimited {
-                retry_after_ms: 2000,
-            })
-        }
-
-        fn name(&self) -> &str {
-            "rate-limited"
-        }
-    }
-
-    struct FailingLlm;
-
-    #[async_trait]
-    impl Provider for FailingLlm {
-        async fn execute(
-            &self,
-            _request: ProviderRequest,
-        ) -> Result<ProviderResponse, ProviderError> {
-            Err(ProviderError::RequestFailed("internal".to_string()))
-        }
-
-        fn name(&self) -> &str {
-            "failing"
-        }
-    }
-
-    struct MockRouter;
-
-    #[async_trait]
-    impl SemanticRouter for MockRouter {
-        async fn route(
-            &self,
-            _user_message: &str,
-            domains: &[(RoutingDomainKind, Vec<RoutingCandidate>)],
-        ) -> Result<RoutingDecision, RouterError> {
-            let mut decision = RoutingDecision::empty();
-            for (kind, candidates) in domains {
-                if let RoutingDomainKind::Commands = kind {
-                    decision.commands = candidates
-                        .iter()
-                        .map(|c| weft_router::ScoredCandidate {
-                            id: c.id.clone(),
-                            score: 1.0,
-                        })
-                        .collect();
-                }
-            }
-            Ok(decision)
-        }
-
-        async fn score_memory_candidates(
-            &self,
-            _text: &str,
-            candidates: &[RoutingCandidate],
-        ) -> Result<Vec<weft_router::ScoredCandidate>, RouterError> {
-            // Score all candidates 1.0 for server tests (memory routing not tested here).
-            Ok(candidates
-                .iter()
-                .map(|c| weft_router::ScoredCandidate {
-                    id: c.id.clone(),
-                    score: 1.0,
-                })
-                .collect())
-        }
-    }
-
-    struct MockRegistry;
-
-    #[async_trait]
-    impl CommandRegistry for MockRegistry {
-        async fn list_commands(&self) -> Result<Vec<CommandStub>, CommandError> {
-            Ok(vec![])
-        }
-
-        async fn describe_command(&self, name: &str) -> Result<CommandDescription, CommandError> {
-            Err(CommandError::NotFound(name.to_string()))
-        }
-
-        async fn execute_command(
-            &self,
-            invocation: &CommandInvocation,
-        ) -> Result<CommandResult, CommandError> {
-            Err(CommandError::NotFound(invocation.name.clone()))
-        }
-    }
+    // ── Minimal test infrastructure for server unit tests ──────────────────
+    //
+    // Integration tests and their full infrastructure live in tests/http_integration.rs.
+    // These helpers provide just enough to exercise the request handler for
+    // validation and error-mapping unit tests.
 
     fn test_config() -> Arc<WeftConfig> {
         Arc::new(WeftConfig {
@@ -682,7 +545,8 @@ mod tests {
         })
     }
 
-    fn make_provider_registry(llm: impl Provider + 'static) -> Arc<ProviderRegistry> {
+    fn make_unit_test_router(llm: impl Provider + 'static) -> Router {
+        let config = test_config();
         let mut providers = HashMap::new();
         providers.insert(
             "test-model".to_string(),
@@ -690,8 +554,8 @@ mod tests {
         );
         let mut model_ids = HashMap::new();
         model_ids.insert("test-model".to_string(), "claude-test".to_string());
-        let mut max_tokens = HashMap::new();
-        max_tokens.insert("test-model".to_string(), 1024u32);
+        let mut max_tokens_map = HashMap::new();
+        max_tokens_map.insert("test-model".to_string(), 1024u32);
         let mut caps: HashMap<String, HashSet<Capability>> = HashMap::new();
         caps.insert(
             "test-model".to_string(),
@@ -699,16 +563,27 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        Arc::new(ProviderRegistry::new(
+        let provider_registry = Arc::new(ProviderRegistry::new(
             providers,
             model_ids,
-            max_tokens,
+            max_tokens_map,
             caps,
             "test-model".to_string(),
-        ))
-    }
+        ));
 
-    fn build_test_activity_registry() -> ActivityRegistry {
+        let services = Arc::new(Services {
+            config: Arc::clone(&config),
+            providers: provider_registry as Arc<dyn weft_llm::ProviderService + Send + Sync>,
+            router: Arc::new(StubRouter) as Arc<dyn weft_router::SemanticRouter + Send + Sync>,
+            commands: Arc::new(weft_commands::test_support::StubCommandRegistry::new())
+                as Arc<dyn weft_commands::CommandRegistry + Send + Sync>,
+            memory: None,
+            hooks: Arc::new(weft_hooks::HookRegistry::empty())
+                as Arc<dyn weft_hooks::HookRunner + Send + Sync>,
+            reactor_handle: std::sync::OnceLock::new(),
+            request_end_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+        });
+
         let mut registry = ActivityRegistry::new();
         registry.register(Arc::new(ValidateActivity)).unwrap();
         registry.register(Arc::new(ModelSelectionActivity)).unwrap();
@@ -732,26 +607,22 @@ mod tests {
         registry
             .register(Arc::new(AssembleResponseActivity))
             .unwrap();
-        registry
-            .register(Arc::new(HookActivity::new(HookEvent::RequestStart)))
-            .unwrap();
-        registry
-            .register(Arc::new(HookActivity::new(HookEvent::RequestEnd)))
-            .unwrap();
-        registry
-            .register(Arc::new(HookActivity::new(HookEvent::PreResponse)))
-            .unwrap();
-        registry
-            .register(Arc::new(HookActivity::new(HookEvent::PreToolUse)))
-            .unwrap();
-        registry
-            .register(Arc::new(HookActivity::new(HookEvent::PostToolUse)))
-            .unwrap();
-        registry
-    }
+        for event in [
+            HookEvent::RequestStart,
+            HookEvent::RequestEnd,
+            HookEvent::PreResponse,
+            HookEvent::PreToolUse,
+            HookEvent::PostToolUse,
+        ] {
+            registry
+                .register(Arc::new(HookActivity::new(event)))
+                .unwrap();
+        }
 
-    fn build_test_reactor_config(config: &WeftConfig) -> ReactorConfig {
-        ReactorConfig {
+        let event_log: Arc<dyn weft_reactor::event_log::EventLog> =
+            Arc::new(weft_eventlog_memory::InMemoryEventLog::new());
+
+        let reactor_config = ReactorConfig {
             pipelines: vec![PipelineConfig {
                 name: "default".to_string(),
                 pre_loop: vec![
@@ -771,8 +642,6 @@ mod tests {
                 generate: ActivityRef::WithConfig {
                     name: "generate".to_string(),
                     config: serde_json::Value::Null,
-                    // No retries in tests: retries add multi-second backoff delays
-                    // and are tested in weft_reactor unit tests, not here.
                     retry: Some(RetryPolicy {
                         max_retries: 0,
                         initial_backoff_ms: 0,
@@ -793,49 +662,26 @@ mod tests {
                 generation_timeout_secs: config.gateway.request_timeout_secs,
                 command_timeout_secs: 10,
             },
-        }
-    }
-
-    fn make_weft_service(llm: impl Provider + 'static) -> Arc<WeftService> {
-        let config = test_config();
-
-        let provider_registry = make_provider_registry(llm);
-
-        let services = Arc::new(Services {
-            config: Arc::clone(&config),
-            providers: provider_registry as Arc<dyn weft_llm::ProviderService + Send + Sync>,
-            router: Arc::new(MockRouter) as Arc<dyn weft_router::SemanticRouter + Send + Sync>,
-            commands: Arc::new(MockRegistry)
-                as Arc<dyn weft_commands::CommandRegistry + Send + Sync>,
-            memory: None,
-            hooks: Arc::new(weft_hooks::HookRegistry::empty())
-                as Arc<dyn weft_hooks::HookRunner + Send + Sync>,
-            reactor_handle: std::sync::OnceLock::new(),
-            request_end_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
-        });
-
-        let registry = Arc::new(build_test_activity_registry());
-        let event_log: Arc<dyn weft_reactor::event_log::EventLog> =
-            Arc::new(weft_eventlog_memory::InMemoryEventLog::new());
-        let reactor_config = build_test_reactor_config(&config);
+        };
 
         let reactor = Arc::new(
-            Reactor::new(Arc::clone(&services), event_log, registry, &reactor_config)
-                .expect("test reactor must construct"),
+            Reactor::new(
+                Arc::clone(&services),
+                event_log,
+                Arc::new(registry),
+                &reactor_config,
+            )
+            .expect("test reactor must construct"),
         );
 
-        // Wire ReactorHandle to break the circular dependency.
         let handle = Arc::new(ReactorHandle::new(Arc::clone(&reactor)));
         services
             .reactor_handle
             .set(handle)
             .expect("OnceLock must be unset");
 
-        Arc::new(WeftService::new(reactor, config))
-    }
-
-    fn make_router(llm: impl Provider + 'static) -> Router {
-        build_router(make_weft_service(llm))
+        let weft_service = Arc::new(WeftService::new(reactor, config));
+        build_router(weft_service)
     }
 
     async fn post_json(router: Router, body: Value) -> (StatusCode, Value) {
@@ -855,25 +701,11 @@ mod tests {
         (status, json)
     }
 
-    // ── HTTP tests ─────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn test_valid_request_returns_200() {
-        let router = make_router(MockLlmProvider::ok("Hello there!"));
-        let body = json!({
-            "model": "auto",
-            "messages": [{"role": "user", "content": "Hi"}]
-        });
-        let (status, resp) = post_json(router, body).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(resp["object"], "chat.completion");
-        assert_eq!(resp["choices"][0]["message"]["content"], "Hello there!");
-        assert!(resp["id"].as_str().unwrap().starts_with("chatcmpl-"));
-    }
+    // ── Validation unit tests ───────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_invalid_json_returns_4xx() {
-        let router = make_router(MockLlmProvider::ok("irrelevant"));
+        let router = make_unit_test_router(weft_llm::test_support::StubProvider::new("irrelevant"));
         let req = Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
@@ -892,7 +724,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_messages_returns_400() {
-        let router = make_router(MockLlmProvider::ok("irrelevant"));
+        let router = make_unit_test_router(weft_llm::test_support::StubProvider::new("irrelevant"));
         let body = json!({
             "model": "gpt-4",
             "messages": []
@@ -904,7 +736,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_user_message_returns_400() {
-        let router = make_router(MockLlmProvider::ok("irrelevant"));
+        let router = make_unit_test_router(weft_llm::test_support::StubProvider::new("irrelevant"));
         let body = json!({
             "model": "gpt-4",
             "messages": [{"role": "system", "content": "system only"}]
@@ -916,7 +748,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_true_returns_400() {
-        let router = make_router(MockLlmProvider::ok("irrelevant"));
+        let router = make_unit_test_router(weft_llm::test_support::StubProvider::new("irrelevant"));
         let body = json!({
             "model": "gpt-4",
             "messages": [{"role": "user", "content": "stream please"}],
@@ -925,115 +757,6 @@ mod tests {
         let (status, resp) = post_json(router, body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(resp["error"]["message"].is_string());
-    }
-
-    #[tokio::test]
-    async fn test_llm_error_returns_500() {
-        let router = make_router(FailingLlm);
-        let body = json!({
-            "model": "auto",
-            "messages": [{"role": "user", "content": "Hello"}]
-        });
-        let (status, _) = post_json(router, body).await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[tokio::test]
-    async fn test_rate_limited_returns_429_with_retry_after() {
-        let router = make_router(RateLimitedLlm);
-        let body = json!({
-            "model": "auto",
-            "messages": [{"role": "user", "content": "Hello"}]
-        });
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&body).unwrap()))
-            .unwrap();
-
-        let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-        // retry_after_ms=2000 → Retry-After: 2 seconds
-        assert_eq!(
-            resp.headers()
-                .get("Retry-After")
-                .and_then(|v| v.to_str().ok()),
-            Some("2")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_response_contains_usage() {
-        let router = make_router(MockLlmProvider::ok("Done"));
-        let body = json!({
-            "model": "auto",
-            "messages": [{"role": "user", "content": "Hi"}]
-        });
-        let (status, resp) = post_json(router, body).await;
-        assert_eq!(status, StatusCode::OK);
-        let usage = &resp["usage"];
-        assert_eq!(usage["prompt_tokens"], 5);
-        assert_eq!(usage["completion_tokens"], 3);
-        assert_eq!(usage["total_tokens"], 8);
-    }
-
-    #[tokio::test]
-    async fn test_health_endpoint_returns_200() {
-        let weft_service = make_weft_service(MockLlmProvider::ok("irrelevant"));
-        let router = build_router(Arc::clone(&weft_service));
-
-        let req = Request::builder()
-            .method("GET")
-            .uri("/health")
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let health: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(health["status"], "ok");
-        assert!(health["classifier_loaded"].is_boolean());
-        assert!(health["tool_registry_connected"].is_boolean());
-        // grpc_service field must be present
-        assert!(health["grpc_service"].is_string());
-        assert_eq!(health["grpc_service"], "serving");
-    }
-
-    #[tokio::test]
-    async fn test_response_model_preserved_from_request() {
-        // The model field from the request is echoed back verbatim in the response,
-        // regardless of which internal model handled the request.
-        // Use "test-model" which matches the test config so routing succeeds.
-        let router = make_router(MockLlmProvider::ok("Hi"));
-        let body = json!({
-            "model": "test-model",
-            "messages": [{"role": "user", "content": "Hello"}]
-        });
-        let (status, resp) = post_json(router, body).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(resp["model"], "test-model");
-    }
-
-    #[tokio::test]
-    async fn test_error_body_format() {
-        let router = make_router(FailingLlm);
-        let body = json!({
-            "model": "auto",
-            "messages": [{"role": "user", "content": "Hello"}]
-        });
-        let (_, resp) = post_json(router, body).await;
-
-        // Must have the OpenAI error envelope
-        assert!(resp["error"]["message"].is_string());
-        assert!(resp["error"]["type"].is_string());
-        // code is present (may be null)
-        assert!(resp["error"].get("code").is_some());
     }
 
     // ── ApiError status code mapping tests ─────────────────────────────────
@@ -1142,11 +865,11 @@ mod tests {
 
     #[test]
     fn test_weft_to_openai_extracts_assistant_text() {
-        use weft_core::{WeftResponse, WeftTiming, WeftUsage};
+        use weft_core::{ContentPart, Source, WeftResponse, WeftTiming, WeftUsage};
         let resp = WeftResponse {
             id: "chatcmpl-test".to_string(),
             model: "gpt-4".to_string(),
-            messages: vec![WeftMessage {
+            messages: vec![weft_core::WeftMessage {
                 role: Role::Assistant,
                 source: Source::Provider,
                 model: Some("gpt-4".to_string()),
@@ -1183,76 +906,5 @@ mod tests {
         let openai_resp = weft_to_openai(resp, "auto".to_string());
         // No assistant message → empty content, not a panic
         assert_eq!(openai_resp.choices[0].message.content, "");
-    }
-
-    // ── Dual-listener test ─────────────────────────────────────────────────
-
-    /// Verify that the combined `build_router()` routes gRPC-content-type requests
-    /// to the tonic handler, not the axum HTTP handler.
-    ///
-    /// Real gRPC requires HTTP/2 framing and prost-encoded bodies. A unit test using
-    /// `tower::ServiceExt::oneshot` sends HTTP/1.1, so the tonic handler will reject
-    /// the request with a gRPC status error — but the key observable is that the
-    /// response carries `content-type: application/grpc` (set by tonic), which proves
-    /// the request was dispatched to the tonic router and NOT handled by the axum
-    /// JSON handlers (which would return `application/json` or a 404/405).
-    ///
-    /// A true end-to-end dual-listener integration test (binding a real port and
-    /// connecting a tonic client) lives in the integration test suite and requires
-    /// a running tokio runtime with a real TCP listener. See `tests/grpc_integration.rs`
-    /// (placeholder) for that path.
-    #[tokio::test]
-    async fn test_grpc_content_type_routes_to_tonic_handler() {
-        let router = make_router(MockLlmProvider::ok("irrelevant"));
-
-        // Send a request with the gRPC content-type header.
-        // The URI matches the tonic-generated service path: /weft.v1.Weft/Chat
-        let req = Request::builder()
-            .method("POST")
-            .uri("/weft.v1.Weft/Chat")
-            .header("content-type", "application/grpc+proto")
-            // te: trailers is required by gRPC spec; tonic checks for it
-            .header("te", "trailers")
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = router.oneshot(req).await.unwrap();
-
-        // Tonic sets content-type: application/grpc on ALL responses it handles,
-        // including error responses. If routing had fallen through to axum, we would
-        // receive application/json (error body) or a 404, not application/grpc.
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert!(
-            content_type.starts_with("application/grpc"),
-            "expected gRPC content-type from tonic handler, got: {content_type:?}"
-        );
-    }
-
-    // ── Single code path test ───────────────────────────────────────────────
-
-    /// Both HTTP and gRPC entry points share the same WeftService instance.
-    /// This test verifies that build_router wires Arc<WeftService> correctly:
-    /// the same service handles requests from both protocols.
-    #[tokio::test]
-    async fn test_shared_weft_service_single_code_path() {
-        // The WeftService is constructed once and shared via Arc.
-        // We verify the HTTP path successfully calls handle_weft_request on it.
-        let weft_service = make_weft_service(MockLlmProvider::ok("shared path response"));
-        let router = build_router(Arc::clone(&weft_service));
-
-        let body = json!({
-            "model": "auto",
-            "messages": [{"role": "user", "content": "test single code path"}]
-        });
-        let (status, resp) = post_json(router, body).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            resp["choices"][0]["message"]["content"],
-            "shared path response"
-        );
     }
 }
