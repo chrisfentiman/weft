@@ -1,2 +1,2 @@
 [alias]
-xtask = "run --manifest-path crates/xtask/Cargo.toml --"
+xtask = "run --quiet --manifest-path crates/xtask/Cargo.toml --"
