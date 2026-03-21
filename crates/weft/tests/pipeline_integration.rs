@@ -160,7 +160,7 @@ async fn test_system_prompt_layers_gateway_and_caller() {
 
     let commands = weft_commands::test_support::StubCommandRegistry::new();
     let (svc, event_log) = make_weft_service_with_event_log(TestProvider::ok("Response"), commands);
-    let router = build_router(svc);
+    let router = build_router(svc, None);
 
     // Request with caller-supplied system message.
     // Via HTTP, this gets Source::Gateway (see openai_to_weft), so it is NOT treated as

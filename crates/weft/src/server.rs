@@ -3,6 +3,7 @@
 //! Endpoints:
 //! - `POST /v1/chat/completions` — OpenAI-compatible chat completions
 //! - `GET /health`               — Health check for load balancers
+//! - `GET /metrics`              — Prometheus metrics (when enabled)
 //!
 //! Both gRPC and HTTP are served on the same port. The gRPC server handles
 //! requests with `content-type: application/grpc`; axum handles everything else.
@@ -13,10 +14,11 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::State,
-    http::{StatusCode, header},
+    http::{self, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use metrics_exporter_prometheus::PrometheusHandle;
 use serde::{Deserialize, Serialize};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
@@ -184,13 +186,19 @@ fn unix_timestamp() -> u64 {
 /// Build the combined axum+gRPC tower service.
 ///
 /// Returns an axum `Router` that handles HTTP endpoints (`/v1/chat/completions`,
-/// `/health`) merged with the tonic gRPC router. Both entry points share the
-/// same `Arc<WeftService>` instance and converge at `handle_weft_request()`.
+/// `/health`, `/metrics`) merged with the tonic gRPC router. Both entry points
+/// share the same `Arc<WeftService>` instance and converge at `handle_weft_request()`.
 ///
 /// Uses `tonic::service::Routes::into_axum_router()` to compose the gRPC server
 /// with axum on a single port. The tonic router handles `content-type: application/grpc`;
 /// axum handles everything else.
-pub fn build_router(weft_service: Arc<WeftService>) -> Router {
+///
+/// When `prometheus_handle` is `Some`, a `GET /metrics` route is added that renders
+/// metrics in Prometheus text exposition format. When `None`, the route is omitted.
+pub fn build_router(
+    weft_service: Arc<WeftService>,
+    prometheus_handle: Option<PrometheusHandle>,
+) -> Router {
     // Build the gRPC router via tonic's axum integration.
     // tonic::service::Routes::new() wraps a NamedService + tower::Service.
     // into_axum_router() returns an axum Router that handles gRPC content-type requests.
@@ -200,10 +208,17 @@ pub fn build_router(weft_service: Arc<WeftService>) -> Router {
     .into_axum_router();
 
     // Build the HTTP axum router for OpenAI compat + health.
-    let http_router = Router::new()
+    let mut http_router = Router::new()
         .route("/v1/chat/completions", post(chat_completions_handler))
         .route("/health", get(health_handler))
         .with_state(Arc::clone(&weft_service));
+
+    // Add the Prometheus /metrics endpoint when metrics are enabled.
+    // PrometheusHandle is Clone, so we move it into the handler via closure state.
+    if let Some(handle) = prometheus_handle {
+        http_router =
+            http_router.route("/metrics", get(move || prometheus_handler(handle.clone())));
+    }
 
     // Merge: gRPC router handles application/grpc requests; HTTP router handles the rest.
     // axum's `merge` composes two routers — tonic's router takes priority for gRPC paths.
@@ -305,6 +320,26 @@ async fn chat_completions_handler(
         Ok(weft_resp) => Ok(Json(weft_to_openai(weft_resp, request_model))),
         Err(e) => Err(ApiError::from_weft_error(e)),
     }
+}
+
+/// `GET /metrics`
+///
+/// Returns current metrics in Prometheus text exposition format.
+///
+/// Renders all registered metrics using the provided `PrometheusHandle`.
+/// The content type is `text/plain; charset=utf-8` as required by the
+/// Prometheus exposition format specification.
+///
+/// This endpoint has no authentication. It is on the same port as the API.
+async fn prometheus_handler(handle: PrometheusHandle) -> impl IntoResponse {
+    let metrics_text = handle.render();
+    (
+        [(
+            http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        metrics_text,
+    )
 }
 
 /// `GET /health`
@@ -690,7 +725,8 @@ mod tests {
             .expect("OnceLock must be unset");
 
         let weft_service = Arc::new(WeftService::new(reactor, config));
-        build_router(weft_service)
+        // Tests do not need Prometheus — pass None for the handle.
+        build_router(weft_service, None)
     }
 
     async fn post_json(router: Router, body: Value) -> (StatusCode, Value) {

@@ -40,6 +40,8 @@ toml = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 uuid = { workspace = true }
 regex = { workspace = true }
 rhai = { workspace = true }
@@ -62,3 +64,4 @@ mockito = { workspace = true }
 tempfile = { version = "3" }
 pretty_assertions.workspace = true
 rstest.workspace = true
+metrics-util = { version = "0.19" }

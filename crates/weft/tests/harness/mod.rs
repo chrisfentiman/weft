@@ -322,7 +322,7 @@ pub fn make_weft_service(llm: impl Provider + 'static) -> Arc<WeftService> {
 
 /// Build a fully wired axum `Router` backed by the given provider.
 pub fn make_router(llm: impl Provider + 'static) -> Router {
-    build_router(make_weft_service(llm))
+    build_router(make_weft_service(llm), None)
 }
 
 /// POST a JSON body to `/v1/chat/completions` and return the (status, parsed body).
@@ -760,7 +760,7 @@ pub fn make_router_with_event_log(
     commands: impl CommandRegistry + 'static,
 ) -> (Router, Arc<weft_eventlog_memory::InMemoryEventLog>) {
     let (svc, log) = make_weft_service_with_event_log(llm, commands);
-    (build_router(svc), log)
+    (build_router(svc, None), log)
 }
 
 /// Build a fully wired `Arc<WeftService>` with a custom config, provider, and command registry.

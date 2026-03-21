@@ -184,7 +184,7 @@ async fn test_command_loop_full_cycle() {
     let provider_clone = provider.clone();
 
     let (svc, event_log) = make_weft_service_with_event_log(provider, commands);
-    let router = build_router(svc);
+    let router = build_router(svc, None);
 
     let body = json!({
         "model": "auto",
@@ -287,7 +287,7 @@ async fn test_command_loop_respects_iteration_limit() {
     let provider_clone = provider.clone();
 
     let (svc, event_log) = make_weft_service_with_config(config, provider, commands);
-    let router = build_router(svc);
+    let router = build_router(svc, None);
 
     let body = json!({
         "model": "auto",
@@ -365,7 +365,7 @@ async fn test_multiple_commands_in_single_response() {
     let provider_clone = provider.clone();
 
     let (svc, event_log) = make_weft_service_with_event_log(provider, commands);
-    let router = build_router(svc);
+    let router = build_router(svc, None);
 
     let body = json!({
         "model": "auto",

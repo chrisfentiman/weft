@@ -107,7 +107,7 @@ async fn test_response_contains_usage() {
 #[tokio::test]
 async fn test_health_endpoint_returns_200() {
     let weft_service = make_weft_service(TestProvider::ok("irrelevant"));
-    let router = build_router(std::sync::Arc::clone(&weft_service));
+    let router = build_router(std::sync::Arc::clone(&weft_service), None);
 
     let req = Request::builder()
         .method("GET")
@@ -170,7 +170,7 @@ async fn test_error_body_format() {
 #[tokio::test]
 async fn test_shared_weft_service_single_code_path() {
     let weft_service = make_weft_service(TestProvider::ok("shared path response"));
-    let router = build_router(std::sync::Arc::clone(&weft_service));
+    let router = build_router(std::sync::Arc::clone(&weft_service), None);
 
     let body = json!({
         "model": "auto",
@@ -219,5 +219,92 @@ async fn test_grpc_content_type_routes_to_tonic_handler() {
     assert!(
         content_type.starts_with("application/grpc"),
         "expected gRPC content-type from tonic handler, got: {content_type:?}"
+    );
+}
+
+// ── Prometheus /metrics endpoint tests ────────────────────────────────────────
+
+/// When a `PrometheusHandle` is supplied, `GET /metrics` returns HTTP 200 with
+/// `content-type: text/plain` and Prometheus text-format body.
+#[tokio::test]
+async fn test_metrics_endpoint_returns_200_when_enabled() {
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
+    // Install a fresh recorder for this test. Each test binary starts a new process,
+    // so there is no collision with the global recorder from other tests.
+    let handle = PrometheusBuilder::new()
+        .install_recorder()
+        .expect("PrometheusBuilder must succeed in integration tests");
+
+    let router = build_router(
+        make_weft_service(TestProvider::ok("irrelevant")),
+        Some(handle),
+    );
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/metrics")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = router.oneshot(req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "/metrics must return 200 when Prometheus is enabled"
+    );
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.starts_with("text/plain"),
+        "/metrics content-type must be text/plain, got: {content_type:?}"
+    );
+
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = std::str::from_utf8(&bytes).expect("/metrics body must be valid UTF-8");
+
+    // A valid Prometheus text-format response starts with "# HELP" lines or is empty.
+    // We only verify it is valid UTF-8 and does not contain an error indicator.
+    assert!(
+        !body.contains("error"),
+        "/metrics body must not contain error text, got: {body}"
+    );
+}
+
+/// When no `PrometheusHandle` is supplied, `GET /metrics` does NOT return
+/// a Prometheus text-format response (content-type is not `text/plain; version=0.0.4`).
+///
+/// The underlying gRPC router may still respond to the path (it catches all unmatched
+/// routes), but it must not serve Prometheus metrics.
+#[tokio::test]
+async fn test_metrics_endpoint_not_prometheus_when_disabled() {
+    let router = build_router(make_weft_service(TestProvider::ok("irrelevant")), None);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/metrics")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = router.oneshot(req).await.unwrap();
+
+    // The /metrics route is absent from the axum HTTP router. Either the gRPC router
+    // intercepts the request (no Prometheus content-type) or axum returns 404.
+    // Either way, the Prometheus content-type header must not be present.
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        !content_type.starts_with("text/plain; version=0.0.4"),
+        "/metrics must not serve Prometheus format when disabled, got content-type: {content_type:?}"
     );
 }

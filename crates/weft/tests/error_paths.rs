@@ -116,7 +116,7 @@ async fn test_command_failure_injected_and_pipeline_continues() {
     let provider_clone = provider.clone();
 
     let (svc, event_log) = make_weft_service_with_event_log(provider, commands);
-    let router = build_router(svc);
+    let router = build_router(svc, None);
 
     let body = json!({
         "model": "auto",
@@ -241,7 +241,7 @@ async fn test_sampling_parameters_clamped_and_passed() {
     let provider_clone = provider.clone();
 
     let (svc, event_log) = make_weft_service_with_event_log(provider, commands);
-    let router = build_router(svc);
+    let router = build_router(svc, None);
 
     let body = json!({
         "model": "auto",

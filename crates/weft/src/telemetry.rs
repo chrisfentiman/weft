@@ -14,16 +14,23 @@
 //! | `RUST_LOG` | `info` | Standard tracing filter expression |
 //! | `WEFT_LOG_FORMAT` | `text` | Log format: `"text"` or `"json"` |
 //! | `WEFT_LOG_SPAN_EVENTS` | `false` | Include span open/close in output |
+//! | `WEFT_PROMETHEUS_ENABLED` | `true` | Enable Prometheus `/metrics` endpoint |
 //! | `OTEL_EXPORTER_OTLP_ENDPOINT` | (unset) | OTLP endpoint (enables OTel when set — Phase 3) |
 //! | `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` | OTLP protocol: `"grpc"` or `"http/protobuf"` (Phase 3) |
 //! | `OTEL_SERVICE_NAME` | `weft` | Service name in OTel resource (Phase 3) |
 
+pub mod metrics_layer;
+
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use tracing::info;
 use tracing_subscriber::{
     EnvFilter, Layer,
     fmt::{self, format::FmtSpan},
     layer::SubscriberExt,
     util::SubscriberInitExt,
 };
+
+use crate::telemetry::metrics_layer::MetricsLayer;
 
 /// Log output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +56,8 @@ pub struct TelemetryConfig {
     pub log_format: LogFormat,
     /// Whether to include span open/close events in log output. Default: false.
     pub log_span_events: bool,
+    /// Whether the Prometheus `/metrics` endpoint is enabled. Default: true.
+    pub prometheus_enabled: bool,
     /// OTLP endpoint (Phase 3). When set, enables OTel export.
     pub otlp_endpoint: Option<String>,
     /// OTLP protocol: grpc or http/protobuf. Default: grpc.
@@ -76,6 +85,11 @@ impl TelemetryConfig {
             .unwrap_or("false")
             == "true";
 
+        let prometheus_enabled = std::env::var("WEFT_PROMETHEUS_ENABLED")
+            .as_deref()
+            .unwrap_or("true")
+            != "false";
+
         let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
 
         let otlp_protocol = match std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL")
@@ -92,6 +106,7 @@ impl TelemetryConfig {
         Self {
             log_format,
             log_span_events,
+            prometheus_enabled,
             otlp_endpoint,
             otlp_protocol,
             service_name,
@@ -102,10 +117,20 @@ impl TelemetryConfig {
 /// Guard that must be held for the program's lifetime.
 ///
 /// When dropped, flushes any buffered output and shuts down background
-/// exporters. Phase 3 will hold an OTel `SdkTracerProvider` here.
+/// exporters. Holds the `PrometheusHandle` used to serve the `/metrics` endpoint.
+/// Phase 3 will hold an OTel `SdkTracerProvider` here.
 pub struct TelemetryGuard {
-    // Phase 3: opentelemetry_sdk::trace::SdkTracerProvider
-    _private: (),
+    /// Prometheus metrics handle. `None` when Prometheus is disabled.
+    prometheus_handle: Option<PrometheusHandle>,
+}
+
+impl TelemetryGuard {
+    /// Return the Prometheus handle if Prometheus is enabled.
+    ///
+    /// The handle is `Clone + Send + Sync` and is used to serve the `/metrics` endpoint.
+    pub fn prometheus_handle(&self) -> Option<&PrometheusHandle> {
+        self.prometheus_handle.as_ref()
+    }
 }
 
 impl Drop for TelemetryGuard {
@@ -122,6 +147,10 @@ impl Drop for TelemetryGuard {
 /// Returns a [`TelemetryGuard`] that must be held for the lifetime of the
 /// program. Dropping it before program exit may lose buffered log output
 /// or OTel spans.
+///
+/// When `config.prometheus_enabled` is `true`, installs a Prometheus metrics
+/// recorder and adds the `MetricsLayer` to the subscriber stack. The
+/// `PrometheusHandle` is accessible via [`TelemetryGuard::prometheus_handle`].
 ///
 /// # Panics
 ///
@@ -151,15 +180,50 @@ pub fn init(config: &TelemetryConfig) -> TelemetryGuard {
             .boxed(),
     };
 
-    // Phase 2: .with(MetricsLayer::new())
+    // Install Prometheus recorder and add MetricsLayer when Prometheus is enabled.
+    let prometheus_handle = if config.prometheus_enabled {
+        match PrometheusBuilder::new().install_recorder() {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                // Telemetry init failure is non-fatal: the gateway still serves requests.
+                // Log via eprintln because the subscriber is not yet initialized.
+                eprintln!(
+                    "warn: failed to install Prometheus metrics recorder: {e} — metrics disabled"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // The MetricsLayer is only added when Prometheus is enabled.
+    // Option<MetricsLayer> implements Layer as a no-op when None.
+    let metrics_layer: Option<MetricsLayer> = if prometheus_handle.is_some() {
+        Some(MetricsLayer::new())
+    } else {
+        None
+    };
+
     // Phase 3: .with(otel_layer)  — optional OpenTelemetryLayer
 
     let _ = tracing_subscriber::registry()
         .with(env_filter)
         .with(fmt_layer)
+        .with(metrics_layer)
         .try_init();
 
-    TelemetryGuard { _private: () }
+    // Log telemetry configuration at INFO level. This uses tracing so it only
+    // fires after the subscriber is initialized above.
+    info!(
+        log_format = ?config.log_format,
+        otlp_enabled = config.otlp_endpoint.is_some(),
+        prometheus_enabled = prometheus_handle.is_some(),
+        service_name = %config.service_name,
+        "telemetry initialized"
+    );
+
+    TelemetryGuard { prometheus_handle }
 }
 
 #[cfg(test)]
@@ -239,7 +303,24 @@ mod tests {
     #[test]
     fn telemetry_guard_drops_without_panic() {
         // Verify the guard drops cleanly (no panic in drop impl).
-        let guard = TelemetryGuard { _private: () };
+        let guard = TelemetryGuard {
+            prometheus_handle: None,
+        };
         drop(guard);
+    }
+
+    #[test]
+    fn prometheus_enabled_by_default() {
+        let enabled = std::env::var("WEFT_PROMETHEUS_ENABLED")
+            .as_deref()
+            .unwrap_or("true")
+            != "false";
+        assert!(enabled);
+    }
+
+    #[test]
+    fn prometheus_disabled_when_env_false() {
+        let enabled = "false" != "false";
+        assert!(!enabled);
     }
 }

@@ -254,7 +254,7 @@ async fn run_with_span_collection(
     let _guard = TEST_MUTEX.get_or_init(|| TokioMutex::new(())).lock().await;
 
     let (svc, _event_log) = make_weft_service_with_event_log(llm, commands);
-    let router = build_router(svc);
+    let router = build_router(svc, None);
 
     // Activate a fresh store.
     let store = Arc::new(Mutex::new(SpanStore::default()));
