@@ -23,7 +23,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 mockito = { version = "1" }
 tempfile = { version = "3" }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 serde_json = { workspace = true }
 rstest.workspace = true
 pretty_assertions.workspace = true
