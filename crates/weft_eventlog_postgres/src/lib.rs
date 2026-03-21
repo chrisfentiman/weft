@@ -1,7 +1,7 @@
 //! PostgreSQL-backed EventLog implementation for production use.
 //!
 //! This crate provides [`PostgresEventLog`], a durable implementation of the
-//! [`weft_reactor::EventLog`] trait backed by PostgreSQL.
+//! [`weft_reactor_trait::EventLog`] trait backed by PostgreSQL.
 //!
 //! # Usage
 //!
@@ -45,11 +45,11 @@ use sqlx::{PgPool, Row};
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use weft_reactor::PipelineEvent;
-use weft_reactor::event::Event;
-use weft_reactor::event_log::{EventLog, EventLogError};
-use weft_reactor::execution::{Execution, ExecutionId, ExecutionStatus};
-use weft_reactor::signal::Signal;
+use weft_reactor_trait::PipelineEvent;
+use weft_reactor_trait::event::Event;
+use weft_reactor_trait::event_log::{EventLog, EventLogError};
+use weft_reactor_trait::execution::{Execution, ExecutionId, ExecutionStatus};
+use weft_reactor_trait::signal::Signal;
 
 /// PostgreSQL-backed event log for production use.
 ///
@@ -161,7 +161,7 @@ async fn signal_poller(
 
             // Push onto the event channel. If the channel is closed, stop polling.
             if event_tx
-                .send(PipelineEvent::Signal(weft_reactor::SignalEvent::Received(
+                .send(PipelineEvent::Signal(weft_reactor_trait::SignalEvent::Received(
                     signal,
                 )))
                 .await
@@ -531,8 +531,8 @@ impl EventLog for PostgresEventLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weft_reactor::event::EVENT_SCHEMA_VERSION;
-    use weft_reactor::execution::{RequestId, TenantId};
+    use weft_reactor_trait::event::EVENT_SCHEMA_VERSION;
+    use weft_reactor_trait::execution::{RequestId, TenantId};
 
     fn make_execution() -> Execution {
         Execution {
@@ -927,7 +927,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires DATABASE_URL and schema.sql applied"]
     async fn test_pipeline_event_jsonb_round_trip() {
-        use weft_reactor::event::{GeneratedEvent, GenerationEvent};
+        use weft_reactor_trait::event::{GeneratedEvent, GenerationEvent};
 
         let url = match std::env::var("DATABASE_URL").ok() {
             Some(u) => u,
@@ -1014,7 +1014,7 @@ mod tests {
         assert!(
             matches!(
                 received,
-                PipelineEvent::Signal(weft_reactor::event::SignalEvent::Received(
+                PipelineEvent::Signal(weft_reactor_trait::event::SignalEvent::Received(
                     Signal::Cancel { .. }
                 ))
             ),

@@ -3,9 +3,9 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use weft_reactor::event::Event;
-use weft_reactor::event_log::{EventLog, EventLogError};
-use weft_reactor::execution::{Execution, ExecutionId, ExecutionStatus};
+use weft_reactor_trait::event::Event;
+use weft_reactor_trait::event_log::{EventLog, EventLogError};
+use weft_reactor_trait::execution::{Execution, ExecutionId, ExecutionStatus};
 
 /// In-memory event log for tests and local development.
 ///
@@ -176,8 +176,8 @@ impl EventLog for InMemoryEventLog {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use weft_reactor::event::EVENT_SCHEMA_VERSION;
-    use weft_reactor::execution::{RequestId, TenantId};
+    use weft_reactor_trait::event::EVENT_SCHEMA_VERSION;
+    use weft_reactor_trait::execution::{RequestId, TenantId};
 
     fn make_execution() -> Execution {
         Execution {
