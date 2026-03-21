@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+exclude = ["crates/xtask"]
 
 [workspace.package]
 version = "0.1.0"
@@ -57,3 +58,6 @@ rhai = { version = "1", features = ["sync", "serde"] }
 # Testing
 rstest = { version = "0.24" }
 pretty_assertions = { version = "1" }
+
+# xtask dev tool
+xshell = { version = "0.2" }
