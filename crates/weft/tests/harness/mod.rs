@@ -43,6 +43,12 @@ use axum::{Router, body::Body, http::Request};
 use serde_json::Value;
 use weft::WeftService;
 use weft::server::build_router;
+use weft_activities::{
+    AssembleResponseActivity, CommandFormattingActivity, CommandSelectionActivity,
+    ExecuteCommandActivity, GenerateActivity, HookActivity, ModelSelectionActivity,
+    ProviderResolutionActivity, SamplingAdjustmentActivity, SystemPromptAssemblyActivity,
+    ValidateActivity,
+};
 use weft_commands::{CommandError, CommandRegistry};
 use weft_core::{
     ClassifierConfig, CommandCallContent, CommandDescription, CommandInvocation, CommandResult,
@@ -55,12 +61,6 @@ use weft_llm::{
 };
 use weft_reactor::{
     ActivityRegistry, Reactor, ReactorConfig,
-    activities::{
-        AssembleResponseActivity, CommandFormattingActivity, CommandSelectionActivity,
-        ExecuteCommandActivity, GenerateActivity, HookActivity, ModelSelectionActivity,
-        ProviderResolutionActivity, SamplingAdjustmentActivity, SystemPromptAssemblyActivity,
-        ValidateActivity,
-    },
     config::{ActivityRef, BudgetConfig, LoopHooks, PipelineConfig, RetryPolicy},
     services::{ReactorHandle, Services},
 };
@@ -184,7 +184,7 @@ pub fn make_provider_registry(llm: impl Provider + 'static) -> Arc<ProviderRegis
 }
 
 /// Build an `ActivityRegistry` with all standard activities registered.
-pub fn build_test_activity_registry() -> ActivityRegistry {
+pub fn build_test_activity_registry(services: &Services) -> ActivityRegistry {
     let mut registry = ActivityRegistry::new();
     registry.register(Arc::new(ValidateActivity)).unwrap();
     registry.register(Arc::new(ModelSelectionActivity)).unwrap();
@@ -208,21 +208,21 @@ pub fn build_test_activity_registry() -> ActivityRegistry {
     registry
         .register(Arc::new(AssembleResponseActivity))
         .unwrap();
-    registry
-        .register(Arc::new(HookActivity::new(HookEvent::RequestStart)))
-        .unwrap();
-    registry
-        .register(Arc::new(HookActivity::new(HookEvent::RequestEnd)))
-        .unwrap();
-    registry
-        .register(Arc::new(HookActivity::new(HookEvent::PreResponse)))
-        .unwrap();
-    registry
-        .register(Arc::new(HookActivity::new(HookEvent::PreToolUse)))
-        .unwrap();
-    registry
-        .register(Arc::new(HookActivity::new(HookEvent::PostToolUse)))
-        .unwrap();
+    for event in [
+        HookEvent::RequestStart,
+        HookEvent::RequestEnd,
+        HookEvent::PreResponse,
+        HookEvent::PreToolUse,
+        HookEvent::PostToolUse,
+    ] {
+        registry
+            .register(Arc::new(HookActivity::new(
+                event,
+                Arc::clone(&services.hooks),
+                Arc::clone(&services.request_end_semaphore),
+            )))
+            .unwrap();
+    }
     registry
 }
 
@@ -297,7 +297,7 @@ pub fn make_weft_service(llm: impl Provider + 'static) -> Arc<WeftService> {
         request_end_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
     });
 
-    let registry = Arc::new(build_test_activity_registry());
+    let registry = Arc::new(build_test_activity_registry(&services));
     let event_log: Arc<dyn weft_reactor::event_log::EventLog> =
         Arc::new(weft_eventlog_memory::InMemoryEventLog::new());
     let reactor_config = build_test_reactor_config(&config);
@@ -789,7 +789,7 @@ pub fn make_weft_service_with_config(
         request_end_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
     });
 
-    let registry = Arc::new(build_test_activity_registry());
+    let registry = Arc::new(build_test_activity_registry(&services));
     let reactor_config = build_test_reactor_config(&config);
 
     let reactor = Arc::new(

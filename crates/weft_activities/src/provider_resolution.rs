@@ -8,27 +8,24 @@
 //! **Fail mode: CLOSED.** If no model_id can be resolved, pushes `ActivityFailed`.
 //! Generation requires a resolved provider — proceeding without one is undefined behaviour.
 
-use std::time::Instant;
-
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::activity::{Activity, ActivityInput};
-use crate::event::PipelineEvent;
-use crate::event_log::EventLog;
-use crate::execution::ExecutionId;
-use crate::services::Services;
+use weft_reactor_trait::{
+    Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, PipelineEvent, SelectionEvent,
+    ServiceLocator,
+};
 
 /// Resolves provider and model capabilities for the model selected by `ModelSelectionActivity`.
 ///
 /// **Name:** `"provider_resolution"`
 ///
 /// **Events pushed:**
-/// - `ActivityStarted { name: "provider_resolution" }`
-/// - `ProviderResolved { model_name, model_id, provider_name, capabilities, max_tokens }` — on success
-/// - `ActivityCompleted { name: "provider_resolution", duration_ms, idempotency_key: None }`
-/// - `ActivityFailed { name: "provider_resolution", error, retryable: false }` — on failure
+/// - `Activity(ActivityEvent::Started { name: "provider_resolution" })`
+/// - `Selection(SelectionEvent::ProviderResolved { model_name, model_id, provider_name, capabilities, max_tokens })` — on success
+/// - `Activity(ActivityEvent::Completed { name: "provider_resolution", idempotency_key: None })`
+/// - `Activity(ActivityEvent::Failed { name: "provider_resolution", error, retryable: false })` — on failure
 pub struct ProviderResolutionActivity;
 
 impl ProviderResolutionActivity {
@@ -54,26 +51,24 @@ impl Activity for ProviderResolutionActivity {
         &self,
         _execution_id: &ExecutionId,
         input: ActivityInput,
-        services: &Services,
+        services: &dyn ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         cancel: CancellationToken,
     ) {
-        let start = Instant::now();
-
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name().to_string(),
-            })
+            }))
             .await;
 
         if cancel.is_cancelled() {
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: self.name().to_string(),
                     error: "cancelled before provider resolution".to_string(),
                     retryable: false,
-                })
+                }))
                 .await;
             return;
         }
@@ -87,36 +82,38 @@ impl Activity for ProviderResolutionActivity {
             Some(m) if !m.is_empty() => m.to_string(),
             _ => {
                 let _ = event_tx
-                    .send(PipelineEvent::ActivityFailed {
+                    .send(PipelineEvent::Activity(ActivityEvent::Failed {
                         name: self.name().to_string(),
                         error: "selected_model missing from metadata — reactor wiring error"
                             .to_string(),
                         retryable: false,
-                    })
+                    }))
                     .await;
                 return;
             }
         };
 
         // Step 2: Resolve model_id. Fail closed if None.
-        let model_id = match services.providers.model_id(&selected_model) {
+        let model_id = match services.providers().model_id(&selected_model) {
             Some(id) => id.to_string(),
             None => {
                 let _ = event_tx
-                    .send(PipelineEvent::ActivityFailed {
+                    .send(PipelineEvent::Activity(ActivityEvent::Failed {
                         name: self.name().to_string(),
                         error: format!(
                             "model '{selected_model}' has no model_id mapping — configuration error"
                         ),
                         retryable: false,
-                    })
+                    }))
                     .await;
                 return;
             }
         };
 
         // Step 3: Resolve capabilities. Default to ["chat_completions"] if None.
-        let capabilities: Vec<String> = match services.providers.model_capabilities(&selected_model)
+        let capabilities: Vec<String> = match services
+            .providers()
+            .model_capabilities(&selected_model)
         {
             Some(caps) => caps.iter().map(|c| c.as_str().to_string()).collect(),
             None => {
@@ -129,7 +126,7 @@ impl Activity for ProviderResolutionActivity {
         };
 
         // Step 4: Resolve max_tokens. Default to 4096 if None.
-        let max_tokens = match services.providers.max_tokens_for(&selected_model) {
+        let max_tokens = match services.providers().max_tokens_for(&selected_model) {
             Some(t) => t,
             None => {
                 warn!(
@@ -142,26 +139,24 @@ impl Activity for ProviderResolutionActivity {
 
         // Step 5: Look up provider_name from config.
         // Config is the source of truth: iterate providers to find which one owns this model.
-        let provider_name = find_provider_name(&services.config, &selected_model);
+        let provider_name = find_provider_name(services.config(), &selected_model);
 
         // Step 6: Push ProviderResolved.
         let _ = event_tx
-            .send(PipelineEvent::ProviderResolved {
+            .send(PipelineEvent::Selection(SelectionEvent::ProviderResolved {
                 model_name: selected_model,
                 model_id,
                 provider_name,
                 capabilities,
                 max_tokens,
-            })
+            }))
             .await;
 
-        let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
-            .send(PipelineEvent::ActivityCompleted {
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
-                duration_ms,
                 idempotency_key: None,
-            })
+            }))
             .await;
     }
 }
@@ -192,6 +187,7 @@ fn find_provider_name(config: &weft_core::WeftConfig, selected_model: &str) -> S
 mod tests {
     use super::*;
     use crate::test_support::{NullEventLog, collect_events, make_test_input, make_test_services};
+    use pretty_assertions::assert_eq;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
@@ -238,30 +234,31 @@ mod tests {
 
         assert!(
             events.iter().any(
-                |e| matches!(e, PipelineEvent::ActivityStarted { name } if name == "provider_resolution")
+                |e| matches!(e, PipelineEvent::Activity(ActivityEvent::Started { name }) if name == "provider_resolution")
             ),
-            "expected ActivityStarted"
+            "expected Activity(Started)"
         );
 
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::ProviderResolved { .. })),
-            "expected ProviderResolved event"
+            events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Selection(SelectionEvent::ProviderResolved { .. })
+            )),
+            "expected Selection(ProviderResolved) event"
         );
 
         assert!(
             events.iter().any(
-                |e| matches!(e, PipelineEvent::ActivityCompleted { name, .. } if name == "provider_resolution")
+                |e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { name, .. }) if name == "provider_resolution")
             ),
-            "expected ActivityCompleted"
+            "expected Activity(Completed)"
         );
 
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "did not expect ActivityFailed"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "did not expect Activity(Failed)"
         );
     }
 
@@ -273,13 +270,13 @@ mod tests {
         let events = run_provider_resolution(input).await;
 
         let resolved = events.iter().find_map(|e| {
-            if let PipelineEvent::ProviderResolved {
+            if let PipelineEvent::Selection(SelectionEvent::ProviderResolved {
                 model_name,
                 model_id,
                 provider_name,
                 capabilities,
                 max_tokens,
-            } = e
+            }) = e
             {
                 Some((
                     model_name.clone(),
@@ -294,19 +291,19 @@ mod tests {
         });
 
         let (model_name, model_id, provider_name, capabilities, max_tokens) =
-            resolved.expect("ProviderResolved must be present");
+            resolved.expect("Selection(ProviderResolved) must be present");
 
         assert_eq!(model_name, "stub-model");
-        // StubProviderServiceV2::model_id("stub-model") returns "stub-model-v1"
+        // StubProviderService::model_id("stub-model") returns "stub-model-v1"
         assert_eq!(model_id, "stub-model-v1");
         // Provider name is "anthropic" from the test config
         assert_eq!(provider_name, "anthropic");
-        // StubProviderServiceV2 registers "chat_completions" for "stub-model"
+        // StubProviderService registers "chat_completions" for "stub-model"
         assert!(
             capabilities.contains(&"chat_completions".to_string()),
             "expected chat_completions in capabilities"
         );
-        // StubProviderServiceV2::max_tokens_for("stub-model") returns 4096
+        // StubProviderService::max_tokens_for("stub-model") returns 4096
         assert_eq!(max_tokens, 4096);
     }
 
@@ -314,7 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_resolution_fails_when_model_id_none() {
-        // "nonexistent-model" is not in StubProviderServiceV2, so model_id returns None.
+        // "nonexistent-model" is not in StubProviderService, so model_id returns None.
         let input =
             make_input_with_metadata(serde_json::json!({ "selected_model": "nonexistent-model" }));
         let events = run_provider_resolution(input).await;
@@ -322,15 +319,16 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "expected ActivityFailed when model_id returns None"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "expected Activity(Failed) when model_id returns None"
         );
 
         assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::ProviderResolved { .. })),
-            "ProviderResolved must not be pushed when model_id is None"
+            !events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Selection(SelectionEvent::ProviderResolved { .. })
+            )),
+            "Selection(ProviderResolved) must not be pushed when model_id is None"
         );
     }
 
@@ -344,15 +342,15 @@ mod tests {
 
         let failed = events
             .iter()
-            .find(|e| matches!(e, PipelineEvent::ActivityFailed { .. }));
+            .find(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. })));
 
-        if let Some(PipelineEvent::ActivityFailed { retryable, .. }) = failed {
+        if let Some(PipelineEvent::Activity(ActivityEvent::Failed { retryable, .. })) = failed {
             assert!(
                 !retryable,
                 "provider resolution failures must not be retryable"
             );
         } else {
-            panic!("expected ActivityFailed");
+            panic!("expected Activity(Failed)");
         }
     }
 
@@ -367,15 +365,16 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "expected ActivityFailed when selected_model is missing from metadata"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "expected Activity(Failed) when selected_model is missing from metadata"
         );
 
         assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::ProviderResolved { .. })),
-            "ProviderResolved must not be pushed when metadata is missing"
+            !events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Selection(SelectionEvent::ProviderResolved { .. })
+            )),
+            "Selection(ProviderResolved) must not be pushed when metadata is missing"
         );
     }
 
@@ -389,8 +388,8 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "expected ActivityFailed when selected_model is empty string"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "expected Activity(Failed) when selected_model is empty string"
         );
     }
 
@@ -417,15 +416,16 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "expected ActivityFailed on cancellation"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "expected Activity(Failed) on cancellation"
         );
 
         assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::ProviderResolved { .. })),
-            "ProviderResolved must not be pushed when cancelled"
+            !events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Selection(SelectionEvent::ProviderResolved { .. })
+            )),
+            "Selection(ProviderResolved) must not be pushed when cancelled"
         );
     }
 
@@ -437,14 +437,17 @@ mod tests {
         let events = run_provider_resolution(input).await;
 
         let caps = events.iter().find_map(|e| {
-            if let PipelineEvent::ProviderResolved { capabilities, .. } = e {
+            if let PipelineEvent::Selection(SelectionEvent::ProviderResolved {
+                capabilities, ..
+            }) = e
+            {
                 Some(capabilities.clone())
             } else {
                 None
             }
         });
 
-        let caps = caps.expect("ProviderResolved must be present");
+        let caps = caps.expect("Selection(ProviderResolved) must be present");
         // All entries must be non-empty strings.
         for cap in &caps {
             assert!(!cap.is_empty(), "capability string must not be empty");
@@ -528,10 +531,11 @@ api_key = "sk-test"
 
     #[tokio::test]
     async fn provider_resolved_default_capabilities_when_none_registered() {
+        use crate::test_support::MockServiceLocator;
         use std::collections::HashSet;
         use std::sync::Arc;
 
-        // Build a custom Services where the model has no capabilities registered.
+        // Build a custom provider service where the model has no capabilities registered.
         struct NoCapProviderService {
             provider: Arc<dyn weft_llm::Provider>,
         }
@@ -632,15 +636,15 @@ api_key = "sk-test"
             provider: provider_arc,
         };
 
-        let services = crate::services::Services {
+        let base = make_test_services();
+        let services = MockServiceLocator {
             config: Arc::new(config),
             providers: Arc::new(svc_impl),
-            router: Arc::new(StubRouterNoCap),
-            commands: Arc::new(StubCmdNoCap),
+            router: base.router,
+            commands: base.commands,
+            hooks: base.hooks,
             memory: None,
-            hooks: Arc::new(weft_hooks::NullHookRunner),
-            reactor_handle: std::sync::OnceLock::new(),
-            request_end_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            request_end_semaphore: base.request_end_semaphore,
         };
 
         let input = make_input_with_metadata(serde_json::json!({ "selected_model": "stub-model" }));
@@ -656,77 +660,21 @@ api_key = "sk-test"
 
         let events = collect_events(&mut rx);
         let caps = events.iter().find_map(|e| {
-            if let PipelineEvent::ProviderResolved { capabilities, .. } = e {
+            if let PipelineEvent::Selection(SelectionEvent::ProviderResolved {
+                capabilities, ..
+            }) = e
+            {
                 Some(capabilities.clone())
             } else {
                 None
             }
         });
 
-        let caps = caps.expect("ProviderResolved must be present");
+        let caps = caps.expect("Selection(ProviderResolved) must be present");
         assert_eq!(
             caps,
             vec!["chat_completions".to_string()],
             "should default to chat_completions when no capabilities registered"
         );
-    }
-
-    // Minimal stubs for the no-cap test above.
-
-    struct StubRouterNoCap;
-    #[async_trait::async_trait]
-    impl weft_router::SemanticRouter for StubRouterNoCap {
-        async fn route(
-            &self,
-            _user_message: &str,
-            _domains: &[(
-                weft_router::RoutingDomainKind,
-                Vec<weft_router::RoutingCandidate>,
-            )],
-        ) -> Result<weft_router::RoutingDecision, weft_router::RouterError> {
-            Ok(weft_router::RoutingDecision::empty())
-        }
-
-        async fn score_memory_candidates(
-            &self,
-            _text: &str,
-            _candidates: &[weft_router::RoutingCandidate],
-        ) -> Result<Vec<weft_router::ScoredCandidate>, weft_router::RouterError> {
-            Ok(vec![])
-        }
-    }
-
-    struct StubCmdNoCap;
-    #[async_trait::async_trait]
-    impl weft_commands::CommandRegistry for StubCmdNoCap {
-        async fn list_commands(
-            &self,
-        ) -> Result<Vec<weft_core::CommandStub>, weft_commands::CommandError> {
-            Ok(vec![])
-        }
-
-        async fn describe_command(
-            &self,
-            name: &str,
-        ) -> Result<weft_core::CommandDescription, weft_commands::CommandError> {
-            Ok(weft_core::CommandDescription {
-                name: name.to_string(),
-                description: String::new(),
-                usage: String::new(),
-                parameters_schema: None,
-            })
-        }
-
-        async fn execute_command(
-            &self,
-            invocation: &weft_core::CommandInvocation,
-        ) -> Result<weft_core::CommandResult, weft_commands::CommandError> {
-            Ok(weft_core::CommandResult {
-                command_name: invocation.name.clone(),
-                success: true,
-                output: String::new(),
-                error: None,
-            })
-        }
     }
 }

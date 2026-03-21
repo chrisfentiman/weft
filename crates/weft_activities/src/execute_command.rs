@@ -1,21 +1,18 @@
 //! ExecuteCommandActivity: executes a single command invocation.
 //!
-//! Calls `Services.commands.execute_command()` with the `CommandInvocation` from
+//! Calls `services.commands().execute_command()` with the `CommandInvocation` from
 //! `ActivityInput.metadata`. Pushes CommandStarted and CommandCompleted events.
-
-use std::time::Instant;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
-use weft_commands::CommandError;
+use weft_commands_trait::CommandError;
 use weft_core::CommandInvocation;
 
-use crate::activity::{Activity, ActivityInput};
-use crate::event::PipelineEvent;
-use crate::event_log::EventLog;
-use crate::execution::ExecutionId;
-use crate::services::Services;
+use weft_reactor_trait::{
+    Activity, ActivityEvent, ActivityInput, CommandEvent, EventLog, ExecutionId, PipelineEvent,
+    ServiceLocator,
+};
 
 /// Executes a single command invocation via the command registry.
 ///
@@ -24,18 +21,19 @@ use crate::services::Services;
 /// before invoking the activity.
 ///
 /// **Note:** Command failures are NOT activity failures. A failed command pushes
-/// `CommandFailed` (with error details) and then `CommandCompleted` (with
-/// `success: false`). Only infrastructure failures push `ActivityFailed`.
+/// `Command(CommandEvent::Failed)` (with error details) and then
+/// `Command(CommandEvent::Completed)` (with `success: false`). Only infrastructure
+/// failures push `Activity(ActivityEvent::Failed)`.
 ///
 /// **Name:** `"execute_command"`
 ///
 /// **Events pushed:**
-/// - `ActivityStarted { name: "execute_command" }`
-/// - `CommandStarted { invocation }` — the full CommandInvocation
-/// - `CommandCompleted { name, result }` — with full CommandResult (success or failure)
-/// - `CommandFailed { name, error }` — if the command failed (in addition to CommandCompleted)
-/// - `ActivityCompleted { name: "execute_command", duration_ms, idempotency_key }` — always
-/// - `ActivityFailed { name: "execute_command", error, retryable }` — only on infrastructure error
+/// - `Activity(ActivityEvent::Started { name: "execute_command" })`
+/// - `Command(CommandEvent::Started { invocation })` — the full CommandInvocation
+/// - `Command(CommandEvent::Completed { name, result })` — with full CommandResult (success or failure)
+/// - `Command(CommandEvent::Failed { name, error })` — if the command failed (in addition to Completed)
+/// - `Activity(ActivityEvent::Completed { name: "execute_command", idempotency_key })` — always
+/// - `Activity(ActivityEvent::Failed { name: "execute_command", error, retryable })` — only on infrastructure error
 pub struct ExecuteCommandActivity;
 
 impl ExecuteCommandActivity {
@@ -69,26 +67,24 @@ impl Activity for ExecuteCommandActivity {
         &self,
         _execution_id: &ExecutionId,
         input: ActivityInput,
-        services: &Services,
+        services: &dyn ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         cancel: CancellationToken,
     ) {
-        let start = Instant::now();
-
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name().to_string(),
-            })
+            }))
             .await;
 
         if cancel.is_cancelled() {
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: self.name().to_string(),
                     error: "cancelled before command execution".to_string(),
                     retryable: false,
-                })
+                }))
                 .await;
             return;
         }
@@ -98,11 +94,11 @@ impl Activity for ExecuteCommandActivity {
             Ok(inv) => inv,
             Err(e) => {
                 let _ = event_tx
-                    .send(PipelineEvent::ActivityFailed {
+                    .send(PipelineEvent::Activity(ActivityEvent::Failed {
                         name: self.name().to_string(),
                         error: format!("invalid invocation in metadata: {e}"),
                         retryable: false,
-                    })
+                    }))
                     .await;
                 return;
             }
@@ -111,29 +107,29 @@ impl Activity for ExecuteCommandActivity {
         let command_name = invocation.name.clone();
         debug!(command = %command_name, "execute_command: starting");
 
-        // Push CommandStarted with full invocation.
+        // Push Command(Started) with full invocation.
         let _ = event_tx
-            .send(PipelineEvent::CommandStarted {
+            .send(PipelineEvent::Command(CommandEvent::Started {
                 invocation: invocation.clone(),
-            })
+            }))
             .await;
 
         // Execute the command.
         let command_result = tokio::select! {
-            result = services.commands.execute_command(&invocation) => result,
+            result = services.commands().execute_command(&invocation) => result,
             _ = cancel.cancelled() => {
                 let _ = event_tx
-                    .send(PipelineEvent::CommandFailed {
+                    .send(PipelineEvent::Command(CommandEvent::Failed {
                         name: command_name.clone(),
                         error: "cancelled during command execution".to_string(),
-                    })
+                    }))
                     .await;
                 let _ = event_tx
-                    .send(PipelineEvent::ActivityFailed {
+                    .send(PipelineEvent::Activity(ActivityEvent::Failed {
                         name: self.name().to_string(),
                         error: "cancelled during command execution".to_string(),
                         retryable: false,
-                    })
+                    }))
                     .await;
                 return;
             }
@@ -142,25 +138,25 @@ impl Activity for ExecuteCommandActivity {
         match command_result {
             Ok(result) => {
                 debug!(command = %command_name, success = result.success, "execute_command: completed");
-                // If command reported failure, also push CommandFailed for observability.
+                // If command reported failure, also push Command(Failed) for observability.
                 if !result.success {
                     let error_msg = result
                         .error
                         .clone()
                         .unwrap_or_else(|| "command reported failure".to_string());
                     let _ = event_tx
-                        .send(PipelineEvent::CommandFailed {
+                        .send(PipelineEvent::Command(CommandEvent::Failed {
                             name: command_name.clone(),
                             error: error_msg,
-                        })
+                        }))
                         .await;
                 }
-                // Always push CommandCompleted with the full result.
+                // Always push Command(Completed) with the full result.
                 let _ = event_tx
-                    .send(PipelineEvent::CommandCompleted {
+                    .send(PipelineEvent::Command(CommandEvent::Completed {
                         name: command_name.clone(),
                         result,
-                    })
+                    }))
                     .await;
             }
             Err(e) => {
@@ -168,33 +164,31 @@ impl Activity for ExecuteCommandActivity {
                 let retryable = command_error_retryable(&e);
                 debug!(command = %command_name, error = %e, retryable, "execute_command: infrastructure error");
                 let _ = event_tx
-                    .send(PipelineEvent::CommandFailed {
+                    .send(PipelineEvent::Command(CommandEvent::Failed {
                         name: command_name.clone(),
                         error: e.to_string(),
-                    })
+                    }))
                     .await;
                 let _ = event_tx
-                    .send(PipelineEvent::ActivityFailed {
+                    .send(PipelineEvent::Activity(ActivityEvent::Failed {
                         name: self.name().to_string(),
                         error: e.to_string(),
                         retryable,
-                    })
+                    }))
                     .await;
-                // No ActivityCompleted on infrastructure failure.
+                // No Activity(Completed) on infrastructure failure.
                 return;
             }
         }
 
-        let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
-            .send(PipelineEvent::ActivityCompleted {
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
-                duration_ms,
                 idempotency_key: input.idempotency_key.clone(),
-            })
+            }))
             .await;
 
-        debug!(duration_ms, command = %command_name, "execute_command: activity completed");
+        debug!(command = %command_name, "execute_command: activity completed");
     }
 }
 
@@ -214,10 +208,11 @@ fn extract_invocation(input: &ActivityInput) -> Result<CommandInvocation, String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::NullEventLog;
     use crate::test_support::{
-        collect_events, make_test_input, make_test_services, make_test_services_with_failed_command,
+        NullEventLog, collect_events, make_test_input, make_test_services,
+        make_test_services_with_failed_command,
     };
+    use pretty_assertions::assert_eq;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
     use weft_core::{CommandAction, CommandInvocation};
@@ -241,7 +236,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let services = make_test_services();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = ExecuteCommandActivity::new();
         activity
@@ -268,33 +263,33 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityStarted { name } if name == "execute_command")),
-            "expected ActivityStarted"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Started { name }) if name == "execute_command")),
+            "expected Activity(Started)"
         );
 
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::CommandStarted { invocation } if invocation.name == "test_command")),
-            "expected CommandStarted with correct invocation"
+                .any(|e| matches!(e, PipelineEvent::Command(CommandEvent::Started { invocation }) if invocation.name == "test_command")),
+            "expected Command(Started) with correct invocation"
         );
 
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::CommandCompleted { name, .. } if name == "test_command")),
-            "expected CommandCompleted"
+                .any(|e| matches!(e, PipelineEvent::Command(CommandEvent::Completed { name, .. }) if name == "test_command")),
+            "expected Command(Completed)"
         );
 
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityCompleted { name, .. } if name == "execute_command")),
-            "expected ActivityCompleted"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { name, .. }) if name == "execute_command")),
+            "expected Activity(Completed)"
         );
     }
 
-    // ── Idempotency key in ActivityCompleted ─────────────────────────────
+    // ── Idempotency key in Activity(Completed) ─────────────────────────────
 
     #[tokio::test]
     async fn execute_command_includes_idempotency_key_in_completed() {
@@ -304,16 +299,16 @@ mod tests {
 
         let completed = events
             .iter()
-            .find(|e| matches!(e, PipelineEvent::ActivityCompleted { name, .. } if name == "execute_command"))
-            .expect("expected ActivityCompleted");
+            .find(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { name, .. }) if name == "execute_command"))
+            .expect("expected Activity(Completed)");
 
         match completed {
-            PipelineEvent::ActivityCompleted {
+            PipelineEvent::Activity(ActivityEvent::Completed {
                 idempotency_key, ..
-            } => {
+            }) => {
                 assert_eq!(*idempotency_key, Some(expected_key));
             }
-            _ => panic!("expected ActivityCompleted"),
+            _ => panic!("expected Activity(Completed)"),
         }
     }
 
@@ -327,14 +322,14 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "expected ActivityFailed when invocation is missing"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "expected Activity(Failed) when invocation is missing"
         );
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityCompleted { .. })),
-            "should not push ActivityCompleted on missing invocation"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { .. }))),
+            "should not push Activity(Completed) on missing invocation"
         );
     }
 
@@ -349,7 +344,7 @@ mod tests {
 
         let services = make_test_services();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = ExecuteCommandActivity::new();
         activity
@@ -360,8 +355,8 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "expected ActivityFailed on cancellation"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "expected Activity(Failed) on cancellation"
         );
     }
 
@@ -377,7 +372,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = ExecuteCommandActivity::new();
         activity
@@ -387,13 +382,13 @@ mod tests {
         let events = collect_events(&mut rx);
         let failed = events
             .iter()
-            .find(|e| matches!(e, PipelineEvent::ActivityFailed { .. }))
-            .expect("expected ActivityFailed");
+            .find(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. })))
+            .expect("expected Activity(Failed)");
         match failed {
-            PipelineEvent::ActivityFailed { retryable, .. } => {
+            PipelineEvent::Activity(ActivityEvent::Failed { retryable, .. }) => {
                 assert!(*retryable, "registry unavailable should be retryable");
             }
-            _ => panic!("expected ActivityFailed"),
+            _ => panic!("expected Activity(Failed)"),
         }
     }
 
@@ -425,8 +420,8 @@ mod tests {
     #[tokio::test]
     async fn execute_command_failed_result_pushes_command_completed_with_failure() {
         // When the command registry returns CommandResult { success: false },
-        // the activity must push CommandFailed (for observability) and then
-        // CommandCompleted (with the failure result). ActivityCompleted must
+        // the activity must push Command(Failed) (for observability) and then
+        // Command(Completed) (with the failure result). Activity(Completed) must
         // still be pushed — a failed command result is not an infrastructure error.
         let services =
             make_test_services_with_failed_command("failing_cmd", "command error detail");
@@ -434,7 +429,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = ExecuteCommandActivity::new();
         activity
@@ -443,52 +438,52 @@ mod tests {
 
         let events = collect_events(&mut rx);
 
-        // CommandFailed must be pushed (observability event for failed results).
+        // Command(Failed) must be pushed (observability event for failed results).
         let cmd_failed = events.iter().find(
-            |e| matches!(e, PipelineEvent::CommandFailed { name, .. } if name == "failing_cmd"),
+            |e| matches!(e, PipelineEvent::Command(CommandEvent::Failed { name, .. }) if name == "failing_cmd"),
         );
         assert!(
             cmd_failed.is_some(),
-            "expected CommandFailed when command returns success=false"
+            "expected Command(Failed) when command returns success=false"
         );
 
-        // CommandCompleted must be pushed with success=false.
+        // Command(Completed) must be pushed with success=false.
         let cmd_completed = events
             .iter()
             .find(|e| {
-                matches!(e, PipelineEvent::CommandCompleted { name, .. } if name == "failing_cmd")
+                matches!(e, PipelineEvent::Command(CommandEvent::Completed { name, .. }) if name == "failing_cmd")
             })
-            .expect("expected CommandCompleted after failed command result");
+            .expect("expected Command(Completed) after failed command result");
         match cmd_completed {
-            PipelineEvent::CommandCompleted { result, .. } => {
+            PipelineEvent::Command(CommandEvent::Completed { result, .. }) => {
                 assert!(
                     !result.success,
-                    "CommandCompleted result must have success=false"
+                    "Command(Completed) result must have success=false"
                 );
                 assert_eq!(
                     result.error.as_deref(),
                     Some("command error detail"),
-                    "CommandCompleted result must carry the error message"
+                    "Command(Completed) result must carry the error message"
                 );
             }
-            _ => panic!("expected CommandCompleted"),
+            _ => panic!("expected Command(Completed)"),
         }
 
-        // ActivityCompleted must still be pushed — failed command is not an
+        // Activity(Completed) must still be pushed — failed command is not an
         // infrastructure error and does not abort the activity.
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityCompleted { name, .. } if name == "execute_command")),
-            "expected ActivityCompleted even when command returns success=false"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { name, .. }) if name == "execute_command")),
+            "expected Activity(Completed) even when command returns success=false"
         );
 
-        // ActivityFailed must NOT be pushed.
+        // Activity(Failed) must NOT be pushed.
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "ActivityFailed must not be pushed for a command-level failure result"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "Activity(Failed) must not be pushed for a command-level failure result"
         );
     }
 }

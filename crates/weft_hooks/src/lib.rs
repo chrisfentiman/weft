@@ -24,6 +24,11 @@ pub(crate) mod http_executor;
 pub(crate) mod rhai_executor;
 pub mod types;
 
+// Re-export trait and associated types from weft_hooks_trait.
+// This makes `weft_hooks::{HookRunner, HookChainResult}` refer to the canonical
+// trait crate types, keeping existing import paths working unchanged.
+pub use weft_hooks_trait::{HookChainResult, HookRunner};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -80,68 +85,21 @@ impl std::fmt::Debug for RegisteredHook {
     }
 }
 
-/// Result of running a hook chain.
-///
-/// Consumed by the engine to determine whether to block or
-/// pass the modified payload to the next stage.
-#[derive(Debug)]
-pub enum HookChainResult {
-    /// All hooks allowed (or no hooks registered for this event).
-    /// Contains the final payload (possibly modified by Modify hooks)
-    /// and any accumulated context strings.
-    Allowed {
-        payload: serde_json::Value,
-        context: Option<String>,
-    },
-    /// A hook blocked the operation.
-    Blocked { reason: String, hook_name: String },
-}
-
-impl HookChainResult {
-    /// Convenience constructor for an Allowed result with unmodified payload and no context.
-    pub fn allow(payload: serde_json::Value) -> Self {
-        Self::Allowed {
-            payload,
-            context: None,
-        }
-    }
-}
-
-/// Trait for hook chain execution.
-///
-/// The engine calls this; implementations determine how hooks are resolved and run.
-///
-/// `Send + Sync + 'static` because the engine holds `Arc<H>` and calls
-/// from async context.
-#[async_trait::async_trait]
-pub trait HookRunner: Send + Sync + 'static {
-    /// Run all hooks for the given event, in priority order.
-    async fn run_chain(
-        &self,
-        event: HookEvent,
-        payload: serde_json::Value,
-        matcher_target: Option<&str>,
-    ) -> HookChainResult;
-}
-
-/// Null implementation. Always returns Allowed with unmodified payload.
+/// Null implementation of `HookRunner`. Always returns Allowed with unmodified payload.
 ///
 /// Used in tests that do not exercise hook behavior and in contexts where
 /// no hook runner is needed.
 pub struct NullHookRunner;
 
 #[async_trait::async_trait]
-impl HookRunner for NullHookRunner {
+impl weft_hooks_trait::HookRunner for NullHookRunner {
     async fn run_chain(
         &self,
         _event: HookEvent,
         payload: serde_json::Value,
         _matcher_target: Option<&str>,
-    ) -> HookChainResult {
-        HookChainResult::Allowed {
-            payload,
-            context: None,
-        }
+    ) -> weft_hooks_trait::HookChainResult {
+        weft_hooks_trait::HookChainResult::allow(payload)
     }
 }
 
@@ -263,7 +221,7 @@ impl HookRegistry {
 }
 
 #[async_trait::async_trait]
-impl HookRunner for HookRegistry {
+impl weft_hooks_trait::HookRunner for HookRegistry {
     /// Run all hooks for the given event, in priority order.
     ///
     /// Returns the final payload (possibly modified) and whether the chain was blocked.
@@ -281,12 +239,12 @@ impl HookRunner for HookRegistry {
         event: HookEvent,
         payload: serde_json::Value,
         matcher_target: Option<&str>,
-    ) -> HookChainResult {
+    ) -> weft_hooks_trait::HookChainResult {
         let hooks = match self.hooks.get(&event) {
             Some(h) if !h.is_empty() => h,
             _ => {
                 // No hooks registered for this event — fast path.
-                return HookChainResult::Allowed {
+                return weft_hooks_trait::HookChainResult::Allowed {
                     payload,
                     context: None,
                 };
@@ -329,7 +287,7 @@ impl HookRunner for HookRegistry {
                         let reason = response
                             .reason
                             .unwrap_or_else(|| "hook blocked without reason".to_string());
-                        return HookChainResult::Blocked {
+                        return weft_hooks_trait::HookChainResult::Blocked {
                             reason,
                             hook_name: hook.name.clone(),
                         };
@@ -374,7 +332,7 @@ impl HookRunner for HookRegistry {
             Some(truncate_bytes_with_suffix(&joined, 4096, "...[truncated]"))
         };
 
-        HookChainResult::Allowed {
+        weft_hooks_trait::HookChainResult::Allowed {
             payload: current_payload,
             context,
         }

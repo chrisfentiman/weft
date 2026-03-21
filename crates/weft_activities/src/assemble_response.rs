@@ -4,19 +4,15 @@
 //! `ActivityInput.accumulated_text`, routing information, and token usage
 //! derived from the event log.
 
-use std::time::Instant;
-
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use weft_core::{ContentPart, Role, Source, WeftMessage, WeftResponse, WeftTiming};
-
-use crate::activity::{Activity, ActivityInput};
-use crate::event::PipelineEvent;
-use crate::event_log::EventLog;
-use crate::execution::ExecutionId;
-use crate::services::Services;
+use weft_reactor_trait::{
+    Activity, ActivityEvent, ActivityInput, ContextEvent, EventLog, ExecutionId, PipelineEvent,
+    ServiceLocator,
+};
 
 /// Constructs the final WeftResponse from accumulated execution state.
 ///
@@ -26,10 +22,10 @@ use crate::services::Services;
 /// **Name:** `"assemble_response"`
 ///
 /// **Events pushed:**
-/// - `ActivityStarted { name: "assemble_response" }`
-/// - `ResponseAssembled { response }` — with the constructed WeftResponse
-/// - `ActivityCompleted { name: "assemble_response", duration_ms, idempotency_key: None }`
-/// - `ActivityFailed { name: "assemble_response", error, retryable: false }` — on error
+/// - `Activity(ActivityEvent::Started { name: "assemble_response" })`
+/// - `Context(ContextEvent::ResponseAssembled { response })` — with the constructed WeftResponse
+/// - `Activity(ActivityEvent::Completed { name: "assemble_response", idempotency_key: None })`
+/// - `Activity(ActivityEvent::Failed { name: "assemble_response", error, retryable: false })` — on error
 pub struct AssembleResponseActivity;
 
 impl AssembleResponseActivity {
@@ -55,26 +51,24 @@ impl Activity for AssembleResponseActivity {
         &self,
         execution_id: &ExecutionId,
         input: ActivityInput,
-        _services: &Services,
+        _services: &dyn ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         cancel: CancellationToken,
     ) {
-        let start = Instant::now();
-
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name().to_string(),
-            })
+            }))
             .await;
 
         if cancel.is_cancelled() {
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: self.name().to_string(),
                     error: "cancelled before response assembly".to_string(),
                     retryable: false,
-                })
+                }))
                 .await;
             return;
         }
@@ -112,27 +106,27 @@ impl Activity for AssembleResponseActivity {
         );
 
         let _ = event_tx
-            .send(PipelineEvent::ResponseAssembled { response })
+            .send(PipelineEvent::Context(ContextEvent::ResponseAssembled {
+                response,
+            }))
             .await;
 
-        let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
-            .send(PipelineEvent::ActivityCompleted {
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
-                duration_ms,
                 idempotency_key: None,
-            })
+            }))
             .await;
 
-        debug!(duration_ms, "assemble_response: completed");
+        debug!("assemble_response: completed");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::NullEventLog;
-    use crate::test_support::{collect_events, make_test_input, make_test_services};
+    use crate::test_support::{NullEventLog, collect_events, make_test_input, make_test_services};
+    use pretty_assertions::assert_eq;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
@@ -141,7 +135,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let services = make_test_services();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = AssembleResponseActivity::new();
         activity
@@ -170,22 +164,23 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityStarted { name } if name == "assemble_response")),
-            "expected ActivityStarted"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Started { name }) if name == "assemble_response")),
+            "expected Activity(Started)"
+        );
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Context(ContextEvent::ResponseAssembled { .. })
+            )),
+            "expected Context(ResponseAssembled)"
         );
 
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ResponseAssembled { .. })),
-            "expected ResponseAssembled"
-        );
-
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityCompleted { name, .. } if name == "assemble_response")),
-            "expected ActivityCompleted"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { name, .. }) if name == "assemble_response")),
+            "expected Activity(Completed)"
         );
     }
 
@@ -200,12 +195,16 @@ mod tests {
 
         let assembled = events
             .iter()
-            .find(|e| matches!(e, PipelineEvent::ResponseAssembled { .. }))
-            .expect("expected ResponseAssembled");
+            .find(|e| {
+                matches!(
+                    e,
+                    PipelineEvent::Context(ContextEvent::ResponseAssembled { .. })
+                )
+            })
+            .expect("expected Context(ResponseAssembled)");
 
         match assembled {
-            PipelineEvent::ResponseAssembled { response } => {
-                // The response messages should contain the accumulated text.
+            PipelineEvent::Context(ContextEvent::ResponseAssembled { response }) => {
                 let has_text = response.messages.iter().any(|m| {
                     m.content.iter().any(|p| {
                         matches!(p, ContentPart::Text(t) if t.contains("This is the final response."))
@@ -213,7 +212,7 @@ mod tests {
                 });
                 assert!(has_text, "response should contain accumulated text");
             }
-            _ => panic!("expected ResponseAssembled"),
+            _ => panic!("expected Context(ResponseAssembled)"),
         }
     }
 
@@ -226,7 +225,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let services = make_test_services();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
         let exec_id_str = exec_id.to_string();
 
         let activity = AssembleResponseActivity::new();
@@ -237,14 +236,19 @@ mod tests {
         let events = collect_events(&mut rx);
         let assembled = events
             .iter()
-            .find(|e| matches!(e, PipelineEvent::ResponseAssembled { .. }))
-            .expect("expected ResponseAssembled");
+            .find(|e| {
+                matches!(
+                    e,
+                    PipelineEvent::Context(ContextEvent::ResponseAssembled { .. })
+                )
+            })
+            .expect("expected Context(ResponseAssembled)");
 
         match assembled {
-            PipelineEvent::ResponseAssembled { response } => {
+            PipelineEvent::Context(ContextEvent::ResponseAssembled { response }) => {
                 assert_eq!(response.id, exec_id_str);
             }
-            _ => panic!("expected ResponseAssembled"),
+            _ => panic!("expected Context(ResponseAssembled)"),
         }
     }
 
@@ -259,7 +263,7 @@ mod tests {
 
         let services = make_test_services();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = AssembleResponseActivity::new();
         activity
@@ -270,14 +274,14 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "expected ActivityFailed when cancelled"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "expected Activity(Failed) when cancelled"
         );
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityCompleted { .. })),
-            "should not push ActivityCompleted when cancelled"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { .. }))),
+            "should not push Activity(Completed) when cancelled"
         );
     }
 }

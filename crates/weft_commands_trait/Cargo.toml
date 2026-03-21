@@ -1,0 +1,14 @@
+[package]
+name = "weft_commands_trait"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+weft_core = { path = "../weft_core" }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+test-support = []

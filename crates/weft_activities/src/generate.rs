@@ -1,16 +1,14 @@
 //! GenerateActivity: calls the generative source and streams tokens.
 //!
-//! Calls the LLM provider via `Services.providers` using `execute_stream`, which
+//! Calls the LLM provider via `services.providers()` using `execute_stream`, which
 //! yields `ProviderChunk` values as they arrive. Delta chunks push
-//! `Generated(Content { .. })` events immediately; the final Complete chunk
-//! triggers `GenerationCompleted`. Providers without true streaming support use
-//! the default `execute_stream` implementation, which wraps `execute()` in a
-//! single-element stream — same code path, zero additional latency for those
-//! providers.
+//! `Generation(GenerationEvent::Chunk(Content { .. }))` events immediately; the
+//! final Complete chunk triggers `Generation(GenerationEvent::Completed)`.
+//! Providers without true streaming support use the default `execute_stream`
+//! implementation, which wraps `execute()` in a single-element stream — same code
+//! path, zero additional latency for those providers.
 //!
 //! Handles cancellation, heartbeat emission, and retryable error classification.
-
-use std::time::Instant;
 
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -19,13 +17,12 @@ use tracing::{debug, warn};
 #[cfg(test)]
 use weft_core::Role;
 use weft_core::{ContentPart, WeftMessage};
-use weft_llm::{ProviderChunk, ProviderError, ProviderRequest, ProviderResponse};
+use weft_llm_trait::{ProviderChunk, ProviderError, ProviderRequest, ProviderResponse};
 
-use crate::activity::{Activity, ActivityInput};
-use crate::event::{GeneratedEvent, PipelineEvent};
-use crate::event_log::EventLog;
-use crate::execution::ExecutionId;
-use crate::services::Services;
+use weft_reactor_trait::{
+    Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, GeneratedEvent, GenerationEvent,
+    PipelineEvent, ServiceLocator,
+};
 
 /// Calls the generative source (LLM provider) and streams the response.
 ///
@@ -37,8 +34,9 @@ use crate::services::Services;
 ///
 /// **Heartbeat support:** If `input.metadata["heartbeat_interval_secs"]` is set
 /// to a positive integer, a background task is spawned that pushes
-/// `Heartbeat { activity_name: "generate" }` events at the configured interval.
-/// The background task is cancelled when generation completes.
+/// `Activity(ActivityEvent::Heartbeat { activity_name: "generate" })` events at
+/// the configured interval. The background task is cancelled when generation
+/// completes.
 ///
 /// **Retryable error classification:**
 /// - `ProviderError::RateLimited` (429) → `retryable: true`
@@ -49,16 +47,16 @@ use crate::services::Services;
 /// - All other errors → `retryable: false`
 ///
 /// **Events pushed:**
-/// - `ActivityStarted { name: "generate" }`
-/// - `GenerationStarted { model, message_count }`
-/// - `Heartbeat { activity_name: "generate" }` (if heartbeat configured)
-/// - `Generated(Content { part })` — one per content chunk
-/// - `Generated(CommandInvocation(..))` — one per parsed command call
-/// - `Generated(Reasoning { content })` — for thinking tokens (if any)
-/// - `Generated(Done)` — when generation is complete
-/// - `GenerationCompleted { model, response_message, generated_events, input_tokens, output_tokens }`
-/// - `ActivityCompleted { name: "generate", duration_ms, idempotency_key }`
-/// - `GenerationFailed { model, error }` + `ActivityFailed { retryable }` — on error
+/// - `Activity(ActivityEvent::Started { name: "generate" })`
+/// - `Generation(GenerationEvent::Started { model, message_count })`
+/// - `Activity(ActivityEvent::Heartbeat { activity_name: "generate" })` (if heartbeat configured)
+/// - `Generation(GenerationEvent::Chunk(Content { part }))` — one per content chunk
+/// - `Generation(GenerationEvent::Chunk(CommandInvocation(..)))` — one per parsed command call
+/// - `Generation(GenerationEvent::Chunk(Reasoning { content }))` — for thinking tokens (if any)
+/// - `Generation(GenerationEvent::Chunk(Done))` — when generation is complete
+/// - `Generation(GenerationEvent::Completed { model, response_message, generated_events, input_tokens, output_tokens })`
+/// - `Activity(ActivityEvent::Completed { name: "generate", idempotency_key })`
+/// - `Generation(GenerationEvent::Failed { model, error })` + `Activity(ActivityEvent::Failed { retryable })` — on error
 pub struct GenerateActivity;
 
 impl GenerateActivity {
@@ -105,34 +103,32 @@ impl Activity for GenerateActivity {
         &self,
         _execution_id: &ExecutionId,
         input: ActivityInput,
-        services: &Services,
+        services: &dyn ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         cancel: CancellationToken,
     ) {
-        let start = Instant::now();
-
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name().to_string(),
-            })
+            }))
             .await;
 
         // Check cancellation before starting work.
         if cancel.is_cancelled() {
             let model = extract_model_name(&input, services);
             let _ = event_tx
-                .send(PipelineEvent::GenerationFailed {
+                .send(PipelineEvent::Generation(GenerationEvent::Failed {
                     model: model.clone(),
                     error: "cancelled".to_string(),
-                })
+                }))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: self.name().to_string(),
                     error: "cancelled before generation".to_string(),
                     retryable: false,
-                })
+                }))
                 .await;
             return;
         }
@@ -140,7 +136,7 @@ impl Activity for GenerateActivity {
         // Determine which model to use.
         let model = extract_model_name(&input, services);
         let model_id = services
-            .providers
+            .providers()
             .model_id(&model)
             .unwrap_or(&model)
             .to_string();
@@ -154,10 +150,10 @@ impl Activity for GenerateActivity {
         let message_count = input.messages.len();
 
         let _ = event_tx
-            .send(PipelineEvent::GenerationStarted {
+            .send(PipelineEvent::Generation(GenerationEvent::Started {
                 model: model.clone(),
                 message_count,
-            })
+            }))
             .await;
 
         debug!(model = %model, message_count, "generate: starting");
@@ -173,9 +169,9 @@ impl Activity for GenerateActivity {
                 loop {
                     tokio::select! {
                         _ = tokio::time::sleep(interval) => {
-                            let _ = hb_tx.send(PipelineEvent::Heartbeat {
+                            let _ = hb_tx.send(PipelineEvent::Activity(ActivityEvent::Heartbeat {
                                 activity_name: activity_name.clone(),
-                            }).await;
+                            })).await;
                         }
                         _ = hb_cancel.cancelled() => {
                             break;
@@ -213,7 +209,7 @@ impl Activity for GenerateActivity {
         };
 
         // Get the provider and open the streaming request.
-        let provider = services.providers.get(&model);
+        let provider = services.providers().get(&model);
 
         // Use tokio::select! to support cancellation while opening the stream.
         let stream_result = tokio::select! {
@@ -225,23 +221,29 @@ impl Activity for GenerateActivity {
                     let _ = handle.await;
                 }
                 let _ = event_tx
-                    .send(PipelineEvent::GenerationFailed {
+                    .send(PipelineEvent::Generation(GenerationEvent::Failed {
                         model: model.clone(),
                         error: "cancelled during generation".to_string(),
-                    })
+                    }))
                     .await;
                 let _ = event_tx
-                    .send(PipelineEvent::ActivityFailed {
+                    .send(PipelineEvent::Activity(ActivityEvent::Failed {
                         name: self.name().to_string(),
                         error: "cancelled during generation".to_string(),
                         retryable: false,
-                    })
+                    }))
                     .await;
                 return;
             }
         };
 
-        let mut stream = match stream_result {
+        let mut stream: std::pin::Pin<
+            Box<
+                dyn futures::Stream<
+                        Item = Result<weft_llm_trait::ProviderChunk, weft_llm_trait::ProviderError>,
+                    > + Send,
+            >,
+        > = match stream_result {
             Ok(s) => s,
             Err(e) => {
                 heartbeat_cancel.cancel();
@@ -251,17 +253,17 @@ impl Activity for GenerateActivity {
                 let retryable = is_retryable(&e);
                 warn!(model = %model, error = %e, retryable, "generate: provider error opening stream");
                 let _ = event_tx
-                    .send(PipelineEvent::GenerationFailed {
+                    .send(PipelineEvent::Generation(GenerationEvent::Failed {
                         model: model.clone(),
                         error: e.to_string(),
-                    })
+                    }))
                     .await;
                 let _ = event_tx
-                    .send(PipelineEvent::ActivityFailed {
+                    .send(PipelineEvent::Activity(ActivityEvent::Failed {
                         name: self.name().to_string(),
                         error: e.to_string(),
                         retryable,
-                    })
+                    }))
                     .await;
                 return;
             }
@@ -293,17 +295,17 @@ impl Activity for GenerateActivity {
                         let _ = handle.await;
                     }
                     let _ = event_tx
-                        .send(PipelineEvent::GenerationFailed {
+                        .send(PipelineEvent::Generation(GenerationEvent::Failed {
                             model: model.clone(),
                             error: "cancelled during streaming".to_string(),
-                        })
+                        }))
                         .await;
                     let _ = event_tx
-                        .send(PipelineEvent::ActivityFailed {
+                        .send(PipelineEvent::Activity(ActivityEvent::Failed {
                             name: self.name().to_string(),
                             error: "cancelled during streaming".to_string(),
                             retryable: false,
-                        })
+                        }))
                         .await;
                     return;
                 }
@@ -335,17 +337,17 @@ impl Activity for GenerateActivity {
                     let retryable = is_retryable(&e);
                     warn!(model = %model, error = %e, retryable, "generate: provider stream error");
                     let _ = event_tx
-                        .send(PipelineEvent::GenerationFailed {
+                        .send(PipelineEvent::Generation(GenerationEvent::Failed {
                             model: model.clone(),
                             error: e.to_string(),
-                        })
+                        }))
                         .await;
                     let _ = event_tx
-                        .send(PipelineEvent::ActivityFailed {
+                        .send(PipelineEvent::Activity(ActivityEvent::Failed {
                             name: self.name().to_string(),
                             error: e.to_string(),
                             retryable,
-                        })
+                        }))
                         .await;
                     return;
                 }
@@ -357,7 +359,9 @@ impl Activity for GenerateActivity {
                             part: ContentPart::Text(text),
                         };
                         all_generated_events.push(event.clone());
-                        let _ = event_tx.send(PipelineEvent::Generated(event)).await;
+                        let _ = event_tx
+                            .send(PipelineEvent::Generation(GenerationEvent::Chunk(event)))
+                            .await;
                     }
                     // Tool call deltas are accumulated for future streaming tool support.
                     // For now they are carried through but not yet pushed as events
@@ -400,7 +404,11 @@ impl Activity for GenerateActivity {
 
                     for event in &events_from_complete {
                         all_generated_events.push(event.clone());
-                        let _ = event_tx.send(PipelineEvent::Generated(event.clone())).await;
+                        let _ = event_tx
+                            .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                                event.clone(),
+                            )))
+                            .await;
                     }
 
                     response_message_opt = Some(msg);
@@ -422,7 +430,11 @@ impl Activity for GenerateActivity {
         {
             let done_event = GeneratedEvent::Done;
             all_generated_events.push(done_event.clone());
-            let _ = event_tx.send(PipelineEvent::Generated(done_event)).await;
+            let _ = event_tx
+                .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                    done_event,
+                )))
+                .await;
         }
 
         // Build response_message for GenerationCompleted. If the provider yielded
@@ -438,25 +450,23 @@ impl Activity for GenerateActivity {
         });
 
         let _ = event_tx
-            .send(PipelineEvent::GenerationCompleted {
+            .send(PipelineEvent::Generation(GenerationEvent::Completed {
                 model: model.clone(),
                 response_message,
                 generated_events: all_generated_events,
                 input_tokens,
                 output_tokens,
-            })
+            }))
             .await;
 
-        let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
-            .send(PipelineEvent::ActivityCompleted {
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
-                duration_ms,
                 idempotency_key: input.idempotency_key.clone(),
-            })
+            }))
             .await;
 
-        debug!(duration_ms, model = %model, "generate: completed");
+        debug!(model = %model, "generate: completed");
     }
 }
 
@@ -464,7 +474,7 @@ impl Activity for GenerateActivity {
 ///
 /// Checks `input.generation_config["model"]`, then `input.routing_result.model_routing.model`,
 /// then falls back to the provider's default.
-fn extract_model_name(input: &ActivityInput, services: &Services) -> String {
+fn extract_model_name(input: &ActivityInput, services: &dyn ServiceLocator) -> String {
     // Check generation_config override first.
     if let Some(ref config) = input.generation_config
         && let Some(model) = config.get("model").and_then(|v| v.as_str())
@@ -476,7 +486,7 @@ fn extract_model_name(input: &ActivityInput, services: &Services) -> String {
         return routing.model_routing.model.clone();
     }
     // Final fallback: provider default.
-    services.providers.default_name().to_string()
+    services.providers().default_name().to_string()
 }
 
 /// Parse a WeftMessage response into a sequence of GeneratedEvent values.
@@ -530,7 +540,7 @@ fn parse_response_to_events(message: &WeftMessage) -> Vec<GeneratedEvent> {
     // the Reactor (Phase 4) will provide the known command set via ActivityInput.
     if !full_text.is_empty() {
         let known_commands = std::collections::HashSet::new();
-        let parsed = weft_commands::parse_response(&full_text, &known_commands);
+        let parsed = weft_commands_trait::parse_response(&full_text, &known_commands);
         for cmd in parsed.invocations {
             // Avoid duplicating CommandInvocations that were already added from CommandCall parts.
             let already_added = events.iter().any(
@@ -592,7 +602,7 @@ fn parse_only_commands_and_done(message: &WeftMessage) -> Vec<GeneratedEvent> {
     // captured CommandCall-based invocations.
     if !full_text.is_empty() {
         let known_commands = std::collections::HashSet::new();
-        let parsed = weft_commands::parse_response(&full_text, &known_commands);
+        let parsed = weft_commands_trait::parse_response(&full_text, &known_commands);
         for cmd in parsed.invocations {
             let already_added = events.iter().any(
                 |e| matches!(e, GeneratedEvent::CommandInvocation(inv) if inv.name == cmd.name),
@@ -610,12 +620,12 @@ fn parse_only_commands_and_done(message: &WeftMessage) -> Vec<GeneratedEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::NullEventLog;
     use crate::test_support::{
-        collect_events, make_test_input, make_test_services_with_chunk_stream,
+        NullEventLog, collect_events, make_test_input, make_test_services_with_chunk_stream,
         make_test_services_with_mid_stream_error, make_test_services_with_response,
         make_test_services_with_slow_provider,
     };
+    use pretty_assertions::assert_eq;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
@@ -636,7 +646,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = GenerateActivity::new();
         activity
@@ -645,52 +655,56 @@ mod tests {
 
         let events = collect_events(&mut rx);
 
-        // Must push ActivityStarted.
+        // Must push Activity(Started).
         assert!(
             events.iter().any(
-                |e| matches!(e, PipelineEvent::ActivityStarted { name } if name == "generate")
+                |e| matches!(e, PipelineEvent::Activity(ActivityEvent::Started { name }) if name == "generate")
             ),
-            "expected ActivityStarted"
+            "expected Activity(Started)"
         );
 
-        // Must push GenerationStarted.
+        // Must push Generation(Started).
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::GenerationStarted { .. })),
-            "expected GenerationStarted"
+            events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Generation(GenerationEvent::Started { .. })
+            )),
+            "expected Generation(Started)"
         );
 
-        // Must push at least one Generated(Content) event.
+        // Must push at least one Generation(Chunk(Content)) event.
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::Generated(GeneratedEvent::Content { .. }))),
-            "expected Generated(Content) events"
+            events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Generation(GenerationEvent::Chunk(GeneratedEvent::Content { .. }))
+            )),
+            "expected Generation(Chunk(Content)) events"
         );
 
-        // Must push Generated(Done).
+        // Must push Generation(Chunk(Done)).
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::Generated(GeneratedEvent::Done))),
-            "expected Generated(Done)"
+            events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Generation(GenerationEvent::Chunk(GeneratedEvent::Done))
+            )),
+            "expected Generation(Chunk(Done))"
         );
 
-        // Must push GenerationCompleted.
+        // Must push Generation(Completed).
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::GenerationCompleted { .. })),
-            "expected GenerationCompleted"
+            events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Generation(GenerationEvent::Completed { .. })
+            )),
+            "expected Generation(Completed)"
         );
 
-        // Must push ActivityCompleted.
+        // Must push Activity(Completed).
         assert!(
             events.iter().any(
-                |e| matches!(e, PipelineEvent::ActivityCompleted { name, .. } if name == "generate")
+                |e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { name, .. }) if name == "generate")
             ),
-            "expected ActivityCompleted"
+            "expected Activity(Completed)"
         );
     }
 
@@ -704,7 +718,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = GenerateActivity::new();
         activity
@@ -715,13 +729,18 @@ mod tests {
 
         let completed = events
             .iter()
-            .find(|e| matches!(e, PipelineEvent::GenerationCompleted { .. }))
-            .expect("expected GenerationCompleted");
+            .find(|e| {
+                matches!(
+                    e,
+                    PipelineEvent::Generation(GenerationEvent::Completed { .. })
+                )
+            })
+            .expect("expected Generation(Completed)");
 
         match completed {
-            PipelineEvent::GenerationCompleted {
+            PipelineEvent::Generation(GenerationEvent::Completed {
                 response_message, ..
-            } => {
+            }) => {
                 // The response_message should be an Assistant message.
                 assert_eq!(response_message.role, Role::Assistant);
                 // Content should contain the response text.
@@ -734,11 +753,11 @@ mod tests {
                     "response_message should contain '{response_text}'"
                 );
             }
-            _ => panic!("expected GenerationCompleted"),
+            _ => panic!("expected Generation(Completed)"),
         }
     }
 
-    // ── Idempotency key in ActivityCompleted ─────────────────────────────
+    // ── Idempotency key in Activity(Completed) ─────────────────────────────
 
     #[tokio::test]
     async fn generate_includes_idempotency_key_in_completed() {
@@ -749,7 +768,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = GenerateActivity::new();
         activity
@@ -760,24 +779,24 @@ mod tests {
 
         let completed = events
             .iter()
-            .find(|e| matches!(e, PipelineEvent::ActivityCompleted { name, .. } if name == "generate"))
-            .expect("expected ActivityCompleted");
+            .find(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { name, .. }) if name == "generate"))
+            .expect("expected Activity(Completed)");
 
         match completed {
-            PipelineEvent::ActivityCompleted {
+            PipelineEvent::Activity(ActivityEvent::Completed {
                 idempotency_key, ..
-            } => {
+            }) => {
                 assert_eq!(
                     *idempotency_key,
                     Some("exec123:generate:0".to_string()),
-                    "idempotency_key should be carried through to ActivityCompleted"
+                    "idempotency_key should be carried through to Activity(Completed)"
                 );
             }
-            _ => panic!("expected ActivityCompleted"),
+            _ => panic!("expected Activity(Completed)"),
         }
     }
 
-    // ── Cancellation: pushes GenerationFailed + ActivityFailed (retryable: false) ──
+    // ── Cancellation: pushes Generation(Failed) + Activity(Failed) (retryable: false) ──
 
     #[tokio::test]
     async fn generate_cancellation_pushes_generation_failed_not_retryable() {
@@ -788,7 +807,7 @@ mod tests {
         cancel.cancel(); // Pre-cancelled
 
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = GenerateActivity::new();
         activity
@@ -797,24 +816,24 @@ mod tests {
 
         let events = collect_events(&mut rx);
 
-        // Must push GenerationFailed.
+        // Must push Generation(Failed).
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::GenerationFailed { .. })),
-            "expected GenerationFailed on cancellation"
+                .any(|e| matches!(e, PipelineEvent::Generation(GenerationEvent::Failed { .. }))),
+            "expected Generation(Failed) on cancellation"
         );
 
-        // Must push ActivityFailed with retryable: false.
+        // Must push Activity(Failed) with retryable: false.
         let failed = events
             .iter()
-            .find(|e| matches!(e, PipelineEvent::ActivityFailed { .. }))
-            .expect("expected ActivityFailed");
+            .find(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. })))
+            .expect("expected Activity(Failed)");
         match failed {
-            PipelineEvent::ActivityFailed { retryable, .. } => {
+            PipelineEvent::Activity(ActivityEvent::Failed { retryable, .. }) => {
                 assert!(!retryable, "cancellation should not be retryable");
             }
-            _ => panic!("expected ActivityFailed"),
+            _ => panic!("expected Activity(Failed)"),
         }
     }
 
@@ -830,7 +849,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = GenerateActivity::new();
         activity
@@ -841,13 +860,13 @@ mod tests {
 
         let failed = events
             .iter()
-            .find(|e| matches!(e, PipelineEvent::ActivityFailed { .. }))
-            .expect("expected ActivityFailed");
+            .find(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. })))
+            .expect("expected Activity(Failed)");
         match failed {
-            PipelineEvent::ActivityFailed { retryable, .. } => {
+            PipelineEvent::Activity(ActivityEvent::Failed { retryable, .. }) => {
                 assert!(*retryable, "rate limit should be retryable");
             }
-            _ => panic!("expected ActivityFailed"),
+            _ => panic!("expected Activity(Failed)"),
         }
     }
 
@@ -864,7 +883,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = GenerateActivity::new();
         activity
@@ -875,13 +894,13 @@ mod tests {
 
         let failed = events
             .iter()
-            .find(|e| matches!(e, PipelineEvent::ActivityFailed { .. }))
-            .expect("expected ActivityFailed");
+            .find(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. })))
+            .expect("expected Activity(Failed)");
         match failed {
-            PipelineEvent::ActivityFailed { retryable, .. } => {
+            PipelineEvent::Activity(ActivityEvent::Failed { retryable, .. }) => {
                 assert!(!retryable, "auth error should not be retryable");
             }
-            _ => panic!("expected ActivityFailed"),
+            _ => panic!("expected Activity(Failed)"),
         }
     }
 
@@ -900,7 +919,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         // Pause the Tokio clock so we control time advancement.
         tokio::time::pause();
@@ -941,8 +960,8 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::Heartbeat { activity_name } if activity_name == "generate")),
-            "expected at least one Heartbeat event"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Heartbeat { activity_name }) if activity_name == "generate")),
+            "expected at least one Activity(Heartbeat) event"
         );
     }
 
@@ -995,8 +1014,8 @@ mod tests {
 
     // ── Streaming: multi-chunk provider pushes events incrementally ───────
 
-    /// Verify that `GenerateActivity` pushes one `Generated(Content)` event per
-    /// delta chunk, and that all three chunks arrive before `GenerationCompleted`.
+    /// Verify that `GenerateActivity` pushes one `Generation(Chunk(Content))` event
+    /// per delta chunk, and that all three chunks arrive before `Generation(Completed)`.
     ///
     /// This is the core streaming correctness test: events must arrive as chunks
     /// are yielded, not after buffering the whole response.
@@ -1008,7 +1027,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = GenerateActivity::new();
         activity
@@ -1017,57 +1036,68 @@ mod tests {
 
         let events = collect_events(&mut rx);
 
-        // Count distinct Generated(Content) events — there must be one per delta chunk.
+        // Count distinct Generation(Chunk(Content)) events — there must be one per delta chunk.
         let content_events: Vec<_> = events
             .iter()
-            .filter(|e| matches!(e, PipelineEvent::Generated(GeneratedEvent::Content { .. })))
+            .filter(|e| {
+                matches!(
+                    e,
+                    PipelineEvent::Generation(GenerationEvent::Chunk(
+                        GeneratedEvent::Content { .. }
+                    ))
+                )
+            })
             .collect();
 
         assert_eq!(
             content_events.len(),
             chunks.len(),
-            "expected one Content event per delta chunk; got {}",
+            "expected one Chunk(Content) event per delta chunk; got {}",
             content_events.len()
         );
 
         // Verify the text of each Content event matches the original chunk text.
         for (i, (expected, event)) in chunks.iter().zip(content_events.iter()).enumerate() {
             match event {
-                PipelineEvent::Generated(GeneratedEvent::Content {
+                PipelineEvent::Generation(GenerationEvent::Chunk(GeneratedEvent::Content {
                     part: ContentPart::Text(text),
-                }) => {
+                })) => {
                     assert_eq!(
                         text, expected,
                         "chunk {i}: expected text {:?}, got {:?}",
                         expected, text
                     );
                 }
-                other => panic!("chunk {i}: expected Generated(Content(Text)), got {other:?}"),
+                other => {
+                    panic!("chunk {i}: expected Generation(Chunk(Content(Text))), got {other:?}")
+                }
             }
         }
 
-        // GenerationCompleted must be pushed.
+        // Generation(Completed) must be pushed.
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::GenerationCompleted { .. })),
-            "expected GenerationCompleted after all chunks"
+            events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Generation(GenerationEvent::Completed { .. })
+            )),
+            "expected Generation(Completed) after all chunks"
         );
 
-        // Generated(Done) must be present.
+        // Generation(Chunk(Done)) must be present.
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::Generated(GeneratedEvent::Done))),
-            "expected Generated(Done)"
+            events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Generation(GenerationEvent::Chunk(GeneratedEvent::Done))
+            )),
+            "expected Generation(Chunk(Done))"
         );
 
-        // ActivityCompleted must be present.
+        // Activity(Completed) must be present.
         assert!(
             events.iter().any(
-                |e| matches!(e, PipelineEvent::ActivityCompleted { name, .. } if name == "generate")
+                |e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { name, .. }) if name == "generate")
             ),
-            "expected ActivityCompleted"
+            "expected Activity(Completed)"
         );
     }
 
@@ -1084,7 +1114,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = GenerateActivity::new();
         activity
@@ -1093,35 +1123,36 @@ mod tests {
 
         let events = collect_events(&mut rx);
 
-        // Must emit at least one Content event with the response text.
+        // Must emit at least one Chunk(Content) event with the response text.
         let has_content = events.iter().any(|e| {
-            matches!(e, PipelineEvent::Generated(GeneratedEvent::Content {
+            matches!(e, PipelineEvent::Generation(GenerationEvent::Chunk(GeneratedEvent::Content {
                 part: ContentPart::Text(t),
-            }) if t.contains(response_text))
+            })) if t.contains(response_text))
         });
         assert!(
             has_content,
-            "expected Generated(Content) with response text"
+            "expected Generation(Chunk(Content)) with response text"
         );
 
-        // Must emit GenerationCompleted.
+        // Must emit Generation(Completed).
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::GenerationCompleted { .. })),
-            "expected GenerationCompleted"
+            events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Generation(GenerationEvent::Completed { .. })
+            )),
+            "expected Generation(Completed)"
         );
 
-        // Must emit ActivityCompleted.
+        // Must emit Activity(Completed).
         assert!(
             events.iter().any(
-                |e| matches!(e, PipelineEvent::ActivityCompleted { name, .. } if name == "generate")
+                |e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { name, .. }) if name == "generate")
             ),
-            "expected ActivityCompleted"
+            "expected Activity(Completed)"
         );
     }
 
-    /// Verify that cancellation mid-stream causes `GenerationFailed` with
+    /// Verify that cancellation mid-stream causes `Generation(Failed)` with
     /// `retryable: false` and drops the stream.
     ///
     /// Uses a pre-cancelled token so the select! in the stream consumption loop
@@ -1136,7 +1167,7 @@ mod tests {
         // Pre-cancel so the stream loop is interrupted immediately.
         cancel.cancel();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = GenerateActivity::new();
         activity
@@ -1145,33 +1176,33 @@ mod tests {
 
         let events = collect_events(&mut rx);
 
-        // Must push GenerationFailed.
+        // Must push Generation(Failed).
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::GenerationFailed { .. })),
-            "expected GenerationFailed on cancellation"
+                .any(|e| matches!(e, PipelineEvent::Generation(GenerationEvent::Failed { .. }))),
+            "expected Generation(Failed) on cancellation"
         );
 
-        // Must push ActivityFailed with retryable: false.
+        // Must push Activity(Failed) with retryable: false.
         let failed = events
             .iter()
-            .find(|e| matches!(e, PipelineEvent::ActivityFailed { .. }))
-            .expect("expected ActivityFailed");
+            .find(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. })))
+            .expect("expected Activity(Failed)");
         match failed {
-            PipelineEvent::ActivityFailed { retryable, .. } => {
+            PipelineEvent::Activity(ActivityEvent::Failed { retryable, .. }) => {
                 assert!(!retryable, "cancellation should not be retryable");
             }
-            _ => panic!("expected ActivityFailed"),
+            _ => panic!("expected Activity(Failed)"),
         }
     }
 
     /// Verify that a mid-stream error (after one chunk was already delivered) causes
-    /// `GenerationFailed` and `ActivityFailed` with the correct `retryable` flag.
+    /// `Generation(Failed)` and `Activity(Failed)` with the correct `retryable` flag.
     ///
     /// The `MidStreamErrorProvider` yields one delta chunk then errors. The first
-    /// chunk must have been pushed as a `Generated(Content)` event, and the error
-    /// must trigger `GenerationFailed` + `ActivityFailed`.
+    /// chunk must have been pushed as a `Generation(Chunk(Content))` event, and the
+    /// error must trigger `Generation(Failed)` + `Activity(Failed)`.
     #[tokio::test]
     async fn test_generate_stream_error_mid_stream() {
         let services = make_test_services_with_mid_stream_error(
@@ -1184,7 +1215,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = GenerateActivity::new();
         activity
@@ -1195,36 +1226,36 @@ mod tests {
 
         // The first chunk must have been pushed before the error.
         let has_partial_content = events.iter().any(|e| {
-            matches!(e, PipelineEvent::Generated(GeneratedEvent::Content {
+            matches!(e, PipelineEvent::Generation(GenerationEvent::Chunk(GeneratedEvent::Content {
                 part: ContentPart::Text(t),
-            }) if t == "partial text")
+            })) if t == "partial text")
         });
         assert!(
             has_partial_content,
-            "expected Generated(Content) with 'partial text' before the mid-stream error"
+            "expected Generation(Chunk(Content)) with 'partial text' before the mid-stream error"
         );
 
-        // Must push GenerationFailed.
+        // Must push Generation(Failed).
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::GenerationFailed { .. })),
-            "expected GenerationFailed after mid-stream error"
+                .any(|e| matches!(e, PipelineEvent::Generation(GenerationEvent::Failed { .. }))),
+            "expected Generation(Failed) after mid-stream error"
         );
 
-        // RateLimited is retryable — ActivityFailed must have retryable: true.
+        // RateLimited is retryable — Activity(Failed) must have retryable: true.
         let failed = events
             .iter()
-            .find(|e| matches!(e, PipelineEvent::ActivityFailed { .. }))
-            .expect("expected ActivityFailed");
+            .find(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. })))
+            .expect("expected Activity(Failed)");
         match failed {
-            PipelineEvent::ActivityFailed { retryable, .. } => {
+            PipelineEvent::Activity(ActivityEvent::Failed { retryable, .. }) => {
                 assert!(
                     *retryable,
                     "rate limit mid-stream error should be retryable"
                 );
             }
-            _ => panic!("expected ActivityFailed"),
+            _ => panic!("expected Activity(Failed)"),
         }
     }
 }

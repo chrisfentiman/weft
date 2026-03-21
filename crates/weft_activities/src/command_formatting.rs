@@ -12,26 +12,23 @@
 //! **Fail mode: OPEN.** On any error (missing metadata, empty commands), the activity completes
 //! with `CommandFormat::NoCommands`. The model can still generate text.
 
-use std::time::Instant;
-
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::activity::{Activity, ActivityInput};
-use crate::event::{CommandFormat, MessageInjectionSource, PipelineEvent};
-use crate::event_log::EventLog;
-use crate::execution::ExecutionId;
-use crate::services::Services;
+use weft_reactor_trait::{
+    Activity, ActivityEvent, ActivityInput, CommandFormat, ContextEvent, EventLog, ExecutionId,
+    MessageInjectionSource, PipelineEvent, ServiceLocator,
+};
 
 /// Formats selected commands for the target provider based on its capabilities.
 ///
 /// **Name:** `"command_formatting"`
 ///
 /// **Events pushed:**
-/// - `ActivityStarted { name: "command_formatting" }`
-/// - `MessageInjected { message, source: CommandFormatInjection }` — only for `PromptInjected` format
-/// - `CommandsFormatted { format, command_count }`
-/// - `ActivityCompleted { name: "command_formatting", duration_ms, idempotency_key: None }`
+/// - `Activity(ActivityEvent::Started { name: "command_formatting" })`
+/// - `Context(ContextEvent::MessageInjected { message, source: CommandFormatInjection })` — only for `PromptInjected` format
+/// - `Context(ContextEvent::CommandsFormatted { format, command_count })`
+/// - `Activity(ActivityEvent::Completed { name: "command_formatting", idempotency_key: None })`
 pub struct CommandFormattingActivity;
 
 impl CommandFormattingActivity {
@@ -57,17 +54,15 @@ impl Activity for CommandFormattingActivity {
         &self,
         _execution_id: &ExecutionId,
         input: ActivityInput,
-        _services: &Services,
+        _services: &dyn ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         _cancel: CancellationToken,
     ) {
-        let start = Instant::now();
-
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name().to_string(),
-            })
+            }))
             .await;
 
         // Extract capabilities from metadata. Missing metadata defaults to PromptInjected
@@ -96,7 +91,6 @@ impl Activity for CommandFormattingActivity {
             .unwrap_or_default();
 
         // Filter available_commands to only those that were selected.
-        // If a selected name doesn't match any available command, skip it silently.
         let selected_commands: Vec<&weft_core::CommandStub> = input
             .available_commands
             .iter()
@@ -104,21 +98,18 @@ impl Activity for CommandFormattingActivity {
             .collect();
 
         if selected_commands.is_empty() {
-            // No commands selected — nothing to format.
             let _ = event_tx
-                .send(PipelineEvent::CommandsFormatted {
+                .send(PipelineEvent::Context(ContextEvent::CommandsFormatted {
                     format: CommandFormat::NoCommands,
                     command_count: 0,
-                })
+                }))
                 .await;
 
-            let duration_ms = start.elapsed().as_millis() as u64;
             let _ = event_tx
-                .send(PipelineEvent::ActivityCompleted {
+                .send(PipelineEvent::Activity(ActivityEvent::Completed {
                     name: self.name().to_string(),
-                    duration_ms,
                     idempotency_key: None,
-                })
+                }))
                 .await;
             return;
         }
@@ -129,10 +120,10 @@ impl Activity for CommandFormattingActivity {
         if has_tool_calling {
             // Structured: provider handles tool definitions natively.
             let _ = event_tx
-                .send(PipelineEvent::CommandsFormatted {
+                .send(PipelineEvent::Context(ContextEvent::CommandsFormatted {
                     format: CommandFormat::Structured,
                     command_count,
-                })
+                }))
                 .await;
         } else {
             // PromptInjected: build a text block describing available commands and inject it.
@@ -148,27 +139,25 @@ impl Activity for CommandFormattingActivity {
             };
 
             let _ = event_tx
-                .send(PipelineEvent::MessageInjected {
+                .send(PipelineEvent::Context(ContextEvent::MessageInjected {
                     message: injected_message,
                     source: MessageInjectionSource::CommandFormatInjection,
-                })
+                }))
                 .await;
 
             let _ = event_tx
-                .send(PipelineEvent::CommandsFormatted {
+                .send(PipelineEvent::Context(ContextEvent::CommandsFormatted {
                     format: CommandFormat::PromptInjected,
                     command_count,
-                })
+                }))
                 .await;
         }
 
-        let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
-            .send(PipelineEvent::ActivityCompleted {
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
-                duration_ms,
                 idempotency_key: None,
-            })
+            }))
             .await;
     }
 }
@@ -201,6 +190,7 @@ fn build_command_text(commands: &[&weft_core::CommandStub]) -> String {
 mod tests {
     use super::*;
     use crate::test_support::{NullEventLog, collect_events, make_test_input, make_test_services};
+    use pretty_assertions::assert_eq;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
     use weft_core::CommandStub;
@@ -254,10 +244,10 @@ mod tests {
         let events = run_formatting(input).await;
 
         let formatted = events.iter().find_map(|e| {
-            if let PipelineEvent::CommandsFormatted {
+            if let PipelineEvent::Context(ContextEvent::CommandsFormatted {
                 format,
                 command_count,
-            } = e
+            }) = e
             {
                 Some((format.clone(), *command_count))
             } else {
@@ -276,16 +266,11 @@ mod tests {
 
     #[tokio::test]
     async fn selected_commands_not_in_available_produces_no_commands() {
-        // Selected names reference commands that don't exist in available_commands.
-        let input = make_input_with_commands(
-            &["tool_calling"],
-            &["nonexistent_cmd"],
-            vec![], // no available commands
-        );
+        let input = make_input_with_commands(&["tool_calling"], &["nonexistent_cmd"], vec![]);
         let events = run_formatting(input).await;
 
         let format = events.iter().find_map(|e| {
-            if let PipelineEvent::CommandsFormatted { format, .. } = e {
+            if let PipelineEvent::Context(ContextEvent::CommandsFormatted { format, .. }) = e {
                 Some(format.clone())
             } else {
                 None
@@ -312,10 +297,10 @@ mod tests {
         let events = run_formatting(input).await;
 
         let formatted = events.iter().find_map(|e| {
-            if let PipelineEvent::CommandsFormatted {
+            if let PipelineEvent::Context(ContextEvent::CommandsFormatted {
                 format,
                 command_count,
-            } = e
+            }) = e
             {
                 Some((format.clone(), *command_count))
             } else {
@@ -344,10 +329,10 @@ mod tests {
         assert!(
             !events.iter().any(|e| matches!(
                 e,
-                PipelineEvent::MessageInjected {
+                PipelineEvent::Context(ContextEvent::MessageInjected {
                     source: MessageInjectionSource::CommandFormatInjection,
                     ..
-                }
+                })
             )),
             "Structured format must NOT emit MessageInjected"
         );
@@ -365,7 +350,7 @@ mod tests {
         let events = run_formatting(input).await;
 
         let format = events.iter().find_map(|e| {
-            if let PipelineEvent::CommandsFormatted { format, .. } = e {
+            if let PipelineEvent::Context(ContextEvent::CommandsFormatted { format, .. }) = e {
                 Some(format.clone())
             } else {
                 None
@@ -379,8 +364,6 @@ mod tests {
         );
     }
 
-    // ── MessageInjected with CommandFormatInjection source for prompt-injected ──
-
     #[tokio::test]
     async fn prompt_injected_emits_message_injected_with_correct_source() {
         let cmds = vec![CommandStub {
@@ -393,10 +376,10 @@ mod tests {
         let found = events.iter().any(|e| {
             matches!(
                 e,
-                PipelineEvent::MessageInjected {
+                PipelineEvent::Context(ContextEvent::MessageInjected {
                     source: MessageInjectionSource::CommandFormatInjection,
                     ..
-                }
+                })
             )
         });
         assert!(
@@ -415,10 +398,10 @@ mod tests {
         let events = run_formatting(input).await;
 
         let msg = events.iter().find_map(|e| {
-            if let PipelineEvent::MessageInjected {
+            if let PipelineEvent::Context(ContextEvent::MessageInjected {
                 message,
                 source: MessageInjectionSource::CommandFormatInjection,
-            } = e
+            }) = e
             {
                 Some(message.clone())
             } else {
@@ -455,10 +438,10 @@ mod tests {
         let events = run_formatting(input).await;
 
         let text = events.iter().find_map(|e| {
-            if let PipelineEvent::MessageInjected {
+            if let PipelineEvent::Context(ContextEvent::MessageInjected {
                 message,
                 source: MessageInjectionSource::CommandFormatInjection,
-            } = e
+            }) = e
                 && let Some(weft_core::ContentPart::Text(t)) = message.content.first()
             {
                 return Some(t.clone());
@@ -492,13 +475,12 @@ mod tests {
         }];
         let mut input = make_test_input();
         input.available_commands = cmds;
-        // Metadata has selected_commands but no capabilities key.
         input.metadata = serde_json::json!({ "selected_commands": ["search"] });
 
         let events = run_formatting(input).await;
 
         let format = events.iter().find_map(|e| {
-            if let PipelineEvent::CommandsFormatted { format, .. } = e {
+            if let PipelineEvent::Context(ContextEvent::CommandsFormatted { format, .. }) = e {
                 Some(format.clone())
             } else {
                 None
@@ -521,20 +503,20 @@ mod tests {
 
         assert!(
             events.iter().any(
-                |e| matches!(e, PipelineEvent::ActivityStarted { name } if name == "command_formatting")
+                |e| matches!(e, PipelineEvent::Activity(ActivityEvent::Started { name }) if name == "command_formatting")
             ),
             "expected ActivityStarted"
         );
         assert!(
             events.iter().any(
-                |e| matches!(e, PipelineEvent::ActivityCompleted { name, .. } if name == "command_formatting")
+                |e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { name, .. }) if name == "command_formatting")
             ),
             "expected ActivityCompleted"
         );
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
             "did not expect ActivityFailed"
         );
     }

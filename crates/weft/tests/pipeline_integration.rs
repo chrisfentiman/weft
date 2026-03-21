@@ -84,17 +84,17 @@ async fn test_pre_loop_activities_produce_events_in_order() {
     let required_in_order: &[&str] = &[
         "execution.started",
         "activity.started", // validate
-        "validation.passed",
-        "model.selected",
-        "commands.selected",
-        "provider.resolved",
-        "system_prompt.assembled",
-        "commands.formatted",
-        "sampling.updated",
+        "execution.validation_passed",
+        "selection.model_selected",
+        "selection.commands_selected",
+        "selection.provider_resolved",
+        "context.system_prompt_assembled",
+        "context.commands_formatted",
+        "context.sampling_updated",
         "generation.started",
-        "generated", // at least one (Content or Done)
+        "generation.chunk", // at least one (Content or Done)
         "generation.completed",
-        "response.assembled",
+        "context.response_assembled",
         "execution.completed",
     ];
 
@@ -146,7 +146,7 @@ async fn test_pre_loop_activities_produce_events_in_order() {
 ///
 /// The test verifies:
 /// - Response is 200 OK.
-/// - `system_prompt.assembled` event is present and carries `layer_count >= 1`.
+/// - `system_prompt.assembled` event is present and carries `message_count >= 1`.
 /// - The `message.injected` event with `source: SystemPromptAssembly` carries the gateway
 ///   prompt text ("You are a test assistant.") in its content.
 ///
@@ -164,7 +164,8 @@ async fn test_system_prompt_layers_gateway_and_caller() {
 
     // Request with caller-supplied system message.
     // Via HTTP, this gets Source::Gateway (see openai_to_weft), so it is NOT treated as
-    // a second caller layer by SystemPromptAssemblyActivity. layer_count will be 1.
+    // a second caller layer by SystemPromptAssemblyActivity. Only the gateway config prompt
+    // is assembled; message_count reflects the post-injection state.
     let body = json!({
         "model": "auto",
         "messages": [
@@ -181,37 +182,37 @@ async fn test_system_prompt_layers_gateway_and_caller() {
     let mut sorted = events.clone();
     sorted.sort_by_key(|e| e.sequence);
 
-    // system_prompt.assembled must be present.
-    // PipelineEvent is externally tagged: the payload is
-    //   {"SystemPromptAssembled": {"prompt_length": N, "layer_count": N, "message_count": N}}
+    // context.system_prompt_assembled must be present.
+    // PipelineEvent is adjacently tagged: outer has {"category": "Context", "event": {...}},
+    // inner event has {"type": "SystemPromptAssembled", "message_count": N}.
+    // Note: prompt_length and layer_count are observability-only and removed from the variant
+    // per Phase 2 slimming; they are no longer stored in the event payload.
     let assembled_event = sorted
         .iter()
-        .find(|e| e.event_type == "system_prompt.assembled")
-        .expect("expected system_prompt.assembled event in log");
+        .find(|e| e.event_type == "context.system_prompt_assembled")
+        .expect("expected context.system_prompt_assembled event in log");
 
-    // Gateway prompt is always present → layer_count >= 1.
-    let layer_count = assembled_event.payload["SystemPromptAssembled"]["layer_count"]
+    // message_count must be >= 1 (at minimum the injected system message is counted).
+    let message_count = assembled_event.payload["event"]["message_count"]
         .as_u64()
-        .expect(
-            "system_prompt.assembled payload must have SystemPromptAssembled.layer_count field",
-        );
+        .expect("context.system_prompt_assembled payload must have event.message_count field");
     assert!(
-        layer_count >= 1,
-        "expected layer_count >= 1 (at least the gateway prompt), got {layer_count}"
+        message_count >= 1,
+        "expected message_count >= 1, got {message_count}"
     );
 
-    // Find the MessageInjected event with source = SystemPromptAssembly.
-    // Payload shape: {"MessageInjected": {"message": {...}, "source": "SystemPromptAssembly"}}
+    // Find the context.message_injected event with source = SystemPromptAssembly.
+    // Payload shape: {"category": "Context", "event": {"type": "MessageInjected", "message": {...}, "source": "SystemPromptAssembly"}}
     let injected_event = sorted
         .iter()
         .find(|e| {
-            e.event_type == "message.injected"
-                && e.payload["MessageInjected"]["source"] == "SystemPromptAssembly"
+            e.event_type == "context.message_injected"
+                && e.payload["event"]["source"] == "SystemPromptAssembly"
         })
-        .expect("expected message.injected event with source SystemPromptAssembly in log");
+        .expect("expected context.message_injected event with source SystemPromptAssembly in log");
 
     // The assembled message content must include the gateway prompt.
-    let content_json = &injected_event.payload["MessageInjected"]["message"]["content"];
+    let content_json = &injected_event.payload["event"]["message"]["content"];
     let content_str = content_json.to_string();
 
     assert!(

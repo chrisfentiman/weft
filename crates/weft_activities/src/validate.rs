@@ -10,11 +10,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-use crate::activity::{Activity, ActivityInput};
-use crate::event::PipelineEvent;
-use crate::event_log::EventLog;
-use crate::execution::ExecutionId;
-use crate::services::Services;
+use weft_reactor_trait::{
+    Activity, ActivityEvent, ActivityInput, CommandEvent, EventLog, ExecutionEvent, ExecutionId,
+    PipelineEvent, ServiceLocator,
+};
 
 /// Validates the incoming request.
 ///
@@ -26,12 +25,12 @@ use crate::services::Services;
 /// **Name:** `"validate"`
 ///
 /// **Events pushed:**
-/// - `ActivityStarted { name: "validate" }`
-/// - `ValidationPassed` — if validation succeeds
-/// - `CommandsAvailable { commands }` — always pushed after `ValidationPassed`
-/// - `ValidationFailed { reason }` — if validation fails
-/// - `ActivityCompleted { name: "validate", duration_ms, idempotency_key: None }`
-/// - `ActivityFailed { name: "validate", error, retryable: false }` — on internal error
+/// - `Activity(ActivityEvent::Started { name: "validate" })`
+/// - `Execution(ExecutionEvent::ValidationPassed)` — if validation succeeds
+/// - `Command(CommandEvent::Available { commands })` — always pushed after ValidationPassed
+/// - `Execution(ExecutionEvent::ValidationFailed { reason })` — if validation fails
+/// - `Activity(ActivityEvent::Completed { name: "validate", idempotency_key: None })`
+/// - `Activity(ActivityEvent::Failed { name: "validate", error, retryable: false })` — on internal error
 pub struct ValidateActivity;
 
 impl ValidateActivity {
@@ -57,7 +56,7 @@ impl Activity for ValidateActivity {
         &self,
         _execution_id: &ExecutionId,
         input: ActivityInput,
-        services: &Services,
+        services: &dyn ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         cancel: CancellationToken,
@@ -66,20 +65,20 @@ impl Activity for ValidateActivity {
 
         // Push ActivityStarted
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name().to_string(),
-            })
+            }))
             .await;
 
         // Check for cancellation before doing any work.
         if cancel.is_cancelled() {
             let duration_ms = start.elapsed().as_millis() as u64;
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: self.name().to_string(),
                     error: "cancelled before validation".to_string(),
                     retryable: false,
-                })
+                }))
                 .await;
             debug!(duration_ms, "validate: cancelled");
             return;
@@ -88,17 +87,17 @@ impl Activity for ValidateActivity {
         // Validate: messages must be non-empty.
         if input.messages.is_empty() {
             let _ = event_tx
-                .send(PipelineEvent::ValidationFailed {
+                .send(PipelineEvent::Execution(ExecutionEvent::ValidationFailed {
                     reason: "messages must not be empty".to_string(),
-                })
+                }))
                 .await;
             let duration_ms = start.elapsed().as_millis() as u64;
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: self.name().to_string(),
                     error: "validation failed: messages must not be empty".to_string(),
                     retryable: false,
-                })
+                }))
                 .await;
             debug!(duration_ms, "validate: failed (empty messages)");
             return;
@@ -106,7 +105,7 @@ impl Activity for ValidateActivity {
 
         // Populate available commands from the registry.
         // On error, fail-open: continue with empty command list and log.
-        let available_commands = match services.commands.list_commands().await {
+        let available_commands = match services.commands().list_commands().await {
             Ok(cmds) => {
                 debug!(count = cmds.len(), "validate: loaded commands");
                 cmds
@@ -117,7 +116,9 @@ impl Activity for ValidateActivity {
             }
         };
 
-        let _ = event_tx.send(PipelineEvent::ValidationPassed).await;
+        let _ = event_tx
+            .send(PipelineEvent::Execution(ExecutionEvent::ValidationPassed))
+            .await;
 
         // Push CommandsAvailable before ActivityCompleted so the Reactor can
         // populate state.available_commands while draining the channel.
@@ -125,32 +126,30 @@ impl Activity for ValidateActivity {
         // vec (the warn is already logged above); commands remain unavailable for
         // this execution, which is preferable to failing the entire request.
         let _ = event_tx
-            .send(PipelineEvent::CommandsAvailable {
+            .send(PipelineEvent::Command(CommandEvent::Available {
                 commands: available_commands,
-            })
+            }))
             .await;
 
-        let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
-            .send(PipelineEvent::ActivityCompleted {
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
-                duration_ms,
                 idempotency_key: None,
-            })
+            }))
             .await;
 
-        debug!(duration_ms, "validate: completed");
+        debug!("validate: completed");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::NullEventLog;
     use crate::test_support::{
-        collect_events, make_test_input, make_test_services,
+        NullEventLog, collect_events, make_test_input, make_test_services,
         make_test_services_with_failing_list_commands,
     };
+    use pretty_assertions::assert_eq;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
@@ -160,7 +159,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let services = make_test_services();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = ValidateActivity::new();
         activity
@@ -187,31 +186,32 @@ mod tests {
         // Must push ActivityStarted.
         assert!(
             events.iter().any(
-                |e| matches!(e, PipelineEvent::ActivityStarted { name } if name == "validate")
+                |e| matches!(e, PipelineEvent::Activity(ActivityEvent::Started { name }) if name == "validate")
             ),
-            "expected ActivityStarted"
+            "expected Activity(Started)"
         );
 
         // Must push ValidationPassed.
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::ValidationPassed)),
-            "expected ValidationPassed"
+            events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Execution(ExecutionEvent::ValidationPassed)
+            )),
+            "expected Execution(ValidationPassed)"
         );
 
         // Must push ActivityCompleted (not ActivityFailed).
         assert!(
             events.iter().any(
-                |e| matches!(e, PipelineEvent::ActivityCompleted { name, .. } if name == "validate")
+                |e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { name, .. }) if name == "validate")
             ),
-            "expected ActivityCompleted"
+            "expected Activity(Completed)"
         );
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "should not push ActivityFailed on success"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "should not push Activity(Failed) on success"
         );
     }
 
@@ -225,24 +225,26 @@ mod tests {
 
         // Must push ValidationFailed.
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::ValidationFailed { reason } if reason.contains("empty"))),
-            "expected ValidationFailed with 'empty' in reason"
+            events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Execution(ExecutionEvent::ValidationFailed { reason })
+                if reason.contains("empty")
+            )),
+            "expected Execution(ValidationFailed) with 'empty' in reason"
         );
 
         // Must push ActivityFailed (not ActivityCompleted).
         assert!(
             events.iter().any(
-                |e| matches!(e, PipelineEvent::ActivityFailed { name, .. } if name == "validate")
+                |e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { name, .. }) if name == "validate")
             ),
-            "expected ActivityFailed"
+            "expected Activity(Failed)"
         );
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityCompleted { .. })),
-            "should not push ActivityCompleted on failure"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { .. }))),
+            "should not push Activity(Completed) on failure"
         );
     }
 
@@ -257,7 +259,7 @@ mod tests {
 
         let services = make_test_services();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = ValidateActivity::new();
         activity
@@ -270,15 +272,16 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "expected ActivityFailed when cancelled"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "expected Activity(Failed) when cancelled"
         );
         // Must NOT push ValidationPassed or ActivityCompleted.
         assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::ValidationPassed)),
-            "should not push ValidationPassed when cancelled"
+            !events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Execution(ExecutionEvent::ValidationPassed)
+            )),
+            "should not push Execution(ValidationPassed) when cancelled"
         );
     }
 
@@ -292,41 +295,41 @@ mod tests {
 
         let failed = events
             .iter()
-            .find(|e| matches!(e, PipelineEvent::ActivityFailed { .. }))
-            .expect("expected ActivityFailed");
+            .find(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. })))
+            .expect("expected Activity(Failed)");
 
         match failed {
-            PipelineEvent::ActivityFailed { retryable, .. } => {
+            PipelineEvent::Activity(ActivityEvent::Failed { retryable, .. }) => {
                 assert!(!retryable, "validation failures should not be retryable");
             }
-            _ => panic!("expected ActivityFailed"),
+            _ => panic!("expected Activity(Failed)"),
         }
     }
 
     // ── CommandsAvailable event ───────────────────────────────────────────────
 
-    /// Verify that a successful run pushes `CommandsAvailable` with the stubs
+    /// Verify that a successful run pushes `Command(Available)` with the stubs
     /// returned by the command registry (one stub: "test_command").
     #[tokio::test]
     async fn test_validate_pushes_commands_available() {
         let input = make_test_input();
         let events = run_validate(input).await;
 
-        // Exactly one CommandsAvailable event must be present.
+        // Exactly one Command(Available) event must be present.
         let commands_events: Vec<_> = events
             .iter()
-            .filter(|e| matches!(e, PipelineEvent::CommandsAvailable { .. }))
+            .filter(|e| matches!(e, PipelineEvent::Command(CommandEvent::Available { .. })))
             .collect();
 
         assert_eq!(
             commands_events.len(),
             1,
-            "expected exactly one CommandsAvailable event, got {}",
+            "expected exactly one Command(Available) event, got {}",
             commands_events.len()
         );
 
         match commands_events[0] {
-            PipelineEvent::CommandsAvailable { commands } => {
+            PipelineEvent::Command(CommandEvent::Available { commands }) => {
                 assert_eq!(
                     commands.len(),
                     1,
@@ -335,26 +338,26 @@ mod tests {
                 assert_eq!(commands[0].name, "test_command");
                 assert_eq!(commands[0].description, "A test command");
             }
-            _ => panic!("expected CommandsAvailable"),
+            _ => panic!("expected Command(Available)"),
         }
 
-        // CommandsAvailable must appear before ActivityCompleted.
+        // Command(Available) must appear before Activity(Completed).
         let ca_pos = events
             .iter()
-            .position(|e| matches!(e, PipelineEvent::CommandsAvailable { .. }))
-            .expect("CommandsAvailable not found");
+            .position(|e| matches!(e, PipelineEvent::Command(CommandEvent::Available { .. })))
+            .expect("Command(Available) not found");
         let completed_pos = events
             .iter()
-            .position(|e| matches!(e, PipelineEvent::ActivityCompleted { .. }))
-            .expect("ActivityCompleted not found");
+            .position(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { .. })))
+            .expect("Activity(Completed) not found");
         assert!(
             ca_pos < completed_pos,
-            "CommandsAvailable (pos {ca_pos}) must come before ActivityCompleted (pos {completed_pos})"
+            "Command(Available) (pos {ca_pos}) must come before Activity(Completed) (pos {completed_pos})"
         );
     }
 
     /// When `list_commands` returns an error, the activity must fail-open:
-    /// push `CommandsAvailable` with an empty vec and continue to `ActivityCompleted`.
+    /// push `Command(Available)` with an empty vec and continue to `Activity(Completed)`.
     #[tokio::test]
     async fn test_validate_commands_available_empty_on_error() {
         let input = make_test_input();
@@ -363,7 +366,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let services = make_test_services_with_failing_list_commands();
         let event_log = NullEventLog;
-        let exec_id = crate::execution::ExecutionId::new();
+        let exec_id = ExecutionId::new();
 
         let activity = ValidateActivity::new();
         activity
@@ -374,41 +377,42 @@ mod tests {
 
         // Must still push ValidationPassed (fail-open).
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::ValidationPassed)),
-            "expected ValidationPassed even when list_commands fails"
+            events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Execution(ExecutionEvent::ValidationPassed)
+            )),
+            "expected Execution(ValidationPassed) even when list_commands fails"
         );
 
-        // Must push CommandsAvailable with an empty commands vec.
+        // Must push Command(Available) with an empty commands vec.
         let ca = events
             .iter()
-            .find(|e| matches!(e, PipelineEvent::CommandsAvailable { .. }))
-            .expect("expected CommandsAvailable even on list_commands error");
+            .find(|e| matches!(e, PipelineEvent::Command(CommandEvent::Available { .. })))
+            .expect("expected Command(Available) even on list_commands error");
 
         match ca {
-            PipelineEvent::CommandsAvailable { commands } => {
+            PipelineEvent::Command(CommandEvent::Available { commands }) => {
                 assert!(
                     commands.is_empty(),
                     "expected empty commands vec on list_commands error, got {:?}",
                     commands
                 );
             }
-            _ => panic!("expected CommandsAvailable"),
+            _ => panic!("expected Command(Available)"),
         }
 
-        // Must still reach ActivityCompleted (not ActivityFailed).
+        // Must still reach Activity(Completed) (not Activity(Failed)).
         assert!(
             events.iter().any(
-                |e| matches!(e, PipelineEvent::ActivityCompleted { name, .. } if name == "validate")
+                |e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { name, .. }) if name == "validate")
             ),
-            "expected ActivityCompleted even when list_commands fails"
+            "expected Activity(Completed) even when list_commands fails"
         );
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "should not push ActivityFailed when list_commands fails (fail-open)"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "should not push Activity(Failed) when list_commands fails (fail-open)"
         );
     }
 }

@@ -1,0 +1,12 @@
+[package]
+name = "weft_memory_trait"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+weft_core = { path = "../weft_core" }
+async-trait = { workspace = true }
+
+[features]
+test-support = []

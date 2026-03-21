@@ -6,15 +6,18 @@
 //! 3. **Signal** -- external control, delivered as events on the channel
 //! 4. **Activity** -- event-producing unit of work
 //! 5. **EventLog** -- pluggable durable store trait
-//! 6. **Reactor** -- dispatch loop (Phase 4+)
+//! 6. **Reactor** -- dispatch loop
 //! 7. **Budget** -- resource limits
 //! 8. **Services** -- shared infrastructure
 //!
+//! The trait contracts (Activity, EventLog, ServiceLocator, ChildSpawner, and all
+//! domain types) live in `weft_reactor_trait` and are re-exported here so existing
+//! import paths keep working.
+//!
 //! EventLog implementations live in separate crates:
 //! - `weft_eventlog_memory` -- for tests and local dev
-//! - `weft_eventlog_postgres` -- for production (Phase 6)
+//! - `weft_eventlog_postgres` -- for production
 
-pub mod activities;
 pub mod activity;
 pub mod budget;
 pub mod config;
@@ -37,10 +40,16 @@ pub use config::{
     ActivityRef, BudgetConfig, LoopHooks, PipelineConfig, ReactorConfig, RetryPolicy,
 };
 pub use error::ReactorError;
-pub use event::{BudgetSnapshot, EVENT_SCHEMA_VERSION, Event, GeneratedEvent, PipelineEvent};
+pub use event::{
+    ActivityEvent, BudgetEvent, BudgetSnapshot, ChildEvent, CommandEvent, CommandFormat,
+    ContextEvent, EVENT_SCHEMA_VERSION, Event, ExecutionEvent, GeneratedEvent, GenerationEvent,
+    HookOutcome, MessageInjectionSource, PipelineEvent, SelectionEvent, SignalEvent,
+};
 pub use event_log::{EventLog, EventLogError};
 pub use execution::{Execution, ExecutionId, ExecutionStatus, RequestId, TenantId};
-pub use reactor::{BudgetUsage, ExecutionResult, Reactor};
+pub use reactor::{BudgetUsage, ExecutionContext, ExecutionResult, Reactor};
 pub use registry::{ActivityRegistry, RegistryError};
-pub use services::{ReactorHandle, Services};
+pub use services::{ReactorChildSpawner, ReactorHandle, Services, SpawnRequest};
 pub use signal::{BudgetUpdate, Signal};
+// Re-export ServiceLocator, ChildSpawner, and SpawnRequest from weft_reactor_trait.
+pub use weft_reactor_trait::{ChildSpawner, ServiceLocator};

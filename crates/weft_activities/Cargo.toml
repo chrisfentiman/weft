@@ -1,0 +1,50 @@
+[package]
+name = "weft_activities"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Reactor contracts — the only reactor-layer dependency allowed here.
+weft_reactor_trait = { path = "../weft_reactor_trait" }
+
+# Domain primitives
+weft_core = { path = "../weft_core" }
+
+# Domain trait crates only (no concrete impl crates)
+weft_llm_trait = { path = "../weft_llm_trait" }
+weft_router_trait = { path = "../weft_router_trait" }
+weft_commands_trait = { path = "../weft_commands_trait" }
+weft_hooks_trait = { path = "../weft_hooks_trait" }
+weft_memory_trait = { path = "../weft_memory_trait" }
+
+# Async
+tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Utilities
+tracing = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+toml = { workspace = true }
+
+[features]
+# Expose test stubs for use in integration tests and dependent crates.
+test-support = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+# Concrete crates needed only in tests (for stub/mock types re-exported by test_support).
+weft_llm = { path = "../weft_llm", features = ["test-support"] }
+weft_router = { path = "../weft_router", features = ["test-support"] }
+weft_commands = { path = "../weft_commands", features = ["test-support"] }
+weft_hooks = { path = "../weft_hooks" }
+weft_core = { path = "../weft_core" }
+toml.workspace = true
+rstest.workspace = true
+pretty_assertions.workspace = true

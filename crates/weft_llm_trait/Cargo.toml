@@ -1,0 +1,17 @@
+[package]
+name = "weft_llm_trait"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+weft_core = { path = "../weft_core" }
+async-trait = { workspace = true }
+futures-core = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+# Expose test stubs for dependent crate test suites.
+test-support = []

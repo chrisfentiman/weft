@@ -9,18 +9,18 @@ use std::sync::Arc;
 use clap::Parser;
 use std::path::PathBuf;
 use tracing::{info, warn};
+use weft_activities::{
+    AssembleResponseActivity, CommandFormattingActivity, CommandSelectionActivity,
+    ExecuteCommandActivity, GenerateActivity, HookActivity, ModelSelectionActivity,
+    ProviderResolutionActivity, SamplingAdjustmentActivity, SystemPromptAssemblyActivity,
+    ValidateActivity,
+};
 use weft_commands::ToolRegistryCommandAdapter;
 use weft_core::{HookEvent, WeftConfig, WireFormat};
 use weft_llm::{AnthropicProvider, Capability, OpenAIProvider, ProviderRegistry, RhaiProvider};
 use weft_memory::{DefaultMemoryService, GrpcMemoryStoreClient, MemoryStoreMux, StoreInfo};
 use weft_reactor::{
     ActivityRegistry, Reactor, ReactorConfig,
-    activities::{
-        AssembleResponseActivity, CommandFormattingActivity, CommandSelectionActivity,
-        ExecuteCommandActivity, GenerateActivity, HookActivity, ModelSelectionActivity,
-        ProviderResolutionActivity, SamplingAdjustmentActivity, SystemPromptAssemblyActivity,
-        ValidateActivity,
-    },
     config::{ActivityRef, BudgetConfig, LoopHooks, PipelineConfig, RetryPolicy},
     services::{ReactorHandle, Services},
 };
@@ -564,7 +564,11 @@ async fn main() {
         HookEvent::PostToolUse,
     ] {
         activity_registry
-            .register(Arc::new(HookActivity::new(event)))
+            .register(Arc::new(HookActivity::new(
+                event,
+                Arc::clone(&services.hooks),
+                Arc::clone(&services.request_end_semaphore),
+            )))
             .unwrap_or_else(|e| {
                 eprintln!("error: failed to register HookActivity for {event:?}: {e}");
                 std::process::exit(1);

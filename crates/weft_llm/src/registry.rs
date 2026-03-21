@@ -132,6 +132,40 @@ impl ProviderRegistry {
     }
 }
 
+impl crate::provider_service::ProviderService for ProviderRegistry {
+    fn get(&self, name: &str) -> &Arc<dyn crate::Provider> {
+        self.get(name)
+    }
+
+    fn model_id(&self, name: &str) -> Option<&str> {
+        self.model_id(name)
+    }
+
+    fn max_tokens_for(&self, name: &str) -> Option<u32> {
+        self.max_tokens_for(name)
+    }
+
+    fn default_provider(&self) -> &Arc<dyn crate::Provider> {
+        self.default_provider()
+    }
+
+    fn default_name(&self) -> &str {
+        self.default_name()
+    }
+
+    fn models_with_capability(&self, capability: &Capability) -> &HashSet<String> {
+        self.models_with_capability(capability)
+    }
+
+    fn model_has_capability(&self, model_name: &str, capability: &Capability) -> bool {
+        self.model_has_capability(model_name, capability)
+    }
+
+    fn model_capabilities(&self, model_name: &str) -> Option<&HashSet<Capability>> {
+        self.model_capabilities(model_name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

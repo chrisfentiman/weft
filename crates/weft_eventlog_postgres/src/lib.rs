@@ -1,7 +1,7 @@
 //! PostgreSQL-backed EventLog implementation for production use.
 //!
 //! This crate provides [`PostgresEventLog`], a durable implementation of the
-//! [`weft_reactor::EventLog`] trait backed by PostgreSQL.
+//! [`weft_reactor_trait::EventLog`] trait backed by PostgreSQL.
 //!
 //! # Usage
 //!
@@ -45,11 +45,11 @@ use sqlx::{PgPool, Row};
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use weft_reactor::PipelineEvent;
-use weft_reactor::event::Event;
-use weft_reactor::event_log::{EventLog, EventLogError};
-use weft_reactor::execution::{Execution, ExecutionId, ExecutionStatus};
-use weft_reactor::signal::Signal;
+use weft_reactor_trait::PipelineEvent;
+use weft_reactor_trait::event::Event;
+use weft_reactor_trait::event_log::{EventLog, EventLogError};
+use weft_reactor_trait::execution::{Execution, ExecutionId, ExecutionStatus};
+use weft_reactor_trait::signal::Signal;
 
 /// PostgreSQL-backed event log for production use.
 ///
@@ -160,7 +160,13 @@ async fn signal_poller(
             };
 
             // Push onto the event channel. If the channel is closed, stop polling.
-            if event_tx.send(PipelineEvent::Signal(signal)).await.is_err() {
+            if event_tx
+                .send(PipelineEvent::Signal(
+                    weft_reactor_trait::SignalEvent::Received(signal),
+                ))
+                .await
+                .is_err()
+            {
                 // Receiver dropped — execution is over.
                 return;
             }
@@ -525,8 +531,8 @@ impl EventLog for PostgresEventLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weft_reactor::event::EVENT_SCHEMA_VERSION;
-    use weft_reactor::execution::{RequestId, TenantId};
+    use weft_reactor_trait::event::EVENT_SCHEMA_VERSION;
+    use weft_reactor_trait::execution::{RequestId, TenantId};
 
     fn make_execution() -> Execution {
         Execution {
@@ -921,7 +927,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires DATABASE_URL and schema.sql applied"]
     async fn test_pipeline_event_jsonb_round_trip() {
-        use weft_reactor::event::GeneratedEvent;
+        use weft_reactor_trait::event::{GeneratedEvent, GenerationEvent};
 
         let url = match std::env::var("DATABASE_URL").ok() {
             Some(u) => u,
@@ -935,7 +941,7 @@ mod tests {
         // Serialize an actual PipelineEvent variant to JSON, store it, read it
         // back, and deserialize to verify the JSONB round-trip path works end-to-end:
         // PipelineEvent -> serde_json::Value -> Postgres JSONB -> serde_json::Value -> PipelineEvent.
-        let original = PipelineEvent::Generated(GeneratedEvent::Done);
+        let original = PipelineEvent::Generation(GenerationEvent::Chunk(GeneratedEvent::Done));
         let payload = serde_json::to_value(&original).expect("serialize PipelineEvent");
 
         let seq = log
@@ -959,9 +965,9 @@ mod tests {
         assert!(
             matches!(
                 round_tripped,
-                PipelineEvent::Generated(GeneratedEvent::Done)
+                PipelineEvent::Generation(GenerationEvent::Chunk(GeneratedEvent::Done))
             ),
-            "expected Generated(Done), got {:?}",
+            "expected Generation(Chunk(Done)), got {:?}",
             round_tripped
         );
     }
@@ -1006,7 +1012,12 @@ mod tests {
             .expect("channel closed");
 
         assert!(
-            matches!(received, PipelineEvent::Signal(Signal::Cancel { .. })),
+            matches!(
+                received,
+                PipelineEvent::Signal(weft_reactor_trait::event::SignalEvent::Received(
+                    Signal::Cancel { .. }
+                ))
+            ),
             "expected Cancel signal, got {:?}",
             received
         );

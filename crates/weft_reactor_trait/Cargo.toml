@@ -1,0 +1,31 @@
+[package]
+name = "weft_reactor_trait"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+weft_core = { path = "../weft_core" }
+weft_llm_trait = { path = "../weft_llm_trait" }
+weft_router_trait = { path = "../weft_router_trait" }
+weft_commands_trait = { path = "../weft_commands_trait" }
+weft_hooks_trait = { path = "../weft_hooks_trait" }
+weft_memory_trait = { path = "../weft_memory_trait" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[features]
+# Expose test stubs for use in integration tests and dependent crates.
+test-support = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+rstest.workspace = true
+pretty_assertions.workspace = true
+toml = { workspace = true }

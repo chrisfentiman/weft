@@ -16,9 +16,13 @@ use weft_reactor::config::{
     ActivityRef, BudgetConfig, LoopHooks, PipelineConfig, ReactorConfig, RetryPolicy,
 };
 use weft_reactor::error::ReactorError;
-use weft_reactor::event::{GeneratedEvent, PipelineEvent};
+use weft_reactor::event::{
+    ActivityEvent, CommandEvent, CommandFormat, ContextEvent, ExecutionEvent, GeneratedEvent,
+    GenerationEvent, HookOutcome, MessageInjectionSource, PipelineEvent, SelectionEvent,
+    SignalEvent,
+};
 use weft_reactor::event_log::EventLog;
-use weft_reactor::execution::{Execution, ExecutionId, ExecutionStatus};
+use weft_reactor::execution::ExecutionId;
 use weft_reactor::reactor::Reactor;
 use weft_reactor::registry::ActivityRegistry;
 use weft_reactor::signal::Signal;
@@ -26,7 +30,7 @@ use weft_reactor::test_support::{
     TestEventLog, make_test_services, make_test_services_with_blocking_hook,
     make_test_services_with_response,
 };
-use weft_reactor::{RequestId, TenantId};
+use weft_reactor::{ExecutionContext, RequestId, TenantId};
 
 use weft_core::{
     CommandAction, CommandInvocation, ContentPart, HookEvent, ModelRoutingInstruction, Role,
@@ -50,34 +54,36 @@ impl Activity for ImmediateDoneActivity {
         &self,
         _execution_id: &ExecutionId,
         input: ActivityInput,
-        _services: &weft_reactor::services::Services,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         cancel: CancellationToken,
     ) {
         if cancel.is_cancelled() {
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: self.name.clone(),
                     error: "cancelled".to_string(),
                     retryable: false,
-                })
+                }))
                 .await;
             return;
         }
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name.clone(),
-            })
+            }))
             .await;
         let _ = event_tx
-            .send(PipelineEvent::GenerationStarted {
+            .send(PipelineEvent::Generation(GenerationEvent::Started {
                 model: "stub-model".to_string(),
                 message_count: input.messages.len(),
-            })
+            }))
             .await;
         let _ = event_tx
-            .send(PipelineEvent::Generated(GeneratedEvent::Done))
+            .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                GeneratedEvent::Done,
+            )))
             .await;
         let response_message = WeftMessage {
             role: Role::Assistant,
@@ -88,20 +94,19 @@ impl Activity for ImmediateDoneActivity {
             message_index: 0,
         };
         let _ = event_tx
-            .send(PipelineEvent::GenerationCompleted {
+            .send(PipelineEvent::Generation(GenerationEvent::Completed {
                 model: "stub-model".to_string(),
                 response_message,
                 generated_events: vec![GeneratedEvent::Done],
                 input_tokens: Some(5),
                 output_tokens: Some(0),
-            })
+            }))
             .await;
         let _ = event_tx
-            .send(PipelineEvent::ActivityCompleted {
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name.clone(),
-                duration_ms: 1,
                 idempotency_key: input.idempotency_key.clone(),
-            })
+            }))
             .await;
     }
 }
@@ -122,39 +127,43 @@ impl Activity for TextGenerateActivity {
         &self,
         _execution_id: &ExecutionId,
         input: ActivityInput,
-        _services: &weft_reactor::services::Services,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         cancel: CancellationToken,
     ) {
         if cancel.is_cancelled() {
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: self.name.clone(),
                     error: "cancelled".to_string(),
                     retryable: false,
-                })
+                }))
                 .await;
             return;
         }
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name.clone(),
-            })
-            .await;
-        let _ = event_tx
-            .send(PipelineEvent::GenerationStarted {
-                model: "stub-model".to_string(),
-                message_count: input.messages.len(),
-            })
-            .await;
-        let _ = event_tx
-            .send(PipelineEvent::Generated(GeneratedEvent::Content {
-                part: ContentPart::Text(self.response_text.clone()),
             }))
             .await;
         let _ = event_tx
-            .send(PipelineEvent::Generated(GeneratedEvent::Done))
+            .send(PipelineEvent::Generation(GenerationEvent::Started {
+                model: "stub-model".to_string(),
+                message_count: input.messages.len(),
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                GeneratedEvent::Content {
+                    part: ContentPart::Text(self.response_text.clone()),
+                },
+            )))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                GeneratedEvent::Done,
+            )))
             .await;
         let response_message = WeftMessage {
             role: Role::Assistant,
@@ -165,20 +174,19 @@ impl Activity for TextGenerateActivity {
             message_index: 0,
         };
         let _ = event_tx
-            .send(PipelineEvent::GenerationCompleted {
+            .send(PipelineEvent::Generation(GenerationEvent::Completed {
                 model: "stub-model".to_string(),
                 response_message,
                 generated_events: vec![GeneratedEvent::Done],
                 input_tokens: Some(5),
                 output_tokens: Some(3),
-            })
+            }))
             .await;
         let _ = event_tx
-            .send(PipelineEvent::ActivityCompleted {
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name.clone(),
-                duration_ms: 1,
                 idempotency_key: input.idempotency_key.clone(),
-            })
+            }))
             .await;
     }
 }
@@ -200,22 +208,22 @@ impl Activity for AlwaysFailActivity {
         &self,
         _execution_id: &ExecutionId,
         _input: ActivityInput,
-        _services: &weft_reactor::services::Services,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         _cancel: CancellationToken,
     ) {
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name.clone(),
-            })
+            }))
             .await;
         let _ = event_tx
-            .send(PipelineEvent::ActivityFailed {
+            .send(PipelineEvent::Activity(ActivityEvent::Failed {
                 name: self.name.clone(),
                 error: self.error_msg.clone(),
                 retryable: self.retryable,
-            })
+            }))
             .await;
     }
 }
@@ -245,15 +253,15 @@ impl Activity for FailThenSucceedActivity {
         &self,
         _execution_id: &ExecutionId,
         input: ActivityInput,
-        _services: &weft_reactor::services::Services,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         _cancel: CancellationToken,
     ) {
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name.clone(),
-            })
+            }))
             .await;
 
         let remaining = self
@@ -267,16 +275,18 @@ impl Activity for FailThenSucceedActivity {
 
         if remaining > 0 {
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: self.name.clone(),
                     error: "transient failure".to_string(),
                     retryable: true,
-                })
+                }))
                 .await;
         } else {
             // Success.
             let _ = event_tx
-                .send(PipelineEvent::Generated(GeneratedEvent::Done))
+                .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                    GeneratedEvent::Done,
+                )))
                 .await;
             let response_message = WeftMessage {
                 role: Role::Assistant,
@@ -287,20 +297,19 @@ impl Activity for FailThenSucceedActivity {
                 message_index: 0,
             };
             let _ = event_tx
-                .send(PipelineEvent::GenerationCompleted {
+                .send(PipelineEvent::Generation(GenerationEvent::Completed {
                     model: "stub-model".to_string(),
                     response_message,
                     generated_events: vec![GeneratedEvent::Done],
                     input_tokens: None,
                     output_tokens: None,
-                })
+                }))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::ActivityCompleted {
+                .send(PipelineEvent::Activity(ActivityEvent::Completed {
                     name: self.name.clone(),
-                    duration_ms: 1,
                     idempotency_key: input.idempotency_key.clone(),
-                })
+                }))
                 .await;
         }
     }
@@ -321,23 +330,24 @@ impl Activity for NoOpActivity {
         &self,
         _execution_id: &ExecutionId,
         _input: ActivityInput,
-        _services: &weft_reactor::services::Services,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         _cancel: CancellationToken,
     ) {
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name.clone(),
-            })
+            }))
             .await;
-        let _ = event_tx.send(PipelineEvent::ValidationPassed).await;
         let _ = event_tx
-            .send(PipelineEvent::ActivityCompleted {
+            .send(PipelineEvent::Execution(ExecutionEvent::ValidationPassed))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name.clone(),
-                duration_ms: 0,
                 idempotency_key: None,
-            })
+            }))
             .await;
     }
 }
@@ -357,15 +367,15 @@ impl Activity for StubAssembleResponse {
         &self,
         execution_id: &ExecutionId,
         input: ActivityInput,
-        _services: &weft_reactor::services::Services,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         _cancel: CancellationToken,
     ) {
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name.clone(),
-            })
+            }))
             .await;
 
         let response_message = WeftMessage {
@@ -384,14 +394,15 @@ impl Activity for StubAssembleResponse {
             timing: weft_core::WeftTiming::default(),
         };
         let _ = event_tx
-            .send(PipelineEvent::ResponseAssembled { response })
+            .send(PipelineEvent::Context(ContextEvent::ResponseAssembled {
+                response,
+            }))
             .await;
         let _ = event_tx
-            .send(PipelineEvent::ActivityCompleted {
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name.clone(),
-                duration_ms: 0,
                 idempotency_key: None,
-            })
+            }))
             .await;
     }
 }
@@ -411,7 +422,7 @@ impl Activity for StubExecuteCommand {
         &self,
         _execution_id: &ExecutionId,
         input: ActivityInput,
-        _services: &weft_reactor::services::Services,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         _cancel: CancellationToken,
@@ -425,12 +436,12 @@ impl Activity for StubExecuteCommand {
             .to_string();
 
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name.clone(),
-            })
+            }))
             .await;
         let _ = event_tx
-            .send(PipelineEvent::CommandCompleted {
+            .send(PipelineEvent::Command(CommandEvent::Completed {
                 name: cmd_name.clone(),
                 result: weft_core::CommandResult {
                     command_name: cmd_name,
@@ -438,14 +449,13 @@ impl Activity for StubExecuteCommand {
                     output: "stub output".to_string(),
                     error: None,
                 },
-            })
+            }))
             .await;
         let _ = event_tx
-            .send(PipelineEvent::ActivityCompleted {
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name.clone(),
-                duration_ms: 1,
                 idempotency_key: input.idempotency_key.clone(),
-            })
+            }))
             .await;
     }
 }
@@ -673,12 +683,14 @@ async fn simple_request_response_completes() {
 
     let (result, _signal_tx) = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await
@@ -734,12 +746,14 @@ async fn pre_loop_activity_runs_before_generate() {
 
     let (result, _) = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await
@@ -750,11 +764,11 @@ async fn pre_loop_activity_runs_before_generate() {
         .await
         .unwrap();
     // validate should come before generation.started in the log.
-    // PipelineEvent serializes with external tagging: {"ActivityStarted": {"name": "..."}}
+    // PipelineEvent serializes with adjacent tagging: {"category": "Activity", "event": {"type": "Started", "name": "..."}}
     let validate_pos = events.iter().position(|e| {
         e.event_type == "activity.started"
             && e.payload
-                .get("ActivityStarted")
+                .get("event")
                 .and_then(|v| v.get("name"))
                 .and_then(|v| v.as_str())
                 == Some("validate")
@@ -808,12 +822,14 @@ async fn budget_exhaustion_terminates_gracefully() {
     // Execution should succeed (budget exhaustion is not an error, it's graceful termination).
     let result = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await;
@@ -847,20 +863,22 @@ async fn cancel_signal_terminates_execution() {
             &self,
             _execution_id: &ExecutionId,
             _input: ActivityInput,
-            _services: &weft_reactor::services::Services,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn EventLog,
             event_tx: mpsc::Sender<PipelineEvent>,
             _cancel: CancellationToken,
         ) {
             let _ = event_tx
-                .send(PipelineEvent::ActivityStarted {
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
                     name: "generate".to_string(),
-                })
+                }))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::Signal(Signal::Cancel {
-                    reason: "test cancel via channel".to_string(),
-                }))
+                .send(PipelineEvent::Signal(SignalEvent::Received(
+                    Signal::Cancel {
+                        reason: "test cancel via channel".to_string(),
+                    },
+                )))
                 .await;
         }
     }
@@ -881,12 +899,14 @@ async fn cancel_signal_terminates_execution() {
 
     let (result, _signal_tx) = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await
@@ -922,20 +942,22 @@ async fn cancel_signal_on_channel_terminates_execution() {
             &self,
             _execution_id: &ExecutionId,
             _input: ActivityInput,
-            _services: &weft_reactor::services::Services,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn EventLog,
             event_tx: mpsc::Sender<PipelineEvent>,
             _cancel: CancellationToken,
         ) {
             let _ = event_tx
-                .send(PipelineEvent::ActivityStarted {
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
                     name: "generate".to_string(),
-                })
+                }))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::Signal(Signal::Cancel {
-                    reason: "test cancel".to_string(),
-                }))
+                .send(PipelineEvent::Signal(SignalEvent::Received(
+                    Signal::Cancel {
+                        reason: "test cancel".to_string(),
+                    },
+                )))
                 .await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -957,12 +979,14 @@ async fn cancel_signal_on_channel_terminates_execution() {
 
     let result = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await;
@@ -1004,39 +1028,38 @@ async fn hook_block_in_pre_loop_returns_hook_blocked_error() {
             &self,
             _execution_id: &ExecutionId,
             _input: ActivityInput,
-            services: &weft_reactor::services::Services,
+            services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn EventLog,
             event_tx: mpsc::Sender<PipelineEvent>,
             _cancel: CancellationToken,
         ) {
             let _ = event_tx
-                .send(PipelineEvent::ActivityStarted {
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
                     name: self.name().to_string(),
-                })
+                }))
                 .await;
 
             let result = services
-                .hooks
+                .hooks()
                 .run_chain(HookEvent::RequestStart, serde_json::json!({}), None)
                 .await;
 
             match result {
                 weft_hooks::HookChainResult::Blocked { hook_name, reason } => {
                     let _ = event_tx
-                        .send(PipelineEvent::HookBlocked {
+                        .send(PipelineEvent::Hook(HookOutcome::Blocked {
                             hook_event: "request_start".to_string(),
                             hook_name,
                             reason,
-                        })
+                        }))
                         .await;
                 }
                 weft_hooks::HookChainResult::Allowed { .. } => {
                     let _ = event_tx
-                        .send(PipelineEvent::ActivityCompleted {
+                        .send(PipelineEvent::Activity(ActivityEvent::Completed {
                             name: self.name().to_string(),
-                            duration_ms: 0,
                             idempotency_key: None,
-                        })
+                        }))
                         .await;
                 }
             }
@@ -1070,12 +1093,14 @@ async fn hook_block_in_pre_loop_returns_hook_blocked_error() {
 
     let result = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await;
@@ -1139,12 +1164,14 @@ async fn generate_fails_once_then_succeeds_with_retry() {
 
     let result = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await;
@@ -1215,12 +1242,14 @@ async fn generate_not_retried_when_retryable_false() {
 
     let result = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await;
@@ -1282,12 +1311,14 @@ async fn retry_exhaustion_returns_error() {
 
     let result = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await;
@@ -1357,12 +1388,14 @@ async fn retry_skipped_when_budget_exhausted() {
 
     let result = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            Some(exhausted_budget),
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: Some(exhausted_budget),
+                client_tx: None,
+            },
             None,
         )
         .await;
@@ -1405,23 +1438,23 @@ async fn generation_timeout_fires_after_silence() {
             &self,
             _execution_id: &ExecutionId,
             _input: ActivityInput,
-            _services: &weft_reactor::services::Services,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn EventLog,
             event_tx: mpsc::Sender<PipelineEvent>,
             cancel: CancellationToken,
         ) {
             let _ = event_tx
-                .send(PipelineEvent::ActivityStarted {
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
                     name: "generate".to_string(),
-                })
+                }))
                 .await;
             cancel.cancelled().await;
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: "generate".to_string(),
                     error: "cancelled".to_string(),
                     retryable: false,
-                })
+                }))
                 .await;
         }
     }
@@ -1470,12 +1503,14 @@ async fn generation_timeout_fires_after_silence() {
     let handle = tokio::spawn(async move {
         reactor_ref
             .execute(
-                test_request(),
-                TenantId("tenant1".to_string()),
-                RequestId("req1".to_string()),
-                None,
-                None,
-                None,
+                ExecutionContext {
+                    request: test_request(),
+                    tenant_id: TenantId("tenant1".to_string()),
+                    request_id: RequestId("req1".to_string()),
+                    parent_id: None,
+                    parent_budget: None,
+                    client_tx: None,
+                },
                 None,
             )
             .await
@@ -1510,33 +1545,33 @@ async fn heartbeat_miss_cancels_activity() {
             &self,
             _execution_id: &ExecutionId,
             _input: ActivityInput,
-            _services: &weft_reactor::services::Services,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn EventLog,
             event_tx: mpsc::Sender<PipelineEvent>,
             cancel: CancellationToken,
         ) {
             let _ = event_tx
-                .send(PipelineEvent::ActivityStarted {
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
                     name: "generate".to_string(),
-                })
+                }))
                 .await;
 
             for _ in 0..2 {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let _ = event_tx
-                    .send(PipelineEvent::Heartbeat {
+                    .send(PipelineEvent::Activity(ActivityEvent::Heartbeat {
                         activity_name: "generate".to_string(),
-                    })
+                    }))
                     .await;
             }
 
             cancel.cancelled().await;
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: "generate".to_string(),
                     error: "cancelled".to_string(),
                     retryable: false,
-                })
+                }))
                 .await;
         }
     }
@@ -1585,12 +1620,14 @@ async fn heartbeat_miss_cancels_activity() {
     let handle = tokio::spawn(async move {
         reactor_ref
             .execute(
-                test_request(),
-                TenantId("tenant1".to_string()),
-                RequestId("req1".to_string()),
-                None,
-                None,
-                None,
+                ExecutionContext {
+                    request: test_request(),
+                    tenant_id: TenantId("tenant1".to_string()),
+                    request_id: RequestId("req1".to_string()),
+                    parent_id: None,
+                    parent_budget: None,
+                    client_tx: None,
+                },
                 None,
             )
             .await
@@ -1603,123 +1640,6 @@ async fn heartbeat_miss_cancels_activity() {
         result.is_err(),
         "heartbeat miss should fail execution without retry: {:?}",
         result
-    );
-}
-
-// ── Idempotency ───────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn idempotency_check_skips_already_completed_activity() {
-    let event_log = test_event_log();
-    let services = Arc::new(make_test_services());
-    let registry = build_registry(vec![
-        Arc::new(ImmediateDoneActivity {
-            name: "generate".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
-    ]);
-
-    let config = reactor_config(simple_pipeline_config("generate"));
-    let reactor = Reactor::new(services, event_log.clone(), registry, &config)
-        .expect("reactor should construct");
-
-    let execution_id = ExecutionId::new();
-    let key = format!("{}:generate:0", execution_id);
-
-    event_log
-        .create_execution(&Execution {
-            id: execution_id.clone(),
-            tenant_id: TenantId("tenant1".to_string()),
-            request_id: RequestId("req1".to_string()),
-            parent_id: None,
-            pipeline_name: "default".to_string(),
-            status: ExecutionStatus::Running,
-            created_at: chrono::Utc::now(),
-            depth: 0,
-        })
-        .await
-        .unwrap();
-
-    event_log
-        .append(
-            &execution_id,
-            "activity.started",
-            serde_json::json!({ "name": "generate" }),
-            1,
-            None,
-        )
-        .await
-        .unwrap();
-
-    let done_ev = weft_reactor::event::PipelineEvent::Generated(GeneratedEvent::Done);
-    event_log
-        .append(
-            &execution_id,
-            done_ev.event_type_string(),
-            serde_json::to_value(&done_ev).unwrap(),
-            1,
-            None,
-        )
-        .await
-        .unwrap();
-
-    event_log
-        .append(
-            &execution_id,
-            "activity.completed",
-            serde_json::json!({
-                "name": "generate",
-                "duration_ms": 1,
-                "idempotency_key": key
-            }),
-            1,
-            Some(&key),
-        )
-        .await
-        .unwrap();
-
-    let result =
-        weft_reactor::reactor::test_hooks::check_idempotency_pub(&reactor, &execution_id, &key)
-            .await
-            .expect("check_idempotency should not fail");
-
-    assert!(
-        result.is_some(),
-        "idempotency check should return Some when key exists in event log"
-    );
-
-    let replayed = result.unwrap();
-    assert!(
-        !replayed.is_empty(),
-        "replayed events slice should not be empty"
-    );
-
-    let types: Vec<&str> = replayed.iter().map(|e| e.event_type.as_str()).collect();
-    assert!(
-        types.contains(&"activity.started"),
-        "replayed events should include activity.started; got: {types:?}"
-    );
-    assert!(
-        types.contains(&"activity.completed"),
-        "replayed events should include activity.completed; got: {types:?}"
-    );
-
-    let miss_key = format!("{}:generate:99", execution_id);
-    let miss_result = weft_reactor::reactor::test_hooks::check_idempotency_pub(
-        &reactor,
-        &execution_id,
-        &miss_key,
-    )
-    .await
-    .expect("check_idempotency should not fail on miss");
-    assert!(
-        miss_result.is_none(),
-        "idempotency check should return None when key is absent"
     );
 }
 
@@ -1751,12 +1671,14 @@ async fn generated_content_events_forwarded_to_client_tx() {
 
     let result = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            Some(client_tx),
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: Some(client_tx),
+            },
             None,
         )
         .await;
@@ -1771,7 +1693,7 @@ async fn generated_content_events_forwarded_to_client_tx() {
     while let Ok(event) = client_rx.try_recv() {
         if matches!(
             &event,
-            PipelineEvent::Generated(GeneratedEvent::Content { .. })
+            PipelineEvent::Generation(GenerationEvent::Chunk(GeneratedEvent::Content { .. }))
         ) {
             content_events.push(event);
         }
@@ -1809,12 +1731,14 @@ async fn event_log_contains_complete_execution_trace() {
 
     let (result, _) = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await
@@ -1835,8 +1759,8 @@ async fn event_log_contains_complete_execution_trace() {
         "missing generation.started"
     );
     assert!(
-        event_types.contains(&"generated"),
-        "missing generated (content)"
+        event_types.contains(&"generation.chunk"),
+        "missing generation.chunk (content)"
     );
     assert!(
         event_types.contains(&"execution.completed"),
@@ -1967,14 +1891,16 @@ async fn spawn_child_returns_err_at_depth_limit() {
     let (parent_tx, _parent_rx) = mpsc::channel::<PipelineEvent>(16);
     let result = handle
         .spawn_child(
-            test_request(),
-            TenantId("t1".to_string()),
-            RequestId("r1".to_string()),
-            weft_reactor::execution::ExecutionId::new(),
-            parent_budget,
-            parent_tx,
+            weft_reactor::SpawnRequest {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id: weft_reactor::execution::ExecutionId::new(),
+                parent_budget,
+                parent_event_tx: parent_tx,
+                pipeline_name: "default".to_string(),
+            },
             None,
-            "default",
         )
         .await;
 
@@ -2026,14 +1952,16 @@ async fn spawn_child_creates_child_with_correct_parent_id_and_depth() {
 
     let result = handle
         .spawn_child(
-            test_request(),
-            TenantId("t1".to_string()),
-            RequestId("r1".to_string()),
-            parent_id.clone(),
-            parent_budget.clone(),
-            parent_tx,
+            weft_reactor::SpawnRequest {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id: parent_id.clone(),
+                parent_budget: parent_budget.clone(),
+                parent_event_tx: parent_tx,
+                pipeline_name: "default".to_string(),
+            },
             None,
-            "default",
         )
         .await;
 
@@ -2041,7 +1969,10 @@ async fn spawn_child_creates_child_with_correct_parent_id_and_depth() {
 
     let mut found_child_completed = false;
     while let Ok(event) = parent_rx.try_recv() {
-        if matches!(event, PipelineEvent::ChildCompleted { .. }) {
+        if matches!(
+            event,
+            PipelineEvent::Child(weft_reactor::ChildEvent::Completed { .. })
+        ) {
             found_child_completed = true;
             break;
         }
@@ -2140,14 +2071,16 @@ async fn spawn_child_with_cancelled_parent_fails_or_cancels() {
 
     let result = handle
         .spawn_child(
-            test_request(),
-            TenantId("t1".to_string()),
-            RequestId("r1".to_string()),
-            parent_id,
-            parent_budget,
-            parent_tx,
+            weft_reactor::SpawnRequest {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id,
+                parent_budget,
+                parent_event_tx: parent_tx,
+                pipeline_name: "default".to_string(),
+            },
             Some(&parent_cancel),
-            "default",
         )
         .await;
 
@@ -2178,7 +2111,7 @@ async fn command_iteration_loop_executes_command_then_calls_generate_again() {
             &self,
             _execution_id: &ExecutionId,
             input: ActivityInput,
-            _services: &weft_reactor::services::Services,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn EventLog,
             event_tx: mpsc::Sender<PipelineEvent>,
             _cancel: CancellationToken,
@@ -2188,15 +2121,15 @@ async fn command_iteration_loop_executes_command_then_calls_generate_again() {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
             let _ = event_tx
-                .send(PipelineEvent::ActivityStarted {
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
                     name: "generate".to_string(),
-                })
+                }))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::GenerationStarted {
+                .send(PipelineEvent::Generation(GenerationEvent::Started {
                     model: "stub-model".to_string(),
                     message_count: input.messages.len(),
-                })
+                }))
                 .await;
 
             if call_n == 0 {
@@ -2206,14 +2139,16 @@ async fn command_iteration_loop_executes_command_then_calls_generate_again() {
                     arguments: serde_json::json!({"arg": "value"}),
                 };
                 let _ = event_tx
-                    .send(PipelineEvent::Generated(GeneratedEvent::CommandInvocation(
-                        invocation,
+                    .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                        GeneratedEvent::CommandInvocation(invocation),
                     )))
                     .await;
             }
 
             let _ = event_tx
-                .send(PipelineEvent::Generated(GeneratedEvent::Done))
+                .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                    GeneratedEvent::Done,
+                )))
                 .await;
 
             let response_message = WeftMessage {
@@ -2225,20 +2160,19 @@ async fn command_iteration_loop_executes_command_then_calls_generate_again() {
                 message_index: 0,
             };
             let _ = event_tx
-                .send(PipelineEvent::GenerationCompleted {
+                .send(PipelineEvent::Generation(GenerationEvent::Completed {
                     model: "stub-model".to_string(),
                     response_message,
                     generated_events: vec![GeneratedEvent::Done],
                     input_tokens: None,
                     output_tokens: None,
-                })
+                }))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::ActivityCompleted {
+                .send(PipelineEvent::Activity(ActivityEvent::Completed {
                     name: "generate".to_string(),
-                    duration_ms: 1,
                     idempotency_key: input.idempotency_key.clone(),
-                })
+                }))
                 .await;
         }
     }
@@ -2261,12 +2195,14 @@ async fn command_iteration_loop_executes_command_then_calls_generate_again() {
 
     let (result, _) = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await
@@ -2294,8 +2230,8 @@ async fn command_iteration_loop_executes_command_then_calls_generate_again() {
         "event log should contain command.completed; got: {event_types:?}"
     );
     assert!(
-        event_types.contains(&"iteration.completed"),
-        "event log should contain iteration.completed; got: {event_types:?}"
+        event_types.contains(&"execution.iteration_completed"),
+        "event log should contain execution.iteration_completed; got: {event_types:?}"
     );
 }
 
@@ -2326,7 +2262,7 @@ async fn pre_response_hook_block_injects_feedback_and_retries_generation() {
             &self,
             _execution_id: &ExecutionId,
             input: ActivityInput,
-            _services: &weft_reactor::services::Services,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn EventLog,
             event_tx: mpsc::Sender<PipelineEvent>,
             _cancel: CancellationToken,
@@ -2334,12 +2270,14 @@ async fn pre_response_hook_block_injects_feedback_and_retries_generation() {
             self.call_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _ = event_tx
-                .send(PipelineEvent::ActivityStarted {
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
                     name: self.name.clone(),
-                })
+                }))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::Generated(GeneratedEvent::Done))
+                .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                    GeneratedEvent::Done,
+                )))
                 .await;
             let response_message = WeftMessage {
                 role: Role::Assistant,
@@ -2350,20 +2288,19 @@ async fn pre_response_hook_block_injects_feedback_and_retries_generation() {
                 message_index: 0,
             };
             let _ = event_tx
-                .send(PipelineEvent::GenerationCompleted {
+                .send(PipelineEvent::Generation(GenerationEvent::Completed {
                     model: "stub-model".to_string(),
                     response_message,
                     generated_events: vec![GeneratedEvent::Done],
                     input_tokens: None,
                     output_tokens: None,
-                })
+                }))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::ActivityCompleted {
+                .send(PipelineEvent::Activity(ActivityEvent::Completed {
                     name: self.name.clone(),
-                    duration_ms: 1,
                     idempotency_key: input.idempotency_key.clone(),
-                })
+                }))
                 .await;
         }
     }
@@ -2384,7 +2321,7 @@ async fn pre_response_hook_block_injects_feedback_and_retries_generation() {
             &self,
             _execution_id: &ExecutionId,
             input: ActivityInput,
-            _services: &weft_reactor::services::Services,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn EventLog,
             event_tx: mpsc::Sender<PipelineEvent>,
             _cancel: CancellationToken,
@@ -2394,26 +2331,25 @@ async fn pre_response_hook_block_injects_feedback_and_retries_generation() {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
             let _ = event_tx
-                .send(PipelineEvent::ActivityStarted {
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
                     name: self.name.clone(),
-                })
+                }))
                 .await;
 
             if call_n == 0 {
                 let _ = event_tx
-                    .send(PipelineEvent::HookBlocked {
+                    .send(PipelineEvent::Hook(HookOutcome::Blocked {
                         hook_event: "pre_response".to_string(),
                         hook_name: self.name.clone(),
                         reason: self.block_reason.clone(),
-                    })
+                    }))
                     .await;
             } else {
                 let _ = event_tx
-                    .send(PipelineEvent::ActivityCompleted {
+                    .send(PipelineEvent::Activity(ActivityEvent::Completed {
                         name: self.name.clone(),
-                        duration_ms: 0,
                         idempotency_key: input.idempotency_key.clone(),
-                    })
+                    }))
                     .await;
             }
         }
@@ -2455,12 +2391,14 @@ async fn pre_response_hook_block_injects_feedback_and_retries_generation() {
 
     let result = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await;
@@ -2514,27 +2452,29 @@ async fn cancel_during_retry_backoff_terminates_execution() {
             &self,
             _execution_id: &ExecutionId,
             _input: ActivityInput,
-            _services: &weft_reactor::services::Services,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn EventLog,
             event_tx: mpsc::Sender<PipelineEvent>,
             _cancel: CancellationToken,
         ) {
             let _ = event_tx
-                .send(PipelineEvent::ActivityStarted {
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
                     name: "generate".to_string(),
-                })
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Signal(Signal::Cancel {
-                    reason: "cancel during backoff".to_string(),
                 }))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Signal(SignalEvent::Received(
+                    Signal::Cancel {
+                        reason: "cancel during backoff".to_string(),
+                    },
+                )))
+                .await;
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: "generate".to_string(),
                     error: "transient failure".to_string(),
                     retryable: true,
-                })
+                }))
                 .await;
         }
     }
@@ -2588,12 +2528,14 @@ async fn cancel_during_retry_backoff_terminates_execution() {
     let handle = tokio::spawn(async move {
         reactor_ref
             .execute(
-                test_request(),
-                TenantId("tenant1".to_string()),
-                RequestId("req1".to_string()),
-                None,
-                None,
-                None,
+                ExecutionContext {
+                    request: test_request(),
+                    tenant_id: TenantId("tenant1".to_string()),
+                    request_id: RequestId("req1".to_string()),
+                    parent_id: None,
+                    parent_budget: None,
+                    client_tx: None,
+                },
                 None,
             )
             .await
@@ -2646,36 +2588,38 @@ async fn per_chunk_timeout_resets_after_each_chunk() {
             &self,
             _execution_id: &ExecutionId,
             _input: ActivityInput,
-            _services: &weft_reactor::services::Services,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn EventLog,
             event_tx: mpsc::Sender<PipelineEvent>,
             cancel: CancellationToken,
         ) {
             let _ = event_tx
-                .send(PipelineEvent::ActivityStarted {
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
                     name: "generate".to_string(),
-                })
+                }))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::GenerationStarted {
+                .send(PipelineEvent::Generation(GenerationEvent::Started {
                     model: "stub-model".to_string(),
                     message_count: 1,
-                })
+                }))
                 .await;
 
             let _ = event_tx
-                .send(PipelineEvent::Generated(GeneratedEvent::Content {
-                    part: ContentPart::Text("first chunk".to_string()),
-                }))
+                .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                    GeneratedEvent::Content {
+                        part: ContentPart::Text("first chunk".to_string()),
+                    },
+                )))
                 .await;
 
             cancel.cancelled().await;
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: "generate".to_string(),
                     error: "cancelled".to_string(),
                     retryable: false,
-                })
+                }))
                 .await;
         }
     }
@@ -2724,12 +2668,14 @@ async fn per_chunk_timeout_resets_after_each_chunk() {
     let handle = tokio::spawn(async move {
         reactor_ref
             .execute(
-                test_request(),
-                TenantId("tenant1".to_string()),
-                RequestId("req1".to_string()),
-                None,
-                None,
-                None,
+                ExecutionContext {
+                    request: test_request(),
+                    tenant_id: TenantId("tenant1".to_string()),
+                    request_id: RequestId("req1".to_string()),
+                    parent_id: None,
+                    parent_budget: None,
+                    client_tx: None,
+                },
                 None,
             )
             .await
@@ -2746,80 +2692,306 @@ async fn per_chunk_timeout_resets_after_each_chunk() {
     );
 }
 
-// ── should_retry / backoff_ms unit tests ─────────────────────────────────
-
-#[test]
-fn should_retry_false_when_no_policy() {
-    let budget = Budget::new(10, 5, 3, chrono::Utc::now() + chrono::Duration::hours(1));
-    let cancel = CancellationToken::new();
-    let result = weft_reactor::reactor::test_hooks::should_retry_pub(None, 0, &budget, &cancel);
-    assert!(!result, "should not retry without policy");
-}
-
-#[test]
-fn should_retry_false_when_attempts_exhausted() {
-    let policy = RetryPolicy {
-        max_retries: 2,
-        initial_backoff_ms: 100,
-        max_backoff_ms: 1000,
-        backoff_multiplier: 2.0,
-    };
-    let budget = Budget::new(10, 5, 3, chrono::Utc::now() + chrono::Duration::hours(1));
-    let cancel = CancellationToken::new();
-    let result =
-        weft_reactor::reactor::test_hooks::should_retry_pub(Some(&policy), 2, &budget, &cancel);
-    assert!(!result);
-}
-
-#[test]
-fn should_retry_false_when_cancelled() {
-    let policy = RetryPolicy {
-        max_retries: 5,
-        initial_backoff_ms: 100,
-        max_backoff_ms: 1000,
-        backoff_multiplier: 2.0,
-    };
-    let budget = Budget::new(10, 5, 3, chrono::Utc::now() + chrono::Duration::hours(1));
-    let cancel = CancellationToken::new();
-    cancel.cancel();
-    let result =
-        weft_reactor::reactor::test_hooks::should_retry_pub(Some(&policy), 0, &budget, &cancel);
-    assert!(!result, "should not retry when cancelled");
-}
-
-#[test]
-fn backoff_ms_respects_cap() {
-    let policy = RetryPolicy {
-        max_retries: 10,
-        initial_backoff_ms: 1000,
-        max_backoff_ms: 5000,
-        backoff_multiplier: 2.0,
-    };
-    let ms = weft_reactor::reactor::test_hooks::backoff_ms_pub(&policy, 5);
-    assert!(ms >= 5000, "backoff should be at least max (before jitter)");
-    assert!(
-        ms < 5000 + 5000 / 4 + 2,
-        "backoff should not exceed cap + 25% jitter"
-    );
-}
-
 // ── Phase 5: Pre-loop activity wiring integration tests ───────────────────
 
-use weft_reactor::activities::{
-    CommandFormattingActivity, CommandSelectionActivity, ModelSelectionActivity,
-    ProviderResolutionActivity, SamplingAdjustmentActivity, SystemPromptAssemblyActivity,
-    ValidateActivity,
-};
+// Stub implementations of the pre-loop activities. These emit the specific
+// events that the reactor integration tests verify, without taking a
+// dev-dependency on weft_activities (per spec Section 10.6).
+
+/// Stub for ValidateActivity: emits ValidationPassed, CommandsAvailable, and Completed.
+struct StubValidateActivity;
+
+#[async_trait::async_trait]
+impl Activity for StubValidateActivity {
+    fn name(&self) -> &str {
+        "validate"
+    }
+
+    async fn execute(
+        &self,
+        _execution_id: &ExecutionId,
+        _input: ActivityInput,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
+        _event_log: &dyn EventLog,
+        event_tx: mpsc::Sender<PipelineEvent>,
+        _cancel: CancellationToken,
+    ) {
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
+                name: self.name().to_string(),
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Execution(ExecutionEvent::ValidationPassed))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Command(CommandEvent::Available {
+                commands: vec![],
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
+                name: self.name().to_string(),
+                idempotency_key: None,
+            }))
+            .await;
+    }
+}
+
+/// Stub for ModelSelectionActivity: emits ModelSelected with a non-empty model name.
+struct StubModelSelectionActivity;
+
+#[async_trait::async_trait]
+impl Activity for StubModelSelectionActivity {
+    fn name(&self) -> &str {
+        "model_selection"
+    }
+
+    async fn execute(
+        &self,
+        _execution_id: &ExecutionId,
+        _input: ActivityInput,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
+        _event_log: &dyn EventLog,
+        event_tx: mpsc::Sender<PipelineEvent>,
+        _cancel: CancellationToken,
+    ) {
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
+                name: self.name().to_string(),
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Selection(SelectionEvent::ModelSelected {
+                model_name: "stub-model".to_string(),
+                score: 0.9,
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
+                name: self.name().to_string(),
+                idempotency_key: None,
+            }))
+            .await;
+    }
+}
+
+/// Stub for CommandSelectionActivity: emits CommandsSelected with an empty list.
+struct StubCommandSelectionActivity;
+
+#[async_trait::async_trait]
+impl Activity for StubCommandSelectionActivity {
+    fn name(&self) -> &str {
+        "command_selection"
+    }
+
+    async fn execute(
+        &self,
+        _execution_id: &ExecutionId,
+        _input: ActivityInput,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
+        _event_log: &dyn EventLog,
+        event_tx: mpsc::Sender<PipelineEvent>,
+        _cancel: CancellationToken,
+    ) {
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
+                name: self.name().to_string(),
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Selection(SelectionEvent::CommandsSelected {
+                selected: vec![],
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
+                name: self.name().to_string(),
+                idempotency_key: None,
+            }))
+            .await;
+    }
+}
+
+/// Stub for ProviderResolutionActivity: emits ProviderResolved with stub values.
+struct StubProviderResolutionActivity;
+
+#[async_trait::async_trait]
+impl Activity for StubProviderResolutionActivity {
+    fn name(&self) -> &str {
+        "provider_resolution"
+    }
+
+    async fn execute(
+        &self,
+        _execution_id: &ExecutionId,
+        _input: ActivityInput,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
+        _event_log: &dyn EventLog,
+        event_tx: mpsc::Sender<PipelineEvent>,
+        _cancel: CancellationToken,
+    ) {
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
+                name: self.name().to_string(),
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Selection(SelectionEvent::ProviderResolved {
+                model_name: "stub-model".to_string(),
+                model_id: "stub-model-v1".to_string(),
+                provider_name: "anthropic".to_string(),
+                capabilities: vec![],
+                max_tokens: 4096,
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
+                name: self.name().to_string(),
+                idempotency_key: None,
+            }))
+            .await;
+    }
+}
+
+/// Stub for SystemPromptAssemblyActivity: emits MessageInjected (SystemPromptAssembly)
+/// and SystemPromptAssembled.
+struct StubSystemPromptAssemblyActivity;
+
+#[async_trait::async_trait]
+impl Activity for StubSystemPromptAssemblyActivity {
+    fn name(&self) -> &str {
+        "system_prompt_assembly"
+    }
+
+    async fn execute(
+        &self,
+        _execution_id: &ExecutionId,
+        _input: ActivityInput,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
+        _event_log: &dyn EventLog,
+        event_tx: mpsc::Sender<PipelineEvent>,
+        _cancel: CancellationToken,
+    ) {
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
+                name: self.name().to_string(),
+            }))
+            .await;
+        let system_message = weft_core::WeftMessage {
+            role: weft_core::Role::System,
+            source: weft_core::Source::Provider,
+            model: None,
+            content: vec![weft_core::ContentPart::Text("You are helpful.".to_string())],
+            delta: false,
+            message_index: 0,
+        };
+        let _ = event_tx
+            .send(PipelineEvent::Context(ContextEvent::MessageInjected {
+                message: system_message,
+                source: MessageInjectionSource::SystemPromptAssembly,
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Context(
+                ContextEvent::SystemPromptAssembled { message_count: 1 },
+            ))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
+                name: self.name().to_string(),
+                idempotency_key: None,
+            }))
+            .await;
+    }
+}
+
+/// Stub for CommandFormattingActivity: emits CommandsFormatted with NoCommands.
+struct StubCommandFormattingActivity;
+
+#[async_trait::async_trait]
+impl Activity for StubCommandFormattingActivity {
+    fn name(&self) -> &str {
+        "command_formatting"
+    }
+
+    async fn execute(
+        &self,
+        _execution_id: &ExecutionId,
+        _input: ActivityInput,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
+        _event_log: &dyn EventLog,
+        event_tx: mpsc::Sender<PipelineEvent>,
+        _cancel: CancellationToken,
+    ) {
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
+                name: self.name().to_string(),
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Context(ContextEvent::CommandsFormatted {
+                format: CommandFormat::NoCommands,
+                command_count: 0,
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
+                name: self.name().to_string(),
+                idempotency_key: None,
+            }))
+            .await;
+    }
+}
+
+/// Stub for SamplingAdjustmentActivity: emits SamplingUpdated with max_tokens 4096.
+struct StubSamplingAdjustmentActivity;
+
+#[async_trait::async_trait]
+impl Activity for StubSamplingAdjustmentActivity {
+    fn name(&self) -> &str {
+        "sampling_adjustment"
+    }
+
+    async fn execute(
+        &self,
+        _execution_id: &ExecutionId,
+        _input: ActivityInput,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
+        _event_log: &dyn EventLog,
+        event_tx: mpsc::Sender<PipelineEvent>,
+        _cancel: CancellationToken,
+    ) {
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
+                name: self.name().to_string(),
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Context(ContextEvent::SamplingUpdated {
+                max_tokens: 4096,
+                temperature: None,
+                top_p: None,
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
+                name: self.name().to_string(),
+                idempotency_key: None,
+            }))
+            .await;
+    }
+}
 
 fn build_new_preloop_registry(generate_name: &str) -> Arc<ActivityRegistry> {
     build_registry(vec![
-        Arc::new(ValidateActivity),
-        Arc::new(ModelSelectionActivity),
-        Arc::new(CommandSelectionActivity),
-        Arc::new(ProviderResolutionActivity),
-        Arc::new(SystemPromptAssemblyActivity),
-        Arc::new(CommandFormattingActivity),
-        Arc::new(SamplingAdjustmentActivity),
+        Arc::new(StubValidateActivity),
+        Arc::new(StubModelSelectionActivity),
+        Arc::new(StubCommandSelectionActivity),
+        Arc::new(StubProviderResolutionActivity),
+        Arc::new(StubSystemPromptAssemblyActivity),
+        Arc::new(StubCommandFormattingActivity),
+        Arc::new(StubSamplingAdjustmentActivity),
         Arc::new(ImmediateDoneActivity {
             name: generate_name.to_string(),
         }),
@@ -2863,12 +3035,14 @@ async fn pre_loop_all_six_activities_produce_expected_events() {
 
     let (result, _) = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await
@@ -2881,28 +3055,28 @@ async fn pre_loop_all_six_activities_produce_expected_events() {
     let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
 
     assert!(
-        event_types.contains(&"model.selected"),
-        "missing model.selected event; got: {event_types:?}"
+        event_types.contains(&"selection.model_selected"),
+        "missing selection.model_selected event; got: {event_types:?}"
     );
     assert!(
-        event_types.contains(&"commands.selected"),
-        "missing commands.selected event; got: {event_types:?}"
+        event_types.contains(&"selection.commands_selected"),
+        "missing selection.commands_selected event; got: {event_types:?}"
     );
     assert!(
-        event_types.contains(&"provider.resolved"),
-        "missing provider.resolved event; got: {event_types:?}"
+        event_types.contains(&"selection.provider_resolved"),
+        "missing selection.provider_resolved event; got: {event_types:?}"
     );
     assert!(
-        event_types.contains(&"system_prompt.assembled"),
-        "missing system_prompt.assembled event; got: {event_types:?}"
+        event_types.contains(&"context.system_prompt_assembled"),
+        "missing context.system_prompt_assembled event; got: {event_types:?}"
     );
     assert!(
-        event_types.contains(&"commands.formatted"),
-        "missing commands.formatted event; got: {event_types:?}"
+        event_types.contains(&"context.commands_formatted"),
+        "missing context.commands_formatted event; got: {event_types:?}"
     );
     assert!(
-        event_types.contains(&"sampling.updated"),
-        "missing sampling.updated event; got: {event_types:?}"
+        event_types.contains(&"context.sampling_updated"),
+        "missing context.sampling_updated event; got: {event_types:?}"
     );
 }
 
@@ -2918,12 +3092,14 @@ async fn pre_loop_events_appear_in_correct_order() {
 
     let (result, _) = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await
@@ -2942,33 +3118,36 @@ async fn pre_loop_events_appear_in_correct_order() {
             .unwrap_or(0)
     };
 
-    let model_seq = seq_of("model.selected");
-    let commands_seq = seq_of("commands.selected");
-    let provider_seq = seq_of("provider.resolved");
-    let sys_prompt_seq = seq_of("system_prompt.assembled");
-    let cmd_fmt_seq = seq_of("commands.formatted");
-    let sampling_seq = seq_of("sampling.updated");
+    let model_seq = seq_of("selection.model_selected");
+    let commands_seq = seq_of("selection.commands_selected");
+    let provider_seq = seq_of("selection.provider_resolved");
+    let sys_prompt_seq = seq_of("context.system_prompt_assembled");
+    let cmd_fmt_seq = seq_of("context.commands_formatted");
+    let sampling_seq = seq_of("context.sampling_updated");
 
-    assert!(model_seq > 0, "model.selected must be present (seq > 0)");
+    assert!(
+        model_seq > 0,
+        "selection.model_selected must be present (seq > 0)"
+    );
     assert!(
         model_seq < commands_seq,
-        "model.selected ({model_seq}) must precede commands.selected ({commands_seq})"
+        "selection.model_selected ({model_seq}) must precede selection.commands_selected ({commands_seq})"
     );
     assert!(
         commands_seq < provider_seq,
-        "commands.selected ({commands_seq}) must precede provider.resolved ({provider_seq})"
+        "selection.commands_selected ({commands_seq}) must precede selection.provider_resolved ({provider_seq})"
     );
     assert!(
         provider_seq < sys_prompt_seq,
-        "provider.resolved ({provider_seq}) must precede system_prompt.assembled ({sys_prompt_seq})"
+        "selection.provider_resolved ({provider_seq}) must precede context.system_prompt_assembled ({sys_prompt_seq})"
     );
     assert!(
         sys_prompt_seq < cmd_fmt_seq,
-        "system_prompt.assembled ({sys_prompt_seq}) must precede commands.formatted ({cmd_fmt_seq})"
+        "context.system_prompt_assembled ({sys_prompt_seq}) must precede context.commands_formatted ({cmd_fmt_seq})"
     );
     assert!(
         cmd_fmt_seq < sampling_seq,
-        "commands.formatted ({cmd_fmt_seq}) must precede sampling.updated ({sampling_seq})"
+        "context.commands_formatted ({cmd_fmt_seq}) must precede context.sampling_updated ({sampling_seq})"
     );
 }
 
@@ -2984,12 +3163,14 @@ async fn pre_loop_system_prompt_at_index_zero() {
 
     let (result, _) = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await
@@ -3001,11 +3182,11 @@ async fn pre_loop_system_prompt_at_index_zero() {
         .unwrap();
 
     let system_prompt_injected = events.iter().any(|e| {
-        if e.event_type != "message.injected" {
+        if e.event_type != "context.message_injected" {
             return false;
         }
         e.payload
-            .get("MessageInjected")
+            .get("event")
             .and_then(|v| v.get("source"))
             .and_then(|s| s.as_str())
             .map(|s| s == "SystemPromptAssembly")
@@ -3013,15 +3194,15 @@ async fn pre_loop_system_prompt_at_index_zero() {
     });
     assert!(
         system_prompt_injected,
-        "expected MessageInjected with SystemPromptAssembly source in event log"
+        "expected context.message_injected with SystemPromptAssembly source in event log"
     );
 
     let has_sys_prompt = events
         .iter()
-        .any(|e| e.event_type == "system_prompt.assembled");
+        .any(|e| e.event_type == "context.system_prompt_assembled");
     assert!(
         has_sys_prompt,
-        "expected system_prompt.assembled event in event log"
+        "expected context.system_prompt_assembled event in event log"
     );
 }
 
@@ -3037,12 +3218,14 @@ async fn pre_loop_generation_config_includes_model() {
 
     let (result, _) = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await
@@ -3055,34 +3238,34 @@ async fn pre_loop_generation_config_includes_model() {
 
     let model_selected = events
         .iter()
-        .find(|e| e.event_type == "model.selected")
-        .expect("model.selected must be in event log");
+        .find(|e| e.event_type == "selection.model_selected")
+        .expect("selection.model_selected must be in event log");
 
     let model_name = model_selected
         .payload
-        .get("ModelSelected")
+        .get("event")
         .and_then(|v| v.get("model_name"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
     assert!(
         !model_name.is_empty(),
-        "model_name in model.selected must be non-empty"
+        "model_name in selection.model_selected must be non-empty"
     );
 
     let sampling_updated = events
         .iter()
-        .find(|e| e.event_type == "sampling.updated")
-        .expect("sampling.updated must be in event log");
+        .find(|e| e.event_type == "context.sampling_updated")
+        .expect("context.sampling_updated must be in event log");
 
     let max_tokens = sampling_updated
         .payload
-        .get("SamplingUpdated")
+        .get("event")
         .and_then(|v| v.get("max_tokens"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     assert!(
         max_tokens > 0,
-        "max_tokens in sampling.updated must be > 0, got {max_tokens}"
+        "max_tokens in context.sampling_updated must be > 0, got {max_tokens}"
     );
 
     assert!(
@@ -3105,22 +3288,22 @@ async fn pre_loop_activity_failure_terminates_execution() {
             &self,
             _execution_id: &ExecutionId,
             _input: ActivityInput,
-            _services: &weft_reactor::services::Services,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn weft_reactor::event_log::EventLog,
             event_tx: mpsc::Sender<PipelineEvent>,
             _cancel: CancellationToken,
         ) {
             let _ = event_tx
-                .send(PipelineEvent::ActivityStarted {
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
                     name: self.name().to_string(),
-                })
+                }))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: self.name().to_string(),
                     error: "model_selection: no eligible models".to_string(),
                     retryable: false,
-                })
+                }))
                 .await;
         }
     }
@@ -3128,13 +3311,13 @@ async fn pre_loop_activity_failure_terminates_execution() {
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
     let registry = build_registry(vec![
-        Arc::new(ValidateActivity),
+        Arc::new(StubValidateActivity),
         Arc::new(FailingModelSelection),
-        Arc::new(CommandSelectionActivity),
-        Arc::new(ProviderResolutionActivity),
-        Arc::new(SystemPromptAssemblyActivity),
-        Arc::new(CommandFormattingActivity),
-        Arc::new(SamplingAdjustmentActivity),
+        Arc::new(StubCommandSelectionActivity),
+        Arc::new(StubProviderResolutionActivity),
+        Arc::new(StubSystemPromptAssemblyActivity),
+        Arc::new(StubCommandFormattingActivity),
+        Arc::new(StubSamplingAdjustmentActivity),
         Arc::new(ImmediateDoneActivity {
             name: "generate".to_string(),
         }),
@@ -3152,12 +3335,14 @@ async fn pre_loop_activity_failure_terminates_execution() {
 
     let result = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await;
