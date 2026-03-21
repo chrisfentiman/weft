@@ -14,7 +14,7 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::State,
-    http::{self, StatusCode, header},
+    http::{self, HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -282,10 +282,25 @@ async fn shutdown_signal() {
 /// chat completion response. Translates to/from `WeftRequest`/`WeftResponse`
 /// and calls `WeftService::handle_weft_request()` — the same code path as gRPC.
 /// Streaming is not supported in v1.
+///
+/// Extracts W3C TraceContext from the `traceparent` request header. When present,
+/// the reactor's root `request` span becomes a child of the incoming trace, enabling
+/// distributed tracing across services.
 async fn chat_completions_handler(
     State(weft_service): State<Arc<WeftService>>,
+    headers: HeaderMap,
     Json(openai_req): Json<OpenAiChatRequest>,
 ) -> Result<Json<OpenAiChatResponse>, ApiError> {
+    // Extract W3C TraceContext from incoming headers and set it on the current span.
+    // tower-http's TraceLayer has already created a span for this request — by setting
+    // its OTel parent here, child spans inherit the incoming distributed trace.
+    // `set_parent` does not use thread-local storage and is safe across await points.
+    {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        let parent_ctx = crate::telemetry::propagation::extract_from_headers(&headers);
+        tracing::Span::current().set_parent(parent_ctx);
+    }
+
     // Validate: must have at least one message.
     if openai_req.messages.is_empty() {
         return Err(ApiError::bad_request("messages array must not be empty"));

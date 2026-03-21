@@ -7,6 +7,39 @@ use async_trait::async_trait;
 use tokio::sync::OnceCell;
 use tracing::{Instrument, debug, info_span, warn};
 
+/// Inject W3C TraceContext into outgoing gRPC request metadata.
+///
+/// Uses the current OTel context (propagated from the active tracing span by the
+/// tracing-opentelemetry layer) to set the `traceparent` metadata key. When OTel
+/// is not configured, `opentelemetry::Context::current()` returns an empty context
+/// and the propagator injects nothing — this is always safe to call.
+///
+/// Compiled only when the `telemetry` feature is enabled.
+#[cfg(feature = "telemetry")]
+fn inject_grpc_trace_context(metadata: &mut tonic::metadata::MetadataMap) {
+    use opentelemetry::propagation::{Injector, TextMapPropagator};
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
+
+    struct MetadataInjector<'a>(&'a mut tonic::metadata::MetadataMap);
+
+    impl Injector for MetadataInjector<'_> {
+        fn set(&mut self, key: &str, value: String) {
+            if let Ok(k) =
+                tonic::metadata::MetadataKey::<tonic::metadata::Ascii>::from_bytes(key.as_bytes())
+                && let Ok(v) = tonic::metadata::MetadataValue::try_from(value.as_str())
+            {
+                self.0.insert(k, v);
+            }
+        }
+    }
+
+    let propagator = TraceContextPropagator::new();
+    propagator.inject_context(
+        &opentelemetry::Context::current(),
+        &mut MetadataInjector(metadata),
+    );
+}
+
 use crate::{
     ToolDescription, ToolExecutionResult, ToolInfo, ToolRegistryClient, ToolRegistryError,
 };
@@ -152,20 +185,28 @@ impl ToolRegistryClient for GrpcToolRegistryClient {
         );
 
         let response = async {
-            client
-                .execute_tool(proto::ExecuteToolRequest {
-                    name: name.to_string(),
-                    arguments_json,
-                })
-                .await
-                .map_err(|e| {
-                    let status = e.code();
-                    if status == tonic::Code::NotFound {
-                        ToolRegistryError::ToolNotFound(name.to_string())
-                    } else {
-                        ToolRegistryError::ExecutionFailed(e.to_string())
-                    }
-                })
+            // Build a tonic Request so we can inject trace context into its metadata.
+            #[cfg_attr(not(feature = "telemetry"), allow(unused_mut))]
+            let mut tonic_req = tonic::Request::new(proto::ExecuteToolRequest {
+                name: name.to_string(),
+                arguments_json,
+            });
+
+            // Inject W3C TraceContext into the outgoing gRPC request metadata inside
+            // the command_call span. When OTel is active, this adds a `traceparent`
+            // key so the tool registry can link its server-side trace as a child of
+            // this span. When OTel is not active, inject_grpc_trace_context is a no-op.
+            #[cfg(feature = "telemetry")]
+            inject_grpc_trace_context(tonic_req.metadata_mut());
+
+            client.execute_tool(tonic_req).await.map_err(|e| {
+                let status = e.code();
+                if status == tonic::Code::NotFound {
+                    ToolRegistryError::ToolNotFound(name.to_string())
+                } else {
+                    ToolRegistryError::ExecutionFailed(e.to_string())
+                }
+            })
         }
         .instrument(command_call_span)
         .await?;

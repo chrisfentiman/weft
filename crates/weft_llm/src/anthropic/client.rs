@@ -7,6 +7,34 @@ use crate::{
     provider::extract_text_messages,
 };
 
+/// Inject W3C TraceContext into outgoing HTTP request headers.
+///
+/// See `openai/client.rs` for the full rationale. Compiled only when the
+/// `telemetry` feature is enabled.
+#[cfg(feature = "telemetry")]
+fn inject_trace_context(headers: &mut reqwest::header::HeaderMap) {
+    use opentelemetry::propagation::{Injector, TextMapPropagator};
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
+
+    struct HeaderInjector<'a>(&'a mut reqwest::header::HeaderMap);
+
+    impl Injector for HeaderInjector<'_> {
+        fn set(&mut self, key: &str, value: String) {
+            if let Ok(name) = reqwest::header::HeaderName::from_bytes(key.as_bytes())
+                && let Ok(val) = reqwest::header::HeaderValue::from_str(&value)
+            {
+                self.0.insert(name, val);
+            }
+        }
+    }
+
+    let propagator = TraceContextPropagator::new();
+    propagator.inject_context(
+        &opentelemetry::Context::current(),
+        &mut HeaderInjector(headers),
+    );
+}
+
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
@@ -109,12 +137,31 @@ impl AnthropicProvider {
         );
 
         let response = async {
-            self.client
+            #[cfg_attr(not(feature = "telemetry"), allow(unused_mut))]
+            let mut req_builder = self
+                .client
                 .post(&self.base_url)
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", ANTHROPIC_VERSION)
                 .header("content-type", "application/json")
-                .json(&request)
+                .json(&request);
+
+            // Inject W3C TraceContext into the outgoing request headers inside the
+            // provider_call span. When OTel is active, this adds a `traceparent`
+            // header so the LLM provider can link its server-side trace as a child
+            // of this span. When OTel is not active, inject_trace_context is a no-op.
+            #[cfg(feature = "telemetry")]
+            {
+                let mut extra_headers = reqwest::header::HeaderMap::new();
+                inject_trace_context(&mut extra_headers);
+                for (k, v) in extra_headers {
+                    if let Some(name) = k {
+                        req_builder = req_builder.header(name, v);
+                    }
+                }
+            }
+
+            req_builder
                 .send()
                 .await
                 .map_err(|e| ProviderError::RequestFailed(e.to_string()))

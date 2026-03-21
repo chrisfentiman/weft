@@ -16,12 +16,12 @@ path = "src/main.rs"
 weft_activities = { path = "../weft_activities" }
 weft_core = { path = "../weft_core" }
 weft_hooks = { path = "../weft_hooks" }
-weft_llm = { path = "../weft_llm" }
+weft_llm = { path = "../weft_llm", features = ["telemetry"] }
 weft_memory = { path = "../weft_memory" }
 weft_rhai = { path = "../weft_rhai" }
 weft_router = { path = "../weft_router" }
 weft_commands = { path = "../weft_commands" }
-weft_tools = { path = "../weft_tools" }
+weft_tools = { path = "../weft_tools", features = ["telemetry"] }
 weft_proto = { workspace = true }
 weft_reactor = { workspace = true }
 weft_eventlog_memory = { workspace = true }
@@ -42,6 +42,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 uuid = { workspace = true }
 regex = { workspace = true }
 rhai = { workspace = true }

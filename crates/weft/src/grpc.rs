@@ -101,10 +101,27 @@ impl WeftService {
 #[tonic::async_trait]
 impl proto::weft_server::Weft for WeftService {
     /// Unary chat RPC: single request → single response.
+    ///
+    /// Extracts W3C TraceContext from gRPC metadata. When a valid `traceparent`
+    /// key is present, the current tracing span (from tower-http's TraceLayer) is
+    /// re-parented to the incoming trace, enabling distributed tracing across services.
     async fn chat(
         &self,
         request: Request<proto::ChatRequest>,
     ) -> Result<Response<proto::ChatResponse>, Status> {
+        // Extract the parent OTel context from incoming gRPC metadata and set it on
+        // the current tracing span. `set_parent` does not use thread-local storage and
+        // is safe across `await` points in Send futures.
+        //
+        // tower-http's TraceLayer has already created the current tracing span — by
+        // setting its OTel parent here, child spans (including the reactor's `request`
+        // span) will be correctly linked into the incoming distributed trace.
+        let parent_ctx = crate::telemetry::propagation::extract_from_metadata(request.metadata());
+        {
+            use tracing_opentelemetry::OpenTelemetrySpanExt;
+            tracing::Span::current().set_parent(parent_ctx);
+        }
+
         let proto_req = request.into_inner();
 
         // Convert proto → domain. weft_request_from_proto validates message structure.
@@ -137,6 +154,14 @@ impl proto::weft_server::Weft for WeftService {
         &self,
         request: Request<proto::ChatRequest>,
     ) -> Result<Response<Self::ChatStreamStream>, Status> {
+        // Extract the parent OTel context from incoming gRPC metadata and set it on
+        // the current tracing span. Safe across await points (no thread-local guard).
+        let parent_ctx = crate::telemetry::propagation::extract_from_metadata(request.metadata());
+        {
+            use tracing_opentelemetry::OpenTelemetrySpanExt;
+            tracing::Span::current().set_parent(parent_ctx);
+        }
+
         let proto_req = request.into_inner();
 
         // Convert proto → domain. Validate before spawning the task so the caller gets
