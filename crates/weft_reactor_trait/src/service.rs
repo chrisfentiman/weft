@@ -46,6 +46,21 @@ pub trait ServiceLocator: Send + Sync {
     fn memory(&self) -> Option<&dyn weft_memory_trait::MemoryService>;
 }
 
+/// Collects the parameters for spawning a child execution.
+///
+/// Passed to `ChildSpawner::spawn_child` in place of the previous 8-parameter
+/// signature. `parent_cancel` is kept separate because it is a borrowed
+/// reference — embedding it would require a lifetime parameter on the struct.
+pub struct SpawnRequest {
+    pub request: weft_core::WeftRequest,
+    pub tenant_id: TenantId,
+    pub request_id: RequestId,
+    pub parent_id: ExecutionId,
+    pub parent_budget: Budget,
+    pub parent_event_tx: tokio::sync::mpsc::Sender<PipelineEvent>,
+    pub pipeline_name: String,
+}
+
 /// Spawns child executions from within an activity.
 ///
 /// Only `GenerateActivity` uses this. The Reactor provides an implementation
@@ -64,20 +79,10 @@ pub trait ChildSpawner: Send + Sync {
     ///
     /// `parent_cancel`: when Some, the child's cancellation token is linked
     /// as a child of this token, so cancelling the parent propagates.
-    ///
-    /// Spec-mandated 8-parameter signature; grouping into a builder struct would
-    /// change the public API contract. Allow lint locally.
-    #[allow(clippy::too_many_arguments)]
     async fn spawn_child(
         &self,
-        request: weft_core::WeftRequest,
-        tenant_id: TenantId,
-        request_id: RequestId,
-        parent_id: ExecutionId,
-        parent_budget: Budget,
-        parent_event_tx: tokio::sync::mpsc::Sender<PipelineEvent>,
+        req: SpawnRequest,
         parent_cancel: Option<&tokio_util::sync::CancellationToken>,
-        pipeline_name: &str,
     ) -> Result<Budget, String>;
 }
 
@@ -334,17 +339,11 @@ api_key = "sk-test"
     impl ChildSpawner for MockChildSpawner {
         async fn spawn_child(
             &self,
-            _request: weft_core::WeftRequest,
-            _tenant_id: TenantId,
-            _request_id: RequestId,
-            _parent_id: ExecutionId,
-            parent_budget: Budget,
-            _parent_event_tx: tokio::sync::mpsc::Sender<PipelineEvent>,
+            req: SpawnRequest,
             _parent_cancel: Option<&tokio_util::sync::CancellationToken>,
-            _pipeline_name: &str,
         ) -> Result<Budget, String> {
             // Return the parent budget unchanged — mock doesn't actually spawn.
-            Ok(parent_budget)
+            Ok(req.parent_budget)
         }
     }
 
@@ -364,18 +363,20 @@ api_key = "sk-test"
 
         let result = spawner
             .spawn_child(
-                weft_core::WeftRequest {
-                    messages: vec![],
-                    routing: weft_core::ModelRoutingInstruction::parse("auto"),
-                    options: weft_core::SamplingOptions::default(),
+                SpawnRequest {
+                    request: weft_core::WeftRequest {
+                        messages: vec![],
+                        routing: weft_core::ModelRoutingInstruction::parse("auto"),
+                        options: weft_core::SamplingOptions::default(),
+                    },
+                    tenant_id: TenantId("t1".to_string()),
+                    request_id: RequestId("r1".to_string()),
+                    parent_id: ExecutionId::new(),
+                    parent_budget: budget.clone(),
+                    parent_event_tx: tx,
+                    pipeline_name: "default".to_string(),
                 },
-                TenantId("t1".to_string()),
-                RequestId("r1".to_string()),
-                ExecutionId::new(),
-                budget.clone(),
-                tx,
                 None,
-                "default",
             )
             .await;
 

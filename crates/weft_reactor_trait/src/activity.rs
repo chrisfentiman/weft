@@ -246,16 +246,10 @@ mod tests {
         impl ChildSpawner for NopSpawner {
             async fn spawn_child(
                 &self,
-                _: weft_core::WeftRequest,
-                _: crate::execution::TenantId,
-                _: crate::execution::RequestId,
-                _: ExecutionId,
-                budget: Budget,
-                _: mpsc::Sender<PipelineEvent>,
+                req: crate::service::SpawnRequest,
                 _: Option<&tokio_util::sync::CancellationToken>,
-                _: &str,
             ) -> Result<Budget, String> {
-                Ok(budget)
+                Ok(req.parent_budget)
             }
         }
 

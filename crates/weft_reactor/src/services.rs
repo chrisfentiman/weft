@@ -36,6 +36,21 @@ use weft_reactor_trait::{
     Budget, ChildSpawner, ExecutionId, PipelineEvent, RequestId, ServiceLocator, TenantId,
 };
 
+/// Collects the parameters for `ReactorHandle::spawn_child` into a single owned struct.
+///
+/// Replaces the previous 8-parameter signature. `parent_cancel` is kept separate
+/// because it is a borrowed reference — embedding it would require a lifetime
+/// parameter on the struct itself.
+pub struct SpawnRequest {
+    pub request: weft_core::WeftRequest,
+    pub tenant_id: TenantId,
+    pub request_id: RequestId,
+    pub parent_id: ExecutionId,
+    pub parent_budget: Budget,
+    pub parent_event_tx: mpsc::Sender<PipelineEvent>,
+    pub pipeline_name: String,
+}
+
 /// Shared infrastructure for pipeline activities.
 ///
 /// Activities receive a `&dyn ServiceLocator` reference (via the `ServiceLocator`
@@ -131,26 +146,21 @@ impl ReactorChildSpawner {
 impl ChildSpawner for ReactorChildSpawner {
     async fn spawn_child(
         &self,
-        request: weft_core::WeftRequest,
-        tenant_id: TenantId,
-        request_id: RequestId,
-        parent_id: ExecutionId,
-        parent_budget: Budget,
-        parent_event_tx: mpsc::Sender<PipelineEvent>,
+        req: weft_reactor_trait::SpawnRequest,
         parent_cancel: Option<&CancellationToken>,
-        pipeline_name: &str,
     ) -> Result<Budget, String> {
+        // Convert the trait's SpawnRequest to services' SpawnRequest.
+        let spawn_req = SpawnRequest {
+            request: req.request,
+            tenant_id: req.tenant_id,
+            request_id: req.request_id,
+            parent_id: req.parent_id,
+            parent_budget: req.parent_budget,
+            parent_event_tx: req.parent_event_tx,
+            pipeline_name: req.pipeline_name,
+        };
         self.handle
-            .spawn_child(
-                request,
-                tenant_id,
-                request_id,
-                parent_id,
-                parent_budget,
-                parent_event_tx,
-                parent_cancel,
-                pipeline_name,
-            )
+            .spawn_child(spawn_req, parent_cancel)
             .await
             .map_err(|e| e.to_string())
     }
@@ -180,7 +190,7 @@ impl ReactorHandle {
 
     /// Spawn a child execution.
     ///
-    /// The child runs the default pipeline with its own `ExecutionId`,
+    /// The child runs the named pipeline with its own `ExecutionId`,
     /// inheriting the parent's remaining budget (depth incremented by 1).
     /// When the child completes, a `ChildCompleted` event is pushed onto
     /// the `parent_event_tx` channel so the parent's dispatch loop receives it.
@@ -208,20 +218,21 @@ impl ReactorHandle {
     /// Returns `ReactorError::BudgetExhausted` if `parent_budget.child_budget()`
     /// fails (depth limit reached). Propagates any other error from the child
     /// execution.
-    // Spec-mandated signature requires 9 positional parameters; grouping into
-    // a builder would change the public API contract. Allow lint locally.
-    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_child(
         &self,
-        request: weft_core::WeftRequest,
-        tenant_id: crate::execution::TenantId,
-        request_id: crate::execution::RequestId,
-        parent_id: crate::execution::ExecutionId,
-        parent_budget: crate::budget::Budget,
-        parent_event_tx: mpsc::Sender<crate::event::PipelineEvent>,
+        req: SpawnRequest,
         parent_cancel: Option<&CancellationToken>,
-        pipeline_name: &str,
     ) -> Result<crate::budget::Budget, crate::error::ReactorError> {
+        let SpawnRequest {
+            request,
+            tenant_id,
+            request_id,
+            parent_id,
+            parent_budget,
+            parent_event_tx,
+            pipeline_name,
+        } = req;
+
         // Pre-validate depth before spawning. This surfaces the Depth error
         // synchronously (before we record ChildSpawned), matching the spec's
         // contract that spawn_child returns Err(BudgetExhausted) at depth limit.
@@ -241,7 +252,7 @@ impl ReactorHandle {
             .send(crate::event::PipelineEvent::Child(
                 weft_reactor_trait::ChildEvent::Spawned {
                     child_id: "pending".to_string(),
-                    pipeline_name: pipeline_name.to_string(),
+                    pipeline_name: pipeline_name.clone(),
                     reason: "spawn_child".to_string(),
                 },
             ))
@@ -249,18 +260,15 @@ impl ReactorHandle {
 
         // Pass the parent's budget directly. reactor.execute() calls child_budget()
         // internally when parent_budget is Some, incrementing depth by 1.
-        let (result, _child_signal_tx) = self
-            .reactor
-            .execute(
-                request,
-                tenant_id,
-                request_id,
-                Some(parent_id.clone()),
-                Some(parent_budget),
-                None, // No client streaming for child executions
-                parent_cancel,
-            )
-            .await?;
+        let ctx = crate::reactor::ExecutionContext {
+            request,
+            tenant_id,
+            request_id,
+            parent_id: Some(parent_id),
+            parent_budget: Some(parent_budget),
+            client_tx: None, // No client streaming for child executions
+        };
+        let (result, _child_signal_tx) = self.reactor.execute(ctx, parent_cancel).await?;
 
         // Push ChildCompleted onto parent's channel using new grouped format.
         // Ignore send errors: if the parent channel is closed, we've already

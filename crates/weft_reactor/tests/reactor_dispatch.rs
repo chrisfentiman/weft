@@ -29,7 +29,7 @@ use weft_reactor::test_support::{
     TestEventLog, make_test_services, make_test_services_with_blocking_hook,
     make_test_services_with_response,
 };
-use weft_reactor::{RequestId, TenantId};
+use weft_reactor::{ExecutionContext, RequestId, TenantId};
 
 use weft_core::{
     CommandAction, CommandInvocation, ContentPart, HookEvent, ModelRoutingInstruction, Role,
@@ -682,12 +682,14 @@ async fn simple_request_response_completes() {
 
     let (result, _signal_tx) = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await
@@ -743,12 +745,14 @@ async fn pre_loop_activity_runs_before_generate() {
 
     let (result, _) = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await
@@ -817,12 +821,14 @@ async fn budget_exhaustion_terminates_gracefully() {
     // Execution should succeed (budget exhaustion is not an error, it's graceful termination).
     let result = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await;
@@ -892,12 +898,14 @@ async fn cancel_signal_terminates_execution() {
 
     let (result, _signal_tx) = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await
@@ -970,12 +978,14 @@ async fn cancel_signal_on_channel_terminates_execution() {
 
     let result = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await;
@@ -1082,12 +1092,14 @@ async fn hook_block_in_pre_loop_returns_hook_blocked_error() {
 
     let result = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await;
@@ -1151,12 +1163,14 @@ async fn generate_fails_once_then_succeeds_with_retry() {
 
     let result = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await;
@@ -1227,12 +1241,14 @@ async fn generate_not_retried_when_retryable_false() {
 
     let result = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await;
@@ -1294,12 +1310,14 @@ async fn retry_exhaustion_returns_error() {
 
     let result = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await;
@@ -1369,12 +1387,14 @@ async fn retry_skipped_when_budget_exhausted() {
 
     let result = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            Some(exhausted_budget),
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: Some(exhausted_budget),
+                client_tx: None,
+            },
             None,
         )
         .await;
@@ -1482,12 +1502,14 @@ async fn generation_timeout_fires_after_silence() {
     let handle = tokio::spawn(async move {
         reactor_ref
             .execute(
-                test_request(),
-                TenantId("tenant1".to_string()),
-                RequestId("req1".to_string()),
-                None,
-                None,
-                None,
+                ExecutionContext {
+                    request: test_request(),
+                    tenant_id: TenantId("tenant1".to_string()),
+                    request_id: RequestId("req1".to_string()),
+                    parent_id: None,
+                    parent_budget: None,
+                    client_tx: None,
+                },
                 None,
             )
             .await
@@ -1597,12 +1619,14 @@ async fn heartbeat_miss_cancels_activity() {
     let handle = tokio::spawn(async move {
         reactor_ref
             .execute(
-                test_request(),
-                TenantId("tenant1".to_string()),
-                RequestId("req1".to_string()),
-                None,
-                None,
-                None,
+                ExecutionContext {
+                    request: test_request(),
+                    tenant_id: TenantId("tenant1".to_string()),
+                    request_id: RequestId("req1".to_string()),
+                    parent_id: None,
+                    parent_budget: None,
+                    client_tx: None,
+                },
                 None,
             )
             .await
@@ -1765,12 +1789,14 @@ async fn generated_content_events_forwarded_to_client_tx() {
 
     let result = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            Some(client_tx),
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: Some(client_tx),
+            },
             None,
         )
         .await;
@@ -1823,12 +1849,14 @@ async fn event_log_contains_complete_execution_trace() {
 
     let (result, _) = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await
@@ -1981,14 +2009,16 @@ async fn spawn_child_returns_err_at_depth_limit() {
     let (parent_tx, _parent_rx) = mpsc::channel::<PipelineEvent>(16);
     let result = handle
         .spawn_child(
-            test_request(),
-            TenantId("t1".to_string()),
-            RequestId("r1".to_string()),
-            weft_reactor::execution::ExecutionId::new(),
-            parent_budget,
-            parent_tx,
+            weft_reactor::SpawnRequest {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id: weft_reactor::execution::ExecutionId::new(),
+                parent_budget,
+                parent_event_tx: parent_tx,
+                pipeline_name: "default".to_string(),
+            },
             None,
-            "default",
         )
         .await;
 
@@ -2040,14 +2070,16 @@ async fn spawn_child_creates_child_with_correct_parent_id_and_depth() {
 
     let result = handle
         .spawn_child(
-            test_request(),
-            TenantId("t1".to_string()),
-            RequestId("r1".to_string()),
-            parent_id.clone(),
-            parent_budget.clone(),
-            parent_tx,
+            weft_reactor::SpawnRequest {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id: parent_id.clone(),
+                parent_budget: parent_budget.clone(),
+                parent_event_tx: parent_tx,
+                pipeline_name: "default".to_string(),
+            },
             None,
-            "default",
         )
         .await;
 
@@ -2157,14 +2189,16 @@ async fn spawn_child_with_cancelled_parent_fails_or_cancels() {
 
     let result = handle
         .spawn_child(
-            test_request(),
-            TenantId("t1".to_string()),
-            RequestId("r1".to_string()),
-            parent_id,
-            parent_budget,
-            parent_tx,
+            weft_reactor::SpawnRequest {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id,
+                parent_budget,
+                parent_event_tx: parent_tx,
+                pipeline_name: "default".to_string(),
+            },
             Some(&parent_cancel),
-            "default",
         )
         .await;
 
@@ -2279,12 +2313,14 @@ async fn command_iteration_loop_executes_command_then_calls_generate_again() {
 
     let (result, _) = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await
@@ -2473,12 +2509,14 @@ async fn pre_response_hook_block_injects_feedback_and_retries_generation() {
 
     let result = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await;
@@ -2608,12 +2646,14 @@ async fn cancel_during_retry_backoff_terminates_execution() {
     let handle = tokio::spawn(async move {
         reactor_ref
             .execute(
-                test_request(),
-                TenantId("tenant1".to_string()),
-                RequestId("req1".to_string()),
-                None,
-                None,
-                None,
+                ExecutionContext {
+                    request: test_request(),
+                    tenant_id: TenantId("tenant1".to_string()),
+                    request_id: RequestId("req1".to_string()),
+                    parent_id: None,
+                    parent_budget: None,
+                    client_tx: None,
+                },
                 None,
             )
             .await
@@ -2746,12 +2786,14 @@ async fn per_chunk_timeout_resets_after_each_chunk() {
     let handle = tokio::spawn(async move {
         reactor_ref
             .execute(
-                test_request(),
-                TenantId("tenant1".to_string()),
-                RequestId("req1".to_string()),
-                None,
-                None,
-                None,
+                ExecutionContext {
+                    request: test_request(),
+                    tenant_id: TenantId("tenant1".to_string()),
+                    request_id: RequestId("req1".to_string()),
+                    parent_id: None,
+                    parent_budget: None,
+                    client_tx: None,
+                },
                 None,
             )
             .await
@@ -2885,12 +2927,14 @@ async fn pre_loop_all_six_activities_produce_expected_events() {
 
     let (result, _) = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await
@@ -2940,12 +2984,14 @@ async fn pre_loop_events_appear_in_correct_order() {
 
     let (result, _) = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await
@@ -3009,12 +3055,14 @@ async fn pre_loop_system_prompt_at_index_zero() {
 
     let (result, _) = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await
@@ -3062,12 +3110,14 @@ async fn pre_loop_generation_config_includes_model() {
 
     let (result, _) = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await
@@ -3177,12 +3227,14 @@ async fn pre_loop_activity_failure_terminates_execution() {
 
     let result = reactor
         .execute(
-            test_request(),
-            TenantId("tenant1".to_string()),
-            RequestId("req1".to_string()),
-            None,
-            None,
-            None,
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("tenant1".to_string()),
+                request_id: RequestId("req1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
             None,
         )
         .await;

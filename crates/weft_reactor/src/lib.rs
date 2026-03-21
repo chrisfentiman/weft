@@ -48,9 +48,9 @@ pub use event::{
 };
 pub use event_log::{EventLog, EventLogError};
 pub use execution::{Execution, ExecutionId, ExecutionStatus, RequestId, TenantId};
-pub use reactor::{BudgetUsage, ExecutionResult, Reactor};
+pub use reactor::{BudgetUsage, ExecutionContext, ExecutionResult, Reactor};
 pub use registry::{ActivityRegistry, RegistryError};
-pub use services::{ReactorChildSpawner, ReactorHandle, Services};
+pub use services::{ReactorChildSpawner, ReactorHandle, Services, SpawnRequest};
 pub use signal::{BudgetUpdate, Signal};
-// Re-export ServiceLocator and ChildSpawner from weft_reactor_trait.
+// Re-export ServiceLocator, ChildSpawner, and SpawnRequest from weft_reactor_trait.
 pub use weft_reactor_trait::{ChildSpawner, ServiceLocator};

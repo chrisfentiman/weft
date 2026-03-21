@@ -41,6 +41,20 @@ const CHANNEL_BUFFER: usize = 256;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
+/// Collects the parameters for `Reactor::execute` into a single owned struct.
+///
+/// Replaces the previous 7-parameter signature. `cancel` is kept separate
+/// because it is a borrowed reference — embedding it would require a lifetime
+/// parameter on the struct itself.
+pub struct ExecutionContext {
+    pub request: weft_core::WeftRequest,
+    pub tenant_id: TenantId,
+    pub request_id: RequestId,
+    pub parent_id: Option<ExecutionId>,
+    pub parent_budget: Option<Budget>,
+    pub client_tx: Option<mpsc::Sender<PipelineEvent>>,
+}
+
 /// The execution engine. A dispatch loop consuming events from a channel.
 pub struct Reactor {
     services: Arc<Services>,
@@ -157,6 +171,22 @@ struct ExecutionState {
     sampling_temperature: Option<f32>,
     /// Sampling top_p. Set by SamplingAdjustmentActivity.
     sampling_top_p: Option<f32>,
+}
+
+/// Bundles all borrows needed by `execute_commands` into a single struct.
+///
+/// All fields are borrowed from the enclosing `execute` dispatch loop scope.
+/// The lifetime `'a` ties them together so the borrow checker can reason
+/// about the lifetimes without threading 9 separate parameters.
+struct CommandContext<'a> {
+    execution_id: &'a ExecutionId,
+    state: &'a mut ExecutionState,
+    request: &'a weft_core::WeftRequest,
+    pipeline: &'a CompiledPipeline,
+    event_tx: &'a mpsc::Sender<PipelineEvent>,
+    event_rx: &'a mut mpsc::Receiver<PipelineEvent>,
+    cancel: &'a CancellationToken,
+    default_timeout_secs: u64,
 }
 
 impl ExecutionState {
@@ -310,27 +340,28 @@ impl Reactor {
     /// Returns the execution result and the event channel sender so that
     /// external systems can inject signals after execute returns.
     ///
-    /// `parent_cancel`: When `Some`, the execution's `CancellationToken` is
+    /// `cancel`: When `Some`, the execution's `CancellationToken` is
     /// created as a child of the provided token. Cancelling the parent token
     /// therefore also cancels this execution. Pass `None` for root executions.
-    // Spec-mandated signature requires 8 positional parameters; grouping into
-    // a builder would change the public API contract. Allow lint locally.
-    #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         &self,
-        request: weft_core::WeftRequest,
-        tenant_id: TenantId,
-        request_id: RequestId,
-        parent_id: Option<ExecutionId>,
-        parent_budget: Option<Budget>,
-        client_tx: Option<mpsc::Sender<PipelineEvent>>,
-        parent_cancel: Option<&CancellationToken>,
+        ctx: ExecutionContext,
+        cancel: Option<&CancellationToken>,
     ) -> Result<(ExecutionResult, mpsc::Sender<PipelineEvent>), ReactorError> {
+        let ExecutionContext {
+            request,
+            tenant_id,
+            request_id,
+            parent_id,
+            parent_budget,
+            client_tx,
+        } = ctx;
+
         // ── Setup ─────────────────────────────────────────────────────────────
         let execution_id = ExecutionId::new();
-        // When a parent cancel token is provided (child execution), create a
-        // child token so that cancelling the parent also cancels this execution.
-        let cancel = match parent_cancel {
+        // When a cancel token is provided (child execution), create a child
+        // token so that cancelling the parent also cancels this execution.
+        let cancel = match cancel {
             Some(parent) => parent.child_token(),
             None => CancellationToken::new(),
         };
@@ -557,22 +588,32 @@ impl Reactor {
                 // Replay cached events without re-running the activity.
                 debug!(key = %gen_idempotency_key, "idempotency hit: replaying cached events");
                 let mut commands_queued: Vec<weft_core::CommandInvocation> = Vec::new();
-                let mut generation_done = false;
-                let mut generation_refused = false;
 
                 for ev in cached_events {
                     // Deserialize the stored payload back to PipelineEvent for dispatch.
                     if let Ok(pe) = serde_json::from_value::<PipelineEvent>(ev.payload.clone()) {
-                        self.dispatch_generated_event(
-                            &execution_id,
-                            &pe,
-                            &mut state,
-                            &client_tx,
-                            &mut commands_queued,
-                            &mut generation_done,
-                            &mut generation_refused,
-                        )
-                        .await?;
+                        // Inline: process generation chunk events from replayed cache.
+                        // Forward Content chunks to the client stream, accumulate state.
+                        if let PipelineEvent::Generation(GenerationEvent::Chunk(ref gen_ev)) = pe {
+                            if let GeneratedEvent::Content { .. } = gen_ev
+                                && let Some(client) = &client_tx
+                            {
+                                let _ = client.send(pe.clone()).await;
+                            }
+                            match gen_ev {
+                                GeneratedEvent::Content { part } => {
+                                    if let weft_core::ContentPart::Text(t) = part {
+                                        state.accumulated_text.push_str(t);
+                                    }
+                                }
+                                GeneratedEvent::CommandInvocation(inv) => {
+                                    commands_queued.push(inv.clone());
+                                }
+                                GeneratedEvent::Done
+                                | GeneratedEvent::Refused { .. }
+                                | GeneratedEvent::Reasoning { .. } => {}
+                            }
+                        }
                     }
                 }
 
@@ -580,18 +621,18 @@ impl Reactor {
                 if commands_queued.is_empty() {
                     break 'dispatch;
                 }
+                let mut cmd_ctx = CommandContext {
+                    execution_id: &execution_id,
+                    state: &mut state,
+                    request: &request,
+                    pipeline,
+                    event_tx: &event_tx,
+                    event_rx: &mut event_rx,
+                    cancel: &cancel,
+                    default_timeout_secs: default_command_timeout,
+                };
                 let terminate = self
-                    .execute_commands(
-                        &execution_id,
-                        &mut commands_queued,
-                        &mut state,
-                        &request,
-                        pipeline,
-                        &event_tx,
-                        &mut event_rx,
-                        &cancel,
-                        default_command_timeout,
-                    )
+                    .execute_commands(&mut cmd_ctx, &mut commands_queued)
                     .await?;
                 if let Some(err) = terminate {
                     self.finalize_failed(&execution_id, &mut state, err).await?;
@@ -1129,18 +1170,18 @@ impl Reactor {
 
             // ── 2h: Execute commands sequentially ────────────────────────────
             if !commands_queued.is_empty() {
+                let mut cmd_ctx = CommandContext {
+                    execution_id: &execution_id,
+                    state: &mut state,
+                    request: &request,
+                    pipeline,
+                    event_tx: &event_tx,
+                    event_rx: &mut event_rx,
+                    cancel: &cancel,
+                    default_timeout_secs: default_command_timeout,
+                };
                 let terminate = self
-                    .execute_commands(
-                        &execution_id,
-                        &mut commands_queued,
-                        &mut state,
-                        &request,
-                        pipeline,
-                        &event_tx,
-                        &mut event_rx,
-                        &cancel,
-                        default_command_timeout,
-                    )
+                    .execute_commands(&mut cmd_ctx, &mut commands_queued)
                     .await?;
                 if let Some(err) = terminate {
                     self.finalize_failed(&execution_id, &mut state, err).await?;
@@ -1485,59 +1526,62 @@ impl Reactor {
     /// Execute all queued commands sequentially.
     ///
     /// Returns Some(err) if execution should terminate, None on success.
-    #[allow(clippy::too_many_arguments)]
     async fn execute_commands(
         &self,
-        execution_id: &ExecutionId,
+        cmd_ctx: &mut CommandContext<'_>,
         commands: &mut Vec<weft_core::CommandInvocation>,
-        state: &mut ExecutionState,
-        request: &weft_core::WeftRequest,
-        pipeline: &CompiledPipeline,
-        event_tx: &mpsc::Sender<PipelineEvent>,
-        event_rx: &mut mpsc::Receiver<PipelineEvent>,
-        cancel: &CancellationToken,
-        default_timeout_secs: u64,
     ) -> Result<Option<ReactorError>, ReactorError> {
         for (cmd_index, invocation) in commands.drain(..).enumerate() {
-            if cancel.is_cancelled() {
+            if cmd_ctx.cancel.is_cancelled() {
                 break;
             }
 
             // Idempotency key for this command.
             let cmd_key = format!(
                 "{}:{}:{}:{}",
-                execution_id, invocation.name, state.iteration, cmd_index
+                cmd_ctx.execution_id, invocation.name, cmd_ctx.state.iteration, cmd_index
             );
 
             // Check idempotency — skip if already completed.
             if self
-                .check_idempotency(execution_id, &cmd_key)
+                .check_idempotency(cmd_ctx.execution_id, &cmd_key)
                 .await?
                 .is_some()
             {
                 debug!(key = %cmd_key, "command idempotency hit: skipping");
-                state.commands_executed += 1;
+                cmd_ctx.state.commands_executed += 1;
                 continue;
             }
 
             // Run pre_tool_use hooks.
-            for hook in &pipeline.loop_hooks.pre_tool_use {
-                if cancel.is_cancelled() {
+            for hook in &cmd_ctx.pipeline.loop_hooks.pre_tool_use {
+                if cmd_ctx.cancel.is_cancelled() {
                     break;
                 }
-                let input = self.build_input(execution_id, state, request, hook, None);
+                let input = self.build_input(
+                    cmd_ctx.execution_id,
+                    cmd_ctx.state,
+                    cmd_ctx.request,
+                    hook,
+                    None,
+                );
                 hook.activity
                     .execute(
-                        execution_id,
+                        cmd_ctx.execution_id,
                         input,
                         self.services.as_ref(),
                         self.event_log.as_ref(),
-                        event_tx.clone(),
-                        cancel.clone(),
+                        cmd_ctx.event_tx.clone(),
+                        cmd_ctx.cancel.clone(),
                     )
                     .await;
                 let terminate = self
-                    .drain_pre_post_loop(execution_id, event_rx, state, cancel)
+                    .drain_pre_post_loop(
+                        cmd_ctx.execution_id,
+                        cmd_ctx.event_rx,
+                        cmd_ctx.state,
+                        cmd_ctx.cancel,
+                    )
                     .await?;
                 if let Some(err) = terminate {
                     return Ok(Some(err));
@@ -1546,10 +1590,10 @@ impl Reactor {
 
             // Build command input with idempotency key.
             let mut cmd_input = self.build_input(
-                execution_id,
-                state,
-                request,
-                &pipeline.execute_command,
+                cmd_ctx.execution_id,
+                cmd_ctx.state,
+                cmd_ctx.request,
+                &cmd_ctx.pipeline.execute_command,
                 Some(cmd_key),
             );
             // Inject the specific invocation into metadata so the activity knows which command to run.
@@ -1559,19 +1603,20 @@ impl Reactor {
             });
 
             let cmd_timeout = Duration::from_secs(
-                pipeline
+                cmd_ctx
+                    .pipeline
                     .execute_command
                     .timeout_secs
-                    .unwrap_or(default_timeout_secs),
+                    .unwrap_or(cmd_ctx.default_timeout_secs),
             );
 
             // Execute command with timeout.
-            let cmd_activity = Arc::clone(&pipeline.execute_command.activity);
-            let cmd_event_tx = event_tx.clone();
-            let cmd_exec_id = execution_id.clone();
+            let cmd_activity = Arc::clone(&cmd_ctx.pipeline.execute_command.activity);
+            let cmd_event_tx = cmd_ctx.event_tx.clone();
+            let cmd_exec_id = cmd_ctx.execution_id.clone();
             let cmd_services = Arc::clone(&self.services);
             let cmd_event_log: Arc<dyn EventLog> = Arc::clone(&self.event_log);
-            let cmd_cancel = cancel.clone();
+            let cmd_cancel = cmd_ctx.cancel.clone();
 
             let cmd_handle = tokio::spawn(async move {
                 cmd_activity
@@ -1597,15 +1642,15 @@ impl Reactor {
             'cmd: loop {
                 tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => {
+                    _ = cmd_ctx.cancel.cancelled() => {
                         cmd_handle.abort();
                         break 'cmd;
                     }
-                    event_opt = event_rx.recv() => {
+                    event_opt = cmd_ctx.event_rx.recv() => {
                         match event_opt {
                             None => return Err(ReactorError::ChannelClosed),
                             Some(event) => {
-                                self.record_event(execution_id, &event, None).await?;
+                                self.record_event(cmd_ctx.execution_id, &event, None).await?;
                                 match &event {
                                     PipelineEvent::Command(CommandEvent::Completed { name, result }) if name == &cmd_name => {
                                         // Inject command result into messages and record the injection
@@ -1617,11 +1662,11 @@ impl Reactor {
                                             model: None,
                                             content: vec![weft_core::ContentPart::Text(result.output.clone())],
                                             delta: false,
-                                            message_index: state.messages.len() as u32,
+                                            message_index: cmd_ctx.state.messages.len() as u32,
                                         };
-                                        state.messages.push(result_msg.clone());
+                                        cmd_ctx.state.messages.push(result_msg.clone());
                                         self.record_event(
-                                            execution_id,
+                                            cmd_ctx.execution_id,
                                             &PipelineEvent::Context(ContextEvent::MessageInjected {
                                                 message: result_msg,
                                                 source: MessageInjectionSource::CommandResult {
@@ -1630,7 +1675,7 @@ impl Reactor {
                                             }),
                                             None,
                                         ).await?;
-                                        state.commands_executed += 1;
+                                        cmd_ctx.state.commands_executed += 1;
                                         cmd_completed = true;
                                     }
                                     PipelineEvent::Command(CommandEvent::Failed { name, error }) if name == &cmd_name => {
@@ -1643,11 +1688,11 @@ impl Reactor {
                                             model: None,
                                             content: vec![weft_core::ContentPart::Text(format!("Command failed: {error}"))],
                                             delta: false,
-                                            message_index: state.messages.len() as u32,
+                                            message_index: cmd_ctx.state.messages.len() as u32,
                                         };
-                                        state.messages.push(err_msg.clone());
+                                        cmd_ctx.state.messages.push(err_msg.clone());
                                         self.record_event(
-                                            execution_id,
+                                            cmd_ctx.execution_id,
                                             &PipelineEvent::Context(ContextEvent::MessageInjected {
                                                 message: err_msg,
                                                 source: MessageInjectionSource::CommandError {
@@ -1656,15 +1701,15 @@ impl Reactor {
                                             }),
                                             None,
                                         ).await?;
-                                        state.commands_executed += 1;
+                                        cmd_ctx.state.commands_executed += 1;
                                         cmd_completed = true;
                                     }
-                                    PipelineEvent::Activity(ActivityEvent::Failed { name, error, retryable }) if name == pipeline.execute_command.activity.name() => {
+                                    PipelineEvent::Activity(ActivityEvent::Failed { name, error, retryable }) if name == cmd_ctx.pipeline.execute_command.activity.name() => {
                                         cmd_failed = true;
                                         cmd_failed_error = error.clone();
                                         cmd_failed_retryable = *retryable;
                                     }
-                                    PipelineEvent::Activity(ActivityEvent::Completed { name, .. }) if name == pipeline.execute_command.activity.name() => {
+                                    PipelineEvent::Activity(ActivityEvent::Completed { name, .. }) if name == cmd_ctx.pipeline.execute_command.activity.name() => {
                                         cmd_completed = true;
                                     }
                                     _ => {}
@@ -1687,8 +1732,10 @@ impl Reactor {
 
             // Handle command failure with retry.
             if cmd_failed {
-                let policy = pipeline.execute_command.retry_policy.as_ref();
-                if cmd_failed_retryable && should_retry(policy, 0, &state.budget, cancel) {
+                let policy = cmd_ctx.pipeline.execute_command.retry_policy.as_ref();
+                if cmd_failed_retryable
+                    && should_retry(policy, 0, &cmd_ctx.state.budget, cmd_ctx.cancel)
+                {
                     // Command retry is not yet implemented. The spec's "on ActivityFailed with
                     // retryable=true, apply retry policy" applies to generation activities.
                     // Command-level retry requires per-command attempt tracking and a retry loop
@@ -1709,23 +1756,34 @@ impl Reactor {
             }
 
             // Run post_tool_use hooks.
-            for hook in &pipeline.loop_hooks.post_tool_use {
-                if cancel.is_cancelled() {
+            for hook in &cmd_ctx.pipeline.loop_hooks.post_tool_use {
+                if cmd_ctx.cancel.is_cancelled() {
                     break;
                 }
-                let input = self.build_input(execution_id, state, request, hook, None);
+                let input = self.build_input(
+                    cmd_ctx.execution_id,
+                    cmd_ctx.state,
+                    cmd_ctx.request,
+                    hook,
+                    None,
+                );
                 hook.activity
                     .execute(
-                        execution_id,
+                        cmd_ctx.execution_id,
                         input,
                         self.services.as_ref(),
                         self.event_log.as_ref(),
-                        event_tx.clone(),
-                        cancel.clone(),
+                        cmd_ctx.event_tx.clone(),
+                        cmd_ctx.cancel.clone(),
                     )
                     .await;
                 let terminate = self
-                    .drain_pre_post_loop(execution_id, event_rx, state, cancel)
+                    .drain_pre_post_loop(
+                        cmd_ctx.execution_id,
+                        cmd_ctx.event_rx,
+                        cmd_ctx.state,
+                        cmd_ctx.cancel,
+                    )
                     .await?;
                 if let Some(err) = terminate {
                     return Ok(Some(err));
@@ -1733,45 +1791,6 @@ impl Reactor {
             }
         }
         Ok(None)
-    }
-
-    /// Dispatch a PipelineEvent from the generation phase to update state.
-    #[allow(clippy::too_many_arguments)]
-    async fn dispatch_generated_event(
-        &self,
-        _execution_id: &ExecutionId,
-        event: &PipelineEvent,
-        state: &mut ExecutionState,
-        client_tx: &Option<mpsc::Sender<PipelineEvent>>,
-        commands_queued: &mut Vec<weft_core::CommandInvocation>,
-        generation_done: &mut bool,
-        generation_refused: &mut bool,
-    ) -> Result<(), ReactorError> {
-        if let PipelineEvent::Generation(GenerationEvent::Chunk(gen_ev)) = event {
-            if let GeneratedEvent::Content { .. } = gen_ev
-                && let Some(client) = client_tx
-            {
-                let _ = client.send(event.clone()).await;
-            }
-            match gen_ev {
-                GeneratedEvent::Content { part } => {
-                    if let weft_core::ContentPart::Text(t) = part {
-                        state.accumulated_text.push_str(t);
-                    }
-                }
-                GeneratedEvent::CommandInvocation(inv) => {
-                    commands_queued.push(inv.clone());
-                }
-                GeneratedEvent::Done => {
-                    *generation_done = true;
-                }
-                GeneratedEvent::Refused { .. } => {
-                    *generation_refused = true;
-                }
-                GeneratedEvent::Reasoning { .. } => {}
-            }
-        }
-        Ok(())
     }
 
     /// Record a PipelineEvent to the EventLog.

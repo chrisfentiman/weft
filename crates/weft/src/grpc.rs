@@ -33,7 +33,7 @@ use weft_core::{
     SamplingOptions, Source, WeftMessage,
 };
 
-use weft_reactor::{Reactor, RequestId, TenantId};
+use weft_reactor::{ExecutionContext, Reactor, RequestId, TenantId};
 
 // ── WeftService ─────────────────────────────────────────────────────────────
 
@@ -73,7 +73,17 @@ impl WeftService {
 
         let (result, _signal_tx) = self
             .reactor
-            .execute(req, tenant_id, request_id, None, None, None, None)
+            .execute(
+                ExecutionContext {
+                    request: req,
+                    tenant_id,
+                    request_id,
+                    parent_id: None,
+                    parent_budget: None,
+                    client_tx: None,
+                },
+                None,
+            )
             .await
             .map_err(reactor_error_to_weft_error)?;
 
@@ -148,7 +158,17 @@ impl proto::weft_server::Weft for WeftService {
             // Execute through the Reactor. Map ReactorError to WeftError
             // so the existing error_code() and ChatError logic works unchanged.
             let result = reactor
-                .execute(weft_req, tenant_id, request_id, None, None, None, None)
+                .execute(
+                    ExecutionContext {
+                        request: weft_req,
+                        tenant_id,
+                        request_id,
+                        parent_id: None,
+                        parent_budget: None,
+                        client_tx: None,
+                    },
+                    None,
+                )
                 .await;
 
             match result {

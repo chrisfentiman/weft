@@ -46,5 +46,5 @@ pub use event::{
 };
 pub use event_log::{EventLog, EventLogError};
 pub use execution::{Execution, ExecutionId, ExecutionStatus, RequestId, TenantId};
-pub use service::{ChildSpawner, ServiceLocator};
+pub use service::{ChildSpawner, ServiceLocator, SpawnRequest};
 pub use signal::{BudgetUpdate, Signal};
