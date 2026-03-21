@@ -233,6 +233,9 @@ impl Activity for GenerateActivity {
 
         // Get the provider and open the streaming request.
         let provider = services.providers().get(&model);
+        // Record provider name now that it is known; must happen before the stream
+        // is opened so the attribute is present for the full span lifetime.
+        generate_span.record("llm.provider", provider.name());
 
         // Use tokio::select! to support cancellation while opening the stream.
         let stream_result = tokio::select! {
