@@ -195,6 +195,7 @@ pub enum ActivityError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
     use std::sync::Arc;
 
     // ── Object safety ─────────────────────────────────────────────────────

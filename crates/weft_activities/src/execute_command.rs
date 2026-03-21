@@ -212,6 +212,7 @@ mod tests {
         NullEventLog, collect_events, make_test_input, make_test_services,
         make_test_services_with_failed_command,
     };
+    use pretty_assertions::assert_eq;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
     use weft_core::{CommandAction, CommandInvocation};

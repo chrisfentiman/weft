@@ -625,6 +625,7 @@ mod tests {
         make_test_services_with_mid_stream_error, make_test_services_with_response,
         make_test_services_with_slow_provider,
     };
+    use pretty_assertions::assert_eq;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 

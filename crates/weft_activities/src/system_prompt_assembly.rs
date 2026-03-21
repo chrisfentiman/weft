@@ -156,6 +156,7 @@ mod tests {
     use crate::test_support::{
         MockServiceLocator, NullEventLog, collect_events, make_test_input, make_test_services,
     };
+    use pretty_assertions::assert_eq;
     use std::sync::Arc;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;

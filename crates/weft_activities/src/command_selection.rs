@@ -288,6 +288,7 @@ mod tests {
         make_test_services_with_blocking_hook, make_test_services_with_failing_router,
         make_test_services_with_memory,
     };
+    use pretty_assertions::assert_eq;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
     use weft_core::HookEvent;

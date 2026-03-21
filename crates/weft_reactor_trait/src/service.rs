@@ -91,6 +91,7 @@ pub trait ChildSpawner: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
     use std::sync::Arc;
 
     // ── ServiceLocator object-safety ───────────────────────────────────────

@@ -430,6 +430,7 @@ mod tests {
         NullEventLog, collect_events, make_test_input, make_test_services,
         make_test_services_with_blocking_hook,
     };
+    use pretty_assertions::assert_eq;
     use std::sync::Arc;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;

@@ -518,6 +518,7 @@ pub fn collect_events(rx: &mut mpsc::Receiver<PipelineEvent>) -> Vec<PipelineEve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
     use weft_commands_trait::CommandRegistry as _;
 
     #[test]

@@ -27,6 +27,7 @@ pub(super) fn extract_user_message(input: &ActivityInput) -> &str {
 mod tests {
     use super::*;
     use crate::test_support::make_test_input;
+    use pretty_assertions::assert_eq;
     use weft_core::{ContentPart, Role, Source, WeftMessage};
 
     #[test]
