@@ -17,7 +17,6 @@
 //!   "event": {
 //!     "type": "Completed",
 //!     "name": "generate",
-//!     "duration_ms": 1234,
 //!     "idempotency_key": "exec-1:generate:0"
 //!   }
 //! }
