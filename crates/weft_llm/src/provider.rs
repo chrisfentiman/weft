@@ -244,6 +244,8 @@ pub enum ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
+    use rstest::rstest;
     use weft_core::{ContentPart, Role, Source, WeftMessage};
 
     // ── Test helpers ──────────────────────────────────────────────────────
@@ -270,7 +272,33 @@ mod tests {
         }
     }
 
-    // ── Capability tests ──────────────────────────────────────────────────
+    // ── Capability constant → string (parametrized) ───────────────────────────
+    //
+    // Each case checks that a well-known Capability constant equals the expected
+    // string used in config files and routing lookups. Add one `#[case]` line
+    // when a new capability constant is introduced.
+
+    #[rstest]
+    #[case::chat(Capability::CHAT_COMPLETIONS, "chat_completions")]
+    #[case::embeddings(Capability::EMBEDDINGS, "embeddings")]
+    #[case::image_gen(Capability::IMAGE_GENERATIONS, "image_generations")]
+    #[case::image_edit(Capability::IMAGE_EDITS, "image_edits")]
+    #[case::video_gen(Capability::VIDEO_GENERATIONS, "video_generations")]
+    #[case::audio_speech(Capability::AUDIO_SPEECH, "audio_speech")]
+    #[case::audio_transcription(Capability::AUDIO_TRANSCRIPTIONS, "audio_transcriptions")]
+    #[case::vision(Capability::VISION, "vision")]
+    #[case::tool_calling(Capability::TOOL_CALLING, "tool_calling")]
+    #[case::streaming(Capability::STREAMING, "streaming")]
+    #[case::moderations(Capability::MODERATIONS, "moderations")]
+    #[case::rerank(Capability::RERANK, "rerank")]
+    #[case::search(Capability::SEARCH, "search")]
+    #[case::realtime(Capability::REALTIME, "realtime")]
+    #[case::structured_output(Capability::STRUCTURED_OUTPUT, "structured_output")]
+    fn capability_constant_matches_string(#[case] constant: &str, #[case] expected: &str) {
+        assert_eq!(constant, expected);
+    }
+
+    // ── Capability construction and equality ─────────────────────────────────
 
     #[test]
     fn test_capability_construction() {
@@ -302,25 +330,6 @@ mod tests {
         // Inserting duplicate should not increase size
         set.insert(Capability::new("chat_completions"));
         assert_eq!(set.len(), 2);
-    }
-
-    #[test]
-    fn test_capability_constants_match_expected_strings() {
-        assert_eq!(Capability::CHAT_COMPLETIONS, "chat_completions");
-        assert_eq!(Capability::EMBEDDINGS, "embeddings");
-        assert_eq!(Capability::IMAGE_GENERATIONS, "image_generations");
-        assert_eq!(Capability::IMAGE_EDITS, "image_edits");
-        assert_eq!(Capability::VIDEO_GENERATIONS, "video_generations");
-        assert_eq!(Capability::AUDIO_SPEECH, "audio_speech");
-        assert_eq!(Capability::AUDIO_TRANSCRIPTIONS, "audio_transcriptions");
-        assert_eq!(Capability::VISION, "vision");
-        assert_eq!(Capability::TOOL_CALLING, "tool_calling");
-        assert_eq!(Capability::STREAMING, "streaming");
-        assert_eq!(Capability::MODERATIONS, "moderations");
-        assert_eq!(Capability::RERANK, "rerank");
-        assert_eq!(Capability::SEARCH, "search");
-        assert_eq!(Capability::REALTIME, "realtime");
-        assert_eq!(Capability::STRUCTURED_OUTPUT, "structured_output");
     }
 
     #[test]
@@ -437,19 +446,45 @@ mod tests {
         assert_eq!(usage.completion_tokens, 50);
     }
 
-    // ── extract_text_messages tests ───────────────────────────────────────
+    // ── extract_text_messages: filtering behavior (parametrized) ─────────────
+    //
+    // Each case checks how a single-message input is filtered. All cases share
+    // the same assertion shape: input messages → expected output count.
+
+    #[rstest]
+    #[case::user_text_passes_through(
+        vec![make_weft_message(Role::User, Source::Client, "Hello")],
+        1
+    )]
+    #[case::gateway_system_with_text_passes_through(
+        vec![make_weft_message(Role::System, Source::Gateway, "Available commands: search")],
+        1
+    )]
+    #[case::client_system_passes_through(
+        vec![make_weft_message(Role::System, Source::Client, "Instructions")],
+        1
+    )]
+    #[case::empty_input(vec![], 0)]
+    fn extract_text_messages_output_count(
+        #[case] messages: Vec<WeftMessage>,
+        #[case] expected_count: usize,
+    ) {
+        let pairs = extract_text_messages(&messages);
+        assert_eq!(pairs.len(), expected_count);
+    }
+
+    // These tests have unique assertions or setup that don't fit the count pattern.
 
     #[test]
-    fn test_extract_text_messages_basic() {
+    fn test_extract_text_messages_basic_content() {
         let messages = vec![make_weft_message(Role::User, Source::Client, "Hello")];
         let pairs = extract_text_messages(&messages);
-        assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, Role::User);
         assert_eq!(pairs[0].1, "Hello");
     }
 
     #[test]
-    fn test_extract_text_messages_gateway_system_with_text_passes_through() {
+    fn test_extract_text_messages_gateway_system_with_text_content() {
         // System+Gateway messages that CONTAIN text (e.g. command descriptions injected
         // by CommandFormattingActivity) must NOT be filtered -- they carry conversational
         // content the LLM needs to see.
@@ -462,7 +497,6 @@ mod tests {
             make_weft_message(Role::User, Source::Client, "Hello"),
         ];
         let pairs = extract_text_messages(&messages);
-        // Both the gateway text injection and the user message pass through.
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0].0, Role::System);
         assert_eq!(pairs[0].1, "Available commands: search, write");
@@ -478,7 +512,6 @@ mod tests {
             role: Role::System,
             source: Source::Gateway,
             model: None,
-            // Non-text only -- this is what actual telemetry looks like
             content: vec![ContentPart::Image(MediaContent {
                 source: MediaSource::Url("internal://hook-result".to_string()),
                 media_type: None,
@@ -502,19 +535,6 @@ mod tests {
             pairs.is_empty(),
             "System+Gateway with empty content must be filtered"
         );
-    }
-
-    #[test]
-    fn test_extract_text_messages_keeps_client_system_messages() {
-        // System messages from Source::Client (not gateway activity) are NOT filtered.
-        let messages = vec![
-            make_weft_message(Role::System, Source::Client, "Additional instructions"),
-            make_weft_message(Role::User, Source::Client, "Hello"),
-        ];
-        let pairs = extract_text_messages(&messages);
-        assert_eq!(pairs.len(), 2);
-        assert_eq!(pairs[0].0, Role::System);
-        assert_eq!(pairs[0].1, "Additional instructions");
     }
 
     #[test]
@@ -584,12 +604,6 @@ mod tests {
         // Messages whose text content is empty after extraction are omitted.
         let msg = make_weft_message_no_content(Role::User, Source::Client);
         let pairs = extract_text_messages(&[msg]);
-        assert!(pairs.is_empty());
-    }
-
-    #[test]
-    fn test_extract_text_messages_empty_input() {
-        let pairs = extract_text_messages(&[]);
         assert!(pairs.is_empty());
     }
 

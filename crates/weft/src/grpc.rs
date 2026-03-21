@@ -899,6 +899,8 @@ fn sampling_options_from_proto(opts: proto::SamplingOptions) -> SamplingOptions 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
+    use rstest::rstest;
     use weft_core::{ContentPart, Role, Source};
     use weft_reactor::{ActivityError, EventLogError, ReactorError};
 
@@ -921,38 +923,132 @@ mod tests {
         }
     }
 
-    // ── Unit tests: reactor_error_to_weft_error ───────────────────────────
+    // ── ReactorError → WeftError mapping (parametrized) ────────────────────────
+    //
+    // Each case maps one ReactorError variant to the expected WeftError variant.
+    // Add one `#[case]` line when a new ReactorError variant is introduced.
 
-    #[test]
-    fn test_budget_exhausted_iterations_maps_to_command_loop_exceeded() {
-        let err = ReactorError::BudgetExhausted("iterations".to_string());
+    #[rstest]
+    #[case::budget_iterations(
+        ReactorError::BudgetExhausted("iterations".to_string()),
+        "command_loop_exceeded"
+    )]
+    #[case::budget_deadline(
+        ReactorError::BudgetExhausted("deadline".to_string()),
+        "request_timeout"
+    )]
+    #[case::budget_generation_calls(
+        ReactorError::BudgetExhausted("generation_calls".to_string()),
+        "command_loop_exceeded"
+    )]
+    #[case::budget_depth(
+        ReactorError::BudgetExhausted("depth".to_string()),
+        "llm"
+    )]
+    #[case::cancelled(
+        ReactorError::Cancelled { reason: "signal".to_string() },
+        "request_timeout"
+    )]
+    #[case::pipeline_not_found(
+        ReactorError::PipelineNotFound("missing-pipeline".to_string()),
+        "config"
+    )]
+    #[case::activity_not_found(
+        ReactorError::ActivityNotFound("missing-activity".to_string()),
+        "config"
+    )]
+    #[case::channel_closed(ReactorError::ChannelClosed, "llm")]
+    #[case::activity_failed_provider(
+        ReactorError::ActivityFailed(ActivityError::Failed {
+            name: "generate".to_string(),
+            reason: "provider returned an error".to_string(),
+        }),
+        "llm"
+    )]
+    #[case::activity_failed_routing(
+        ReactorError::ActivityFailed(ActivityError::Failed {
+            name: "route".to_string(),
+            reason: "routing failed: no models match".to_string(),
+        }),
+        "routing"
+    )]
+    #[case::activity_failed_command(
+        ReactorError::ActivityFailed(ActivityError::Failed {
+            name: "execute_command".to_string(),
+            reason: "command execution failed".to_string(),
+        }),
+        "command"
+    )]
+    #[case::activity_failed_tool_registry(
+        ReactorError::ActivityFailed(ActivityError::Failed {
+            name: "execute_command".to_string(),
+            reason: "tool registry unavailable".to_string(),
+        }),
+        "tool_registry"
+    )]
+    #[case::activity_failed_memory(
+        ReactorError::ActivityFailed(ActivityError::Failed {
+            name: "recall".to_string(),
+            reason: "memory store connection failed".to_string(),
+        }),
+        "memory_store"
+    )]
+    #[case::activity_failed_invalid_request(
+        ReactorError::ActivityFailed(ActivityError::Failed {
+            name: "validate".to_string(),
+            reason: "invalid request: messages array empty".to_string(),
+        }),
+        "invalid_request"
+    )]
+    #[case::activity_failed_catch_all(
+        ReactorError::ActivityFailed(ActivityError::Failed {
+            name: "unknown".to_string(),
+            reason: "some completely unknown error".to_string(),
+        }),
+        "llm"
+    )]
+    #[case::activity_cancelled(
+        ReactorError::ActivityFailed(ActivityError::Cancelled {
+            name: "generate".to_string(),
+        }),
+        "request_timeout"
+    )]
+    #[case::activity_timeout(
+        ReactorError::ActivityFailed(ActivityError::Timeout {
+            name: "generate".to_string(),
+        }),
+        "request_timeout"
+    )]
+    fn reactor_error_maps_to_weft_error_variant(
+        #[case] err: ReactorError,
+        #[case] expected_variant: &str,
+    ) {
         let weft_err = reactor_error_to_weft_error(err);
-        assert!(matches!(weft_err, WeftError::CommandLoopExceeded { .. }));
+        let actual_variant = match &weft_err {
+            WeftError::CommandLoopExceeded { .. } => "command_loop_exceeded",
+            WeftError::RequestTimeout { .. } => "request_timeout",
+            WeftError::Llm(_) => "llm",
+            WeftError::Config(_) => "config",
+            WeftError::Routing(_) => "routing",
+            WeftError::Command(_) => "command",
+            WeftError::ToolRegistry(_) => "tool_registry",
+            WeftError::MemoryStore(_) => "memory_store",
+            WeftError::InvalidRequest(_) => "invalid_request",
+            WeftError::RateLimited { .. } => "rate_limited",
+            WeftError::HookBlocked { .. } => "hook_blocked",
+            WeftError::HookBlockedAfterRetries { .. } => "hook_blocked_after_retries",
+            WeftError::ModelNotFound { .. } => "model_not_found",
+            WeftError::NoEligibleModels { .. } => "no_eligible_models",
+            WeftError::StreamingNotSupported => "streaming_not_supported",
+            WeftError::ProtoConversion(_) => "proto_conversion",
+        };
+        assert_eq!(actual_variant, expected_variant);
     }
 
-    #[test]
-    fn test_budget_exhausted_deadline_maps_to_timeout() {
-        let err = ReactorError::BudgetExhausted("deadline".to_string());
-        let weft_err = reactor_error_to_weft_error(err);
-        assert!(matches!(weft_err, WeftError::RequestTimeout { .. }));
-    }
+    // These ReactorError cases have additional field assertions beyond variant matching.
 
     #[test]
-    fn test_budget_exhausted_generation_calls_maps_to_command_loop_exceeded() {
-        let err = ReactorError::BudgetExhausted("generation_calls".to_string());
-        let weft_err = reactor_error_to_weft_error(err);
-        assert!(matches!(weft_err, WeftError::CommandLoopExceeded { .. }));
-    }
-
-    #[test]
-    fn test_budget_exhausted_depth_maps_to_llm() {
-        let err = ReactorError::BudgetExhausted("depth".to_string());
-        let weft_err = reactor_error_to_weft_error(err);
-        assert!(matches!(weft_err, WeftError::Llm(_)));
-    }
-
-    #[test]
-    fn test_hook_blocked_maps_to_hook_blocked() {
+    fn test_hook_blocked_preserves_fields() {
         let err = ReactorError::HookBlocked {
             hook_name: "auth-hook".to_string(),
             reason: "policy violation".to_string(),
@@ -972,40 +1068,18 @@ mod tests {
     }
 
     #[test]
-    fn test_cancelled_maps_to_timeout() {
-        let err = ReactorError::Cancelled {
-            reason: "signal".to_string(),
-        };
-        let weft_err = reactor_error_to_weft_error(err);
-        assert!(matches!(weft_err, WeftError::RequestTimeout { .. }));
-    }
-
-    #[test]
-    fn test_pipeline_not_found_maps_to_config() {
+    fn test_pipeline_not_found_message_contains_name() {
         let err = ReactorError::PipelineNotFound("missing-pipeline".to_string());
         let weft_err = reactor_error_to_weft_error(err);
-        assert!(matches!(weft_err, WeftError::Config(_)));
         if let WeftError::Config(msg) = weft_err {
             assert!(msg.contains("pipeline not found"));
+        } else {
+            panic!("expected Config error");
         }
     }
 
     #[test]
-    fn test_activity_not_found_maps_to_config() {
-        let err = ReactorError::ActivityNotFound("missing-activity".to_string());
-        let weft_err = reactor_error_to_weft_error(err);
-        assert!(matches!(weft_err, WeftError::Config(_)));
-    }
-
-    #[test]
-    fn test_channel_closed_maps_to_llm() {
-        let err = ReactorError::ChannelClosed;
-        let weft_err = reactor_error_to_weft_error(err);
-        assert!(matches!(weft_err, WeftError::Llm(_)));
-    }
-
-    #[test]
-    fn test_activity_failed_rate_limited_maps_to_rate_limited() {
+    fn test_activity_failed_rate_limited_parses_retry_after_ms() {
         let err = ReactorError::ActivityFailed(ActivityError::Failed {
             name: "generate".to_string(),
             reason: "rate limited: retry_after_ms: 2000".to_string(),
@@ -1020,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn test_activity_failed_rate_limited_no_ms_uses_default() {
+    fn test_activity_failed_rate_limited_defaults_to_1000ms() {
         let err = ReactorError::ActivityFailed(ActivityError::Failed {
             name: "generate".to_string(),
             reason: "rate limited by provider".to_string(),
@@ -1035,85 +1109,7 @@ mod tests {
     }
 
     #[test]
-    fn test_activity_failed_provider_maps_to_llm() {
-        let err = ReactorError::ActivityFailed(ActivityError::Failed {
-            name: "generate".to_string(),
-            reason: "provider returned an error".to_string(),
-        });
-        let weft_err = reactor_error_to_weft_error(err);
-        assert!(matches!(weft_err, WeftError::Llm(_)));
-    }
-
-    #[test]
-    fn test_activity_failed_routing_maps_to_routing() {
-        let err = ReactorError::ActivityFailed(ActivityError::Failed {
-            name: "route".to_string(),
-            reason: "routing failed: no models match".to_string(),
-        });
-        let weft_err = reactor_error_to_weft_error(err);
-        assert!(matches!(weft_err, WeftError::Routing(_)));
-    }
-
-    #[test]
-    fn test_activity_failed_command_maps_to_command() {
-        let err = ReactorError::ActivityFailed(ActivityError::Failed {
-            name: "execute_command".to_string(),
-            reason: "command execution failed".to_string(),
-        });
-        let weft_err = reactor_error_to_weft_error(err);
-        assert!(matches!(weft_err, WeftError::Command(_)));
-    }
-
-    #[test]
-    fn test_activity_failed_tool_registry_maps_to_tool_registry() {
-        let err = ReactorError::ActivityFailed(ActivityError::Failed {
-            name: "execute_command".to_string(),
-            reason: "tool registry unavailable".to_string(),
-        });
-        let weft_err = reactor_error_to_weft_error(err);
-        assert!(matches!(weft_err, WeftError::ToolRegistry(_)));
-    }
-
-    #[test]
-    fn test_activity_failed_memory_maps_to_memory_store() {
-        let err = ReactorError::ActivityFailed(ActivityError::Failed {
-            name: "recall".to_string(),
-            reason: "memory store connection failed".to_string(),
-        });
-        let weft_err = reactor_error_to_weft_error(err);
-        assert!(matches!(weft_err, WeftError::MemoryStore(_)));
-    }
-
-    #[test]
-    fn test_activity_failed_invalid_request_maps_to_invalid_request() {
-        let err = ReactorError::ActivityFailed(ActivityError::Failed {
-            name: "validate".to_string(),
-            reason: "invalid request: messages array empty".to_string(),
-        });
-        let weft_err = reactor_error_to_weft_error(err);
-        assert!(matches!(weft_err, WeftError::InvalidRequest(_)));
-    }
-
-    #[test]
-    fn test_activity_cancelled_maps_to_timeout() {
-        let err = ReactorError::ActivityFailed(ActivityError::Cancelled {
-            name: "generate".to_string(),
-        });
-        let weft_err = reactor_error_to_weft_error(err);
-        assert!(matches!(weft_err, WeftError::RequestTimeout { .. }));
-    }
-
-    #[test]
-    fn test_activity_timeout_maps_to_timeout() {
-        let err = ReactorError::ActivityFailed(ActivityError::Timeout {
-            name: "generate".to_string(),
-        });
-        let weft_err = reactor_error_to_weft_error(err);
-        assert!(matches!(weft_err, WeftError::RequestTimeout { .. }));
-    }
-
-    #[test]
-    fn test_activity_invalid_input_maps_to_invalid_request() {
+    fn test_activity_invalid_input_preserves_reason() {
         let err = ReactorError::ActivityFailed(ActivityError::InvalidInput {
             name: "validate".to_string(),
             reason: "empty messages".to_string(),
@@ -1123,7 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn test_activity_event_log_maps_to_llm() {
+    fn test_activity_event_log_includes_activity_name_in_message() {
         let err = ReactorError::ActivityFailed(ActivityError::EventLog {
             name: "generate".to_string(),
             source: EventLogError::Storage("write failed".to_string()),
@@ -1135,129 +1131,67 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_activity_failed_catch_all_maps_to_llm() {
-        let err = ReactorError::ActivityFailed(ActivityError::Failed {
-            name: "unknown".to_string(),
-            reason: "some completely unknown error".to_string(),
-        });
-        let weft_err = reactor_error_to_weft_error(err);
-        assert!(matches!(weft_err, WeftError::Llm(_)));
-    }
+    // ── WeftError → tonic::Status mapping (parametrized) ─────────────────────
+    //
+    // Each case maps one WeftError variant to the expected gRPC status code.
+    // Add one `#[case]` line when a new WeftError variant is introduced.
 
-    // ── Unit tests: error mapping ─────────────────────────────────────────
-
-    #[test]
-    fn test_invalid_request_maps_to_invalid_argument() {
-        let err = WeftError::InvalidRequest("bad input".to_string());
-        let status = weft_error_to_status(&err);
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    }
-
-    #[test]
-    fn test_streaming_not_supported_maps_to_invalid_argument() {
-        let err = WeftError::StreamingNotSupported;
-        let status = weft_error_to_status(&err);
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    }
-
-    #[test]
-    fn test_rate_limited_maps_to_resource_exhausted() {
-        let err = WeftError::RateLimited {
-            retry_after_ms: 5000,
-        };
-        let status = weft_error_to_status(&err);
-        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
-    }
-
-    #[test]
-    fn test_timeout_maps_to_deadline_exceeded() {
-        let err = WeftError::RequestTimeout { timeout_secs: 30 };
-        let status = weft_error_to_status(&err);
-        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
-    }
-
-    #[test]
-    fn test_model_not_found_maps_to_not_found() {
-        let err = WeftError::ModelNotFound {
-            name: "unknown".to_string(),
-        };
-        let status = weft_error_to_status(&err);
-        assert_eq!(status.code(), tonic::Code::NotFound);
-    }
-
-    #[test]
-    fn test_hook_blocked_maps_to_permission_denied() {
-        let err = WeftError::HookBlocked {
-            event: "request_start".to_string(),
-            reason: "policy".to_string(),
-            hook_name: "auth".to_string(),
-        };
-        let status = weft_error_to_status(&err);
-        assert_eq!(status.code(), tonic::Code::PermissionDenied);
-    }
-
-    #[test]
-    fn test_hook_blocked_after_retries_maps_to_aborted() {
-        let err = WeftError::HookBlockedAfterRetries {
-            event: "pre_response".to_string(),
-            reason: "content".to_string(),
-            hook_name: "filter".to_string(),
+    #[rstest]
+    #[case::invalid_request(WeftError::InvalidRequest("bad".to_string()), tonic::Code::InvalidArgument)]
+    #[case::streaming_not_supported(WeftError::StreamingNotSupported, tonic::Code::InvalidArgument)]
+    #[case::config(WeftError::Config("bad".to_string()), tonic::Code::Internal)]
+    #[case::llm(WeftError::Llm("fail".to_string()), tonic::Code::Internal)]
+    #[case::command(WeftError::Command("fail".to_string()), tonic::Code::Internal)]
+    #[case::tool_registry(WeftError::ToolRegistry("fail".to_string()), tonic::Code::Unavailable)]
+    #[case::memory_store(WeftError::MemoryStore("fail".to_string()), tonic::Code::Unavailable)]
+    #[case::command_loop_exceeded(
+        WeftError::CommandLoopExceeded { max: 10 },
+        tonic::Code::ResourceExhausted
+    )]
+    #[case::request_timeout(
+        WeftError::RequestTimeout { timeout_secs: 30 },
+        tonic::Code::DeadlineExceeded
+    )]
+    #[case::rate_limited(
+        WeftError::RateLimited { retry_after_ms: 5000 },
+        tonic::Code::ResourceExhausted
+    )]
+    #[case::routing(WeftError::Routing("fail".to_string()), tonic::Code::FailedPrecondition)]
+    #[case::model_not_found(
+        WeftError::ModelNotFound { name: "x".to_string() },
+        tonic::Code::NotFound
+    )]
+    #[case::no_eligible_models(
+        WeftError::NoEligibleModels { capability: "vision".to_string() },
+        tonic::Code::FailedPrecondition
+    )]
+    #[case::hook_blocked(
+        WeftError::HookBlocked {
+            event: "e".to_string(),
+            reason: "r".to_string(),
+            hook_name: "h".to_string(),
+        },
+        tonic::Code::PermissionDenied
+    )]
+    #[case::hook_blocked_after_retries(
+        WeftError::HookBlockedAfterRetries {
+            event: "e".to_string(),
+            reason: "r".to_string(),
+            hook_name: "h".to_string(),
             retries: 3,
-        };
-        let status = weft_error_to_status(&err);
-        assert_eq!(status.code(), tonic::Code::Aborted);
-    }
-
-    #[test]
-    fn test_tool_registry_maps_to_unavailable() {
-        let err = WeftError::ToolRegistry("connection refused".to_string());
-        let status = weft_error_to_status(&err);
-        assert_eq!(status.code(), tonic::Code::Unavailable);
-    }
-
-    #[test]
-    fn test_memory_store_maps_to_unavailable() {
-        let err = WeftError::MemoryStore("store down".to_string());
-        let status = weft_error_to_status(&err);
-        assert_eq!(status.code(), tonic::Code::Unavailable);
-    }
-
-    #[test]
-    fn test_command_loop_exceeded_maps_to_resource_exhausted() {
-        let err = WeftError::CommandLoopExceeded { max: 10 };
-        let status = weft_error_to_status(&err);
-        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
-    }
-
-    #[test]
-    fn test_routing_error_maps_to_failed_precondition() {
-        let err = WeftError::Routing("no models match".to_string());
-        let status = weft_error_to_status(&err);
-        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    }
-
-    #[test]
-    fn test_no_eligible_models_maps_to_failed_precondition() {
-        let err = WeftError::NoEligibleModels {
-            capability: "vision".to_string(),
-        };
-        let status = weft_error_to_status(&err);
-        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    }
-
-    #[test]
-    fn test_proto_conversion_maps_to_internal() {
-        let err = WeftError::ProtoConversion("missing role".to_string());
-        let status = weft_error_to_status(&err);
-        assert_eq!(status.code(), tonic::Code::Internal);
-    }
-
-    #[test]
-    fn test_llm_error_maps_to_internal() {
-        let err = WeftError::Llm("provider failed".to_string());
-        let status = weft_error_to_status(&err);
-        assert_eq!(status.code(), tonic::Code::Internal);
+        },
+        tonic::Code::Aborted
+    )]
+    #[case::proto_conversion(
+        WeftError::ProtoConversion("fail".to_string()),
+        tonic::Code::Internal
+    )]
+    fn weft_error_maps_to_grpc_status(
+        #[case] error: WeftError,
+        #[case] expected_code: tonic::Code,
+    ) {
+        let status = weft_error_to_status(&error);
+        assert_eq!(status.code(), expected_code);
     }
 
     // ── Unit tests: proto conversion ──────────────────────────────────────
