@@ -354,7 +354,7 @@ fn build_services_full_ext(
     failed_result_command: Option<(String, String)>,
     fail_list_commands: bool,
 ) -> Services {
-    let config = Arc::new(make_test_config());
+    let weft_config = make_test_config();
     // StubProviderService (renamed from StubProviderServiceV2) comes from weft_llm::test_support.
     let providers: Arc<dyn weft_llm::ProviderService + Send + Sync> =
         Arc::new(StubProviderService::new(provider));
@@ -368,8 +368,12 @@ fn build_services_full_ext(
             fail_list_commands,
         });
 
+    let config_store = Arc::new(weft_core::ConfigStore::new(weft_config));
+    let resolved_config = config_store.snapshot();
+
     Services {
-        config,
+        config_store,
+        resolved_config,
         providers,
         router,
         commands,
@@ -483,7 +487,7 @@ pub fn make_test_services_with_failing_router() -> Services {
     let provider: Arc<dyn Provider> = Arc::new(StubProvider::new("stub response"));
     let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(weft_hooks::NullHookRunner);
 
-    let config = Arc::new(make_test_config());
+    let weft_config = make_test_config();
     let providers: Arc<dyn weft_llm::ProviderService + Send + Sync> =
         Arc::new(StubProviderService::new(provider));
     // ErrorRouter comes from weft_router::test_support.
@@ -492,8 +496,12 @@ pub fn make_test_services_with_failing_router() -> Services {
     let commands: Arc<dyn weft_commands::CommandRegistry + Send + Sync> =
         Arc::new(StubCommandRegistry::new());
 
+    let config_store = Arc::new(weft_core::ConfigStore::new(weft_config));
+    let resolved_config = config_store.snapshot();
+
     Services {
-        config,
+        config_store,
+        resolved_config,
         providers,
         router,
         commands,
@@ -529,6 +537,10 @@ pub fn make_test_services_with_slow_provider(delay_secs: u64, response_text: &st
 pub fn make_test_input() -> ActivityInput {
     use chrono::Utc;
 
+    let weft_config = make_test_config();
+    let config_store = weft_core::ConfigStore::new(weft_config);
+    let config = config_store.snapshot();
+
     ActivityInput {
         messages: vec![WeftMessage {
             role: Role::User,
@@ -560,6 +572,7 @@ pub fn make_test_input() -> ActivityInput {
         idempotency_key: None,
         accumulated_usage: weft_core::WeftUsage::default(),
         child_spawner: None,
+        config,
     }
 }
 

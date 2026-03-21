@@ -136,6 +136,9 @@ capabilities = ["chat_completions"]
 
     #[test]
     fn test_load_config_from_valid_toml() {
+        // Acquire ENV_MUTEX to prevent contamination from env-var-setting tests
+        // running concurrently in the same binary.
+        let _guard = ENV_MUTEX.lock().expect("env mutex must not be poisoned");
         // Use unique field values not shared with any env var override test.
         let toml = r#"
 [server]
@@ -200,6 +203,9 @@ capabilities = ["chat_completions"]
 
     #[test]
     fn test_load_and_build_store_produces_correct_snapshot() {
+        // Acquire ENV_MUTEX to prevent contamination from env-var-setting tests
+        // running concurrently in the same binary.
+        let _guard = ENV_MUTEX.lock().expect("env mutex must not be poisoned");
         // Use unique field values not shared with any env var override test.
         let toml = r#"
 [server]

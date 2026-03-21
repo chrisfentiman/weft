@@ -20,7 +20,7 @@ use weft_reactor_trait::{
     Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, HookOutcome, PipelineEvent,
     SelectionEvent, SemanticSelection, ServiceLocator,
 };
-use weft_router_trait::{RoutingCandidate, RoutingDomainKind, build_model_candidates};
+use weft_router_trait::{RoutingCandidate, RoutingDomainKind};
 
 use super::selection_util::extract_user_message;
 
@@ -90,14 +90,23 @@ impl Activity for ModelSelectionActivity {
         // Extract last user message text for semantic scoring.
         let user_message = extract_user_message(&input);
 
-        // Build all model candidates from config.
-        let all_candidates: Vec<RoutingCandidate> = build_model_candidates(services.config());
+        // Convert pre-computed ModelCandidates from config snapshot to RoutingCandidates.
+        // Done once per request (not per-score-call) to avoid repeated allocation.
+        let all_candidates: Vec<RoutingCandidate> = input
+            .config
+            .model_candidates
+            .iter()
+            .map(|mc| RoutingCandidate {
+                id: mc.name.clone(),
+                examples: mc.examples.clone(),
+            })
+            .collect();
 
         // Resolve the routing instruction to the candidate set.
         let instruction = &input.request.routing;
 
-        // Build ModelInfo list from config for filter resolution.
-        let model_infos: Vec<ModelInfo> = build_model_infos(services.config());
+        // Use pre-computed ModelInfo list from config snapshot for filter resolution.
+        let model_infos: Vec<ModelInfo> = input.config.model_infos.clone();
 
         // Fire PreRoute hook for "model" domain BEFORE routing (per spec Section 5.1 step 4).
         let pre_payload = serde_json::json!({
@@ -223,13 +232,7 @@ impl Activity for ModelSelectionActivity {
 
         // Apply model threshold: if the selected model's score is below the domain threshold,
         // fall back to the default model (per spec Section 5.1 step 7).
-        let model_threshold = services
-            .config()
-            .router
-            .domains
-            .model
-            .as_ref()
-            .and_then(|d| d.threshold);
+        let model_threshold = input.config.model_domain_threshold;
 
         let (final_model, final_score) = if let Some(threshold) = model_threshold {
             if score < threshold && score > 0.0 {
@@ -308,24 +311,6 @@ impl Activity for ModelSelectionActivity {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Build `ModelInfo` list from config for filter resolution.
-fn build_model_infos(config: &weft_core::WeftConfig) -> Vec<ModelInfo> {
-    config
-        .router
-        .providers
-        .iter()
-        .flat_map(|p| {
-            p.models.iter().map(|m| ModelInfo {
-                routing_name: m.name.clone(),
-                provider_name: p.name.clone(),
-                // Capabilities in config are not currently stored per model — use empty.
-                // (Capabilities are runtime-registered via ProviderRegistry.)
-                capabilities: vec![],
-            })
-        })
-        .collect()
-}
 
 /// Score `candidates` semantically and return `(selected_model, score, all_scores)`.
 ///
@@ -800,17 +785,15 @@ mod tests {
         // The stub router always scores at 0.9. We set the model domain threshold
         // above 0.9 (e.g. 0.95) so the selected model's score fails the threshold
         // and the activity should fall back to the default model.
-        let input = make_test_input();
-        let (tx, mut rx) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
+        //
+        // model_selection reads the threshold from input.config.model_domain_threshold,
+        // so we construct an input with a ResolvedConfig derived from a config that has
+        // threshold = 0.95.
+        let mut input = make_test_input();
 
-        // Build services with a model domain threshold of 0.95.
-        // The stub router will return 0.9, which is below the threshold.
-        let services = {
-            use crate::test_support::MockServiceLocator;
-            use weft_core::WeftConfig;
-
-            let toml = r#"
+        // Override input.config with a ResolvedConfig that has model_domain_threshold = 0.95.
+        let threshold_config: weft_core::WeftConfig = toml::from_str(
+            r#"
 [server]
 bind_address = "0.0.0.0:8080"
 
@@ -835,22 +818,14 @@ api_key = "sk-test"
   name = "stub-model"
   model = "stub-model-v1"
   examples = ["example query"]
-"#;
-            let config: WeftConfig =
-                toml::from_str(toml).expect("threshold test config must parse");
+"#,
+        )
+        .expect("threshold test config must parse");
+        input.config = Arc::new(weft_core::ResolvedConfig::from_operator(&threshold_config));
 
-            let base = make_test_services();
-            MockServiceLocator {
-                config: Arc::new(config),
-                providers: base.providers,
-                router: base.router,
-                commands: base.commands,
-                hooks: base.hooks,
-                memory: None,
-                request_end_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
-            }
-        };
-
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let services = make_test_services();
         let event_log = NullEventLog;
         let exec_id = ExecutionId::new();
 

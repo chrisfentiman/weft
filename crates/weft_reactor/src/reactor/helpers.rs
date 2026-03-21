@@ -70,6 +70,11 @@ impl Reactor {
                 spawner
             });
 
+        // Take a config snapshot once per build_input call. In the normal flow
+        // this is called once per request at pre-loop entry, so all activities
+        // in a single request share the same config version.
+        let config = self.services.config_store.snapshot();
+
         ActivityInput {
             messages: state.messages.clone(),
             request: request.clone(),
@@ -82,6 +87,7 @@ impl Reactor {
             idempotency_key,
             accumulated_usage: state.accumulated_usage.clone(),
             child_spawner,
+            config,
         }
     }
 

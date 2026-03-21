@@ -571,8 +571,14 @@ mod tests {
             "test-model".to_string(),
         ));
 
+        // Unpack Arc<WeftConfig> to build ConfigStore (takes owned WeftConfig).
+        // Clone first so config is still available for BudgetConfig/ReactorConfig below.
+        let weft_config = (*config).clone();
+        let config_store = Arc::new(weft_core::ConfigStore::new(weft_config));
+        let resolved_config = config_store.snapshot();
         let services = Arc::new(Services {
-            config: Arc::clone(&config),
+            config_store,
+            resolved_config,
             providers: provider_registry as Arc<dyn weft_llm::ProviderService + Send + Sync>,
             router: Arc::new(StubRouter) as Arc<dyn weft_router::SemanticRouter + Send + Sync>,
             commands: Arc::new(weft_commands::test_support::StubCommandRegistry::new())

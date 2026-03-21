@@ -107,6 +107,12 @@ pub struct ActivityInput {
     /// `GenerateActivity` uses this instead of accessing `services.reactor_handle`
     /// directly, since the Activity trait no longer receives a concrete `Services`.
     pub child_spawner: Option<Arc<dyn ChildSpawner>>,
+    /// Resolved config snapshot for this request.
+    ///
+    /// Taken once at request entry by the reactor. All activities in the
+    /// same request see the same config version. Access hot config
+    /// (system prompt, thresholds, pre-computed provider data) via this field.
+    pub config: Arc<weft_core::ResolvedConfig>,
 }
 
 impl std::fmt::Debug for ActivityInput {
@@ -126,6 +132,7 @@ impl std::fmt::Debug for ActivityInput {
                 "child_spawner",
                 &self.child_spawner.as_ref().map(|_| "<ChildSpawner>"),
             )
+            .field("config", &"<ResolvedConfig>")
             .finish()
     }
 }
@@ -362,6 +369,39 @@ mod tests {
             WeftRequest,
         };
 
+        let config: weft_core::WeftConfig = toml::from_str(
+            r#"
+[server]
+bind_address = "0.0.0.0:8080"
+
+[gateway]
+system_prompt = "test"
+max_command_iterations = 10
+request_timeout_secs = 300
+
+[router]
+default_model = "stub"
+
+[router.classifier]
+model_path = "models/stub.onnx"
+tokenizer_path = "models/tokenizer.json"
+threshold = 0.3
+max_commands = 20
+
+[[router.providers]]
+name = "stub"
+wire_format = "anthropic"
+api_key = "sk-test"
+
+  [[router.providers.models]]
+  name = "stub"
+  model = "stub-model"
+  max_tokens = 4096
+  examples = ["test"]
+"#,
+        )
+        .expect("minimal test TOML must parse");
+
         ActivityInput {
             messages: vec![WeftMessage {
                 role: Role::User,
@@ -385,6 +425,7 @@ mod tests {
             idempotency_key,
             accumulated_usage: weft_core::WeftUsage::default(),
             child_spawner,
+            config: Arc::new(weft_core::ResolvedConfig::from_operator(&config)),
         }
     }
 }

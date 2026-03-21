@@ -74,7 +74,7 @@ async fn main() {
     }));
 
     // Obtain the full WeftConfig for startup wiring (provider construction, router init,
-    // semaphore sizing). Activities continue using services.config() for now (Phase 1).
+    // semaphore sizing). Activities use input.config (ResolvedConfig snapshot) at runtime.
     let config = config_store.operator_config();
 
     info!(path = %cli.config.display(), "configuration loaded");
@@ -466,9 +466,14 @@ async fn main() {
     //
     // Services is constructed before the Reactor to break the circular dependency.
     // The reactor_handle field is populated via OnceLock after Reactor construction.
+    //
+    // config_store provides per-request snapshots via config_store.snapshot().
+    // resolved_config holds the current snapshot for ServiceLocator::resolved_config().
 
+    let resolved_config = config_store.snapshot();
     let services = Arc::new(Services {
-        config: Arc::clone(&config),
+        config_store: Arc::clone(&config_store),
+        resolved_config,
         providers: provider_registry as Arc<dyn weft_llm::ProviderService + Send + Sync>,
         router: router as Arc<dyn weft_router::SemanticRouter + Send + Sync>,
         commands: command_registry as Arc<dyn weft_commands::CommandRegistry + Send + Sync>,

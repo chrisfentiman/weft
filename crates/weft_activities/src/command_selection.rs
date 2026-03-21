@@ -106,11 +106,8 @@ impl Activity for CommandSelectionActivity {
         let mut full_candidates: Vec<CommandStub> = input.available_commands.clone();
 
         // Include /recall and /remember if memory has at least one store.
-        let has_memory = services
-            .config()
-            .memory
-            .as_ref()
-            .is_some_and(|m| !m.stores.is_empty());
+        // Reads from the pre-snapshotted ResolvedConfig for per-request consistency.
+        let has_memory = input.config.has_memory_stores;
 
         if has_memory {
             if !full_candidates.iter().any(|c| c.name == RECALL_NAME) {
@@ -205,15 +202,15 @@ impl Activity for CommandSelectionActivity {
                 // Fail-open: router error → include all commands capped by max_commands,
                 // sorted alphabetically.
                 warn!(error = %e, "command_selection: router error, including all commands");
-                let max_commands = services.config().router.classifier.max_commands;
+                let max_commands = input.config.classifier_max_commands;
                 let mut fallback = full_candidates.clone();
                 fallback.sort_by(|a, b| a.name.cmp(&b.name));
                 fallback.truncate(max_commands);
                 fallback
             }
             Ok(decision) => {
-                let threshold = services.config().router.classifier.threshold;
-                let max_commands = services.config().router.classifier.max_commands;
+                let threshold = input.config.classifier_threshold;
+                let max_commands = input.config.classifier_max_commands;
 
                 let filtered = filter_by_threshold(decision.commands, threshold);
                 let top = take_top(filtered, max_commands);
@@ -375,7 +372,7 @@ mod tests {
         input.available_commands = vec![];
 
         let services = make_test_services();
-        assert!(services.config.memory.is_none());
+        assert!(!services.resolved_config.has_memory_stores);
 
         let events = run_command_selection(input, services).await;
 
@@ -401,7 +398,11 @@ mod tests {
             description: "Search the web".to_string(),
         }];
 
+        // command_selection reads has_memory_stores from input.config, not services.
+        // Build services with memory config and align input.config to the same config.
         let services = make_test_services_with_memory();
+        // Override input.config to match services' resolved config (has_memory_stores = true).
+        input.config = std::sync::Arc::clone(&services.resolved_config);
 
         let events = run_command_selection(input, services).await;
 
