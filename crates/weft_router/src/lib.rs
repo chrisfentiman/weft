@@ -13,6 +13,9 @@ pub mod domain;
 pub mod routing_service;
 pub(crate) mod tokenizer;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 pub use bert::ModernBertRouter;
 pub use domain::{RoutingCandidate, RoutingDecision, RoutingDomainKind, ScoredCandidate};
 pub use routing_service::{
