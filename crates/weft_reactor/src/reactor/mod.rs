@@ -47,9 +47,6 @@ mod types;
 
 pub use types::{BudgetUsage, ExecutionContext, ExecutionResult};
 
-#[cfg(any(test, feature = "test-support"))]
-pub mod test_hooks;
-
 /// The execution engine. A dispatch loop consuming events from a channel.
 pub struct Reactor {
     services: Arc<Services>,

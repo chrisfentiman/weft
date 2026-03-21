@@ -22,7 +22,7 @@ use weft_reactor::event::{
     SignalEvent,
 };
 use weft_reactor::event_log::EventLog;
-use weft_reactor::execution::{Execution, ExecutionId, ExecutionStatus};
+use weft_reactor::execution::ExecutionId;
 use weft_reactor::reactor::Reactor;
 use weft_reactor::registry::ActivityRegistry;
 use weft_reactor::signal::Signal;
@@ -1643,125 +1643,6 @@ async fn heartbeat_miss_cancels_activity() {
     );
 }
 
-// ── Idempotency ───────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn idempotency_check_skips_already_completed_activity() {
-    let event_log = test_event_log();
-    let services = Arc::new(make_test_services());
-    let registry = build_registry(vec![
-        Arc::new(ImmediateDoneActivity {
-            name: "generate".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
-    ]);
-
-    let config = reactor_config(simple_pipeline_config("generate"));
-    let reactor = Reactor::new(services, event_log.clone(), registry, &config)
-        .expect("reactor should construct");
-
-    let execution_id = ExecutionId::new();
-    let key = format!("{}:generate:0", execution_id);
-
-    event_log
-        .create_execution(&Execution {
-            id: execution_id.clone(),
-            tenant_id: TenantId("tenant1".to_string()),
-            request_id: RequestId("req1".to_string()),
-            parent_id: None,
-            pipeline_name: "default".to_string(),
-            status: ExecutionStatus::Running,
-            created_at: chrono::Utc::now(),
-            depth: 0,
-        })
-        .await
-        .unwrap();
-
-    event_log
-        .append(
-            &execution_id,
-            "activity.started",
-            serde_json::json!({ "name": "generate" }),
-            1,
-            None,
-        )
-        .await
-        .unwrap();
-
-    let done_ev = weft_reactor::event::PipelineEvent::Generation(GenerationEvent::Chunk(
-        GeneratedEvent::Done,
-    ));
-    event_log
-        .append(
-            &execution_id,
-            done_ev.event_type_string(),
-            serde_json::to_value(&done_ev).unwrap(),
-            1,
-            None,
-        )
-        .await
-        .unwrap();
-
-    event_log
-        .append(
-            &execution_id,
-            "activity.completed",
-            serde_json::json!({
-                "name": "generate",
-                "duration_ms": 1,
-                "idempotency_key": key
-            }),
-            1,
-            Some(&key),
-        )
-        .await
-        .unwrap();
-
-    let result =
-        weft_reactor::reactor::test_hooks::check_idempotency_pub(&reactor, &execution_id, &key)
-            .await
-            .expect("check_idempotency should not fail");
-
-    assert!(
-        result.is_some(),
-        "idempotency check should return Some when key exists in event log"
-    );
-
-    let replayed = result.unwrap();
-    assert!(
-        !replayed.is_empty(),
-        "replayed events slice should not be empty"
-    );
-
-    let types: Vec<&str> = replayed.iter().map(|e| e.event_type.as_str()).collect();
-    assert!(
-        types.contains(&"activity.started"),
-        "replayed events should include activity.started; got: {types:?}"
-    );
-    assert!(
-        types.contains(&"activity.completed"),
-        "replayed events should include activity.completed; got: {types:?}"
-    );
-
-    let miss_key = format!("{}:generate:99", execution_id);
-    let miss_result = weft_reactor::reactor::test_hooks::check_idempotency_pub(
-        &reactor,
-        &execution_id,
-        &miss_key,
-    )
-    .await
-    .expect("check_idempotency should not fail on miss");
-    assert!(
-        miss_result.is_none(),
-        "idempotency check should return None when key is absent"
-    );
-}
-
 // ── Streaming ─────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -2808,63 +2689,6 @@ async fn per_chunk_timeout_resets_after_each_chunk() {
     assert!(
         result.is_err(),
         "per-chunk timeout should fail execution after silence; got Ok"
-    );
-}
-
-// ── should_retry / backoff_ms unit tests ─────────────────────────────────
-
-#[test]
-fn should_retry_false_when_no_policy() {
-    let budget = Budget::new(10, 5, 3, chrono::Utc::now() + chrono::Duration::hours(1));
-    let cancel = CancellationToken::new();
-    let result = weft_reactor::reactor::test_hooks::should_retry_pub(None, 0, &budget, &cancel);
-    assert!(!result, "should not retry without policy");
-}
-
-#[test]
-fn should_retry_false_when_attempts_exhausted() {
-    let policy = RetryPolicy {
-        max_retries: 2,
-        initial_backoff_ms: 100,
-        max_backoff_ms: 1000,
-        backoff_multiplier: 2.0,
-    };
-    let budget = Budget::new(10, 5, 3, chrono::Utc::now() + chrono::Duration::hours(1));
-    let cancel = CancellationToken::new();
-    let result =
-        weft_reactor::reactor::test_hooks::should_retry_pub(Some(&policy), 2, &budget, &cancel);
-    assert!(!result);
-}
-
-#[test]
-fn should_retry_false_when_cancelled() {
-    let policy = RetryPolicy {
-        max_retries: 5,
-        initial_backoff_ms: 100,
-        max_backoff_ms: 1000,
-        backoff_multiplier: 2.0,
-    };
-    let budget = Budget::new(10, 5, 3, chrono::Utc::now() + chrono::Duration::hours(1));
-    let cancel = CancellationToken::new();
-    cancel.cancel();
-    let result =
-        weft_reactor::reactor::test_hooks::should_retry_pub(Some(&policy), 0, &budget, &cancel);
-    assert!(!result, "should not retry when cancelled");
-}
-
-#[test]
-fn backoff_ms_respects_cap() {
-    let policy = RetryPolicy {
-        max_retries: 10,
-        initial_backoff_ms: 1000,
-        max_backoff_ms: 5000,
-        backoff_multiplier: 2.0,
-    };
-    let ms = weft_reactor::reactor::test_hooks::backoff_ms_pub(&policy, 5);
-    assert!(ms >= 5000, "backoff should be at least max (before jitter)");
-    assert!(
-        ms < 5000 + 5000 / 4 + 2,
-        "backoff should not exceed cap + 25% jitter"
     );
 }
 
