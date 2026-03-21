@@ -25,7 +25,9 @@ pub(crate) fn run(sh: &Shell) -> Result<()> {
 
     // Step 2: clippy.
     eprintln!("[xtask] running clippy...");
-    if let Err(e) = cmd!(sh, "cargo clippy --workspace --all-targets -- -D warnings").run() {
+    if let Err(e) =
+        cmd!(sh, "cargo clippy --workspace --exclude xtask --all-targets -- -D warnings").run()
+    {
         eprintln!("[xtask] FAILED: clippy");
         return Err(e.into());
     }
@@ -33,13 +35,13 @@ pub(crate) fn run(sh: &Shell) -> Result<()> {
     // Step 3: tests (use nextest if available, fall back to cargo test).
     eprintln!("[xtask] running tests...");
     let test_result = if has_nextest(sh) {
-        cmd!(sh, "cargo nextest run --workspace").run()
+        cmd!(sh, "cargo nextest run --workspace --exclude xtask").run()
     } else {
         eprintln!(
             "[xtask] note: cargo-nextest not found, using cargo test. \
              Run `cargo xtask setup` to install."
         );
-        cmd!(sh, "cargo test --workspace").run()
+        cmd!(sh, "cargo test --workspace --exclude xtask").run()
     };
     if let Err(e) = test_result {
         eprintln!("[xtask] FAILED: tests");
@@ -48,7 +50,7 @@ pub(crate) fn run(sh: &Shell) -> Result<()> {
 
     // Step 4: build.
     eprintln!("[xtask] building workspace...");
-    if let Err(e) = cmd!(sh, "cargo build --workspace").run() {
+    if let Err(e) = cmd!(sh, "cargo build --workspace --exclude xtask").run() {
         eprintln!("[xtask] FAILED: build");
         return Err(e.into());
     }
