@@ -35,7 +35,6 @@ pub(super) fn backoff_ms(policy: &RetryPolicy, attempt: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pretty_assertions::assert_eq;
 
     fn test_budget() -> Budget {
         Budget::new(10, 5, 3, chrono::Utc::now() + chrono::Duration::hours(1))
