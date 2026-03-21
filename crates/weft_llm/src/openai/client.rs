@@ -1,4 +1,4 @@
-use tracing::{debug, warn};
+use tracing::{Instrument, debug, info_span, warn};
 use weft_core::{ContentPart, Role, SamplingOptions, Source, WeftMessage};
 
 use super::wire::{OpenAIMessage, OpenAIRequest, OpenAIResponse};
@@ -6,6 +6,38 @@ use crate::{
     Provider, ProviderError, ProviderRequest, ProviderResponse, TokenUsage,
     provider::extract_text_messages,
 };
+
+/// Inject W3C TraceContext into outgoing HTTP request headers.
+///
+/// Uses the current OTel context (propagated from the active tracing span by the
+/// tracing-opentelemetry layer) to set the `traceparent` header. When OTel is not
+/// configured, `opentelemetry::Context::current()` returns an empty context and
+/// the propagator injects nothing — this is always safe to call.
+///
+/// This function is only compiled when the `telemetry` feature is enabled.
+#[cfg(feature = "telemetry")]
+fn inject_trace_context(headers: &mut reqwest::header::HeaderMap) {
+    use opentelemetry::propagation::{Injector, TextMapPropagator};
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
+
+    struct HeaderInjector<'a>(&'a mut reqwest::header::HeaderMap);
+
+    impl Injector for HeaderInjector<'_> {
+        fn set(&mut self, key: &str, value: String) {
+            if let Ok(name) = reqwest::header::HeaderName::from_bytes(key.as_bytes())
+                && let Ok(val) = reqwest::header::HeaderValue::from_str(&value)
+            {
+                self.0.insert(name, val);
+            }
+        }
+    }
+
+    let propagator = TraceContextPropagator::new();
+    propagator.inject_context(
+        &opentelemetry::Context::current(),
+        &mut HeaderInjector(headers),
+    );
+}
 
 const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
 
@@ -97,17 +129,51 @@ impl OpenAIProvider {
 
         debug!(model = %model, "sending OpenAI request");
 
-        let response = self
-            .client
-            .post(&self.base_url)
-            .bearer_auth(&self.api_key)
-            .header("content-type", "application/json")
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
+        // Wrap the HTTP round-trip in a `provider_call` span so downstream
+        // telemetry can observe provider latency independently of generation logic.
+        let provider_call_span = info_span!(
+            "provider_call",
+            http.request.method = "POST",
+            url.full = %self.base_url,
+            otel.kind = "client",
+            http.response.status_code = tracing::field::Empty,
+        );
+
+        let response = async {
+            // Build the request with content-type and auth headers first.
+            #[cfg_attr(not(feature = "telemetry"), allow(unused_mut))]
+            let mut req_builder = self
+                .client
+                .post(&self.base_url)
+                .bearer_auth(&self.api_key)
+                .header("content-type", "application/json")
+                .json(&request);
+
+            // Inject W3C TraceContext into the outgoing request headers inside the
+            // provider_call span. When OTel is active, this adds a `traceparent`
+            // header so the LLM provider can link its server-side trace as a child
+            // of this span. When OTel is not active, inject_trace_context is a no-op.
+            #[cfg(feature = "telemetry")]
+            {
+                let mut extra_headers = reqwest::header::HeaderMap::new();
+                inject_trace_context(&mut extra_headers);
+                for (k, v) in extra_headers {
+                    if let Some(name) = k {
+                        req_builder = req_builder.header(name, v);
+                    }
+                }
+            }
+
+            req_builder
+                .send()
+                .await
+                .map_err(|e| ProviderError::RequestFailed(e.to_string()))
+        }
+        .instrument(provider_call_span.clone())
+        .await?;
 
         let status = response.status().as_u16();
+        provider_call_span.record("http.response.status_code", status as i64);
 
         if status == 429 {
             let retry_after_ms = response

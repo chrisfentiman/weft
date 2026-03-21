@@ -7,6 +7,7 @@ pub mod config_loading;
 pub mod event_log;
 pub mod grpc;
 pub mod server;
+pub mod telemetry;
 pub mod types;
 
 pub use grpc::WeftService;

@@ -32,6 +32,7 @@ use weft_tools::GrpcToolRegistryClient;
 use weft::config_loading::load_and_build_store;
 use weft::grpc::WeftService;
 use weft::server::build_router;
+use weft::telemetry::TelemetryConfig;
 use weft::types::BinaryCommandRegistry;
 
 /// Weft — AI orchestration gateway
@@ -52,13 +53,10 @@ struct Cli {
 async fn main() {
     let cli = Cli::parse();
 
-    // Initialize tracing from RUST_LOG environment variable.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Initialize the tracing subscriber. The guard must be held for the entire
+    // program lifetime to ensure buffers are flushed on exit.
+    let telemetry_config = TelemetryConfig::from_env();
+    let _telemetry_guard = weft::telemetry::init(&telemetry_config);
 
     // Load, resolve, validate, and build ConfigStore.
     //
@@ -663,8 +661,12 @@ async fn main() {
     let weft_service = Arc::new(WeftService::new(reactor, Arc::clone(&config)));
 
     // ── Start the combined gRPC + HTTP server ──────────────────────────────
+    //
+    // Pass the PrometheusHandle from the telemetry guard so build_router can
+    // add the /metrics endpoint. The handle is None when Prometheus is disabled.
 
-    let router = build_router(Arc::clone(&weft_service));
+    let prometheus_handle = _telemetry_guard.prometheus_handle().cloned();
+    let router = build_router(Arc::clone(&weft_service), prometheus_handle);
     let bind_address = &config.server.bind_address;
 
     if let Err(e) = weft::server::serve(router, bind_address).await {

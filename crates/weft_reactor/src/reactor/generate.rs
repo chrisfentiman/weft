@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{Instrument, warn};
 
 use crate::error::ReactorError;
 use crate::event::{
@@ -69,25 +69,35 @@ impl Reactor {
 
         // Spawn the generate activity on a separate task so we can concurrently
         // process events from it while it produces them.
+        //
+        // Carry the current span (the `iteration` span, set by `.instrument()` at
+        // the `run_generate_loop` call site) into the spawned task. Without this,
+        // `tokio::spawn` creates a new task with no span context, and the `generate`
+        // span created inside `GenerateActivity::execute` becomes an orphan root span
+        // disconnected from the request trace.
         let gen_activity = Arc::clone(&lctx.pipeline.generate.activity);
         let gen_event_tx = lctx.event_tx.clone();
         let gen_exec_id = lctx.execution_id.clone();
         let gen_services = Arc::clone(&self.services);
         let gen_event_log: Arc<dyn crate::event_log::EventLog> = Arc::clone(&self.event_log);
         let gen_cancel = lctx.cancel.clone();
+        let gen_span = tracing::Span::current();
 
-        let gen_handle = tokio::spawn(async move {
-            gen_activity
-                .execute(
-                    &gen_exec_id,
-                    gen_input,
-                    gen_services.as_ref(),
-                    gen_event_log.as_ref(),
-                    gen_event_tx,
-                    gen_cancel,
-                )
-                .await;
-        });
+        let gen_handle = tokio::spawn(
+            async move {
+                gen_activity
+                    .execute(
+                        &gen_exec_id,
+                        gen_input,
+                        gen_services.as_ref(),
+                        gen_event_log.as_ref(),
+                        gen_event_tx,
+                        gen_cancel,
+                    )
+                    .await;
+            }
+            .instrument(gen_span),
+        );
 
         let mut commands_queued: Vec<weft_core::CommandInvocation> = Vec::new();
         let mut generation_done = false;

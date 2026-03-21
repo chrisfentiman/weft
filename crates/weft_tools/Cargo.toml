@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
+
 [dependencies]
 weft_core = { path = "../weft_core" }
 async-trait = { workspace = true }
@@ -13,6 +16,8 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio-stream = { workspace = true }
