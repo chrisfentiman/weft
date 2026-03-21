@@ -16,7 +16,10 @@ use weft_reactor::config::{
     ActivityRef, BudgetConfig, LoopHooks, PipelineConfig, ReactorConfig, RetryPolicy,
 };
 use weft_reactor::error::ReactorError;
-use weft_reactor::event::{GeneratedEvent, PipelineEvent};
+use weft_reactor::event::{
+    ActivityEvent, CommandEvent, ContextEvent, ExecutionEvent, GeneratedEvent, GenerationEvent,
+    HookOutcome, PipelineEvent, SignalEvent,
+};
 use weft_reactor::event_log::EventLog;
 use weft_reactor::execution::{Execution, ExecutionId, ExecutionStatus};
 use weft_reactor::reactor::Reactor;
@@ -50,34 +53,36 @@ impl Activity for ImmediateDoneActivity {
         &self,
         _execution_id: &ExecutionId,
         input: ActivityInput,
-        _services: &weft_reactor::services::Services,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         cancel: CancellationToken,
     ) {
         if cancel.is_cancelled() {
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: self.name.clone(),
                     error: "cancelled".to_string(),
                     retryable: false,
-                })
+                }))
                 .await;
             return;
         }
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name.clone(),
-            })
+            }))
             .await;
         let _ = event_tx
-            .send(PipelineEvent::GenerationStarted {
+            .send(PipelineEvent::Generation(GenerationEvent::Started {
                 model: "stub-model".to_string(),
                 message_count: input.messages.len(),
-            })
+            }))
             .await;
         let _ = event_tx
-            .send(PipelineEvent::Generated(GeneratedEvent::Done))
+            .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                GeneratedEvent::Done,
+            )))
             .await;
         let response_message = WeftMessage {
             role: Role::Assistant,
@@ -88,20 +93,20 @@ impl Activity for ImmediateDoneActivity {
             message_index: 0,
         };
         let _ = event_tx
-            .send(PipelineEvent::GenerationCompleted {
+            .send(PipelineEvent::Generation(GenerationEvent::Completed {
                 model: "stub-model".to_string(),
                 response_message,
                 generated_events: vec![GeneratedEvent::Done],
                 input_tokens: Some(5),
                 output_tokens: Some(0),
-            })
+            }))
             .await;
         let _ = event_tx
-            .send(PipelineEvent::ActivityCompleted {
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name.clone(),
                 duration_ms: 1,
                 idempotency_key: input.idempotency_key.clone(),
-            })
+            }))
             .await;
     }
 }
@@ -122,39 +127,43 @@ impl Activity for TextGenerateActivity {
         &self,
         _execution_id: &ExecutionId,
         input: ActivityInput,
-        _services: &weft_reactor::services::Services,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         cancel: CancellationToken,
     ) {
         if cancel.is_cancelled() {
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: self.name.clone(),
                     error: "cancelled".to_string(),
                     retryable: false,
-                })
+                }))
                 .await;
             return;
         }
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name.clone(),
-            })
-            .await;
-        let _ = event_tx
-            .send(PipelineEvent::GenerationStarted {
-                model: "stub-model".to_string(),
-                message_count: input.messages.len(),
-            })
-            .await;
-        let _ = event_tx
-            .send(PipelineEvent::Generated(GeneratedEvent::Content {
-                part: ContentPart::Text(self.response_text.clone()),
             }))
             .await;
         let _ = event_tx
-            .send(PipelineEvent::Generated(GeneratedEvent::Done))
+            .send(PipelineEvent::Generation(GenerationEvent::Started {
+                model: "stub-model".to_string(),
+                message_count: input.messages.len(),
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                GeneratedEvent::Content {
+                    part: ContentPart::Text(self.response_text.clone()),
+                },
+            )))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                GeneratedEvent::Done,
+            )))
             .await;
         let response_message = WeftMessage {
             role: Role::Assistant,
@@ -165,20 +174,20 @@ impl Activity for TextGenerateActivity {
             message_index: 0,
         };
         let _ = event_tx
-            .send(PipelineEvent::GenerationCompleted {
+            .send(PipelineEvent::Generation(GenerationEvent::Completed {
                 model: "stub-model".to_string(),
                 response_message,
                 generated_events: vec![GeneratedEvent::Done],
                 input_tokens: Some(5),
                 output_tokens: Some(3),
-            })
+            }))
             .await;
         let _ = event_tx
-            .send(PipelineEvent::ActivityCompleted {
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name.clone(),
                 duration_ms: 1,
                 idempotency_key: input.idempotency_key.clone(),
-            })
+            }))
             .await;
     }
 }
@@ -200,22 +209,22 @@ impl Activity for AlwaysFailActivity {
         &self,
         _execution_id: &ExecutionId,
         _input: ActivityInput,
-        _services: &weft_reactor::services::Services,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         _cancel: CancellationToken,
     ) {
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name.clone(),
-            })
+            }))
             .await;
         let _ = event_tx
-            .send(PipelineEvent::ActivityFailed {
+            .send(PipelineEvent::Activity(ActivityEvent::Failed {
                 name: self.name.clone(),
                 error: self.error_msg.clone(),
                 retryable: self.retryable,
-            })
+            }))
             .await;
     }
 }
@@ -245,15 +254,15 @@ impl Activity for FailThenSucceedActivity {
         &self,
         _execution_id: &ExecutionId,
         input: ActivityInput,
-        _services: &weft_reactor::services::Services,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         _cancel: CancellationToken,
     ) {
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name.clone(),
-            })
+            }))
             .await;
 
         let remaining = self
@@ -267,16 +276,18 @@ impl Activity for FailThenSucceedActivity {
 
         if remaining > 0 {
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: self.name.clone(),
                     error: "transient failure".to_string(),
                     retryable: true,
-                })
+                }))
                 .await;
         } else {
             // Success.
             let _ = event_tx
-                .send(PipelineEvent::Generated(GeneratedEvent::Done))
+                .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                    GeneratedEvent::Done,
+                )))
                 .await;
             let response_message = WeftMessage {
                 role: Role::Assistant,
@@ -287,20 +298,20 @@ impl Activity for FailThenSucceedActivity {
                 message_index: 0,
             };
             let _ = event_tx
-                .send(PipelineEvent::GenerationCompleted {
+                .send(PipelineEvent::Generation(GenerationEvent::Completed {
                     model: "stub-model".to_string(),
                     response_message,
                     generated_events: vec![GeneratedEvent::Done],
                     input_tokens: None,
                     output_tokens: None,
-                })
+                }))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::ActivityCompleted {
+                .send(PipelineEvent::Activity(ActivityEvent::Completed {
                     name: self.name.clone(),
                     duration_ms: 1,
                     idempotency_key: input.idempotency_key.clone(),
-                })
+                }))
                 .await;
         }
     }
@@ -321,23 +332,25 @@ impl Activity for NoOpActivity {
         &self,
         _execution_id: &ExecutionId,
         _input: ActivityInput,
-        _services: &weft_reactor::services::Services,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         _cancel: CancellationToken,
     ) {
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name.clone(),
-            })
+            }))
             .await;
-        let _ = event_tx.send(PipelineEvent::ValidationPassed).await;
         let _ = event_tx
-            .send(PipelineEvent::ActivityCompleted {
+            .send(PipelineEvent::Execution(ExecutionEvent::ValidationPassed))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name.clone(),
                 duration_ms: 0,
                 idempotency_key: None,
-            })
+            }))
             .await;
     }
 }
@@ -357,15 +370,15 @@ impl Activity for StubAssembleResponse {
         &self,
         execution_id: &ExecutionId,
         input: ActivityInput,
-        _services: &weft_reactor::services::Services,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         _cancel: CancellationToken,
     ) {
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name.clone(),
-            })
+            }))
             .await;
 
         let response_message = WeftMessage {
@@ -384,14 +397,16 @@ impl Activity for StubAssembleResponse {
             timing: weft_core::WeftTiming::default(),
         };
         let _ = event_tx
-            .send(PipelineEvent::ResponseAssembled { response })
+            .send(PipelineEvent::Context(ContextEvent::ResponseAssembled {
+                response,
+            }))
             .await;
         let _ = event_tx
-            .send(PipelineEvent::ActivityCompleted {
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name.clone(),
                 duration_ms: 0,
                 idempotency_key: None,
-            })
+            }))
             .await;
     }
 }
@@ -411,7 +426,7 @@ impl Activity for StubExecuteCommand {
         &self,
         _execution_id: &ExecutionId,
         input: ActivityInput,
-        _services: &weft_reactor::services::Services,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         _cancel: CancellationToken,
@@ -425,12 +440,12 @@ impl Activity for StubExecuteCommand {
             .to_string();
 
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name.clone(),
-            })
+            }))
             .await;
         let _ = event_tx
-            .send(PipelineEvent::CommandCompleted {
+            .send(PipelineEvent::Command(CommandEvent::Completed {
                 name: cmd_name.clone(),
                 result: weft_core::CommandResult {
                     command_name: cmd_name,
@@ -438,14 +453,14 @@ impl Activity for StubExecuteCommand {
                     output: "stub output".to_string(),
                     error: None,
                 },
-            })
+            }))
             .await;
         let _ = event_tx
-            .send(PipelineEvent::ActivityCompleted {
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name.clone(),
                 duration_ms: 1,
                 idempotency_key: input.idempotency_key.clone(),
-            })
+            }))
             .await;
     }
 }
@@ -750,11 +765,11 @@ async fn pre_loop_activity_runs_before_generate() {
         .await
         .unwrap();
     // validate should come before generation.started in the log.
-    // PipelineEvent serializes with external tagging: {"ActivityStarted": {"name": "..."}}
+    // PipelineEvent serializes with adjacent tagging: {"category": "Activity", "event": {"type": "Started", "name": "..."}}
     let validate_pos = events.iter().position(|e| {
         e.event_type == "activity.started"
             && e.payload
-                .get("ActivityStarted")
+                .get("event")
                 .and_then(|v| v.get("name"))
                 .and_then(|v| v.as_str())
                 == Some("validate")
@@ -847,20 +862,22 @@ async fn cancel_signal_terminates_execution() {
             &self,
             _execution_id: &ExecutionId,
             _input: ActivityInput,
-            _services: &weft_reactor::services::Services,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn EventLog,
             event_tx: mpsc::Sender<PipelineEvent>,
             _cancel: CancellationToken,
         ) {
             let _ = event_tx
-                .send(PipelineEvent::ActivityStarted {
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
                     name: "generate".to_string(),
-                })
+                }))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::Signal(Signal::Cancel {
-                    reason: "test cancel via channel".to_string(),
-                }))
+                .send(PipelineEvent::Signal(SignalEvent::Received(
+                    Signal::Cancel {
+                        reason: "test cancel via channel".to_string(),
+                    },
+                )))
                 .await;
         }
     }
@@ -922,20 +939,22 @@ async fn cancel_signal_on_channel_terminates_execution() {
             &self,
             _execution_id: &ExecutionId,
             _input: ActivityInput,
-            _services: &weft_reactor::services::Services,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn EventLog,
             event_tx: mpsc::Sender<PipelineEvent>,
             _cancel: CancellationToken,
         ) {
             let _ = event_tx
-                .send(PipelineEvent::ActivityStarted {
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
                     name: "generate".to_string(),
-                })
+                }))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::Signal(Signal::Cancel {
-                    reason: "test cancel".to_string(),
-                }))
+                .send(PipelineEvent::Signal(SignalEvent::Received(
+                    Signal::Cancel {
+                        reason: "test cancel".to_string(),
+                    },
+                )))
                 .await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -1004,39 +1023,39 @@ async fn hook_block_in_pre_loop_returns_hook_blocked_error() {
             &self,
             _execution_id: &ExecutionId,
             _input: ActivityInput,
-            services: &weft_reactor::services::Services,
+            services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn EventLog,
             event_tx: mpsc::Sender<PipelineEvent>,
             _cancel: CancellationToken,
         ) {
             let _ = event_tx
-                .send(PipelineEvent::ActivityStarted {
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
                     name: self.name().to_string(),
-                })
+                }))
                 .await;
 
             let result = services
-                .hooks
+                .hooks()
                 .run_chain(HookEvent::RequestStart, serde_json::json!({}), None)
                 .await;
 
             match result {
                 weft_hooks::HookChainResult::Blocked { hook_name, reason } => {
                     let _ = event_tx
-                        .send(PipelineEvent::HookBlocked {
+                        .send(PipelineEvent::Hook(HookOutcome::Blocked {
                             hook_event: "request_start".to_string(),
                             hook_name,
                             reason,
-                        })
+                        }))
                         .await;
                 }
                 weft_hooks::HookChainResult::Allowed { .. } => {
                     let _ = event_tx
-                        .send(PipelineEvent::ActivityCompleted {
+                        .send(PipelineEvent::Activity(ActivityEvent::Completed {
                             name: self.name().to_string(),
                             duration_ms: 0,
                             idempotency_key: None,
-                        })
+                        }))
                         .await;
                 }
             }
@@ -1405,23 +1424,23 @@ async fn generation_timeout_fires_after_silence() {
             &self,
             _execution_id: &ExecutionId,
             _input: ActivityInput,
-            _services: &weft_reactor::services::Services,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn EventLog,
             event_tx: mpsc::Sender<PipelineEvent>,
             cancel: CancellationToken,
         ) {
             let _ = event_tx
-                .send(PipelineEvent::ActivityStarted {
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
                     name: "generate".to_string(),
-                })
+                }))
                 .await;
             cancel.cancelled().await;
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: "generate".to_string(),
                     error: "cancelled".to_string(),
                     retryable: false,
-                })
+                }))
                 .await;
         }
     }
@@ -1510,33 +1529,33 @@ async fn heartbeat_miss_cancels_activity() {
             &self,
             _execution_id: &ExecutionId,
             _input: ActivityInput,
-            _services: &weft_reactor::services::Services,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn EventLog,
             event_tx: mpsc::Sender<PipelineEvent>,
             cancel: CancellationToken,
         ) {
             let _ = event_tx
-                .send(PipelineEvent::ActivityStarted {
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
                     name: "generate".to_string(),
-                })
+                }))
                 .await;
 
             for _ in 0..2 {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let _ = event_tx
-                    .send(PipelineEvent::Heartbeat {
+                    .send(PipelineEvent::Activity(ActivityEvent::Heartbeat {
                         activity_name: "generate".to_string(),
-                    })
+                    }))
                     .await;
             }
 
             cancel.cancelled().await;
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: "generate".to_string(),
                     error: "cancelled".to_string(),
                     retryable: false,
-                })
+                }))
                 .await;
         }
     }
@@ -1656,7 +1675,9 @@ async fn idempotency_check_skips_already_completed_activity() {
         .await
         .unwrap();
 
-    let done_ev = weft_reactor::event::PipelineEvent::Generated(GeneratedEvent::Done);
+    let done_ev = weft_reactor::event::PipelineEvent::Generation(GenerationEvent::Chunk(
+        GeneratedEvent::Done,
+    ));
     event_log
         .append(
             &execution_id,
@@ -1771,7 +1792,7 @@ async fn generated_content_events_forwarded_to_client_tx() {
     while let Ok(event) = client_rx.try_recv() {
         if matches!(
             &event,
-            PipelineEvent::Generated(GeneratedEvent::Content { .. })
+            PipelineEvent::Generation(GenerationEvent::Chunk(GeneratedEvent::Content { .. }))
         ) {
             content_events.push(event);
         }
@@ -1835,8 +1856,8 @@ async fn event_log_contains_complete_execution_trace() {
         "missing generation.started"
     );
     assert!(
-        event_types.contains(&"generated"),
-        "missing generated (content)"
+        event_types.contains(&"generation.chunk"),
+        "missing generation.chunk (content)"
     );
     assert!(
         event_types.contains(&"execution.completed"),
@@ -2041,7 +2062,10 @@ async fn spawn_child_creates_child_with_correct_parent_id_and_depth() {
 
     let mut found_child_completed = false;
     while let Ok(event) = parent_rx.try_recv() {
-        if matches!(event, PipelineEvent::ChildCompleted { .. }) {
+        if matches!(
+            event,
+            PipelineEvent::Child(weft_reactor::ChildEvent::Completed { .. })
+        ) {
             found_child_completed = true;
             break;
         }
@@ -2178,7 +2202,7 @@ async fn command_iteration_loop_executes_command_then_calls_generate_again() {
             &self,
             _execution_id: &ExecutionId,
             input: ActivityInput,
-            _services: &weft_reactor::services::Services,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn EventLog,
             event_tx: mpsc::Sender<PipelineEvent>,
             _cancel: CancellationToken,
@@ -2188,15 +2212,15 @@ async fn command_iteration_loop_executes_command_then_calls_generate_again() {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
             let _ = event_tx
-                .send(PipelineEvent::ActivityStarted {
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
                     name: "generate".to_string(),
-                })
+                }))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::GenerationStarted {
+                .send(PipelineEvent::Generation(GenerationEvent::Started {
                     model: "stub-model".to_string(),
                     message_count: input.messages.len(),
-                })
+                }))
                 .await;
 
             if call_n == 0 {
@@ -2206,14 +2230,16 @@ async fn command_iteration_loop_executes_command_then_calls_generate_again() {
                     arguments: serde_json::json!({"arg": "value"}),
                 };
                 let _ = event_tx
-                    .send(PipelineEvent::Generated(GeneratedEvent::CommandInvocation(
-                        invocation,
+                    .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                        GeneratedEvent::CommandInvocation(invocation),
                     )))
                     .await;
             }
 
             let _ = event_tx
-                .send(PipelineEvent::Generated(GeneratedEvent::Done))
+                .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                    GeneratedEvent::Done,
+                )))
                 .await;
 
             let response_message = WeftMessage {
@@ -2225,20 +2251,20 @@ async fn command_iteration_loop_executes_command_then_calls_generate_again() {
                 message_index: 0,
             };
             let _ = event_tx
-                .send(PipelineEvent::GenerationCompleted {
+                .send(PipelineEvent::Generation(GenerationEvent::Completed {
                     model: "stub-model".to_string(),
                     response_message,
                     generated_events: vec![GeneratedEvent::Done],
                     input_tokens: None,
                     output_tokens: None,
-                })
+                }))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::ActivityCompleted {
+                .send(PipelineEvent::Activity(ActivityEvent::Completed {
                     name: "generate".to_string(),
                     duration_ms: 1,
                     idempotency_key: input.idempotency_key.clone(),
-                })
+                }))
                 .await;
         }
     }
@@ -2294,8 +2320,8 @@ async fn command_iteration_loop_executes_command_then_calls_generate_again() {
         "event log should contain command.completed; got: {event_types:?}"
     );
     assert!(
-        event_types.contains(&"iteration.completed"),
-        "event log should contain iteration.completed; got: {event_types:?}"
+        event_types.contains(&"execution.iteration_completed"),
+        "event log should contain execution.iteration_completed; got: {event_types:?}"
     );
 }
 
@@ -2326,7 +2352,7 @@ async fn pre_response_hook_block_injects_feedback_and_retries_generation() {
             &self,
             _execution_id: &ExecutionId,
             input: ActivityInput,
-            _services: &weft_reactor::services::Services,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn EventLog,
             event_tx: mpsc::Sender<PipelineEvent>,
             _cancel: CancellationToken,
@@ -2334,12 +2360,14 @@ async fn pre_response_hook_block_injects_feedback_and_retries_generation() {
             self.call_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _ = event_tx
-                .send(PipelineEvent::ActivityStarted {
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
                     name: self.name.clone(),
-                })
+                }))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::Generated(GeneratedEvent::Done))
+                .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                    GeneratedEvent::Done,
+                )))
                 .await;
             let response_message = WeftMessage {
                 role: Role::Assistant,
@@ -2350,20 +2378,20 @@ async fn pre_response_hook_block_injects_feedback_and_retries_generation() {
                 message_index: 0,
             };
             let _ = event_tx
-                .send(PipelineEvent::GenerationCompleted {
+                .send(PipelineEvent::Generation(GenerationEvent::Completed {
                     model: "stub-model".to_string(),
                     response_message,
                     generated_events: vec![GeneratedEvent::Done],
                     input_tokens: None,
                     output_tokens: None,
-                })
+                }))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::ActivityCompleted {
+                .send(PipelineEvent::Activity(ActivityEvent::Completed {
                     name: self.name.clone(),
                     duration_ms: 1,
                     idempotency_key: input.idempotency_key.clone(),
-                })
+                }))
                 .await;
         }
     }
@@ -2384,7 +2412,7 @@ async fn pre_response_hook_block_injects_feedback_and_retries_generation() {
             &self,
             _execution_id: &ExecutionId,
             input: ActivityInput,
-            _services: &weft_reactor::services::Services,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn EventLog,
             event_tx: mpsc::Sender<PipelineEvent>,
             _cancel: CancellationToken,
@@ -2394,26 +2422,26 @@ async fn pre_response_hook_block_injects_feedback_and_retries_generation() {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
             let _ = event_tx
-                .send(PipelineEvent::ActivityStarted {
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
                     name: self.name.clone(),
-                })
+                }))
                 .await;
 
             if call_n == 0 {
                 let _ = event_tx
-                    .send(PipelineEvent::HookBlocked {
+                    .send(PipelineEvent::Hook(HookOutcome::Blocked {
                         hook_event: "pre_response".to_string(),
                         hook_name: self.name.clone(),
                         reason: self.block_reason.clone(),
-                    })
+                    }))
                     .await;
             } else {
                 let _ = event_tx
-                    .send(PipelineEvent::ActivityCompleted {
+                    .send(PipelineEvent::Activity(ActivityEvent::Completed {
                         name: self.name.clone(),
                         duration_ms: 0,
                         idempotency_key: input.idempotency_key.clone(),
-                    })
+                    }))
                     .await;
             }
         }
@@ -2514,27 +2542,29 @@ async fn cancel_during_retry_backoff_terminates_execution() {
             &self,
             _execution_id: &ExecutionId,
             _input: ActivityInput,
-            _services: &weft_reactor::services::Services,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn EventLog,
             event_tx: mpsc::Sender<PipelineEvent>,
             _cancel: CancellationToken,
         ) {
             let _ = event_tx
-                .send(PipelineEvent::ActivityStarted {
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
                     name: "generate".to_string(),
-                })
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Signal(Signal::Cancel {
-                    reason: "cancel during backoff".to_string(),
                 }))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Signal(SignalEvent::Received(
+                    Signal::Cancel {
+                        reason: "cancel during backoff".to_string(),
+                    },
+                )))
+                .await;
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: "generate".to_string(),
                     error: "transient failure".to_string(),
                     retryable: true,
-                })
+                }))
                 .await;
         }
     }
@@ -2646,36 +2676,38 @@ async fn per_chunk_timeout_resets_after_each_chunk() {
             &self,
             _execution_id: &ExecutionId,
             _input: ActivityInput,
-            _services: &weft_reactor::services::Services,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn EventLog,
             event_tx: mpsc::Sender<PipelineEvent>,
             cancel: CancellationToken,
         ) {
             let _ = event_tx
-                .send(PipelineEvent::ActivityStarted {
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
                     name: "generate".to_string(),
-                })
+                }))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::GenerationStarted {
+                .send(PipelineEvent::Generation(GenerationEvent::Started {
                     model: "stub-model".to_string(),
                     message_count: 1,
-                })
+                }))
                 .await;
 
             let _ = event_tx
-                .send(PipelineEvent::Generated(GeneratedEvent::Content {
-                    part: ContentPart::Text("first chunk".to_string()),
-                }))
+                .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                    GeneratedEvent::Content {
+                        part: ContentPart::Text("first chunk".to_string()),
+                    },
+                )))
                 .await;
 
             cancel.cancelled().await;
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: "generate".to_string(),
                     error: "cancelled".to_string(),
                     retryable: false,
-                })
+                }))
                 .await;
         }
     }
@@ -2881,28 +2913,28 @@ async fn pre_loop_all_six_activities_produce_expected_events() {
     let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
 
     assert!(
-        event_types.contains(&"model.selected"),
-        "missing model.selected event; got: {event_types:?}"
+        event_types.contains(&"selection.model_selected"),
+        "missing selection.model_selected event; got: {event_types:?}"
     );
     assert!(
-        event_types.contains(&"commands.selected"),
-        "missing commands.selected event; got: {event_types:?}"
+        event_types.contains(&"selection.commands_selected"),
+        "missing selection.commands_selected event; got: {event_types:?}"
     );
     assert!(
-        event_types.contains(&"provider.resolved"),
-        "missing provider.resolved event; got: {event_types:?}"
+        event_types.contains(&"selection.provider_resolved"),
+        "missing selection.provider_resolved event; got: {event_types:?}"
     );
     assert!(
-        event_types.contains(&"system_prompt.assembled"),
-        "missing system_prompt.assembled event; got: {event_types:?}"
+        event_types.contains(&"context.system_prompt_assembled"),
+        "missing context.system_prompt_assembled event; got: {event_types:?}"
     );
     assert!(
-        event_types.contains(&"commands.formatted"),
-        "missing commands.formatted event; got: {event_types:?}"
+        event_types.contains(&"context.commands_formatted"),
+        "missing context.commands_formatted event; got: {event_types:?}"
     );
     assert!(
-        event_types.contains(&"sampling.updated"),
-        "missing sampling.updated event; got: {event_types:?}"
+        event_types.contains(&"context.sampling_updated"),
+        "missing context.sampling_updated event; got: {event_types:?}"
     );
 }
 
@@ -2942,33 +2974,36 @@ async fn pre_loop_events_appear_in_correct_order() {
             .unwrap_or(0)
     };
 
-    let model_seq = seq_of("model.selected");
-    let commands_seq = seq_of("commands.selected");
-    let provider_seq = seq_of("provider.resolved");
-    let sys_prompt_seq = seq_of("system_prompt.assembled");
-    let cmd_fmt_seq = seq_of("commands.formatted");
-    let sampling_seq = seq_of("sampling.updated");
+    let model_seq = seq_of("selection.model_selected");
+    let commands_seq = seq_of("selection.commands_selected");
+    let provider_seq = seq_of("selection.provider_resolved");
+    let sys_prompt_seq = seq_of("context.system_prompt_assembled");
+    let cmd_fmt_seq = seq_of("context.commands_formatted");
+    let sampling_seq = seq_of("context.sampling_updated");
 
-    assert!(model_seq > 0, "model.selected must be present (seq > 0)");
+    assert!(
+        model_seq > 0,
+        "selection.model_selected must be present (seq > 0)"
+    );
     assert!(
         model_seq < commands_seq,
-        "model.selected ({model_seq}) must precede commands.selected ({commands_seq})"
+        "selection.model_selected ({model_seq}) must precede selection.commands_selected ({commands_seq})"
     );
     assert!(
         commands_seq < provider_seq,
-        "commands.selected ({commands_seq}) must precede provider.resolved ({provider_seq})"
+        "selection.commands_selected ({commands_seq}) must precede selection.provider_resolved ({provider_seq})"
     );
     assert!(
         provider_seq < sys_prompt_seq,
-        "provider.resolved ({provider_seq}) must precede system_prompt.assembled ({sys_prompt_seq})"
+        "selection.provider_resolved ({provider_seq}) must precede context.system_prompt_assembled ({sys_prompt_seq})"
     );
     assert!(
         sys_prompt_seq < cmd_fmt_seq,
-        "system_prompt.assembled ({sys_prompt_seq}) must precede commands.formatted ({cmd_fmt_seq})"
+        "context.system_prompt_assembled ({sys_prompt_seq}) must precede context.commands_formatted ({cmd_fmt_seq})"
     );
     assert!(
         cmd_fmt_seq < sampling_seq,
-        "commands.formatted ({cmd_fmt_seq}) must precede sampling.updated ({sampling_seq})"
+        "context.commands_formatted ({cmd_fmt_seq}) must precede context.sampling_updated ({sampling_seq})"
     );
 }
 
@@ -3001,11 +3036,11 @@ async fn pre_loop_system_prompt_at_index_zero() {
         .unwrap();
 
     let system_prompt_injected = events.iter().any(|e| {
-        if e.event_type != "message.injected" {
+        if e.event_type != "context.message_injected" {
             return false;
         }
         e.payload
-            .get("MessageInjected")
+            .get("event")
             .and_then(|v| v.get("source"))
             .and_then(|s| s.as_str())
             .map(|s| s == "SystemPromptAssembly")
@@ -3013,15 +3048,15 @@ async fn pre_loop_system_prompt_at_index_zero() {
     });
     assert!(
         system_prompt_injected,
-        "expected MessageInjected with SystemPromptAssembly source in event log"
+        "expected context.message_injected with SystemPromptAssembly source in event log"
     );
 
     let has_sys_prompt = events
         .iter()
-        .any(|e| e.event_type == "system_prompt.assembled");
+        .any(|e| e.event_type == "context.system_prompt_assembled");
     assert!(
         has_sys_prompt,
-        "expected system_prompt.assembled event in event log"
+        "expected context.system_prompt_assembled event in event log"
     );
 }
 
@@ -3055,34 +3090,34 @@ async fn pre_loop_generation_config_includes_model() {
 
     let model_selected = events
         .iter()
-        .find(|e| e.event_type == "model.selected")
-        .expect("model.selected must be in event log");
+        .find(|e| e.event_type == "selection.model_selected")
+        .expect("selection.model_selected must be in event log");
 
     let model_name = model_selected
         .payload
-        .get("ModelSelected")
+        .get("event")
         .and_then(|v| v.get("model_name"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
     assert!(
         !model_name.is_empty(),
-        "model_name in model.selected must be non-empty"
+        "model_name in selection.model_selected must be non-empty"
     );
 
     let sampling_updated = events
         .iter()
-        .find(|e| e.event_type == "sampling.updated")
-        .expect("sampling.updated must be in event log");
+        .find(|e| e.event_type == "context.sampling_updated")
+        .expect("context.sampling_updated must be in event log");
 
     let max_tokens = sampling_updated
         .payload
-        .get("SamplingUpdated")
+        .get("event")
         .and_then(|v| v.get("max_tokens"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     assert!(
         max_tokens > 0,
-        "max_tokens in sampling.updated must be > 0, got {max_tokens}"
+        "max_tokens in context.sampling_updated must be > 0, got {max_tokens}"
     );
 
     assert!(
@@ -3105,22 +3140,22 @@ async fn pre_loop_activity_failure_terminates_execution() {
             &self,
             _execution_id: &ExecutionId,
             _input: ActivityInput,
-            _services: &weft_reactor::services::Services,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn weft_reactor::event_log::EventLog,
             event_tx: mpsc::Sender<PipelineEvent>,
             _cancel: CancellationToken,
         ) {
             let _ = event_tx
-                .send(PipelineEvent::ActivityStarted {
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
                     name: self.name().to_string(),
-                })
+                }))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: self.name().to_string(),
                     error: "model_selection: no eligible models".to_string(),
                     retryable: false,
-                })
+                }))
                 .await;
         }
     }

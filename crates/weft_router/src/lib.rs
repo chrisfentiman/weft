@@ -22,51 +22,8 @@ pub use routing_service::{
     MemoryCandidates, MemoryStoreRef, RoutingInput, RoutingResult, build_memory_candidates,
     build_model_candidates, route_domains, tool_necessity_candidates,
 };
-
-use async_trait::async_trait;
-
-/// Semantic router that makes all routing decisions for a request.
-///
-/// Send + Sync + 'static: shared via Arc, used from async handlers.
-#[async_trait]
-pub trait SemanticRouter: Send + Sync + 'static {
-    /// Make all routing decisions for a user message across all configured domains.
-    ///
-    /// `user_message`: The latest user message text.
-    /// `domains`: Slice of (domain kind, candidates) pairs. Only domains present are scored.
-    ///
-    /// Returns a RoutingDecision with scored results per domain.
-    async fn route(
-        &self,
-        user_message: &str,
-        domains: &[(RoutingDomainKind, Vec<RoutingCandidate>)],
-    ) -> Result<RoutingDecision, RouterError>;
-
-    /// Score memory store candidates against the given text.
-    ///
-    /// Used for per-invocation routing by both `/recall` (with the query argument)
-    /// and `/remember` (with the content argument). Each invocation routes
-    /// independently based on its own argument content, not the user's original message.
-    ///
-    /// Returns scored candidates (unsorted, unfiltered — caller applies threshold and
-    /// capability filtering). Returns `Err(RouterError::ModelNotLoaded)` if the
-    /// embedding model is unavailable (fallback mode).
-    async fn score_memory_candidates(
-        &self,
-        text: &str,
-        candidates: &[RoutingCandidate],
-    ) -> Result<Vec<ScoredCandidate>, RouterError>;
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum RouterError {
-    #[error("model inference failed: {0}")]
-    InferenceFailed(String),
-    #[error("tokenization failed: {0}")]
-    TokenizationFailed(String),
-    #[error("model not loaded")]
-    ModelNotLoaded,
-}
+// Re-export trait and error from weft_router_trait so existing import paths work.
+pub use weft_router_trait::{RouterError, SemanticRouter};
 
 /// Filter scored candidates to those scoring at or above `threshold`.
 ///

@@ -110,33 +110,33 @@ async fn test_commands_formatted_and_injected() {
 
     let events = event_log.all_events();
 
-    // commands.formatted must be present.
-    let formatted_event = find_event(&events, "commands.formatted")
-        .expect("expected commands.formatted event in log");
+    // context.commands_formatted must be present.
+    let formatted_event = find_event(&events, "context.commands_formatted")
+        .expect("expected context.commands_formatted event in log");
 
     // The format must not be NoCommands — we registered a command.
-    let format_val = &formatted_event.payload["CommandsFormatted"]["format"];
+    let format_val = &formatted_event.payload["event"]["format"];
     assert_ne!(
         format_val.as_str().unwrap_or(""),
         "NoCommands",
-        "commands.formatted must not be NoCommands when commands are registered; got payload: {}",
+        "context.commands_formatted must not be NoCommands when commands are registered; got payload: {}",
         formatted_event.payload
     );
 
-    // message.injected with source CommandFormatInjection must be present.
-    let injected_events = find_events(&events, "message.injected");
+    // context.message_injected with source CommandFormatInjection must be present.
+    let injected_events = find_events(&events, "context.message_injected");
     let format_injection = injected_events
         .iter()
-        .find(|e| e.payload["MessageInjected"]["source"] == "CommandFormatInjection")
+        .find(|e| e.payload["event"]["source"] == "CommandFormatInjection")
         .unwrap_or_else(|| {
             panic!(
-                "expected message.injected event with source CommandFormatInjection.\nAll message.injected payloads: {:?}",
+                "expected context.message_injected event with source CommandFormatInjection.\nAll context.message_injected payloads: {:?}",
                 injected_events.iter().map(|e| &e.payload).collect::<Vec<_>>()
             )
         });
 
     // The injected content must include the command name and description.
-    let content_str = format_injection.payload["MessageInjected"]["message"]["content"].to_string();
+    let content_str = format_injection.payload["event"]["message"]["content"].to_string();
     assert!(
         content_str.contains("web_search"),
         "injected command text must contain 'web_search', got: {content_str}"
@@ -226,7 +226,7 @@ async fn test_command_loop_full_cycle() {
     // command.completed must carry success: true.
     let cmd_completed =
         find_event(&events, "command.completed").expect("command.completed event must exist");
-    let success = cmd_completed.payload["CommandCompleted"]["result"]["success"]
+    let success = cmd_completed.payload["event"]["result"]["success"]
         .as_bool()
         .unwrap_or(false);
     assert!(
@@ -238,7 +238,7 @@ async fn test_command_loop_full_cycle() {
     // command.started must name the correct command.
     let cmd_started =
         find_event(&events, "command.started").expect("command.started event must exist");
-    let cmd_name = cmd_started.payload["CommandStarted"]["invocation"]["name"]
+    let cmd_name = cmd_started.payload["event"]["invocation"]["name"]
         .as_str()
         .unwrap_or("");
     assert_eq!(
@@ -320,7 +320,7 @@ async fn test_command_loop_respects_iteration_limit() {
     );
 
     // At most 2 iteration.completed events (one per completed command iteration).
-    let iteration_count = count_event_type(&events, "iteration.completed");
+    let iteration_count = count_event_type(&events, "execution.iteration_completed");
     assert!(
         iteration_count <= 2,
         "expected at most 2 iteration.completed events, got {iteration_count}"
@@ -412,7 +412,7 @@ async fn test_multiple_commands_in_single_response() {
 
     let executed_names: Vec<&str> = started_events
         .iter()
-        .filter_map(|e| e.payload["CommandStarted"]["invocation"]["name"].as_str())
+        .filter_map(|e| e.payload["event"]["invocation"]["name"].as_str())
         .collect();
 
     assert!(

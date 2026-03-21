@@ -91,9 +91,9 @@ mod tests {
     use crate::event::PipelineEvent;
     use crate::event_log::EventLog;
     use crate::execution::ExecutionId;
-    use crate::services::Services;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
+    use weft_reactor_trait::ServiceLocator;
 
     // ── Test activity stubs ─────────────────────────────────────────────────
 
@@ -119,7 +119,7 @@ mod tests {
             &self,
             _execution_id: &ExecutionId,
             _input: ActivityInput,
-            _services: &Services,
+            _services: &dyn ServiceLocator,
             _event_log: &dyn EventLog,
             _event_tx: mpsc::Sender<PipelineEvent>,
             _cancel: CancellationToken,

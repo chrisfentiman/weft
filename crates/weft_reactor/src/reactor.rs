@@ -25,8 +25,9 @@ use crate::budget::{Budget, BudgetCheck};
 use crate::config::{PipelineConfig, ReactorConfig, RetryPolicy};
 use crate::error::ReactorError;
 use crate::event::{
-    CommandFormat, EVENT_SCHEMA_VERSION, Event, GeneratedEvent, MessageInjectionSource,
-    PipelineEvent,
+    ActivityEvent, BudgetEvent, CommandEvent, CommandFormat, ContextEvent, EVENT_SCHEMA_VERSION,
+    Event, ExecutionEvent, GeneratedEvent, GenerationEvent, MessageInjectionSource, PipelineEvent,
+    SelectionEvent, SignalEvent,
 };
 use crate::event_log::EventLog;
 use crate::execution::{Execution, ExecutionId, ExecutionStatus, RequestId, TenantId};
@@ -378,14 +379,14 @@ impl Reactor {
         let budget_snapshot = budget.snapshot();
         self.record_event(
             &execution_id,
-            &PipelineEvent::ExecutionStarted {
+            &PipelineEvent::Execution(ExecutionEvent::Started {
                 pipeline_name: pipeline_name.to_string(),
                 tenant_id: tenant_id.0.clone(),
                 request_id: request_id.0.clone(),
                 parent_id: parent_id.as_ref().map(|id| id.to_string()),
                 depth,
                 budget: budget_snapshot,
-            },
+            }),
         )
         .await?;
 
@@ -431,7 +432,7 @@ impl Reactor {
                 .execute(
                     &execution_id,
                     input,
-                    &self.services,
+                    self.services.as_ref(),
                     self.event_log.as_ref(),
                     event_tx.clone(),
                     cancel.clone(),
@@ -445,10 +446,10 @@ impl Reactor {
             if let Some(err) = terminate {
                 self.record_event(
                     &execution_id,
-                    &PipelineEvent::ExecutionFailed {
+                    &PipelineEvent::Execution(ExecutionEvent::Failed {
                         error: err.to_string(),
                         partial_text: Some(state.accumulated_text.clone()),
-                    },
+                    }),
                 )
                 .await?;
                 self.event_log
@@ -469,9 +470,9 @@ impl Reactor {
                     let resource = reason.to_string();
                     self.record_event(
                         &execution_id,
-                        &PipelineEvent::BudgetExhausted {
+                        &PipelineEvent::Budget(BudgetEvent::Exhausted {
                             resource: resource.clone(),
-                        },
+                        }),
                     )
                     .await?;
                     debug!("budget exhausted: {resource}");
@@ -480,10 +481,10 @@ impl Reactor {
                 BudgetCheck::Warning(info) => {
                     self.record_event(
                         &execution_id,
-                        &PipelineEvent::BudgetWarning {
+                        &PipelineEvent::Budget(BudgetEvent::Warning {
                             resource: info.resource.clone(),
                             remaining: info.remaining,
-                        },
+                        }),
                     )
                     .await?;
                 }
@@ -500,7 +501,7 @@ impl Reactor {
                     .execute(
                         &execution_id,
                         input,
-                        &self.services,
+                        self.services.as_ref(),
                         self.event_log.as_ref(),
                         event_tx.clone(),
                         cancel.clone(),
@@ -512,10 +513,10 @@ impl Reactor {
                 if let Some(err) = terminate {
                     self.record_event(
                         &execution_id,
-                        &PipelineEvent::ExecutionFailed {
+                        &PipelineEvent::Execution(ExecutionEvent::Failed {
                             error: err.to_string(),
                             partial_text: Some(state.accumulated_text.clone()),
-                        },
+                        }),
                     )
                     .await?;
                     self.event_log
@@ -529,9 +530,9 @@ impl Reactor {
             if let Err(reason) = state.budget.record_generation() {
                 self.record_event(
                     &execution_id,
-                    &PipelineEvent::BudgetExhausted {
+                    &PipelineEvent::Budget(BudgetEvent::Exhausted {
                         resource: reason.to_string(),
-                    },
+                    }),
                 )
                 .await?;
                 break 'dispatch;
@@ -600,19 +601,19 @@ impl Reactor {
                 if let Err(reason) = state.budget.record_iteration() {
                     self.record_event(
                         &execution_id,
-                        &PipelineEvent::BudgetExhausted {
+                        &PipelineEvent::Budget(BudgetEvent::Exhausted {
                             resource: reason.to_string(),
-                        },
+                        }),
                     )
                     .await?;
                     break 'dispatch;
                 }
                 self.record_event(
                     &execution_id,
-                    &PipelineEvent::IterationCompleted {
+                    &PipelineEvent::Execution(ExecutionEvent::IterationCompleted {
                         iteration: state.iteration,
                         commands_executed_this_iteration: cmds_this_iter,
-                    },
+                    }),
                 )
                 .await?;
                 state.iteration += 1;
@@ -651,7 +652,7 @@ impl Reactor {
                     .execute(
                         &gen_exec_id,
                         gen_input,
-                        &gen_services,
+                        gen_services.as_ref(),
                         gen_event_log.as_ref(),
                         gen_event_tx,
                         gen_cancel,
@@ -696,10 +697,10 @@ impl Reactor {
                         debug!(execution_id = %execution_id, "cancelled during generate dispatch");
                         self.record_event(
                             &execution_id,
-                            &PipelineEvent::ExecutionCancelled {
+                            &PipelineEvent::Execution(ExecutionEvent::Cancelled {
                                 reason: "Signal::Cancel received".to_string(),
                                 partial_text: Some(state.accumulated_text.clone()),
-                            },
+                            }),
                         ).await?;
                         self.event_log
                             .update_execution_status(&execution_id, ExecutionStatus::Cancelled)
@@ -732,19 +733,16 @@ impl Reactor {
 
                                 // Update heartbeat/chunk timers on any event from generate.
                                 match &event {
-                                    PipelineEvent::Generated(_)
-                                    | PipelineEvent::GenerationStarted { .. }
-                                    | PipelineEvent::GenerationCompleted { .. }
-                                    | PipelineEvent::GenerationFailed { .. }
-                                    | PipelineEvent::ActivityStarted { .. }
-                                    | PipelineEvent::ActivityCompleted { .. }
-                                    | PipelineEvent::ActivityFailed { .. } => {
+                                    PipelineEvent::Generation(_)
+                                    | PipelineEvent::Activity(ActivityEvent::Started { .. })
+                                    | PipelineEvent::Activity(ActivityEvent::Completed { .. })
+                                    | PipelineEvent::Activity(ActivityEvent::Failed { .. }) => {
                                         chunk_deadline = tokio::time::Instant::now() + chunk_timeout;
                                         if let Some(secs) = heartbeat_interval {
                                             heartbeat_expiry = Some(tokio::time::Instant::now() + Duration::from_secs(secs * 2));
                                         }
                                     }
-                                    PipelineEvent::Heartbeat { activity_name } => {
+                                    PipelineEvent::Activity(ActivityEvent::Heartbeat { activity_name }) => {
                                         state.last_activity_event.insert(activity_name.clone(), Instant::now());
                                         if let Some(secs) = heartbeat_interval {
                                             heartbeat_expiry = Some(tokio::time::Instant::now() + Duration::from_secs(secs * 2));
@@ -754,8 +752,8 @@ impl Reactor {
                                     _ => {}
                                 }
 
-                                // Forward Generated(Content) events to client stream.
-                                if let PipelineEvent::Generated(GeneratedEvent::Content { .. }) = &event {
+                                // Forward Generation(Chunk(Content)) events to client stream.
+                                if let PipelineEvent::Generation(GenerationEvent::Chunk(GeneratedEvent::Content { .. })) = &event {
                                     if let Some(ref client) = client_tx {
                                         let _ = client.send(event.clone()).await;
                                     }
@@ -764,7 +762,7 @@ impl Reactor {
 
                                 // Dispatch by type.
                                 match event {
-                                    PipelineEvent::Generated(ref gen_ev) => {
+                                    PipelineEvent::Generation(GenerationEvent::Chunk(ref gen_ev)) => {
                                         match gen_ev {
                                             GeneratedEvent::Content { part } => {
                                                 if let weft_core::ContentPart::Text(t) = part {
@@ -785,15 +783,15 @@ impl Reactor {
                                             }
                                         }
                                     }
-                                    PipelineEvent::Signal(ref signal) => {
+                                    PipelineEvent::Signal(SignalEvent::Received(ref signal)) => {
                                         let signal_type = signal.signal_type().to_string();
                                         let payload = serde_json::to_value(signal).unwrap_or_default();
                                         self.record_event(
                                             &execution_id,
-                                            &PipelineEvent::SignalReceived {
+                                            &PipelineEvent::Signal(SignalEvent::Logged {
                                                 signal_type,
                                                 payload,
-                                            },
+                                            }),
                                         ).await?;
                                         match signal.clone() {
                                             Signal::Cancel { reason } => {
@@ -802,10 +800,10 @@ impl Reactor {
                                                 let _ = gen_handle.await;
                                                 self.record_event(
                                                     &execution_id,
-                                                    &PipelineEvent::ExecutionCancelled {
+                                                    &PipelineEvent::Execution(ExecutionEvent::Cancelled {
                                                         reason: reason.clone(),
                                                         partial_text: Some(state.accumulated_text.clone()),
-                                                    },
+                                                    }),
                                                 ).await?;
                                                 self.event_log
                                                     .update_execution_status(&execution_id, ExecutionStatus::Cancelled)
@@ -833,10 +831,10 @@ impl Reactor {
                                                 for msg in &messages {
                                                     self.record_event(
                                                         &execution_id,
-                                                        &PipelineEvent::MessageInjected {
+                                                        &PipelineEvent::Context(ContextEvent::MessageInjected {
                                                             message: msg.clone(),
                                                             source: MessageInjectionSource::SignalInjection,
-                                                        },
+                                                        }),
                                                     ).await?;
                                                 }
                                                 state.messages.extend(messages);
@@ -852,15 +850,15 @@ impl Reactor {
                                                 loop {
                                                     match event_rx.recv().await {
                                                         None => return Err(ReactorError::ChannelClosed),
-                                                        Some(PipelineEvent::Signal(Signal::Resume)) => break,
-                                                        Some(PipelineEvent::Signal(Signal::Cancel { reason })) => {
+                                                        Some(PipelineEvent::Signal(SignalEvent::Received(Signal::Resume))) => break,
+                                                        Some(PipelineEvent::Signal(SignalEvent::Received(Signal::Cancel { reason }))) => {
                                                             cancel.cancel();
                                                             self.record_event(
                                                                 &execution_id,
-                                                                &PipelineEvent::ExecutionCancelled {
+                                                                &PipelineEvent::Execution(ExecutionEvent::Cancelled {
                                                                     reason: reason.clone(),
                                                                     partial_text: Some(state.accumulated_text.clone()),
-                                                                },
+                                                                }),
                                                             ).await?;
                                                             self.event_log
                                                                 .update_execution_status(&execution_id, ExecutionStatus::Cancelled)
@@ -891,20 +889,20 @@ impl Reactor {
                                             }
                                         }
                                     }
-                                    PipelineEvent::BudgetExhausted { resource } => {
+                                    PipelineEvent::Budget(BudgetEvent::Exhausted { resource }) => {
                                         debug!(resource = %resource, "budget exhausted event");
                                         cancel.cancel();
                                         gen_handle.abort();
                                         let _ = gen_handle.await;
                                         break 'dispatch;
                                     }
-                                    PipelineEvent::ActivityCompleted { ref name, .. }
+                                    PipelineEvent::Activity(ActivityEvent::Completed { ref name, .. })
                                         if name == pipeline.generate.activity.name() =>
                                     {
                                         // Generate activity finished — exit inner loop.
                                         break 'generate;
                                     }
-                                    PipelineEvent::ActivityFailed { ref name, ref error, retryable }
+                                    PipelineEvent::Activity(ActivityEvent::Failed { ref name, ref error, retryable })
                                         if name == pipeline.generate.activity.name() =>
                                     {
                                         activity_failed = true;
@@ -912,11 +910,11 @@ impl Reactor {
                                         failed_error = error.clone();
                                         break 'generate;
                                     }
-                                    PipelineEvent::GenerationCompleted {
+                                    PipelineEvent::Generation(GenerationEvent::Completed {
                                         input_tokens,
                                         output_tokens,
                                         ..
-                                    } => {
+                                    }) => {
                                         // Accumulate token usage from each generation call.
                                         if let Some(n) = input_tokens {
                                             state.accumulated_usage.prompt_tokens += n;
@@ -950,11 +948,11 @@ impl Reactor {
                         let _ = gen_handle.await;
 
                         // Push GenerationTimedOut event.
-                        let timed_out_event = PipelineEvent::GenerationTimedOut {
+                        let timed_out_event = PipelineEvent::Generation(GenerationEvent::TimedOut {
                             model: current_model.clone(),
                             timeout_secs: chunk_timeout.as_secs(),
                             chunks_received: chunks_this_generation,
-                        };
+                        });
                         self.record_event(&execution_id, &timed_out_event).await?;
 
                         // Treat timeout as a retryable failure.
@@ -981,12 +979,12 @@ impl Reactor {
                     let policy = pipeline.generate.retry_policy.as_ref();
                     if should_retry(policy, state.generate_retry_attempt, &state.budget, &cancel) {
                         let backoff = backoff_ms(policy.unwrap(), state.generate_retry_attempt);
-                        let retry_event = PipelineEvent::ActivityRetried {
+                        let retry_event = PipelineEvent::Activity(ActivityEvent::Retried {
                             name: pipeline.generate.activity.name().to_string(),
                             attempt: state.generate_retry_attempt + 1,
                             backoff_ms: backoff,
                             error: failed_error.clone(),
-                        };
+                        });
                         self.record_event(&execution_id, &retry_event).await?;
                         state.generate_retry_attempt += 1;
 
@@ -997,10 +995,10 @@ impl Reactor {
                             _ = cancel.cancelled() => {
                                 self.record_event(
                                     &execution_id,
-                                    &PipelineEvent::ExecutionCancelled {
+                                    &PipelineEvent::Execution(ExecutionEvent::Cancelled {
                                         reason: "cancelled during retry backoff".to_string(),
                                         partial_text: Some(state.accumulated_text.clone()),
-                                    },
+                                    }),
                                 ).await?;
                                 self.event_log
                                     .update_execution_status(&execution_id, ExecutionStatus::Cancelled)
@@ -1028,10 +1026,10 @@ impl Reactor {
                 }
 
                 // Not retryable or exhausted retries.
-                let err_event = PipelineEvent::ExecutionFailed {
+                let err_event = PipelineEvent::Execution(ExecutionEvent::Failed {
                     error: failed_error.clone(),
                     partial_text: Some(state.accumulated_text.clone()),
-                };
+                });
                 self.record_event(&execution_id, &err_event).await?;
                 self.event_log
                     .update_execution_status(&execution_id, ExecutionStatus::Failed)
@@ -1056,7 +1054,7 @@ impl Reactor {
                         .execute(
                             &execution_id,
                             input,
-                            &self.services,
+                            self.services.as_ref(),
                             self.event_log.as_ref(),
                             event_tx.clone(),
                             cancel.clone(),
@@ -1081,12 +1079,12 @@ impl Reactor {
                             state.messages.push(feedback_msg.clone());
                             self.record_event(
                                 &execution_id,
-                                &PipelineEvent::MessageInjected {
+                                &PipelineEvent::Context(ContextEvent::MessageInjected {
                                     message: feedback_msg,
                                     source: MessageInjectionSource::HookFeedback {
                                         hook_name: hook_name.clone(),
                                     },
-                                },
+                                }),
                             )
                             .await?;
                             state.generate_retry_attempt = 0;
@@ -1137,19 +1135,19 @@ impl Reactor {
             if let Err(reason) = state.budget.record_iteration() {
                 self.record_event(
                     &execution_id,
-                    &PipelineEvent::BudgetExhausted {
+                    &PipelineEvent::Budget(BudgetEvent::Exhausted {
                         resource: reason.to_string(),
-                    },
+                    }),
                 )
                 .await?;
                 break 'dispatch;
             }
             self.record_event(
                 &execution_id,
-                &PipelineEvent::IterationCompleted {
+                &PipelineEvent::Execution(ExecutionEvent::IterationCompleted {
                     iteration: state.iteration,
                     commands_executed_this_iteration: cmds_this_iter,
-                },
+                }),
             )
             .await?;
             state.iteration += 1;
@@ -1167,7 +1165,7 @@ impl Reactor {
                 .execute(
                     &execution_id,
                     input,
-                    &self.services,
+                    self.services.as_ref(),
                     self.event_log.as_ref(),
                     event_tx.clone(),
                     cancel.clone(),
@@ -1190,12 +1188,12 @@ impl Reactor {
 
         self.record_event(
             &execution_id,
-            &PipelineEvent::ExecutionCompleted {
+            &PipelineEvent::Execution(ExecutionEvent::Completed {
                 generation_calls: generation_calls_used,
                 commands_executed: state.commands_executed,
                 iterations: state.iteration,
                 duration_ms,
-            },
+            }),
         )
         .await?;
         self.event_log
@@ -1274,6 +1272,17 @@ impl Reactor {
         // (e.g., execute_commands) override the metadata field after calling build_input.
         let metadata = serde_json::Value::Null;
 
+        // Build a ChildSpawner if the reactor handle is available (it's set after
+        // construction). Activities that spawn child executions (e.g., GenerateActivity)
+        // use this instead of accessing Services directly.
+        let child_spawner: Option<Arc<dyn crate::activity::ChildSpawner>> =
+            self.services.reactor_handle.get().map(|handle| {
+                let spawner: Arc<dyn crate::activity::ChildSpawner> = Arc::new(
+                    crate::services::ReactorChildSpawner::new(Arc::clone(handle)),
+                );
+                spawner
+            });
+
         ActivityInput {
             messages: state.messages.clone(),
             request: request.clone(),
@@ -1285,6 +1294,7 @@ impl Reactor {
             available_commands: state.available_commands.clone(),
             idempotency_key,
             accumulated_usage: state.accumulated_usage.clone(),
+            child_spawner,
         }
     }
 
@@ -1304,7 +1314,7 @@ impl Reactor {
                 Ok(event) => {
                     self.record_event(execution_id, &event).await?;
                     match &event {
-                        PipelineEvent::ActivityFailed { name, error, .. } => {
+                        PipelineEvent::Activity(ActivityEvent::Failed { name, error, .. }) => {
                             return Ok(Some(ReactorError::ActivityFailed(
                                 crate::activity::ActivityError::Failed {
                                     name: name.clone(),
@@ -1312,30 +1322,28 @@ impl Reactor {
                                 },
                             )));
                         }
-                        PipelineEvent::HookBlocked {
-                            hook_name, reason, ..
-                        } => {
+                        PipelineEvent::Hook(crate::event::HookOutcome::Blocked {
+                            hook_name,
+                            reason,
+                            ..
+                        }) => {
                             return Ok(Some(ReactorError::HookBlocked {
                                 hook_name: hook_name.clone(),
                                 reason: reason.clone(),
                             }));
                         }
-                        PipelineEvent::RouteCompleted { routing, .. } => {
-                            state.routing = Some(RoutingSnapshot {
-                                model_routing: routing.clone(),
-                                tool_necessity: None,
-                                tool_necessity_score: None,
-                            });
+                        PipelineEvent::Execution(ExecutionEvent::ValidationPassed) => {
+                            // Commands are now communicated via Command(Available) events.
                         }
-                        PipelineEvent::ValidationPassed => {
-                            // Commands are now communicated via CommandsAvailable events.
-                        }
-                        PipelineEvent::CommandsAvailable { commands } => {
+                        PipelineEvent::Command(CommandEvent::Available { commands }) => {
                             // Populate available_commands from the validate activity's event.
                             // This makes available_commands reconstructable from the event log.
                             state.available_commands = commands.clone();
                         }
-                        PipelineEvent::MessageInjected { message, source } => {
+                        PipelineEvent::Context(ContextEvent::MessageInjected {
+                            message,
+                            source,
+                        }) => {
                             // Dispatch on source to determine insertion position.
                             // SystemPromptAssembly: insert/replace at messages[0] so the
                             //   provider sees the gateway-assembled prompt as the canonical
@@ -1371,19 +1379,21 @@ impl Reactor {
                                 }
                             }
                         }
-                        PipelineEvent::ResponseAssembled { response } => {
+                        PipelineEvent::Context(ContextEvent::ResponseAssembled { response }) => {
                             state.response = Some(response.clone());
                         }
-                        PipelineEvent::Signal(Signal::Cancel { reason }) => {
+                        PipelineEvent::Signal(SignalEvent::Received(Signal::Cancel { reason })) => {
                             cancel.cancel();
                             return Ok(Some(ReactorError::Cancelled {
                                 reason: reason.clone(),
                             }));
                         }
                         // ── New pre-loop activity events (Phase 1+) ──────────────
-                        PipelineEvent::ModelSelected {
-                            model_name, score, ..
-                        } => {
+                        PipelineEvent::Selection(SelectionEvent::ModelSelected {
+                            model_name,
+                            score,
+                            ..
+                        }) => {
                             state.selected_model = Some(model_name.clone());
                             // Maintain backward compat: populate routing snapshot so
                             // GenerateActivity continues to receive routing_result unchanged.
@@ -1397,33 +1407,38 @@ impl Reactor {
                                 tool_necessity_score: None,
                             });
                         }
-                        PipelineEvent::CommandsSelected { selected, .. } => {
+                        PipelineEvent::Selection(SelectionEvent::CommandsSelected {
+                            selected,
+                            ..
+                        }) => {
                             state.selected_commands = selected.clone();
                         }
-                        PipelineEvent::ProviderResolved {
+                        PipelineEvent::Selection(SelectionEvent::ProviderResolved {
                             model_id,
                             provider_name,
                             capabilities,
                             max_tokens,
                             ..
-                        } => {
+                        }) => {
                             state.selected_model_id = Some(model_id.clone());
                             state.selected_provider = Some(provider_name.clone());
                             state.model_capabilities = capabilities.clone();
                             state.model_max_tokens = Some(*max_tokens);
                         }
-                        PipelineEvent::SystemPromptAssembled { .. } => {
+                        PipelineEvent::Context(ContextEvent::SystemPromptAssembled { .. }) => {
                             // System prompt insertion is handled by the MessageInjected arm
                             // when source == SystemPromptAssembly. Nothing to do here.
                         }
-                        PipelineEvent::CommandsFormatted { format, .. } => {
+                        PipelineEvent::Context(ContextEvent::CommandsFormatted {
+                            format, ..
+                        }) => {
                             state.command_format = Some(format.clone());
                         }
-                        PipelineEvent::SamplingUpdated {
+                        PipelineEvent::Context(ContextEvent::SamplingUpdated {
                             max_tokens,
                             temperature,
                             top_p,
-                        } => {
+                        }) => {
                             state.sampling_max_tokens = Some(*max_tokens);
                             state.sampling_temperature = *temperature;
                             state.sampling_top_p = *top_p;
@@ -1488,7 +1503,7 @@ impl Reactor {
                     .execute(
                         execution_id,
                         input,
-                        &self.services,
+                        self.services.as_ref(),
                         self.event_log.as_ref(),
                         event_tx.clone(),
                         cancel.clone(),
@@ -1536,7 +1551,7 @@ impl Reactor {
                     .execute(
                         &cmd_exec_id,
                         cmd_input,
-                        &cmd_services,
+                        cmd_services.as_ref(),
                         cmd_event_log.as_ref(),
                         cmd_event_tx,
                         cmd_cancel,
@@ -1565,7 +1580,7 @@ impl Reactor {
                             Some(event) => {
                                 self.record_event(execution_id, &event).await?;
                                 match &event {
-                                    PipelineEvent::CommandCompleted { name, result } if name == &cmd_name => {
+                                    PipelineEvent::Command(CommandEvent::Completed { name, result }) if name == &cmd_name => {
                                         // Inject command result into messages and record the injection
                                         // as a MessageInjected event so the message list is fully
                                         // reconstructable from the event log.
@@ -1580,17 +1595,17 @@ impl Reactor {
                                         state.messages.push(result_msg.clone());
                                         self.record_event(
                                             execution_id,
-                                            &PipelineEvent::MessageInjected {
+                                            &PipelineEvent::Context(ContextEvent::MessageInjected {
                                                 message: result_msg,
                                                 source: MessageInjectionSource::CommandResult {
                                                     command_name: name.clone(),
                                                 },
-                                            },
+                                            }),
                                         ).await?;
                                         state.commands_executed += 1;
                                         cmd_completed = true;
                                     }
-                                    PipelineEvent::CommandFailed { name, error } if name == &cmd_name => {
+                                    PipelineEvent::Command(CommandEvent::Failed { name, error }) if name == &cmd_name => {
                                         // Inject error into messages and record the injection
                                         // as a MessageInjected event so the message list is fully
                                         // reconstructable from the event log.
@@ -1605,22 +1620,22 @@ impl Reactor {
                                         state.messages.push(err_msg.clone());
                                         self.record_event(
                                             execution_id,
-                                            &PipelineEvent::MessageInjected {
+                                            &PipelineEvent::Context(ContextEvent::MessageInjected {
                                                 message: err_msg,
                                                 source: MessageInjectionSource::CommandError {
                                                     command_name: name.clone(),
                                                 },
-                                            },
+                                            }),
                                         ).await?;
                                         state.commands_executed += 1;
                                         cmd_completed = true;
                                     }
-                                    PipelineEvent::ActivityFailed { name, error, retryable } if name == pipeline.execute_command.activity.name() => {
+                                    PipelineEvent::Activity(ActivityEvent::Failed { name, error, retryable }) if name == pipeline.execute_command.activity.name() => {
                                         cmd_failed = true;
                                         cmd_failed_error = error.clone();
                                         cmd_failed_retryable = *retryable;
                                     }
-                                    PipelineEvent::ActivityCompleted { name, .. } if name == pipeline.execute_command.activity.name() => {
+                                    PipelineEvent::Activity(ActivityEvent::Completed { name, .. }) if name == pipeline.execute_command.activity.name() => {
                                         cmd_completed = true;
                                     }
                                     _ => {}
@@ -1674,7 +1689,7 @@ impl Reactor {
                     .execute(
                         execution_id,
                         input,
-                        &self.services,
+                        self.services.as_ref(),
                         self.event_log.as_ref(),
                         event_tx.clone(),
                         cancel.clone(),
@@ -1703,7 +1718,7 @@ impl Reactor {
         generation_done: &mut bool,
         generation_refused: &mut bool,
     ) -> Result<(), ReactorError> {
-        if let PipelineEvent::Generated(gen_ev) = event {
+        if let PipelineEvent::Generation(GenerationEvent::Chunk(gen_ev)) = event {
             if let GeneratedEvent::Content { .. } = gen_ev
                 && let Some(client) = client_tx
             {
@@ -1743,10 +1758,10 @@ impl Reactor {
         let event_type = event.event_type_string();
         let payload = serde_json::to_value(event)?;
         let idempotency_key = match event {
-            PipelineEvent::ActivityCompleted {
+            PipelineEvent::Activity(ActivityEvent::Completed {
                 idempotency_key: Some(key),
                 ..
-            } => Some(key.as_str()),
+            }) => Some(key.as_str()),
             _ => None,
         };
         let seq = self
@@ -1833,10 +1848,10 @@ impl Reactor {
     ) -> Result<(), ReactorError> {
         self.record_event(
             execution_id,
-            &PipelineEvent::ExecutionFailed {
+            &PipelineEvent::Execution(ExecutionEvent::Failed {
                 error: err.to_string(),
                 partial_text: Some(state.accumulated_text.clone()),
-            },
+            }),
         )
         .await?;
         self.event_log

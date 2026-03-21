@@ -8,6 +8,10 @@
 //! activity invocations. The `reactor_handle` field is populated after
 //! Reactor construction to break the circular dependency.
 //!
+//! Also defines `ReactorChildSpawner`, which implements `ChildSpawner` by
+//! delegating to `ReactorHandle::spawn_child`. This is what gets stored in
+//! `ActivityInput::child_spawner` for GenerateActivity.
+//!
 //! # Two-phase construction (OnceLock pattern)
 //!
 //! `Services` and `Reactor` have a circular dependency: Reactor needs
@@ -28,12 +32,15 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use weft_reactor_trait::{
+    Budget, ChildSpawner, ExecutionId, PipelineEvent, RequestId, ServiceLocator, TenantId,
+};
 
 /// Shared infrastructure for pipeline activities.
 ///
-/// Activities receive a `&Services` reference and use it to access
-/// providers, routing, commands, memory, and hooks. They do not own
-/// these resources directly.
+/// Activities receive a `&dyn ServiceLocator` reference (via the `ServiceLocator`
+/// impl below) and use it to access providers, routing, commands, memory, and hooks.
+/// They do not own these resources directly.
 ///
 /// All fields are Arc-wrapped trait objects. The Services struct itself
 /// is shared via `Arc<Services>`.
@@ -42,19 +49,19 @@ pub struct Services {
     pub config: Arc<weft_core::WeftConfig>,
 
     /// LLM provider service: routes model names to provider implementations.
-    pub providers: Arc<dyn weft_llm::ProviderService + Send + Sync>,
+    pub providers: Arc<dyn weft_llm_trait::ProviderService + Send + Sync>,
 
     /// Semantic router: makes all routing decisions for a request.
-    pub router: Arc<dyn weft_router::SemanticRouter + Send + Sync>,
+    pub router: Arc<dyn weft_router_trait::SemanticRouter + Send + Sync>,
 
     /// Command registry: lists, describes, and executes commands.
-    pub commands: Arc<dyn weft_commands::CommandRegistry + Send + Sync>,
+    pub commands: Arc<dyn weft_commands_trait::CommandRegistry + Send + Sync>,
 
     /// Optional memory service. None when memory is disabled in config.
-    pub memory: Option<Arc<dyn weft_memory::MemoryService + Send + Sync>>,
+    pub memory: Option<Arc<dyn weft_memory_trait::MemoryService + Send + Sync>>,
 
     /// Hook runner: executes hook chains at lifecycle points.
-    pub hooks: Arc<dyn weft_hooks::HookRunner + Send + Sync>,
+    pub hooks: Arc<dyn weft_hooks_trait::HookRunner + Send + Sync>,
 
     /// Handle for spawning child executions.
     ///
@@ -74,6 +81,79 @@ pub struct Services {
     /// spawns hook execution on a separate tokio task gated by this
     /// semaphore, then immediately pushes ActivityCompleted without waiting.
     pub request_end_semaphore: Arc<tokio::sync::Semaphore>,
+}
+
+impl ServiceLocator for Services {
+    fn providers(&self) -> &dyn weft_llm_trait::ProviderService {
+        self.providers.as_ref()
+    }
+
+    fn router(&self) -> &dyn weft_router_trait::SemanticRouter {
+        self.router.as_ref()
+    }
+
+    fn commands(&self) -> &dyn weft_commands_trait::CommandRegistry {
+        self.commands.as_ref()
+    }
+
+    fn hooks(&self) -> &dyn weft_hooks_trait::HookRunner {
+        self.hooks.as_ref()
+    }
+
+    fn config(&self) -> &Arc<weft_core::WeftConfig> {
+        &self.config
+    }
+
+    fn memory(&self) -> Option<&dyn weft_memory_trait::MemoryService> {
+        self.memory
+            .as_ref()
+            .map(|m| m.as_ref() as &dyn weft_memory_trait::MemoryService)
+    }
+}
+
+/// `ChildSpawner` implementation backed by `ReactorHandle`.
+///
+/// Created in `Reactor::build_input` and stored in `ActivityInput::child_spawner`.
+/// `GenerateActivity` uses this instead of accessing `Services::reactor_handle` directly,
+/// which eliminates the need for activities to know about the `Services` struct at all.
+pub struct ReactorChildSpawner {
+    handle: Arc<ReactorHandle>,
+}
+
+impl ReactorChildSpawner {
+    /// Create a new spawner wrapping the given handle.
+    pub fn new(handle: Arc<ReactorHandle>) -> Self {
+        Self { handle }
+    }
+}
+
+#[async_trait::async_trait]
+impl ChildSpawner for ReactorChildSpawner {
+    async fn spawn_child(
+        &self,
+        request: weft_core::WeftRequest,
+        tenant_id: TenantId,
+        request_id: RequestId,
+        parent_id: ExecutionId,
+        parent_budget: Budget,
+        parent_event_tx: mpsc::Sender<PipelineEvent>,
+        parent_cancel: Option<&CancellationToken>,
+        pipeline_name: &str,
+    ) -> Result<Budget, String> {
+        self.handle
+            .spawn_child(
+                request,
+                tenant_id,
+                request_id,
+                parent_id,
+                parent_budget,
+                parent_event_tx,
+                parent_cancel,
+                pipeline_name,
+            )
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// Handle for spawning child executions.
@@ -154,15 +234,17 @@ impl ReactorHandle {
             .child_budget()
             .map_err(|r| crate::error::ReactorError::BudgetExhausted(r.to_string()))?;
 
-        // Record child spawn event on the parent's channel.
+        // Record child spawn event on the parent's channel using new grouped format.
         // This is fire-and-forget: if the parent channel is full, we lose the log event
         // but still proceed with the child execution.
         let _ = parent_event_tx
-            .send(crate::event::PipelineEvent::ChildSpawned {
-                child_id: "pending".to_string(),
-                pipeline_name: pipeline_name.to_string(),
-                reason: "spawn_child".to_string(),
-            })
+            .send(crate::event::PipelineEvent::Child(
+                weft_reactor_trait::ChildEvent::Spawned {
+                    child_id: "pending".to_string(),
+                    pipeline_name: pipeline_name.to_string(),
+                    reason: "spawn_child".to_string(),
+                },
+            ))
             .await;
 
         // Pass the parent's budget directly. reactor.execute() calls child_budget()
@@ -180,15 +262,17 @@ impl ReactorHandle {
             )
             .await?;
 
-        // Push ChildCompleted onto parent's channel.
+        // Push ChildCompleted onto parent's channel using new grouped format.
         // Ignore send errors: if the parent channel is closed, we've already
         // completed the child and can't do anything about the notification.
         let _ = parent_event_tx
-            .send(crate::event::PipelineEvent::ChildCompleted {
-                child_id: result.execution_id.clone(),
-                status: "completed".to_string(),
-                result_summary: serde_json::to_value(&result.budget_used).unwrap_or_default(),
-            })
+            .send(crate::event::PipelineEvent::Child(
+                weft_reactor_trait::ChildEvent::Completed {
+                    child_id: result.execution_id.clone(),
+                    status: "completed".to_string(),
+                    result_summary: serde_json::to_value(&result.budget_used).unwrap_or_default(),
+                },
+            ))
             .await;
 
         // Return child's final budget so caller can deduct from parent.
@@ -216,9 +300,142 @@ mod tests {
 
     #[test]
     fn reactor_handle_debug_impl_exists() {
-        // The Debug impl is derived on ReactorHandle (via the Debug impl on Reactor).
-        // We verify the struct name appears in the output.
+        // Verify the struct name appears in the type name.
         let s = format!("{:?}", std::any::type_name::<ReactorHandle>());
         assert!(s.contains("ReactorHandle"));
+    }
+
+    #[test]
+    fn services_implements_service_locator() {
+        // Verify Services can be used as &dyn ServiceLocator.
+        // This is a compile-time check — if this test builds, the impl is correct.
+        use std::collections::{HashMap, HashSet};
+
+        struct PanicProvider;
+        #[async_trait::async_trait]
+        impl weft_llm_trait::Provider for PanicProvider {
+            async fn execute(
+                &self,
+                _request: weft_llm_trait::ProviderRequest,
+            ) -> Result<weft_llm_trait::ProviderResponse, weft_llm_trait::ProviderError>
+            {
+                panic!("not called in test")
+            }
+            fn name(&self) -> &str {
+                "panic-provider"
+            }
+        }
+
+        struct PanicRouter;
+        #[async_trait::async_trait]
+        impl weft_router_trait::SemanticRouter for PanicRouter {
+            async fn route(
+                &self,
+                _: &str,
+                _: &[(
+                    weft_router_trait::RoutingDomainKind,
+                    Vec<weft_router_trait::RoutingCandidate>,
+                )],
+            ) -> Result<weft_router_trait::RoutingDecision, weft_router_trait::RouterError>
+            {
+                panic!("not called in test")
+            }
+            async fn score_memory_candidates(
+                &self,
+                _: &str,
+                _: &[weft_router_trait::RoutingCandidate],
+            ) -> Result<Vec<weft_router_trait::ScoredCandidate>, weft_router_trait::RouterError>
+            {
+                panic!("not called in test")
+            }
+        }
+
+        struct PanicCommands;
+        #[async_trait::async_trait]
+        impl weft_commands_trait::CommandRegistry for PanicCommands {
+            async fn list_commands(
+                &self,
+            ) -> Result<Vec<weft_core::CommandStub>, weft_commands_trait::CommandError>
+            {
+                panic!("not called in test")
+            }
+            async fn describe_command(
+                &self,
+                _: &str,
+            ) -> Result<weft_core::CommandDescription, weft_commands_trait::CommandError>
+            {
+                panic!("not called in test")
+            }
+            async fn execute_command(
+                &self,
+                _: &weft_core::CommandInvocation,
+            ) -> Result<weft_core::CommandResult, weft_commands_trait::CommandError> {
+                panic!("not called in test")
+            }
+        }
+
+        let config: weft_core::WeftConfig = toml::from_str(
+            r#"
+[server]
+bind_address = "0.0.0.0:8080"
+
+[gateway]
+system_prompt = "test"
+max_command_iterations = 10
+request_timeout_secs = 300
+
+[router]
+default_model = "stub"
+
+[router.classifier]
+model_path = "models/stub.onnx"
+tokenizer_path = "models/tokenizer.json"
+threshold = 0.3
+max_commands = 20
+
+[[router.providers]]
+name = "stub"
+wire_format = "anthropic"
+api_key = "sk-test"
+
+  [[router.providers.models]]
+  name = "stub"
+  model = "stub-model"
+  max_tokens = 4096
+  examples = ["test"]
+"#,
+        )
+        .expect("minimal test TOML must parse");
+
+        let mut providers: HashMap<String, Arc<dyn weft_llm_trait::Provider>> = HashMap::new();
+        providers.insert("stub".to_string(), Arc::new(PanicProvider));
+        let mut model_ids = HashMap::new();
+        model_ids.insert("stub".to_string(), "stub-model".to_string());
+        let mut max_tokens = HashMap::new();
+        max_tokens.insert("stub".to_string(), 4096u32);
+        let capabilities: HashMap<String, HashSet<weft_llm_trait::Capability>> = HashMap::new();
+        let registry = weft_llm::ProviderRegistry::new(
+            providers,
+            model_ids,
+            max_tokens,
+            capabilities,
+            "stub".to_string(),
+        );
+
+        let services = Services {
+            config: Arc::new(config),
+            providers: Arc::new(registry),
+            router: Arc::new(PanicRouter),
+            commands: Arc::new(PanicCommands),
+            memory: None,
+            hooks: Arc::new(weft_hooks::NullHookRunner),
+            reactor_handle: std::sync::OnceLock::new(),
+            request_end_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+
+        // Compile-time check: Services implements ServiceLocator
+        let _loc: &dyn ServiceLocator = &services;
+        // Verify memory() returns None when not configured.
+        assert!(services.memory().is_none());
     }
 }

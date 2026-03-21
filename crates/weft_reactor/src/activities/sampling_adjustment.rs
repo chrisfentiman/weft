@@ -19,10 +19,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::activity::{Activity, ActivityInput};
-use crate::event::PipelineEvent;
+use crate::event::{ActivityEvent, ContextEvent, PipelineEvent};
 use crate::event_log::EventLog;
 use crate::execution::ExecutionId;
-use crate::services::Services;
+use weft_reactor_trait::ServiceLocator;
 
 /// The default model max_tokens when the metadata value is missing.
 const DEFAULT_MODEL_MAX_TOKENS: u32 = 4096;
@@ -32,9 +32,9 @@ const DEFAULT_MODEL_MAX_TOKENS: u32 = 4096;
 /// **Name:** `"sampling_adjustment"`
 ///
 /// **Events pushed:**
-/// - `ActivityStarted { name: "sampling_adjustment" }`
-/// - `SamplingUpdated { max_tokens, temperature, top_p }`
-/// - `ActivityCompleted { name: "sampling_adjustment", duration_ms, idempotency_key: None }`
+/// - `Activity(ActivityEvent::Started { name: "sampling_adjustment" })`
+/// - `Context(ContextEvent::SamplingUpdated { max_tokens, temperature, top_p })`
+/// - `Activity(ActivityEvent::Completed { name: "sampling_adjustment", duration_ms, idempotency_key: None })`
 pub struct SamplingAdjustmentActivity;
 
 impl SamplingAdjustmentActivity {
@@ -60,7 +60,7 @@ impl Activity for SamplingAdjustmentActivity {
         &self,
         _execution_id: &ExecutionId,
         input: ActivityInput,
-        _services: &Services,
+        _services: &dyn ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         _cancel: CancellationToken,
@@ -68,9 +68,9 @@ impl Activity for SamplingAdjustmentActivity {
         let start = Instant::now();
 
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name().to_string(),
-            })
+            }))
             .await;
 
         // Read model max_tokens from metadata. Default to 4096 when absent.
@@ -94,20 +94,20 @@ impl Activity for SamplingAdjustmentActivity {
         };
 
         let _ = event_tx
-            .send(PipelineEvent::SamplingUpdated {
+            .send(PipelineEvent::Context(ContextEvent::SamplingUpdated {
                 max_tokens: final_max_tokens,
                 temperature,
                 top_p,
-            })
+            }))
             .await;
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
-            .send(PipelineEvent::ActivityCompleted {
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
                 duration_ms,
                 idempotency_key: None,
-            })
+            }))
             .await;
     }
 }
@@ -178,7 +178,7 @@ mod tests {
         let events = run_sampling(input).await;
 
         let updated = events.iter().find_map(|e| {
-            if let PipelineEvent::SamplingUpdated { max_tokens, .. } = e {
+            if let PipelineEvent::Context(ContextEvent::SamplingUpdated { max_tokens, .. }) = e {
                 Some(*max_tokens)
             } else {
                 None
@@ -199,7 +199,7 @@ mod tests {
         let events = run_sampling(input).await;
 
         let updated = events.iter().find_map(|e| {
-            if let PipelineEvent::SamplingUpdated { max_tokens, .. } = e {
+            if let PipelineEvent::Context(ContextEvent::SamplingUpdated { max_tokens, .. }) = e {
                 Some(*max_tokens)
             } else {
                 None
@@ -221,7 +221,7 @@ mod tests {
         let events = run_sampling(input).await;
 
         let updated = events.iter().find_map(|e| {
-            if let PipelineEvent::SamplingUpdated { max_tokens, .. } = e {
+            if let PipelineEvent::Context(ContextEvent::SamplingUpdated { max_tokens, .. }) = e {
                 Some(*max_tokens)
             } else {
                 None
@@ -243,7 +243,7 @@ mod tests {
         let events = run_sampling(input).await;
 
         let updated = events.iter().find_map(|e| {
-            if let PipelineEvent::SamplingUpdated { max_tokens, .. } = e {
+            if let PipelineEvent::Context(ContextEvent::SamplingUpdated { max_tokens, .. }) = e {
                 Some(*max_tokens)
             } else {
                 None
@@ -264,7 +264,7 @@ mod tests {
         let events = run_sampling(input).await;
 
         let updated = events.iter().find_map(|e| {
-            if let PipelineEvent::SamplingUpdated { max_tokens, .. } = e {
+            if let PipelineEvent::Context(ContextEvent::SamplingUpdated { max_tokens, .. }) = e {
                 Some(*max_tokens)
             } else {
                 None
@@ -285,7 +285,7 @@ mod tests {
         let events = run_sampling(input).await;
 
         let updated = events.iter().find_map(|e| {
-            if let PipelineEvent::SamplingUpdated { max_tokens, .. } = e {
+            if let PipelineEvent::Context(ContextEvent::SamplingUpdated { max_tokens, .. }) = e {
                 Some(*max_tokens)
             } else {
                 None
@@ -307,7 +307,7 @@ mod tests {
         let events = run_sampling(input).await;
 
         let temp = events.iter().find_map(|e| {
-            if let PipelineEvent::SamplingUpdated { temperature, .. } = e {
+            if let PipelineEvent::Context(ContextEvent::SamplingUpdated { temperature, .. }) = e {
                 Some(*temperature)
             } else {
                 None
@@ -328,7 +328,7 @@ mod tests {
         let events = run_sampling(input).await;
 
         let temp = events.iter().find_map(|e| {
-            if let PipelineEvent::SamplingUpdated { temperature, .. } = e {
+            if let PipelineEvent::Context(ContextEvent::SamplingUpdated { temperature, .. }) = e {
                 Some(*temperature)
             } else {
                 None
@@ -347,7 +347,7 @@ mod tests {
         let events = run_sampling(input).await;
 
         let tp = events.iter().find_map(|e| {
-            if let PipelineEvent::SamplingUpdated { top_p, .. } = e {
+            if let PipelineEvent::Context(ContextEvent::SamplingUpdated { top_p, .. }) = e {
                 Some(*top_p)
             } else {
                 None
@@ -368,7 +368,7 @@ mod tests {
         let events = run_sampling(input).await;
 
         let tp = events.iter().find_map(|e| {
-            if let PipelineEvent::SamplingUpdated { top_p, .. } = e {
+            if let PipelineEvent::Context(ContextEvent::SamplingUpdated { top_p, .. }) = e {
                 Some(*top_p)
             } else {
                 None
@@ -388,11 +388,11 @@ mod tests {
         let events = run_sampling(input).await;
 
         let updated = events.iter().find_map(|e| {
-            if let PipelineEvent::SamplingUpdated {
+            if let PipelineEvent::Context(ContextEvent::SamplingUpdated {
                 max_tokens,
                 temperature,
                 top_p,
-            } = e
+            }) = e
             {
                 Some((*max_tokens, *temperature, *top_p))
             } else {
@@ -418,20 +418,20 @@ mod tests {
 
         assert!(
             events.iter().any(
-                |e| matches!(e, PipelineEvent::ActivityStarted { name } if name == "sampling_adjustment")
+                |e| matches!(e, PipelineEvent::Activity(ActivityEvent::Started { name }) if name == "sampling_adjustment")
             ),
             "expected ActivityStarted"
         );
         assert!(
             events.iter().any(
-                |e| matches!(e, PipelineEvent::ActivityCompleted { name, .. } if name == "sampling_adjustment")
+                |e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { name, .. }) if name == "sampling_adjustment")
             ),
             "expected ActivityCompleted"
         );
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
             "did not expect ActivityFailed (fail-open)"
         );
     }
@@ -444,7 +444,7 @@ mod tests {
         let events = run_sampling(input).await;
 
         let updated = events.iter().find_map(|e| {
-            if let PipelineEvent::SamplingUpdated { max_tokens, .. } = e {
+            if let PipelineEvent::Context(ContextEvent::SamplingUpdated { max_tokens, .. }) = e {
                 Some(*max_tokens)
             } else {
                 None

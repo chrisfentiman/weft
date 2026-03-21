@@ -18,25 +18,25 @@ use tracing::{debug, warn};
 use weft_core::routing::resolve_filters;
 use weft_core::{HookEvent, ModelInfo, RoutingMode};
 use weft_hooks::HookChainResult;
+use weft_reactor_trait::ServiceLocator;
 use weft_router::{RoutingCandidate, RoutingDomainKind, build_model_candidates};
 
 use super::selection_util::extract_user_message;
 use crate::activity::{Activity, ActivityInput, SemanticSelection};
-use crate::event::PipelineEvent;
+use crate::event::{ActivityEvent, HookOutcome, PipelineEvent, SelectionEvent};
 use crate::event_log::EventLog;
 use crate::execution::ExecutionId;
-use crate::services::Services;
 
 /// Selects the model to use for the current execution via semantic routing.
 ///
 /// **Name:** `"model_selection"`
 ///
 /// **Events pushed:**
-/// - `ActivityStarted { name: "model_selection" }`
-/// - `HookEvaluated` / `HookBlocked` — for PreRoute / PostRoute hooks
-/// - `ModelSelected { model_name, score, all_scores }` — on success
-/// - `ActivityCompleted { name: "model_selection", duration_ms, idempotency_key: None }`
-/// - `ActivityFailed { name: "model_selection", error, retryable: false }` — on failure
+/// - `Activity(ActivityEvent::Started { name: "model_selection" })`
+/// - `Hook(HookOutcome::Evaluated)` / `Hook(HookOutcome::Blocked)` — for PreRoute / PostRoute hooks
+/// - `Selection(SelectionEvent::ModelSelected { model_name, score, all_scores })` — on success
+/// - `Activity(ActivityEvent::Completed { name: "model_selection", duration_ms, idempotency_key: None })`
+/// - `Activity(ActivityEvent::Failed { name: "model_selection", error, retryable: false })` — on failure
 pub struct ModelSelectionActivity;
 
 impl ModelSelectionActivity {
@@ -68,7 +68,7 @@ impl Activity for ModelSelectionActivity {
         &self,
         _execution_id: &ExecutionId,
         input: ActivityInput,
-        services: &Services,
+        services: &dyn ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         cancel: CancellationToken,
@@ -76,18 +76,18 @@ impl Activity for ModelSelectionActivity {
         let start = Instant::now();
 
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name().to_string(),
-            })
+            }))
             .await;
 
         if cancel.is_cancelled() {
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: self.name().to_string(),
                     error: "cancelled before model selection".to_string(),
                     retryable: false,
-                })
+                }))
                 .await;
             return;
         }
@@ -96,13 +96,13 @@ impl Activity for ModelSelectionActivity {
         let user_message = extract_user_message(&input);
 
         // Build all model candidates from config.
-        let all_candidates: Vec<RoutingCandidate> = build_model_candidates(&services.config);
+        let all_candidates: Vec<RoutingCandidate> = build_model_candidates(services.config());
 
         // Resolve the routing instruction to the candidate set.
         let instruction = &input.request.routing;
 
         // Build ModelInfo list from config for filter resolution.
-        let model_infos: Vec<ModelInfo> = build_model_infos(&services.config);
+        let model_infos: Vec<ModelInfo> = build_model_infos(services.config());
 
         // Fire PreRoute hook for "model" domain BEFORE routing (per spec Section 5.1 step 4).
         let pre_payload = serde_json::json!({
@@ -111,7 +111,7 @@ impl Activity for ModelSelectionActivity {
         });
         let hook_start = Instant::now();
         let pre_result = services
-            .hooks
+            .hooks()
             .run_chain(HookEvent::PreRoute, pre_payload, Some("model"))
             .await;
         let hook_duration = hook_start.elapsed().as_millis() as u64;
@@ -119,30 +119,30 @@ impl Activity for ModelSelectionActivity {
         match pre_result {
             HookChainResult::Blocked { reason, hook_name } => {
                 let _ = event_tx
-                    .send(PipelineEvent::HookBlocked {
+                    .send(PipelineEvent::Hook(HookOutcome::Blocked {
                         hook_event: "pre_route".to_string(),
                         hook_name,
                         reason: reason.clone(),
-                    })
+                    }))
                     .await;
                 let _ = event_tx
-                    .send(PipelineEvent::ActivityFailed {
+                    .send(PipelineEvent::Activity(ActivityEvent::Failed {
                         name: self.name().to_string(),
                         error: format!("pre_route hook blocked model selection: {reason}"),
                         retryable: false,
-                    })
+                    }))
                     .await;
                 debug!("model_selection: blocked by pre_route hook");
                 return;
             }
             HookChainResult::Allowed { .. } => {
                 let _ = event_tx
-                    .send(PipelineEvent::HookEvaluated {
+                    .send(PipelineEvent::Hook(HookOutcome::Evaluated {
                         hook_event: "pre_route".to_string(),
                         hook_name: "pre_route".to_string(),
                         decision: "allow".to_string(),
                         duration_ms: hook_duration,
-                    })
+                    }))
                     .await;
             }
         }
@@ -162,11 +162,11 @@ impl Activity for ModelSelectionActivity {
                     // Zero survivors: fail closed.
                     let filter_str = instruction.filters.join("/");
                     let _ = event_tx
-                        .send(PipelineEvent::ActivityFailed {
+                        .send(PipelineEvent::Activity(ActivityEvent::Failed {
                             name: self.name().to_string(),
                             error: format!("no models match routing instruction '{filter_str}'"),
                             retryable: false,
-                        })
+                        }))
                         .await;
                     return;
                 }
@@ -215,7 +215,7 @@ impl Activity for ModelSelectionActivity {
                 if candidates.is_empty() {
                     // No candidates after filtering: fall back to default.
                     warn!("model_selection: no candidates after filter, using default");
-                    let default_name = services.providers.default_name().to_string();
+                    let default_name = services.providers().default_name().to_string();
                     (default_name, 0.0_f32, vec![])
                 } else {
                     match semantic_score(services, user_message, candidates, &event_tx, self.name())
@@ -231,7 +231,7 @@ impl Activity for ModelSelectionActivity {
         // Apply model threshold: if the selected model's score is below the domain threshold,
         // fall back to the default model (per spec Section 5.1 step 7).
         let model_threshold = services
-            .config
+            .config()
             .router
             .domains
             .model
@@ -245,7 +245,7 @@ impl Activity for ModelSelectionActivity {
                     score,
                     threshold, "model_selection: score below threshold, using default model"
                 );
-                (services.providers.default_name().to_string(), 0.0_f32)
+                (services.providers().default_name().to_string(), 0.0_f32)
             } else {
                 (selected_model, score)
             }
@@ -255,11 +255,11 @@ impl Activity for ModelSelectionActivity {
 
         // Push ModelSelected event.
         let _ = event_tx
-            .send(PipelineEvent::ModelSelected {
+            .send(PipelineEvent::Selection(SelectionEvent::ModelSelected {
                 model_name: final_model.clone(),
                 score: final_score,
                 all_scores: all_scores.clone(),
-            })
+            }))
             .await;
 
         debug!(model = %final_model, score = final_score, "model_selection: model selected");
@@ -272,7 +272,7 @@ impl Activity for ModelSelectionActivity {
         });
         let hook_start = Instant::now();
         let post_result = services
-            .hooks
+            .hooks()
             .run_chain(HookEvent::PostRoute, post_payload, Some("model"))
             .await;
         let hook_duration = hook_start.elapsed().as_millis() as u64;
@@ -280,41 +280,41 @@ impl Activity for ModelSelectionActivity {
         match post_result {
             HookChainResult::Blocked { reason, hook_name } => {
                 let _ = event_tx
-                    .send(PipelineEvent::HookBlocked {
+                    .send(PipelineEvent::Hook(HookOutcome::Blocked {
                         hook_event: "post_route".to_string(),
                         hook_name,
                         reason: reason.clone(),
-                    })
+                    }))
                     .await;
                 let _ = event_tx
-                    .send(PipelineEvent::ActivityFailed {
+                    .send(PipelineEvent::Activity(ActivityEvent::Failed {
                         name: self.name().to_string(),
                         error: format!("post_route hook blocked model selection: {reason}"),
                         retryable: false,
-                    })
+                    }))
                     .await;
                 debug!("model_selection: blocked by post_route hook");
                 return;
             }
             HookChainResult::Allowed { .. } => {
                 let _ = event_tx
-                    .send(PipelineEvent::HookEvaluated {
+                    .send(PipelineEvent::Hook(HookOutcome::Evaluated {
                         hook_event: "post_route".to_string(),
                         hook_name: "post_route".to_string(),
                         decision: "allow".to_string(),
                         duration_ms: hook_duration,
-                    })
+                    }))
                     .await;
             }
         }
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
-            .send(PipelineEvent::ActivityCompleted {
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
                 duration_ms,
                 idempotency_key: None,
-            })
+            }))
             .await;
     }
 }
@@ -348,28 +348,28 @@ fn build_model_infos(config: &weft_core::WeftConfig) -> Vec<ModelInfo> {
 /// Note: this helper does NOT fire hooks. Hook firing happens in `execute` around
 /// the call to this helper.
 async fn semantic_score(
-    services: &Services,
+    services: &dyn ServiceLocator,
     user_message: &str,
     candidates: Vec<RoutingCandidate>,
     event_tx: &mpsc::Sender<PipelineEvent>,
     activity_name: &str,
 ) -> Option<(String, f32, Vec<(String, f32)>)> {
     let domains = [(RoutingDomainKind::Model, candidates.clone())];
-    match services.router.route(user_message, &domains).await {
+    match services.router().route(user_message, &domains).await {
         Err(e) => {
             // Router failure: fall back to default with score 0.0.
             warn!(error = %e, "model_selection: router error, falling back to default");
-            let default_name = services.providers.default_name().to_string();
+            let default_name = services.providers().default_name().to_string();
             // Verify default exists in providers; if not, fail closed.
-            if services.providers.model_id(&default_name).is_none() {
+            if services.providers().model_id(&default_name).is_none() {
                 let _ = event_tx
-                    .send(PipelineEvent::ActivityFailed {
+                    .send(PipelineEvent::Activity(ActivityEvent::Failed {
                         name: activity_name.to_string(),
                         error: format!(
                             "router failed and default model '{default_name}' is not registered"
                         ),
                         retryable: false,
-                    })
+                    }))
                     .await;
                 return None;
             }
@@ -384,19 +384,19 @@ async fn semantic_score(
                 .map(|m| m.id.clone())
                 .unwrap_or_else(|| {
                     warn!("model_selection: router returned no model, using default");
-                    services.providers.default_name().to_string()
+                    services.providers().default_name().to_string()
                 });
             let selected_score = model_result.as_ref().map(|m| m.score).unwrap_or(0.0_f32);
 
             // Verify the selected model is in the provider registry.
             // If not, fall back to default with a warning.
             let (final_model, final_score) =
-                if services.providers.model_id(&selected_model).is_none() {
+                if services.providers().model_id(&selected_model).is_none() {
                     warn!(
                         model = %selected_model,
                         "model_selection: router selected unknown model, using default"
                     );
-                    let default_name = services.providers.default_name().to_string();
+                    let default_name = services.providers().default_name().to_string();
                     (default_name, 0.0_f32)
                 } else {
                     (selected_model, selected_score)
@@ -482,31 +482,32 @@ mod tests {
 
         assert!(
             events.iter().any(
-                |e| matches!(e, PipelineEvent::ActivityStarted { name } if name == "model_selection")
+                |e| matches!(e, PipelineEvent::Activity(ActivityEvent::Started { name }) if name == "model_selection")
             ),
-            "expected ActivityStarted"
+            "expected Activity(Started)"
         );
 
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::ModelSelected { .. })),
-            "expected ModelSelected event"
+            events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Selection(SelectionEvent::ModelSelected { .. })
+            )),
+            "expected Selection(ModelSelected) event"
         );
 
         assert!(
             events.iter().any(
-                |e| matches!(e, PipelineEvent::ActivityCompleted { name, .. } if name == "model_selection")
+                |e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { name, .. }) if name == "model_selection")
             ),
-            "expected ActivityCompleted"
+            "expected Activity(Completed)"
         );
 
         // No failure events.
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "did not expect ActivityFailed"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "did not expect Activity(Failed)"
         );
     }
 
@@ -518,11 +519,11 @@ mod tests {
         let events = run_model_selection(input).await;
 
         let selected = events.iter().find_map(|e| {
-            if let PipelineEvent::ModelSelected {
+            if let PipelineEvent::Selection(SelectionEvent::ModelSelected {
                 model_name,
                 score,
                 all_scores,
-            } = e
+            }) = e
             {
                 Some((model_name.clone(), *score, all_scores.clone()))
             } else {
@@ -530,7 +531,8 @@ mod tests {
             }
         });
 
-        let (model_name, score, all_scores) = selected.expect("ModelSelected must be present");
+        let (model_name, score, all_scores) =
+            selected.expect("Selection(ModelSelected) must be present");
         assert!(!model_name.is_empty(), "model_name must not be empty");
         assert!(score >= 0.0, "score must be non-negative");
         // all_scores may be empty for direct single-model routing; just verify it serializes.
@@ -559,15 +561,16 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "expected ActivityFailed on cancellation"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "expected Activity(Failed) on cancellation"
         );
         // Must NOT have ModelSelected when cancelled.
         assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::ModelSelected { .. })),
-            "must not emit ModelSelected when cancelled"
+            !events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Selection(SelectionEvent::ModelSelected { .. })
+            )),
+            "must not emit Selection(ModelSelected) when cancelled"
         );
     }
 
@@ -591,23 +594,27 @@ mod tests {
         let events = collect_events(&mut rx);
 
         let hook_blocked = events.iter().find(|e| {
-            matches!(e, PipelineEvent::HookBlocked { hook_event, .. } if hook_event == "pre_route")
+            matches!(e, PipelineEvent::Hook(HookOutcome::Blocked { hook_event, .. }) if hook_event == "pre_route")
         });
-        assert!(hook_blocked.is_some(), "expected HookBlocked for pre_route");
+        assert!(
+            hook_blocked.is_some(),
+            "expected Hook(Blocked) for pre_route"
+        );
 
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "expected ActivityFailed after pre_route hook block"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "expected Activity(Failed) after pre_route hook block"
         );
 
         // ModelSelected must NOT be present.
         assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::ModelSelected { .. })),
-            "ModelSelected must not be pushed when pre_route hook blocks"
+            !events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Selection(SelectionEvent::ModelSelected { .. })
+            )),
+            "Selection(ModelSelected) must not be pushed when pre_route hook blocks"
         );
     }
 
@@ -630,18 +637,18 @@ mod tests {
         let events = collect_events(&mut rx);
 
         let hook_blocked = events.iter().find(|e| {
-            matches!(e, PipelineEvent::HookBlocked { hook_event, .. } if hook_event == "post_route")
+            matches!(e, PipelineEvent::Hook(HookOutcome::Blocked { hook_event, .. }) if hook_event == "post_route")
         });
         assert!(
             hook_blocked.is_some(),
-            "expected HookBlocked for post_route"
+            "expected Hook(Blocked) for post_route"
         );
 
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "expected ActivityFailed after post_route hook block"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "expected Activity(Failed) after post_route hook block"
         );
     }
 
@@ -658,11 +665,11 @@ mod tests {
         let events = run_model_selection(input).await;
 
         let selected = events.iter().find_map(|e| {
-            if let PipelineEvent::ModelSelected {
+            if let PipelineEvent::Selection(SelectionEvent::ModelSelected {
                 model_name,
                 score,
                 all_scores,
-            } = e
+            }) = e
             {
                 Some((model_name.clone(), *score, all_scores.clone()))
             } else {
@@ -670,7 +677,8 @@ mod tests {
             }
         });
 
-        let (_model_name, score, all_scores) = selected.expect("ModelSelected must be present");
+        let (_model_name, score, all_scores) =
+            selected.expect("Selection(ModelSelected) must be present");
         assert!(
             (score - 1.0_f32).abs() < 1e-5,
             "direct single-model routing should have score 1.0"
@@ -694,15 +702,16 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "expected ActivityFailed when no models match filters"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "expected Activity(Failed) when no models match filters"
         );
 
         assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::ModelSelected { .. })),
-            "ModelSelected must not be pushed when zero survivors"
+            !events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Selection(SelectionEvent::ModelSelected { .. })
+            )),
+            "Selection(ModelSelected) must not be pushed when zero survivors"
         );
     }
 
@@ -717,10 +726,11 @@ mod tests {
         let events = run_model_selection(input).await;
 
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::ModelSelected { .. })),
-            "expected ModelSelected in auto mode"
+            events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Selection(SelectionEvent::ModelSelected { .. })
+            )),
+            "expected Selection(ModelSelected) in auto mode"
         );
     }
 
@@ -746,11 +756,11 @@ mod tests {
         let events = collect_events(&mut rx);
         let failed = events
             .iter()
-            .find(|e| matches!(e, PipelineEvent::ActivityFailed { .. }));
-        if let Some(PipelineEvent::ActivityFailed { retryable, .. }) = failed {
+            .find(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. })));
+        if let Some(PipelineEvent::Activity(ActivityEvent::Failed { retryable, .. })) = failed {
             assert!(!retryable, "model selection failures must not be retryable");
         } else {
-            panic!("expected ActivityFailed");
+            panic!("expected Activity(Failed)");
         }
     }
 
@@ -775,19 +785,22 @@ mod tests {
 
         // ModelSelected must be present (fallback, not failure).
         let selected = events.iter().find_map(|e| {
-            if let PipelineEvent::ModelSelected {
-                model_name, score, ..
-            } = e
+            if let PipelineEvent::Selection(SelectionEvent::ModelSelected {
+                model_name,
+                score,
+                ..
+            }) = e
             {
                 Some((model_name.clone(), *score))
             } else {
                 None
             }
         });
-        let (model_name, score) = selected.expect("ModelSelected must be present on router error");
+        let (model_name, score) =
+            selected.expect("Selection(ModelSelected) must be present on router error");
         assert_eq!(
             model_name,
-            services.providers.default_name(),
+            services.providers().default_name(),
             "router error must fall back to default model"
         );
         assert!(
@@ -799,8 +812,8 @@ mod tests {
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "router error must not push ActivityFailed (fallback mode)"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "router error must not push Activity(Failed) (fallback mode)"
         );
     }
 
@@ -874,19 +887,21 @@ api_key = "sk-test"
 
         // ModelSelected must be present.
         let selected = events.iter().find_map(|e| {
-            if let PipelineEvent::ModelSelected {
-                model_name, score, ..
-            } = e
+            if let PipelineEvent::Selection(SelectionEvent::ModelSelected {
+                model_name,
+                score,
+                ..
+            }) = e
             {
                 Some((model_name.clone(), *score))
             } else {
                 None
             }
         });
-        let (model_name, score) = selected.expect("ModelSelected must be present");
+        let (model_name, score) = selected.expect("Selection(ModelSelected) must be present");
         assert_eq!(
             model_name,
-            services.providers.default_name(),
+            services.providers().default_name(),
             "score below threshold must fall back to default model"
         );
         assert!(
@@ -923,19 +938,22 @@ api_key = "sk-test"
 
         // Fail-open: ModelSelected must be present (no ActivityFailed).
         let selected = events.iter().find_map(|e| {
-            if let PipelineEvent::ModelSelected {
-                model_name, score, ..
-            } = e
+            if let PipelineEvent::Selection(SelectionEvent::ModelSelected {
+                model_name,
+                score,
+                ..
+            }) = e
             {
                 Some((model_name.clone(), *score))
             } else {
                 None
             }
         });
-        let (model_name, score) = selected.expect("ModelSelected must be present (fail-open)");
+        let (model_name, score) =
+            selected.expect("Selection(ModelSelected) must be present (fail-open)");
         assert_eq!(
             model_name,
-            services.providers.default_name(),
+            services.providers().default_name(),
             "empty candidates after Auto filter must fall back to default model"
         );
         assert!(
@@ -947,8 +965,8 @@ api_key = "sk-test"
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "Auto mode empty candidates must not push ActivityFailed"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "Auto mode empty candidates must not push Activity(Failed)"
         );
     }
 }

@@ -23,5 +23,7 @@ pub use default_service::{
 };
 pub use mux::MemoryStoreMux;
 pub use null_service::NullMemoryService;
-pub use service::{MemoryService, StoreInfo};
+// Re-export MemoryService and StoreInfo from weft_memory_trait.
+// This keeps existing import paths like `weft_memory::{MemoryService, StoreInfo}` working.
 pub use types::{MemoryEntry, MemoryQueryResult, MemoryStoreResult};
+pub use weft_memory_trait::{MemoryService, StoreInfo};

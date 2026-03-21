@@ -1,12 +1,12 @@
 //! SystemPromptAssembly activity: layer the system prompt from gateway config and caller request.
 //!
 //! Assembles the final system prompt by combining:
-//! - Layer 1: gateway foundational prompt from `services.config.gateway.system_prompt`
+//! - Layer 1: gateway foundational prompt from `services.config().gateway.system_prompt`
 //! - Layer 2: caller-provided system prompt, if `input.messages[0]` has `Role::System`
 //!
 //! Agent instructions (a future layer 2) are deferred until agent config exists in the schema.
 //!
-//! The assembled prompt is pushed as a `MessageInjected` with source `SystemPromptAssembly`.
+//! The assembled prompt is pushed as a `Context(MessageInjected)` with source `SystemPromptAssembly`.
 //! The reactor inserts this message at `messages[0]`, replacing any existing system-role message.
 //!
 //! **Fail mode: OPEN.** If assembly encounters an error (should not happen with current inputs),
@@ -16,22 +16,22 @@ use std::time::Instant;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use weft_reactor_trait::ServiceLocator;
 
 use crate::activity::{Activity, ActivityInput};
-use crate::event::{MessageInjectionSource, PipelineEvent};
+use crate::event::{ActivityEvent, ContextEvent, MessageInjectionSource, PipelineEvent};
 use crate::event_log::EventLog;
 use crate::execution::ExecutionId;
-use crate::services::Services;
 
 /// Assembles the system prompt from gateway config and caller-provided layers.
 ///
 /// **Name:** `"system_prompt_assembly"`
 ///
 /// **Events pushed:**
-/// - `ActivityStarted { name: "system_prompt_assembly" }`
-/// - `MessageInjected { message, source: SystemPromptAssembly }` — the assembled system prompt
-/// - `SystemPromptAssembled { prompt_length, layer_count, message_count }`
-/// - `ActivityCompleted { name: "system_prompt_assembly", duration_ms, idempotency_key: None }`
+/// - `Activity(ActivityEvent::Started { name: "system_prompt_assembly" })`
+/// - `Context(ContextEvent::MessageInjected { message, source: SystemPromptAssembly })` — the assembled system prompt
+/// - `Context(ContextEvent::SystemPromptAssembled { prompt_length, layer_count, message_count })`
+/// - `Activity(ActivityEvent::Completed { name: "system_prompt_assembly", duration_ms, idempotency_key: None })`
 pub struct SystemPromptAssemblyActivity;
 
 impl SystemPromptAssemblyActivity {
@@ -57,7 +57,7 @@ impl Activity for SystemPromptAssemblyActivity {
         &self,
         _execution_id: &ExecutionId,
         input: ActivityInput,
-        services: &Services,
+        services: &dyn ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         _cancel: CancellationToken,
@@ -65,13 +65,13 @@ impl Activity for SystemPromptAssemblyActivity {
         let start = Instant::now();
 
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name().to_string(),
-            })
+            }))
             .await;
 
         // Layer 1: gateway foundational prompt.
-        let gateway_prompt = services.config.gateway.system_prompt.clone();
+        let gateway_prompt = services.config().gateway.system_prompt.clone();
 
         // Layer 2: caller-provided system prompt.
         // Present when messages[0] has Role::System and Source::Client.
@@ -117,10 +117,10 @@ impl Activity for SystemPromptAssemblyActivity {
 
         // MessageInjected carries the assembled prompt. The reactor inserts it at messages[0].
         let _ = event_tx
-            .send(PipelineEvent::MessageInjected {
+            .send(PipelineEvent::Context(ContextEvent::MessageInjected {
                 message: injected_message,
                 source: MessageInjectionSource::SystemPromptAssembly,
-            })
+            }))
             .await;
 
         // The message_count reflects the state AFTER the system prompt is inserted.
@@ -142,20 +142,22 @@ impl Activity for SystemPromptAssemblyActivity {
         };
 
         let _ = event_tx
-            .send(PipelineEvent::SystemPromptAssembled {
-                prompt_length,
-                layer_count,
-                message_count,
-            })
+            .send(PipelineEvent::Context(
+                ContextEvent::SystemPromptAssembled {
+                    prompt_length,
+                    layer_count,
+                    message_count,
+                },
+            ))
             .await;
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
-            .send(PipelineEvent::ActivityCompleted {
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
                 duration_ms,
                 idempotency_key: None,
-            })
+            }))
             .await;
     }
 }
@@ -204,51 +206,52 @@ mod tests {
         let input = make_test_input();
         let events = run_assembly(input).await;
 
-        // ActivityStarted must be first.
+        // Activity(Started) must be first.
         assert!(
             events.iter().any(
-                |e| matches!(e, PipelineEvent::ActivityStarted { name } if name == "system_prompt_assembly")
+                |e| matches!(e, PipelineEvent::Activity(ActivityEvent::Started { name }) if name == "system_prompt_assembly")
             ),
-            "expected ActivityStarted"
+            "expected Activity(Started)"
         );
 
-        // A MessageInjected event must be present with SystemPromptAssembly source.
+        // A Context(MessageInjected) event must be present with SystemPromptAssembly source.
         let injected = events.iter().find(|e| {
             matches!(
                 e,
-                PipelineEvent::MessageInjected {
+                PipelineEvent::Context(ContextEvent::MessageInjected {
                     source: MessageInjectionSource::SystemPromptAssembly,
                     ..
-                }
+                })
             )
         });
         assert!(
             injected.is_some(),
-            "expected MessageInjected with SystemPromptAssembly source"
+            "expected Context(MessageInjected) with SystemPromptAssembly source"
         );
 
-        // SystemPromptAssembled must follow.
+        // Context(SystemPromptAssembled) must follow.
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::SystemPromptAssembled { .. })),
-            "expected SystemPromptAssembled"
+            events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Context(ContextEvent::SystemPromptAssembled { .. })
+            )),
+            "expected Context(SystemPromptAssembled)"
         );
 
-        // ActivityCompleted must be last.
+        // Activity(Completed) must be last.
         assert!(
             events.iter().any(
-                |e| matches!(e, PipelineEvent::ActivityCompleted { name, .. } if name == "system_prompt_assembly")
+                |e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { name, .. }) if name == "system_prompt_assembly")
             ),
-            "expected ActivityCompleted"
+            "expected Activity(Completed)"
         );
 
-        // No ActivityFailed.
+        // No Activity(Failed).
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "did not expect ActivityFailed"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "did not expect Activity(Failed)"
         );
     }
 
@@ -271,10 +274,10 @@ mod tests {
         let events = collect_events(&mut rx);
 
         let injected_text = events.iter().find_map(|e| {
-            if let PipelineEvent::MessageInjected {
+            if let PipelineEvent::Context(ContextEvent::MessageInjected {
                 message,
                 source: MessageInjectionSource::SystemPromptAssembly,
-            } = e
+            }) = e
                 && let Some(ContentPart::Text(text)) = message.content.first()
             {
                 return Some(text.clone());
@@ -282,7 +285,7 @@ mod tests {
             None
         });
 
-        let text = injected_text.expect("MessageInjected must carry text content");
+        let text = injected_text.expect("Context(MessageInjected) must carry text content");
         // The test config uses "You are helpful." as the gateway system prompt.
         assert!(
             text.contains("You are helpful"),
@@ -321,10 +324,10 @@ mod tests {
         let events = collect_events(&mut rx);
 
         let injected_text = events.iter().find_map(|e| {
-            if let PipelineEvent::MessageInjected {
+            if let PipelineEvent::Context(ContextEvent::MessageInjected {
                 message,
                 source: MessageInjectionSource::SystemPromptAssembly,
-            } = e
+            }) = e
                 && let Some(ContentPart::Text(text)) = message.content.first()
             {
                 return Some(text.clone());
@@ -332,7 +335,7 @@ mod tests {
             None
         });
 
-        let text = injected_text.expect("MessageInjected must be present");
+        let text = injected_text.expect("Context(MessageInjected) must be present");
         assert!(
             text.contains("You are helpful"),
             "expected gateway prompt in assembled text"
@@ -344,14 +347,17 @@ mod tests {
 
         // layer_count should be 2 (gateway + caller).
         let assembled = events.iter().find_map(|e| {
-            if let PipelineEvent::SystemPromptAssembled { layer_count, .. } = e {
+            if let PipelineEvent::Context(ContextEvent::SystemPromptAssembled {
+                layer_count, ..
+            }) = e
+            {
                 Some(*layer_count)
             } else {
                 None
             }
         });
         assert_eq!(
-            assembled.expect("SystemPromptAssembled must be present"),
+            assembled.expect("Context(SystemPromptAssembled) must be present"),
             2,
             "expected layer_count = 2"
         );
@@ -410,11 +416,11 @@ api_key = "sk-test"
         let events = collect_events(&mut rx);
 
         let assembled = events.iter().find_map(|e| {
-            if let PipelineEvent::SystemPromptAssembled {
+            if let PipelineEvent::Context(ContextEvent::SystemPromptAssembled {
                 prompt_length,
                 layer_count,
                 ..
-            } = e
+            }) = e
             {
                 Some((*prompt_length, *layer_count))
             } else {
@@ -422,7 +428,7 @@ api_key = "sk-test"
             }
         });
 
-        let (length, count) = assembled.expect("SystemPromptAssembled must be present");
+        let (length, count) = assembled.expect("Context(SystemPromptAssembled) must be present");
         assert_eq!(length, 0, "empty gateway prompt → prompt_length = 0");
         assert_eq!(
             count, 0,
@@ -440,10 +446,10 @@ api_key = "sk-test"
         let found = events.iter().any(|e| {
             matches!(
                 e,
-                PipelineEvent::MessageInjected {
+                PipelineEvent::Context(ContextEvent::MessageInjected {
                     source: MessageInjectionSource::SystemPromptAssembly,
                     ..
-                }
+                })
             )
         });
         assert!(found, "source must be SystemPromptAssembly");
@@ -457,10 +463,10 @@ api_key = "sk-test"
         let events = run_assembly(input).await;
 
         let msg = events.iter().find_map(|e| {
-            if let PipelineEvent::MessageInjected {
+            if let PipelineEvent::Context(ContextEvent::MessageInjected {
                 message,
                 source: MessageInjectionSource::SystemPromptAssembly,
-            } = e
+            }) = e
             {
                 Some(message.clone())
             } else {
@@ -468,7 +474,7 @@ api_key = "sk-test"
             }
         });
 
-        let msg = msg.expect("MessageInjected must be present");
+        let msg = msg.expect("Context(MessageInjected) must be present");
         assert_eq!(
             msg.role,
             Role::System,
@@ -502,7 +508,11 @@ api_key = "sk-test"
         let events = run_assembly(input).await;
 
         let count = events.iter().find_map(|e| {
-            if let PipelineEvent::SystemPromptAssembled { message_count, .. } = e {
+            if let PipelineEvent::Context(ContextEvent::SystemPromptAssembled {
+                message_count,
+                ..
+            }) = e
+            {
                 Some(*message_count)
             } else {
                 None
@@ -510,7 +520,7 @@ api_key = "sk-test"
         });
 
         assert_eq!(
-            count.expect("SystemPromptAssembled must be present"),
+            count.expect("Context(SystemPromptAssembled) must be present"),
             2,
             "inserting a system message at position 0 should make message_count = 2"
         );
@@ -542,7 +552,11 @@ api_key = "sk-test"
         let events = run_assembly(input).await;
 
         let count = events.iter().find_map(|e| {
-            if let PipelineEvent::SystemPromptAssembled { message_count, .. } = e {
+            if let PipelineEvent::Context(ContextEvent::SystemPromptAssembled {
+                message_count,
+                ..
+            }) = e
+            {
                 Some(*message_count)
             } else {
                 None
@@ -551,7 +565,7 @@ api_key = "sk-test"
 
         // The system message at [0] will be replaced (not inserted), so count stays at 2.
         assert_eq!(
-            count.expect("SystemPromptAssembled must be present"),
+            count.expect("Context(SystemPromptAssembled) must be present"),
             2,
             "replacing existing System message should keep message_count = 2"
         );
@@ -578,7 +592,10 @@ api_key = "sk-test"
         let events = run_assembly(input).await;
 
         let assembled = events.iter().find_map(|e| {
-            if let PipelineEvent::SystemPromptAssembled { layer_count, .. } = e {
+            if let PipelineEvent::Context(ContextEvent::SystemPromptAssembled {
+                layer_count, ..
+            }) = e
+            {
                 Some(*layer_count)
             } else {
                 None
@@ -588,7 +605,7 @@ api_key = "sk-test"
         // Only the gateway prompt from config contributes — source=Gateway message at [0] is NOT
         // treated as a caller layer, so layer_count = 1 (gateway only).
         assert_eq!(
-            assembled.expect("SystemPromptAssembled must be present"),
+            assembled.expect("Context(SystemPromptAssembled) must be present"),
             1,
             "non-Client system message must not be counted as a caller layer"
         );

@@ -18,20 +18,22 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::activity::{Activity, ActivityInput};
-use crate::event::{CommandFormat, MessageInjectionSource, PipelineEvent};
+use crate::event::{
+    ActivityEvent, CommandFormat, ContextEvent, MessageInjectionSource, PipelineEvent,
+};
 use crate::event_log::EventLog;
 use crate::execution::ExecutionId;
-use crate::services::Services;
+use weft_reactor_trait::ServiceLocator;
 
 /// Formats selected commands for the target provider based on its capabilities.
 ///
 /// **Name:** `"command_formatting"`
 ///
 /// **Events pushed:**
-/// - `ActivityStarted { name: "command_formatting" }`
-/// - `MessageInjected { message, source: CommandFormatInjection }` — only for `PromptInjected` format
-/// - `CommandsFormatted { format, command_count }`
-/// - `ActivityCompleted { name: "command_formatting", duration_ms, idempotency_key: None }`
+/// - `Activity(ActivityEvent::Started { name: "command_formatting" })`
+/// - `Context(ContextEvent::MessageInjected { message, source: CommandFormatInjection })` — only for `PromptInjected` format
+/// - `Context(ContextEvent::CommandsFormatted { format, command_count })`
+/// - `Activity(ActivityEvent::Completed { name: "command_formatting", duration_ms, idempotency_key: None })`
 pub struct CommandFormattingActivity;
 
 impl CommandFormattingActivity {
@@ -57,7 +59,7 @@ impl Activity for CommandFormattingActivity {
         &self,
         _execution_id: &ExecutionId,
         input: ActivityInput,
-        _services: &Services,
+        _services: &dyn ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         _cancel: CancellationToken,
@@ -65,9 +67,9 @@ impl Activity for CommandFormattingActivity {
         let start = Instant::now();
 
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name().to_string(),
-            })
+            }))
             .await;
 
         // Extract capabilities from metadata. Missing metadata defaults to PromptInjected
@@ -106,19 +108,19 @@ impl Activity for CommandFormattingActivity {
         if selected_commands.is_empty() {
             // No commands selected — nothing to format.
             let _ = event_tx
-                .send(PipelineEvent::CommandsFormatted {
+                .send(PipelineEvent::Context(ContextEvent::CommandsFormatted {
                     format: CommandFormat::NoCommands,
                     command_count: 0,
-                })
+                }))
                 .await;
 
             let duration_ms = start.elapsed().as_millis() as u64;
             let _ = event_tx
-                .send(PipelineEvent::ActivityCompleted {
+                .send(PipelineEvent::Activity(ActivityEvent::Completed {
                     name: self.name().to_string(),
                     duration_ms,
                     idempotency_key: None,
-                })
+                }))
                 .await;
             return;
         }
@@ -129,10 +131,10 @@ impl Activity for CommandFormattingActivity {
         if has_tool_calling {
             // Structured: provider handles tool definitions natively.
             let _ = event_tx
-                .send(PipelineEvent::CommandsFormatted {
+                .send(PipelineEvent::Context(ContextEvent::CommandsFormatted {
                     format: CommandFormat::Structured,
                     command_count,
-                })
+                }))
                 .await;
         } else {
             // PromptInjected: build a text block describing available commands and inject it.
@@ -148,27 +150,27 @@ impl Activity for CommandFormattingActivity {
             };
 
             let _ = event_tx
-                .send(PipelineEvent::MessageInjected {
+                .send(PipelineEvent::Context(ContextEvent::MessageInjected {
                     message: injected_message,
                     source: MessageInjectionSource::CommandFormatInjection,
-                })
+                }))
                 .await;
 
             let _ = event_tx
-                .send(PipelineEvent::CommandsFormatted {
+                .send(PipelineEvent::Context(ContextEvent::CommandsFormatted {
                     format: CommandFormat::PromptInjected,
                     command_count,
-                })
+                }))
                 .await;
         }
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
-            .send(PipelineEvent::ActivityCompleted {
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
                 duration_ms,
                 idempotency_key: None,
-            })
+            }))
             .await;
     }
 }
@@ -254,10 +256,10 @@ mod tests {
         let events = run_formatting(input).await;
 
         let formatted = events.iter().find_map(|e| {
-            if let PipelineEvent::CommandsFormatted {
+            if let PipelineEvent::Context(ContextEvent::CommandsFormatted {
                 format,
                 command_count,
-            } = e
+            }) = e
             {
                 Some((format.clone(), *command_count))
             } else {
@@ -285,7 +287,7 @@ mod tests {
         let events = run_formatting(input).await;
 
         let format = events.iter().find_map(|e| {
-            if let PipelineEvent::CommandsFormatted { format, .. } = e {
+            if let PipelineEvent::Context(ContextEvent::CommandsFormatted { format, .. }) = e {
                 Some(format.clone())
             } else {
                 None
@@ -312,10 +314,10 @@ mod tests {
         let events = run_formatting(input).await;
 
         let formatted = events.iter().find_map(|e| {
-            if let PipelineEvent::CommandsFormatted {
+            if let PipelineEvent::Context(ContextEvent::CommandsFormatted {
                 format,
                 command_count,
-            } = e
+            }) = e
             {
                 Some((format.clone(), *command_count))
             } else {
@@ -344,10 +346,10 @@ mod tests {
         assert!(
             !events.iter().any(|e| matches!(
                 e,
-                PipelineEvent::MessageInjected {
+                PipelineEvent::Context(ContextEvent::MessageInjected {
                     source: MessageInjectionSource::CommandFormatInjection,
                     ..
-                }
+                })
             )),
             "Structured format must NOT emit MessageInjected"
         );
@@ -365,7 +367,7 @@ mod tests {
         let events = run_formatting(input).await;
 
         let format = events.iter().find_map(|e| {
-            if let PipelineEvent::CommandsFormatted { format, .. } = e {
+            if let PipelineEvent::Context(ContextEvent::CommandsFormatted { format, .. }) = e {
                 Some(format.clone())
             } else {
                 None
@@ -393,10 +395,10 @@ mod tests {
         let found = events.iter().any(|e| {
             matches!(
                 e,
-                PipelineEvent::MessageInjected {
+                PipelineEvent::Context(ContextEvent::MessageInjected {
                     source: MessageInjectionSource::CommandFormatInjection,
                     ..
-                }
+                })
             )
         });
         assert!(
@@ -415,10 +417,10 @@ mod tests {
         let events = run_formatting(input).await;
 
         let msg = events.iter().find_map(|e| {
-            if let PipelineEvent::MessageInjected {
+            if let PipelineEvent::Context(ContextEvent::MessageInjected {
                 message,
                 source: MessageInjectionSource::CommandFormatInjection,
-            } = e
+            }) = e
             {
                 Some(message.clone())
             } else {
@@ -455,10 +457,10 @@ mod tests {
         let events = run_formatting(input).await;
 
         let text = events.iter().find_map(|e| {
-            if let PipelineEvent::MessageInjected {
+            if let PipelineEvent::Context(ContextEvent::MessageInjected {
                 message,
                 source: MessageInjectionSource::CommandFormatInjection,
-            } = e
+            }) = e
                 && let Some(weft_core::ContentPart::Text(t)) = message.content.first()
             {
                 return Some(t.clone());
@@ -498,7 +500,7 @@ mod tests {
         let events = run_formatting(input).await;
 
         let format = events.iter().find_map(|e| {
-            if let PipelineEvent::CommandsFormatted { format, .. } = e {
+            if let PipelineEvent::Context(ContextEvent::CommandsFormatted { format, .. }) = e {
                 Some(format.clone())
             } else {
                 None
@@ -521,20 +523,20 @@ mod tests {
 
         assert!(
             events.iter().any(
-                |e| matches!(e, PipelineEvent::ActivityStarted { name } if name == "command_formatting")
+                |e| matches!(e, PipelineEvent::Activity(ActivityEvent::Started { name }) if name == "command_formatting")
             ),
             "expected ActivityStarted"
         );
         assert!(
             events.iter().any(
-                |e| matches!(e, PipelineEvent::ActivityCompleted { name, .. } if name == "command_formatting")
+                |e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { name, .. }) if name == "command_formatting")
             ),
             "expected ActivityCompleted"
         );
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
             "did not expect ActivityFailed"
         );
     }

@@ -1,11 +1,11 @@
 //! CommandSelection activity: semantic command selection for the pre-loop.
 //!
 //! Replaces the command-routing half of `RouteActivity`. Selects relevant commands
-//! via semantic scoring and emits `CommandsSelected`. Also determines whether
-//! `/recall` and `/remember` are available based on memory configuration.
+//! via semantic scoring and emits `Selection(CommandsSelected)`. Also determines
+//! whether `/recall` and `/remember` are available based on memory configuration.
 //!
 //! **Fail mode: OPEN.** If command selection fails for any reason (router error,
-//! hook block), the activity pushes `CommandsSelected { selected: vec![], ... }`
+//! hook block), the activity pushes `Selection(CommandsSelected { selected: vec![], ... })`
 //! and completes normally. The model can still generate without commands.
 
 use std::time::Instant;
@@ -20,10 +20,10 @@ use weft_router::{RoutingCandidate, RoutingDomainKind, filter_by_threshold, take
 
 use super::selection_util::extract_user_message;
 use crate::activity::{Activity, ActivityInput, SemanticSelection};
-use crate::event::PipelineEvent;
+use crate::event::{ActivityEvent, HookOutcome, PipelineEvent, SelectionEvent};
 use crate::event_log::EventLog;
 use crate::execution::ExecutionId;
-use crate::services::Services;
+use weft_reactor_trait::ServiceLocator;
 
 /// Selects the commands relevant to the current turn via semantic routing.
 ///
@@ -34,10 +34,10 @@ use crate::services::Services;
 /// **Name:** `"command_selection"`
 ///
 /// **Events pushed:**
-/// - `ActivityStarted { name: "command_selection" }`
-/// - `HookEvaluated` / `HookBlocked` — for PreRoute / PostRoute hooks
-/// - `CommandsSelected { selected, candidates_scored }` — always (fail-open)
-/// - `ActivityCompleted { name: "command_selection", duration_ms, idempotency_key: None }`
+/// - `Activity(ActivityEvent::Started { name: "command_selection" })`
+/// - `Hook(HookOutcome::Evaluated)` / `Hook(HookOutcome::Blocked)` — for PreRoute / PostRoute hooks
+/// - `Selection(SelectionEvent::CommandsSelected { selected, candidates_scored })` — always (fail-open)
+/// - `Activity(ActivityEvent::Completed { name: "command_selection", duration_ms, idempotency_key: None })`
 pub struct CommandSelectionActivity;
 
 impl CommandSelectionActivity {
@@ -75,7 +75,7 @@ impl Activity for CommandSelectionActivity {
         &self,
         _execution_id: &ExecutionId,
         input: ActivityInput,
-        services: &Services,
+        services: &dyn ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         cancel: CancellationToken,
@@ -83,26 +83,26 @@ impl Activity for CommandSelectionActivity {
         let start = Instant::now();
 
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name().to_string(),
-            })
+            }))
             .await;
 
         if cancel.is_cancelled() {
-            // Fail-open: push empty selection and complete rather than ActivityFailed.
+            // Fail-open: push empty selection and complete rather than Activity(Failed).
             let _ = event_tx
-                .send(PipelineEvent::CommandsSelected {
+                .send(PipelineEvent::Selection(SelectionEvent::CommandsSelected {
                     selected: vec![],
                     candidates_scored: 0,
-                })
+                }))
                 .await;
             let duration_ms = start.elapsed().as_millis() as u64;
             let _ = event_tx
-                .send(PipelineEvent::ActivityCompleted {
+                .send(PipelineEvent::Activity(ActivityEvent::Completed {
                     name: self.name().to_string(),
                     duration_ms,
                     idempotency_key: None,
-                })
+                }))
                 .await;
             return;
         }
@@ -116,7 +116,7 @@ impl Activity for CommandSelectionActivity {
 
         // Include /recall and /remember if memory has at least one store.
         let has_memory = services
-            .config
+            .config()
             .memory
             .as_ref()
             .is_some_and(|m| !m.stores.is_empty());
@@ -140,18 +140,18 @@ impl Activity for CommandSelectionActivity {
         // If no candidates, push empty selection and complete (no scoring needed).
         if full_candidates.is_empty() {
             let _ = event_tx
-                .send(PipelineEvent::CommandsSelected {
+                .send(PipelineEvent::Selection(SelectionEvent::CommandsSelected {
                     selected: vec![],
                     candidates_scored: 0,
-                })
+                }))
                 .await;
             let duration_ms = start.elapsed().as_millis() as u64;
             let _ = event_tx
-                .send(PipelineEvent::ActivityCompleted {
+                .send(PipelineEvent::Activity(ActivityEvent::Completed {
                     name: self.name().to_string(),
                     duration_ms,
                     idempotency_key: None,
-                })
+                }))
                 .await;
             return;
         }
@@ -174,7 +174,7 @@ impl Activity for CommandSelectionActivity {
         });
         let hook_start = Instant::now();
         let pre_result = services
-            .hooks
+            .hooks()
             .run_chain(HookEvent::PreRoute, pre_payload, Some("commands"))
             .await;
         let hook_duration = hook_start.elapsed().as_millis() as u64;
@@ -183,48 +183,48 @@ impl Activity for CommandSelectionActivity {
             HookChainResult::Blocked { reason, hook_name } => {
                 // Fail-open: hook blocked means no commands, not an error.
                 let _ = event_tx
-                    .send(PipelineEvent::HookBlocked {
+                    .send(PipelineEvent::Hook(HookOutcome::Blocked {
                         hook_event: "pre_route".to_string(),
                         hook_name,
                         reason,
-                    })
+                    }))
                     .await;
                 let _ = event_tx
-                    .send(PipelineEvent::CommandsSelected {
+                    .send(PipelineEvent::Selection(SelectionEvent::CommandsSelected {
                         selected: vec![],
                         candidates_scored: 0,
-                    })
+                    }))
                     .await;
                 let duration_ms = start.elapsed().as_millis() as u64;
                 let _ = event_tx
-                    .send(PipelineEvent::ActivityCompleted {
+                    .send(PipelineEvent::Activity(ActivityEvent::Completed {
                         name: self.name().to_string(),
                         duration_ms,
                         idempotency_key: None,
-                    })
+                    }))
                     .await;
                 return;
             }
             HookChainResult::Allowed { .. } => {
                 let _ = event_tx
-                    .send(PipelineEvent::HookEvaluated {
+                    .send(PipelineEvent::Hook(HookOutcome::Evaluated {
                         hook_event: "pre_route".to_string(),
                         hook_name: "pre_route".to_string(),
                         decision: "allow".to_string(),
                         duration_ms: hook_duration,
-                    })
+                    }))
                     .await;
             }
         }
 
         // Score candidates via the semantic router.
         let domains = [(RoutingDomainKind::Commands, routing_candidates.clone())];
-        let selected = match services.router.route(user_message, &domains).await {
+        let selected = match services.router().route(user_message, &domains).await {
             Err(e) => {
                 // Fail-open: router error → include all commands capped by max_commands,
                 // sorted alphabetically (matching route_domains fallback behaviour).
                 warn!(error = %e, "command_selection: router error, including all commands");
-                let max_commands = services.config.router.classifier.max_commands;
+                let max_commands = services.config().router.classifier.max_commands;
                 let mut fallback = full_candidates.clone();
                 fallback.sort_by(|a, b| a.name.cmp(&b.name));
                 fallback.truncate(max_commands);
@@ -232,8 +232,8 @@ impl Activity for CommandSelectionActivity {
             }
             Ok(decision) => {
                 // Apply threshold and max_commands filtering.
-                let threshold = services.config.router.classifier.threshold;
-                let max_commands = services.config.router.classifier.max_commands;
+                let threshold = services.config().router.classifier.threshold;
+                let max_commands = services.config().router.classifier.max_commands;
 
                 let filtered = filter_by_threshold(decision.commands, threshold);
                 let top = take_top(filtered, max_commands);
@@ -253,7 +253,7 @@ impl Activity for CommandSelectionActivity {
         });
         let hook_start = Instant::now();
         let post_result = services
-            .hooks
+            .hooks()
             .run_chain(HookEvent::PostRoute, post_payload, Some("commands"))
             .await;
         let hook_duration = hook_start.elapsed().as_millis() as u64;
@@ -262,22 +262,22 @@ impl Activity for CommandSelectionActivity {
             HookChainResult::Blocked { reason, hook_name } => {
                 // Fail-open: post_route blocking clears commands.
                 let _ = event_tx
-                    .send(PipelineEvent::HookBlocked {
+                    .send(PipelineEvent::Hook(HookOutcome::Blocked {
                         hook_event: "post_route".to_string(),
                         hook_name,
                         reason,
-                    })
+                    }))
                     .await;
                 vec![]
             }
             HookChainResult::Allowed { .. } => {
                 let _ = event_tx
-                    .send(PipelineEvent::HookEvaluated {
+                    .send(PipelineEvent::Hook(HookOutcome::Evaluated {
                         hook_event: "post_route".to_string(),
                         hook_name: "post_route".to_string(),
                         decision: "allow".to_string(),
                         duration_ms: hook_duration,
-                    })
+                    }))
                     .await;
                 selected
             }
@@ -289,19 +289,19 @@ impl Activity for CommandSelectionActivity {
         );
 
         let _ = event_tx
-            .send(PipelineEvent::CommandsSelected {
+            .send(PipelineEvent::Selection(SelectionEvent::CommandsSelected {
                 selected: final_selected,
                 candidates_scored,
-            })
+            }))
             .await;
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
-            .send(PipelineEvent::ActivityCompleted {
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
                 duration_ms,
                 idempotency_key: None,
-            })
+            }))
             .await;
     }
 }
@@ -351,7 +351,7 @@ mod tests {
         );
     }
 
-    // ── Happy path: emits CommandsSelected ───────────────────────────────────
+    // ── Happy path: emits Selection(CommandsSelected) ───────────────────────
 
     #[tokio::test]
     async fn command_selection_emits_commands_selected() {
@@ -365,31 +365,32 @@ mod tests {
 
         assert!(
             events.iter().any(
-                |e| matches!(e, PipelineEvent::ActivityStarted { name } if name == "command_selection")
+                |e| matches!(e, PipelineEvent::Activity(ActivityEvent::Started { name }) if name == "command_selection")
             ),
-            "expected ActivityStarted"
+            "expected Activity(Started)"
         );
 
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::CommandsSelected { .. })),
-            "expected CommandsSelected event"
+            events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::Selection(SelectionEvent::CommandsSelected { .. })
+            )),
+            "expected Selection(CommandsSelected) event"
         );
 
         assert!(
             events.iter().any(
-                |e| matches!(e, PipelineEvent::ActivityCompleted { name, .. } if name == "command_selection")
+                |e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { name, .. }) if name == "command_selection")
             ),
-            "expected ActivityCompleted"
+            "expected Activity(Completed)"
         );
 
-        // Fail-open: no ActivityFailed.
+        // Fail-open: no Activity(Failed).
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "did not expect ActivityFailed"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "did not expect Activity(Failed)"
         );
     }
 
@@ -407,10 +408,10 @@ mod tests {
         let events = run_command_selection(input, services).await;
 
         let selected = events.iter().find_map(|e| {
-            if let PipelineEvent::CommandsSelected {
+            if let PipelineEvent::Selection(SelectionEvent::CommandsSelected {
                 selected,
                 candidates_scored,
-            } = e
+            }) = e
             {
                 Some((selected.clone(), *candidates_scored))
             } else {
@@ -418,7 +419,8 @@ mod tests {
             }
         });
 
-        let (selected, candidates_scored) = selected.expect("CommandsSelected must be present");
+        let (selected, candidates_scored) =
+            selected.expect("Selection(CommandsSelected) must be present");
         assert!(selected.is_empty(), "expected empty selection");
         assert_eq!(candidates_scored, 0, "expected zero candidates scored");
     }
@@ -439,14 +441,14 @@ mod tests {
         let events = run_command_selection(input, services).await;
 
         let selected = events.iter().find_map(|e| {
-            if let PipelineEvent::CommandsSelected { selected, .. } = e {
+            if let PipelineEvent::Selection(SelectionEvent::CommandsSelected { selected, .. }) = e {
                 Some(selected.clone())
             } else {
                 None
             }
         });
 
-        let selected = selected.expect("CommandsSelected must be present");
+        let selected = selected.expect("Selection(CommandsSelected) must be present");
 
         // /recall and /remember should be in the selected set (since stub router scores
         // all candidates above threshold).
@@ -477,14 +479,14 @@ mod tests {
         let events = run_command_selection(input, services).await;
 
         let selected = events.iter().find_map(|e| {
-            if let PipelineEvent::CommandsSelected { selected, .. } = e {
+            if let PipelineEvent::Selection(SelectionEvent::CommandsSelected { selected, .. }) = e {
                 Some(selected.clone())
             } else {
                 None
             }
         });
 
-        let selected = selected.expect("CommandsSelected must be present");
+        let selected = selected.expect("Selection(CommandsSelected) must be present");
         assert!(
             !selected.iter().any(|c| c.name == RECALL_NAME),
             "/recall must not be included when memory is not configured"
@@ -510,42 +512,43 @@ mod tests {
 
         let events = run_command_selection(input, services).await;
 
-        // Must NOT have ActivityFailed (fail-open).
+        // Must NOT have Activity(Failed) (fail-open).
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "hook blocking must be fail-open (no ActivityFailed)"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "hook blocking must be fail-open (no Activity(Failed))"
         );
 
-        // Must have HookBlocked.
+        // Must have Hook(Blocked).
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::HookBlocked { .. })),
-            "expected HookBlocked event"
+                .any(|e| matches!(e, PipelineEvent::Hook(HookOutcome::Blocked { .. }))),
+            "expected Hook(Blocked) event"
         );
 
-        // Must have CommandsSelected with empty selection.
+        // Must have Selection(CommandsSelected) with empty selection.
         let selected = events.iter().find_map(|e| {
-            if let PipelineEvent::CommandsSelected { selected, .. } = e {
+            if let PipelineEvent::Selection(SelectionEvent::CommandsSelected { selected, .. }) = e {
                 Some(selected.clone())
             } else {
                 None
             }
         });
-        let selected = selected.expect("CommandsSelected must be present even when hook blocks");
+        let selected =
+            selected.expect("Selection(CommandsSelected) must be present even when hook blocks");
         assert!(
             selected.is_empty(),
             "commands must be empty when pre_route hook blocks"
         );
 
-        // ActivityCompleted must be present (not ActivityFailed).
+        // Activity(Completed) must be present (not Activity(Failed)).
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityCompleted { .. })),
-            "expected ActivityCompleted (fail-open)"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { .. }))),
+            "expected Activity(Completed) (fail-open)"
         );
     }
 
@@ -564,34 +567,34 @@ mod tests {
 
         let events = run_command_selection(input, services).await;
 
-        // Must NOT have ActivityFailed.
+        // Must NOT have Activity(Failed).
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
             "post_route hook blocking must be fail-open"
         );
 
-        // Must have CommandsSelected with empty selection (cleared by block).
+        // Must have Selection(CommandsSelected) with empty selection (cleared by block).
         let selected = events.iter().find_map(|e| {
-            if let PipelineEvent::CommandsSelected { selected, .. } = e {
+            if let PipelineEvent::Selection(SelectionEvent::CommandsSelected { selected, .. }) = e {
                 Some(selected.clone())
             } else {
                 None
             }
         });
-        let selected = selected.expect("CommandsSelected must be present");
+        let selected = selected.expect("Selection(CommandsSelected) must be present");
         assert!(
             selected.is_empty(),
             "commands must be empty when post_route hook blocks"
         );
 
-        // ActivityCompleted must be present.
+        // Activity(Completed) must be present.
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityCompleted { .. })),
-            "expected ActivityCompleted (fail-open)"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { .. }))),
+            "expected Activity(Completed) (fail-open)"
         );
     }
 
@@ -614,20 +617,20 @@ mod tests {
 
         let events = collect_events(&mut rx);
 
-        // No ActivityFailed.
+        // No Activity(Failed).
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "cancellation must be fail-open (no ActivityFailed)"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "cancellation must be fail-open (no Activity(Failed))"
         );
 
-        // ActivityCompleted present.
+        // Activity(Completed) present.
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityCompleted { .. })),
-            "expected ActivityCompleted on cancellation (fail-open)"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { .. }))),
+            "expected Activity(Completed) on cancellation (fail-open)"
         );
     }
 
@@ -654,9 +657,10 @@ mod tests {
         let events = run_command_selection(input, make_test_services()).await;
 
         let candidates_scored = events.iter().find_map(|e| {
-            if let PipelineEvent::CommandsSelected {
-                candidates_scored, ..
-            } = e
+            if let PipelineEvent::Selection(SelectionEvent::CommandsSelected {
+                candidates_scored,
+                ..
+            }) = e
             {
                 Some(*candidates_scored)
             } else {
@@ -666,7 +670,7 @@ mod tests {
 
         // 3 commands were passed, no memory configured → 3 candidates scored.
         assert_eq!(
-            candidates_scored.expect("CommandsSelected must be present"),
+            candidates_scored.expect("Selection(CommandsSelected) must be present"),
             3
         );
     }
@@ -677,7 +681,7 @@ mod tests {
     async fn command_selection_router_error_falls_back_to_all_commands_capped() {
         // When the router errors, command_selection falls back to all commands
         // sorted alphabetically and truncated to max_commands. This is fail-open:
-        // no ActivityFailed, CommandsSelected is still pushed.
+        // no Activity(Failed), Selection(CommandsSelected) is still pushed.
         let mut input = make_test_input();
         input.available_commands = vec![
             CommandStub {
@@ -698,23 +702,24 @@ mod tests {
 
         let events = run_command_selection(input, services).await;
 
-        // Fail-open: no ActivityFailed.
+        // Fail-open: no Activity(Failed).
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "router error must be fail-open (no ActivityFailed)"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "router error must be fail-open (no Activity(Failed))"
         );
 
-        // CommandsSelected must be present.
+        // Selection(CommandsSelected) must be present.
         let selected = events.iter().find_map(|e| {
-            if let PipelineEvent::CommandsSelected { selected, .. } = e {
+            if let PipelineEvent::Selection(SelectionEvent::CommandsSelected { selected, .. }) = e {
                 Some(selected.clone())
             } else {
                 None
             }
         });
-        let selected = selected.expect("CommandsSelected must be present on router error");
+        let selected =
+            selected.expect("Selection(CommandsSelected) must be present on router error");
 
         // Fallback includes all commands (capped by max_commands, sorted alphabetically).
         // The test config has max_commands = 10 (classifier default), so all 3 appear.
@@ -730,12 +735,12 @@ mod tests {
         assert_eq!(selected[1].name, "m_command");
         assert_eq!(selected[2].name, "z_command");
 
-        // ActivityCompleted must be present.
+        // Activity(Completed) must be present.
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityCompleted { .. })),
-            "expected ActivityCompleted (fail-open)"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { .. }))),
+            "expected Activity(Completed) (fail-open)"
         );
     }
 

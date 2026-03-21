@@ -559,6 +559,7 @@ pub fn make_test_input() -> ActivityInput {
         available_commands: vec![],
         idempotency_key: None,
         accumulated_usage: weft_core::WeftUsage::default(),
+        child_spawner: None,
     }
 }
 
@@ -585,8 +586,9 @@ mod tests {
 
     #[test]
     fn make_test_services_returns_services() {
+        use weft_reactor_trait::ServiceLocator as _;
         let services = make_test_services();
-        assert_eq!(services.providers.default_name(), "stub-model");
+        assert_eq!(services.providers().default_name(), "stub-model");
         assert!(services.memory.is_none());
     }
 
@@ -623,9 +625,14 @@ mod tests {
 
     #[tokio::test]
     async fn collect_events_drains_channel() {
+        use crate::event::ExecutionEvent;
         let (tx, mut rx) = mpsc::channel(8);
-        tx.send(PipelineEvent::ValidationPassed).await.unwrap();
-        tx.send(PipelineEvent::ValidationPassed).await.unwrap();
+        tx.send(PipelineEvent::Execution(ExecutionEvent::ValidationPassed))
+            .await
+            .unwrap();
+        tx.send(PipelineEvent::Execution(ExecutionEvent::ValidationPassed))
+            .await
+            .unwrap();
         let events = collect_events(&mut rx);
         assert_eq!(events.len(), 2);
     }

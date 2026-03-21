@@ -615,7 +615,11 @@ mod tests {
             HookEvent::PostToolUse,
         ] {
             registry
-                .register(Arc::new(HookActivity::new(event)))
+                .register(Arc::new(HookActivity::new(
+                    event,
+                    Arc::clone(&services.hooks),
+                    Arc::clone(&services.request_end_semaphore),
+                )))
                 .unwrap();
         }
 

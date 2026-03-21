@@ -8,10 +8,16 @@ license.workspace = true
 # Workspace
 weft_core = { path = "../weft_core" }
 weft_hooks = { path = "../weft_hooks" }
+weft_hooks_trait = { path = "../weft_hooks_trait" }
 weft_llm = { path = "../weft_llm" }
+weft_llm_trait = { path = "../weft_llm_trait" }
 weft_commands = { path = "../weft_commands" }
+weft_commands_trait = { path = "../weft_commands_trait" }
 weft_router = { path = "../weft_router" }
+weft_router_trait = { path = "../weft_router_trait" }
 weft_memory = { path = "../weft_memory" }
+weft_memory_trait = { path = "../weft_memory_trait" }
+weft_reactor_trait = { path = "../weft_reactor_trait" }
 
 # Async
 tokio = { workspace = true }

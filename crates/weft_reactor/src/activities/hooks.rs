@@ -3,8 +3,9 @@
 //! Each `HookActivity` is parameterized by its `HookEvent`. Errors from the
 //! hook runner are fail-open (logged, treated as Allow). The `hook_request_end`
 //! special case is fire-and-forget: it spawns hook execution on a separate task
-//! and immediately pushes `ActivityCompleted`.
+//! gated by the `request_end_semaphore`, then immediately pushes `ActivityCompleted`.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::mpsc;
@@ -12,12 +13,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use weft_core::HookEvent;
 use weft_hooks::HookChainResult;
+use weft_reactor_trait::ServiceLocator;
 
 use crate::activity::{Activity, ActivityInput};
-use crate::event::PipelineEvent;
+use crate::event::{ActivityEvent, HookOutcome, PipelineEvent};
 use crate::event_log::EventLog;
 use crate::execution::ExecutionId;
-use crate::services::Services;
 
 /// Wraps the `HookRunner` to fire hooks at a specific lifecycle point.
 ///
@@ -33,16 +34,20 @@ use crate::services::Services;
 /// waiting for the hook to finish.
 ///
 /// **Events pushed:**
-/// - `ActivityStarted { name }`
-/// - `HookEvaluated { hook_event, hook_name, decision, duration_ms }` (for each hook)
-/// - `HookBlocked { hook_event, hook_name, reason }` (if a hook blocks)
-/// - `ActivityCompleted { name, duration_ms, idempotency_key: None }`
-/// - `ActivityFailed { name, error, retryable: false }` — if hook blocks and event can_block()
+/// - `Activity(ActivityEvent::Started { name })`
+/// - `Hook(HookOutcome::Evaluated { hook_event, hook_name, decision, duration_ms })` (for each hook)
+/// - `Hook(HookOutcome::Blocked { hook_event, hook_name, reason })` (if a hook blocks)
+/// - `Activity(ActivityEvent::Completed { name, duration_ms, idempotency_key: None })`
+/// - `Activity(ActivityEvent::Failed { name, error, retryable: false })` — if hook blocks and event can_block()
 pub struct HookActivity {
     /// The lifecycle event this activity handles.
     hook_event: HookEvent,
     /// Activity name: `"hook_{event_name}"`.
     name: String,
+    /// Arc handle to the hook runner for fire-and-forget RequestEnd spawning.
+    hooks: Arc<dyn weft_hooks_trait::HookRunner + Send + Sync>,
+    /// Semaphore for bounding RequestEnd hook concurrency.
+    request_end_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl HookActivity {
@@ -50,9 +55,18 @@ impl HookActivity {
     ///
     /// The name is derived from the event: `HookEvent::RequestStart` becomes
     /// `"hook_request_start"`, `HookEvent::PreToolUse` becomes `"hook_pre_tool_use"`, etc.
-    pub fn new(hook_event: HookEvent) -> Self {
+    pub fn new(
+        hook_event: HookEvent,
+        hooks: Arc<dyn weft_hooks_trait::HookRunner + Send + Sync>,
+        request_end_semaphore: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
         let name = format!("hook_{}", hook_event_name_slug(hook_event));
-        Self { hook_event, name }
+        Self {
+            hook_event,
+            name,
+            hooks,
+            request_end_semaphore,
+        }
     }
 }
 
@@ -79,7 +93,7 @@ impl Activity for HookActivity {
         &self,
         _execution_id: &ExecutionId,
         input: ActivityInput,
-        services: &Services,
+        services: &dyn ServiceLocator,
         _event_log: &dyn EventLog,
         event_tx: mpsc::Sender<PipelineEvent>,
         cancel: CancellationToken,
@@ -87,18 +101,18 @@ impl Activity for HookActivity {
         let start = Instant::now();
 
         let _ = event_tx
-            .send(PipelineEvent::ActivityStarted {
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
                 name: self.name().to_string(),
-            })
+            }))
             .await;
 
         if cancel.is_cancelled() {
             let _ = event_tx
-                .send(PipelineEvent::ActivityFailed {
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
                     name: self.name().to_string(),
                     error: "cancelled before hook execution".to_string(),
                     retryable: false,
-                })
+                }))
                 .await;
             return;
         }
@@ -109,8 +123,8 @@ impl Activity for HookActivity {
 
         // RequestEnd: fire-and-forget. Spawn on separate task and return immediately.
         if hook_event == HookEvent::RequestEnd {
-            let semaphore = services.request_end_semaphore.clone();
-            let hooks = services.hooks.clone();
+            let semaphore = self.request_end_semaphore.clone();
+            let hooks = self.hooks.clone();
             let payload = hook_payload.clone();
 
             tokio::spawn(async move {
@@ -128,20 +142,20 @@ impl Activity for HookActivity {
 
             let duration_ms = start.elapsed().as_millis() as u64;
             let _ = event_tx
-                .send(PipelineEvent::ActivityCompleted {
+                .send(PipelineEvent::Activity(ActivityEvent::Completed {
                     name: self.name().to_string(),
                     duration_ms,
                     idempotency_key: None,
-                })
+                }))
                 .await;
             debug!(duration_ms, event = ?hook_event, "hook_activity: request_end fire-and-forget");
             return;
         }
 
-        // For all other hook events: run synchronously.
+        // For all other hook events: run synchronously via ServiceLocator.
         let hook_start = Instant::now();
         let result = services
-            .hooks
+            .hooks()
             .run_chain(hook_event, hook_payload, None)
             .await;
         let hook_duration = hook_start.elapsed().as_millis() as u64;
@@ -149,32 +163,32 @@ impl Activity for HookActivity {
         match result {
             HookChainResult::Allowed { .. } => {
                 let _ = event_tx
-                    .send(PipelineEvent::HookEvaluated {
+                    .send(PipelineEvent::Hook(HookOutcome::Evaluated {
                         hook_event: hook_event_name_slug(hook_event).to_string(),
                         hook_name: self.name().to_string(),
                         decision: "allow".to_string(),
                         duration_ms: hook_duration,
-                    })
+                    }))
                     .await;
             }
             HookChainResult::Blocked { reason, hook_name } => {
                 let _ = event_tx
-                    .send(PipelineEvent::HookBlocked {
+                    .send(PipelineEvent::Hook(HookOutcome::Blocked {
                         hook_event: hook_event_name_slug(hook_event).to_string(),
                         hook_name: hook_name.clone(),
                         reason: reason.clone(),
-                    })
+                    }))
                     .await;
 
                 // If this event can block, fail the activity.
                 if hook_event.can_block() {
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let _ = event_tx
-                        .send(PipelineEvent::ActivityFailed {
+                        .send(PipelineEvent::Activity(ActivityEvent::Failed {
                             name: self.name().to_string(),
                             error: format!("hook blocked: {reason}"),
                             retryable: false,
-                        })
+                        }))
                         .await;
                     debug!(
                         duration_ms,
@@ -195,11 +209,11 @@ impl Activity for HookActivity {
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx
-            .send(PipelineEvent::ActivityCompleted {
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
                 name: self.name().to_string(),
                 duration_ms,
                 idempotency_key: None,
-            })
+            }))
             .await;
 
         debug!(duration_ms, event = ?hook_event, "hook_activity: completed");
@@ -222,6 +236,26 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
+    fn make_hook_activity(event: HookEvent) -> HookActivity {
+        let services = make_test_services();
+        HookActivity::new(
+            event,
+            services.hooks.clone(),
+            services.request_end_semaphore.clone(),
+        )
+    }
+
+    fn make_hook_activity_with_services(
+        event: HookEvent,
+        services: &crate::services::Services,
+    ) -> HookActivity {
+        HookActivity::new(
+            event,
+            services.hooks.clone(),
+            services.request_end_semaphore.clone(),
+        )
+    }
+
     async fn run_hook(event: HookEvent, input: ActivityInput) -> Vec<PipelineEvent> {
         let (tx, mut rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
@@ -229,7 +263,7 @@ mod tests {
         let event_log = NullEventLog;
         let exec_id = crate::execution::ExecutionId::new();
 
-        let activity = HookActivity::new(event);
+        let activity = make_hook_activity(event);
         activity
             .execute(&exec_id, input, &services, &event_log, tx, cancel)
             .await;
@@ -241,31 +275,31 @@ mod tests {
 
     #[test]
     fn hook_activity_name_request_start() {
-        let a = HookActivity::new(HookEvent::RequestStart);
+        let a = make_hook_activity(HookEvent::RequestStart);
         assert_eq!(a.name(), "hook_request_start");
     }
 
     #[test]
     fn hook_activity_name_pre_tool_use() {
-        let a = HookActivity::new(HookEvent::PreToolUse);
+        let a = make_hook_activity(HookEvent::PreToolUse);
         assert_eq!(a.name(), "hook_pre_tool_use");
     }
 
     #[test]
     fn hook_activity_name_request_end() {
-        let a = HookActivity::new(HookEvent::RequestEnd);
+        let a = make_hook_activity(HookEvent::RequestEnd);
         assert_eq!(a.name(), "hook_request_end");
     }
 
     #[test]
     fn hook_activity_name_pre_response() {
-        let a = HookActivity::new(HookEvent::PreResponse);
+        let a = make_hook_activity(HookEvent::PreResponse);
         assert_eq!(a.name(), "hook_pre_response");
     }
 
     #[test]
     fn hook_activity_name_post_tool_use() {
-        let a = HookActivity::new(HookEvent::PostToolUse);
+        let a = make_hook_activity(HookEvent::PostToolUse);
         assert_eq!(a.name(), "hook_post_tool_use");
     }
 
@@ -279,22 +313,22 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityStarted { .. })),
-            "expected ActivityStarted"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Started { .. }))),
+            "expected Activity(Started)"
         );
 
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::HookEvaluated { decision, .. } if decision == "allow")),
-            "expected HookEvaluated with allow"
+                .any(|e| matches!(e, PipelineEvent::Hook(HookOutcome::Evaluated { decision, .. }) if decision == "allow")),
+            "expected Hook(Evaluated) with allow"
         );
 
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityCompleted { .. })),
-            "expected ActivityCompleted"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { .. }))),
+            "expected Activity(Completed)"
         );
     }
 
@@ -314,7 +348,7 @@ mod tests {
             "blocked by test",
         );
 
-        let activity = HookActivity::new(HookEvent::RequestStart);
+        let activity = make_hook_activity_with_services(HookEvent::RequestStart, &services);
         activity
             .execute(&exec_id, input, &services, &event_log, tx, cancel)
             .await;
@@ -324,24 +358,24 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::HookBlocked { .. })),
-            "expected HookBlocked"
+                .any(|e| matches!(e, PipelineEvent::Hook(HookOutcome::Blocked { .. }))),
+            "expected Hook(Blocked)"
         );
         assert!(
             events.iter().any(|e| matches!(
                 e,
-                PipelineEvent::ActivityFailed {
+                PipelineEvent::Activity(ActivityEvent::Failed {
                     retryable: false,
                     ..
-                }
+                })
             )),
-            "expected ActivityFailed(retryable: false)"
+            "expected Activity(Failed(retryable: false))"
         );
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityCompleted { .. })),
-            "should not push ActivityCompleted when blocked"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { .. }))),
+            "should not push Activity(Completed) when blocked"
         );
     }
 
@@ -356,15 +390,15 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityCompleted { name, .. } if name == "hook_request_end")),
-            "expected ActivityCompleted for RequestEnd (fire-and-forget)"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { name, .. }) if name == "hook_request_end")),
+            "expected Activity(Completed) for RequestEnd (fire-and-forget)"
         );
         // Should NOT push HookEvaluated inline (it fires on a separate task).
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::HookEvaluated { .. })),
-            "RequestEnd hook should not push HookEvaluated inline"
+                .any(|e| matches!(e, PipelineEvent::Hook(HookOutcome::Evaluated { .. }))),
+            "RequestEnd hook should not push Hook(Evaluated) inline"
         );
     }
 
@@ -381,7 +415,7 @@ mod tests {
         let event_log = NullEventLog;
         let exec_id = crate::execution::ExecutionId::new();
 
-        let activity = HookActivity::new(HookEvent::PreResponse);
+        let activity = make_hook_activity(HookEvent::PreResponse);
         activity
             .execute(&exec_id, input, &services, &event_log, tx, cancel)
             .await;
@@ -390,8 +424,8 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "expected ActivityFailed when cancelled"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "expected Activity(Failed) when cancelled"
         );
     }
 
@@ -411,7 +445,7 @@ mod tests {
             "blocked by test",
         );
 
-        let activity = HookActivity::new(HookEvent::PostToolUse);
+        let activity = make_hook_activity_with_services(HookEvent::PostToolUse, &services);
         activity
             .execute(&exec_id, input, &services, &event_log, tx, cancel)
             .await;
@@ -422,14 +456,14 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityCompleted { .. })),
-            "PostToolUse block should be fail-open (ActivityCompleted)"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Completed { .. }))),
+            "PostToolUse block should be fail-open (Activity(Completed))"
         );
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::ActivityFailed { .. })),
-            "PostToolUse block should not push ActivityFailed"
+                .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
+            "PostToolUse block should not push Activity(Failed)"
         );
     }
 }

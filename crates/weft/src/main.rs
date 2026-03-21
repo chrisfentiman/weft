@@ -564,7 +564,11 @@ async fn main() {
         HookEvent::PostToolUse,
     ] {
         activity_registry
-            .register(Arc::new(HookActivity::new(event)))
+            .register(Arc::new(HookActivity::new(
+                event,
+                Arc::clone(&services.hooks),
+                Arc::clone(&services.request_end_semaphore),
+            )))
             .unwrap_or_else(|e| {
                 eprintln!("error: failed to register HookActivity for {event:?}: {e}");
                 std::process::exit(1);

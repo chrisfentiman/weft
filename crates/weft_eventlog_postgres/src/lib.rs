@@ -160,7 +160,13 @@ async fn signal_poller(
             };
 
             // Push onto the event channel. If the channel is closed, stop polling.
-            if event_tx.send(PipelineEvent::Signal(signal)).await.is_err() {
+            if event_tx
+                .send(PipelineEvent::Signal(weft_reactor::SignalEvent::Received(
+                    signal,
+                )))
+                .await
+                .is_err()
+            {
                 // Receiver dropped — execution is over.
                 return;
             }
@@ -921,7 +927,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires DATABASE_URL and schema.sql applied"]
     async fn test_pipeline_event_jsonb_round_trip() {
-        use weft_reactor::event::GeneratedEvent;
+        use weft_reactor::event::{GeneratedEvent, GenerationEvent};
 
         let url = match std::env::var("DATABASE_URL").ok() {
             Some(u) => u,
@@ -935,7 +941,7 @@ mod tests {
         // Serialize an actual PipelineEvent variant to JSON, store it, read it
         // back, and deserialize to verify the JSONB round-trip path works end-to-end:
         // PipelineEvent -> serde_json::Value -> Postgres JSONB -> serde_json::Value -> PipelineEvent.
-        let original = PipelineEvent::Generated(GeneratedEvent::Done);
+        let original = PipelineEvent::Generation(GenerationEvent::Chunk(GeneratedEvent::Done));
         let payload = serde_json::to_value(&original).expect("serialize PipelineEvent");
 
         let seq = log
@@ -959,9 +965,9 @@ mod tests {
         assert!(
             matches!(
                 round_tripped,
-                PipelineEvent::Generated(GeneratedEvent::Done)
+                PipelineEvent::Generation(GenerationEvent::Chunk(GeneratedEvent::Done))
             ),
-            "expected Generated(Done), got {:?}",
+            "expected Generation(Chunk(Done)), got {:?}",
             round_tripped
         );
     }
@@ -1006,7 +1012,12 @@ mod tests {
             .expect("channel closed");
 
         assert!(
-            matches!(received, PipelineEvent::Signal(Signal::Cancel { .. })),
+            matches!(
+                received,
+                PipelineEvent::Signal(weft_reactor::event::SignalEvent::Received(
+                    Signal::Cancel { .. }
+                ))
+            ),
             "expected Cancel signal, got {:?}",
             received
         );

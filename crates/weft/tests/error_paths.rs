@@ -146,7 +146,7 @@ async fn test_command_failure_injected_and_pipeline_continues() {
         });
 
     // The result must carry success: false.
-    let success = cmd_completed.payload["CommandCompleted"]["result"]["success"]
+    let success = cmd_completed.payload["event"]["result"]["success"]
         .as_bool()
         .unwrap_or(true);
     assert!(
@@ -253,21 +253,21 @@ async fn test_sampling_parameters_clamped_and_passed() {
 
     assert_eq!(status, StatusCode::OK, "expected 200 OK, got: {resp}");
 
-    // Event log must contain sampling.updated with clamped max_tokens.
+    // Event log must contain context.sampling_updated with clamped max_tokens.
     let events = event_log.all_events();
     let sampling_event = events
         .iter()
-        .find(|e| e.event_type == "sampling.updated")
+        .find(|e| e.event_type == "context.sampling_updated")
         .unwrap_or_else(|| {
             panic!(
-                "expected sampling.updated event.\nAll event types: {:?}",
+                "expected context.sampling_updated event.\nAll event types: {:?}",
                 sorted_event_types(&events)
             )
         });
 
-    let max_tokens_in_event = sampling_event.payload["SamplingUpdated"]["max_tokens"]
+    let max_tokens_in_event = sampling_event.payload["event"]["max_tokens"]
         .as_u64()
-        .expect("sampling.updated payload must have SamplingUpdated.max_tokens");
+        .expect("context.sampling_updated payload must have event.max_tokens");
 
     assert!(
         max_tokens_in_event <= 1024,

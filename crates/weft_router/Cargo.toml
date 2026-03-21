@@ -9,6 +9,7 @@ test-support = []
 
 [dependencies]
 weft_core = { path = "../weft_core" }
+weft_router_trait = { path = "../weft_router_trait" }
 async-trait = { workspace = true }
 ort = { workspace = true }
 tokenizers = { workspace = true }
