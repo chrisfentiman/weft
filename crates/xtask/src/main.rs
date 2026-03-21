@@ -1,5 +1,6 @@
 mod build;
 mod ci;
+mod completions;
 mod grpc;
 mod lint;
 mod run;
@@ -203,7 +204,7 @@ pub(crate) struct GrpcHealthArgs {
 #[derive(Debug, clap::Args)]
 pub(crate) struct CompletionsArgs {
     /// Shell to generate completions for.
-    pub(crate) shell: String,
+    pub(crate) shell: clap_complete::Shell,
 }
 
 fn main() -> util::Result<()> {
@@ -223,13 +224,6 @@ fn main() -> util::Result<()> {
         Command::Ci => ci::run(&sh),
         Command::Grpc(args) => grpc::run(&sh, args),
         Command::Setup => setup::run(&sh),
-        Command::Completions(args) => {
-            eprintln!(
-                "[xtask] completions for '{}' not yet implemented (Phase 2). \
-                 Shell completion generation is coming in the next phase.",
-                args.shell
-            );
-            Ok(())
-        }
+        Command::Completions(args) => completions::run(args),
     }
 }
