@@ -27,11 +27,8 @@ pub mod registry;
 pub mod services;
 pub mod signal;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
-
-#[cfg(test)]
-mod reactor_tests;
 
 // Re-exports for convenience
 pub use activity::{Activity, ActivityError, ActivityInput, RoutingSnapshot};

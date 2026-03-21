@@ -90,7 +90,7 @@ mod tests {
     fn construct_content_part_image_data() {
         let _part = ContentPart {
             part: Some(content_part::Part::Image(ImageContent {
-                source: Some(image_content::Source::Data(vec![0u8, 1u8, 2u8].into())),
+                source: Some(image_content::Source::Data(vec![0u8, 1u8, 2u8])),
                 media_type: "image/jpeg".to_string(),
             })),
         };

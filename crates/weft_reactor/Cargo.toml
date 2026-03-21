@@ -33,6 +33,16 @@ tracing = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
 
+[features]
+# Expose test stubs and helpers for use in integration tests and dependent crates.
+test-support = []
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 weft_eventlog_memory = { path = "../weft_eventlog_memory" }
+weft_llm = { path = "../weft_llm", features = ["test-support"] }
+weft_router = { path = "../weft_router", features = ["test-support"] }
+weft_commands = { path = "../weft_commands", features = ["test-support"] }
+weft_reactor = { path = ".", features = ["test-support"] }
+rstest.workspace = true
+pretty_assertions.workspace = true

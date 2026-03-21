@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 weft_core = { path = "../weft_core" }
 weft_rhai = { path = "../weft_rhai" }
@@ -20,5 +23,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 mockito = { version = "1" }
 tempfile = { version = "3" }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 serde_json = { workspace = true }
+rstest.workspace = true
+pretty_assertions.workspace = true

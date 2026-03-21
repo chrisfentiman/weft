@@ -3,7 +3,8 @@
 //! The Reactor is the execution engine for the Weft pipeline. It is NOT a
 //! step-by-step executor. It is an event dispatch loop:
 //!
-//! 1. Run pre-loop activities sequentially (validate, route, assemble_prompt).
+//! 1. Run pre-loop activities sequentially (validate, model_selection, command_selection,
+//!    provider_resolution, system_prompt_assembly, command_formatting, sampling_adjustment).
 //! 2. Enter the dispatch loop:
 //!    a. Spawn the generate activity as an event producer.
 //!    b. Receive events from the channel via `tokio::select!`.
@@ -24,7 +25,8 @@ use crate::budget::{Budget, BudgetCheck};
 use crate::config::{PipelineConfig, ReactorConfig, RetryPolicy};
 use crate::error::ReactorError;
 use crate::event::{
-    EVENT_SCHEMA_VERSION, Event, GeneratedEvent, MessageInjectionSource, PipelineEvent,
+    CommandFormat, EVENT_SCHEMA_VERSION, Event, GeneratedEvent, MessageInjectionSource,
+    PipelineEvent,
 };
 use crate::event_log::EventLog;
 use crate::execution::{Execution, ExecutionId, ExecutionStatus, RequestId, TenantId};
@@ -108,6 +110,8 @@ struct ExecutionState {
     /// Current budget state.
     budget: Budget,
     /// Routing result, set from RouteCompleted events.
+    /// Maintained for backward compatibility: populated by the ModelSelected
+    /// drain arm so GenerateActivity continues to receive routing_result.
     routing: Option<RoutingSnapshot>,
     /// Generation config override from ForceGenerationConfig signal.
     generation_config_override: Option<serde_json::Value>,
@@ -129,6 +133,29 @@ struct ExecutionState {
     generate_retry_attempt: u32,
     /// Accumulated token usage across all generation calls.
     accumulated_usage: weft_core::WeftUsage,
+
+    // ── Fields set by new pre-loop activities (Phase 1+) ─────────────
+    /// Selected model routing name. Set by ModelSelectionActivity.
+    selected_model: Option<String>,
+    /// Selected model API identifier. Set by ProviderResolutionActivity.
+    selected_model_id: Option<String>,
+    /// Provider name for the selected model. Set by ProviderResolutionActivity.
+    selected_provider: Option<String>,
+    /// Capabilities of the selected model, as strings. Set by ProviderResolutionActivity.
+    /// Converted from `HashSet<Capability>` via `cap.as_str().to_string()`.
+    model_capabilities: Vec<String>,
+    /// Max tokens for the selected model. Set by ProviderResolutionActivity.
+    model_max_tokens: Option<u32>,
+    /// Commands selected by semantic routing. Set by CommandSelectionActivity.
+    selected_commands: Vec<weft_core::CommandStub>,
+    /// How commands are formatted for the provider. Set by CommandFormattingActivity.
+    command_format: Option<CommandFormat>,
+    /// Sampling max_tokens after clamping. Set by SamplingAdjustmentActivity.
+    sampling_max_tokens: Option<u32>,
+    /// Sampling temperature. Set by SamplingAdjustmentActivity.
+    sampling_temperature: Option<f32>,
+    /// Sampling top_p. Set by SamplingAdjustmentActivity.
+    sampling_top_p: Option<f32>,
 }
 
 impl ExecutionState {
@@ -147,6 +174,16 @@ impl ExecutionState {
             last_activity_event: HashMap::new(),
             generate_retry_attempt: 0,
             accumulated_usage: weft_core::WeftUsage::default(),
+            selected_model: None,
+            selected_model_id: None,
+            selected_provider: None,
+            model_capabilities: Vec::new(),
+            model_max_tokens: None,
+            selected_commands: Vec::new(),
+            command_format: None,
+            sampling_max_tokens: None,
+            sampling_temperature: None,
+            sampling_top_p: None,
         }
     }
 }
@@ -362,7 +399,33 @@ impl Reactor {
                 break;
             }
 
-            let input = self.build_input(&execution_id, &state, &request, resolved, None);
+            let mut input = self.build_input(&execution_id, &state, &request, resolved, None);
+            // Per spec Section 6.3: inject per-activity metadata so downstream
+            // activities receive the state accumulated by prior pre-loop activities.
+            match resolved.activity.name() {
+                "provider_resolution" => {
+                    input.metadata = serde_json::json!({
+                        "selected_model": state.selected_model.as_deref().unwrap_or("")
+                    });
+                }
+                "command_formatting" => {
+                    let cmd_names: Vec<&str> = state
+                        .selected_commands
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect();
+                    input.metadata = serde_json::json!({
+                        "capabilities": state.model_capabilities,
+                        "selected_commands": cmd_names,
+                    });
+                }
+                "sampling_adjustment" => {
+                    input.metadata = serde_json::json!({
+                        "max_tokens": state.model_max_tokens.unwrap_or(4096)
+                    });
+                }
+                _ => {}
+            }
             resolved
                 .activity
                 .execute(
@@ -1176,13 +1239,34 @@ impl Reactor {
         _resolved: &ResolvedActivity,
         idempotency_key: Option<String>,
     ) -> ActivityInput {
-        // Per spec Section 6.4: generation_config derives from override, then routing.
-        let generation_config = state.generation_config_override.clone().or_else(|| {
-            state
-                .routing
-                .as_ref()
-                .map(|r| serde_json::json!({ "model": r.model_routing.model }))
-        });
+        // Per spec Section 6.4: generation_config derives from override, then selected_model
+        // (with sampling params), then falls back to routing snapshot for backward compat.
+        let generation_config = state
+            .generation_config_override
+            .clone()
+            .or_else(|| {
+                state.selected_model.as_ref().map(|model| {
+                    let mut config = serde_json::json!({ "model": model });
+                    if let Some(max_tokens) = state.sampling_max_tokens {
+                        config["max_tokens"] = serde_json::json!(max_tokens);
+                    }
+                    if let Some(temp) = state.sampling_temperature {
+                        config["temperature"] = serde_json::json!(temp);
+                    }
+                    if let Some(top_p) = state.sampling_top_p {
+                        config["top_p"] = serde_json::json!(top_p);
+                    }
+                    config
+                })
+            })
+            .or_else(|| {
+                // Backward compat: if selected_model not yet set (e.g., pre-loop not complete),
+                // fall back to routing snapshot for serialized event log replay.
+                state
+                    .routing
+                    .as_ref()
+                    .map(|r| serde_json::json!({ "model": r.model_routing.model }))
+            });
 
         // Per spec Section 6.4: metadata comes from ActivityRef.config().
         // ResolvedActivity carries the activity but not the original ActivityRef.
@@ -1251,13 +1335,41 @@ impl Reactor {
                             // This makes available_commands reconstructable from the event log.
                             state.available_commands = commands.clone();
                         }
-                        PipelineEvent::MessageInjected { message, .. } => {
-                            // During replay scenarios where drain_pre_post_loop processes
-                            // a MessageInjected event, append the message to state.
-                            // In normal execution this variant is recorded by the Reactor
-                            // itself (not produced by activities), so this arm exists for
-                            // completeness and replay correctness.
-                            state.messages.push(message.clone());
+                        PipelineEvent::MessageInjected { message, source } => {
+                            // Dispatch on source to determine insertion position.
+                            // SystemPromptAssembly: insert/replace at messages[0] so the
+                            //   provider sees the gateway-assembled prompt as the canonical
+                            //   system prompt.
+                            // CommandFormatInjection: insert after the system prompt (position
+                            //   1 if a system message exists, else 0) so command descriptions
+                            //   appear before user messages.
+                            // All other sources: append (existing behavior).
+                            match source {
+                                MessageInjectionSource::SystemPromptAssembly => {
+                                    if !state.messages.is_empty()
+                                        && state.messages[0].role == weft_core::Role::System
+                                    {
+                                        state.messages[0] = message.clone();
+                                    } else {
+                                        state.messages.insert(0, message.clone());
+                                    }
+                                }
+                                MessageInjectionSource::CommandFormatInjection => {
+                                    // Insert after the system prompt, before user messages.
+                                    let insert_pos = if !state.messages.is_empty()
+                                        && state.messages[0].role == weft_core::Role::System
+                                    {
+                                        1
+                                    } else {
+                                        0
+                                    };
+                                    state.messages.insert(insert_pos, message.clone());
+                                }
+                                _ => {
+                                    // Existing behavior: append.
+                                    state.messages.push(message.clone());
+                                }
+                            }
                         }
                         PipelineEvent::ResponseAssembled { response } => {
                             state.response = Some(response.clone());
@@ -1267,6 +1379,54 @@ impl Reactor {
                             return Ok(Some(ReactorError::Cancelled {
                                 reason: reason.clone(),
                             }));
+                        }
+                        // ── New pre-loop activity events (Phase 1+) ──────────────
+                        PipelineEvent::ModelSelected {
+                            model_name, score, ..
+                        } => {
+                            state.selected_model = Some(model_name.clone());
+                            // Maintain backward compat: populate routing snapshot so
+                            // GenerateActivity continues to receive routing_result unchanged.
+                            state.routing = Some(RoutingSnapshot {
+                                model_routing: weft_core::RoutingActivity {
+                                    model: model_name.clone(),
+                                    score: *score,
+                                    filters: vec![],
+                                },
+                                tool_necessity: None,
+                                tool_necessity_score: None,
+                            });
+                        }
+                        PipelineEvent::CommandsSelected { selected, .. } => {
+                            state.selected_commands = selected.clone();
+                        }
+                        PipelineEvent::ProviderResolved {
+                            model_id,
+                            provider_name,
+                            capabilities,
+                            max_tokens,
+                            ..
+                        } => {
+                            state.selected_model_id = Some(model_id.clone());
+                            state.selected_provider = Some(provider_name.clone());
+                            state.model_capabilities = capabilities.clone();
+                            state.model_max_tokens = Some(*max_tokens);
+                        }
+                        PipelineEvent::SystemPromptAssembled { .. } => {
+                            // System prompt insertion is handled by the MessageInjected arm
+                            // when source == SystemPromptAssembly. Nothing to do here.
+                        }
+                        PipelineEvent::CommandsFormatted { format, .. } => {
+                            state.command_format = Some(format.clone());
+                        }
+                        PipelineEvent::SamplingUpdated {
+                            max_tokens,
+                            temperature,
+                            top_p,
+                        } => {
+                            state.sampling_max_tokens = Some(*max_tokens);
+                            state.sampling_temperature = *temperature;
+                            state.sampling_top_p = *top_p;
                         }
                         _ => {}
                     }
@@ -1723,7 +1883,7 @@ fn empty_response(execution_id: &ExecutionId) -> weft_core::WeftResponse {
 
 // ── Test hooks (unit test access to private free functions) ───────────────────
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_hooks {
     use super::*;
 

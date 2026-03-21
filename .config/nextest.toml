@@ -1,0 +1,27 @@
+# cargo-nextest configuration for the Weft workspace.
+#
+# Install: cargo install cargo-nextest --locked
+# Usage:
+#   cargo nextest run               - run all tests
+#   cargo nextest run -p weft_reactor - run a single crate
+#   cargo nextest run -E 'test(name)' - run a named test
+
+[store]
+dir = "target/nextest"
+
+[profile.default]
+# Per-test timeout: 30 seconds, terminate after 2 periods (60s total).
+# Generous for async tests with time manipulation (tokio::time::pause).
+slow-timeout = { period = "30s", terminate-after = 2 }
+
+# Do not retry by default. Flaky tests should be fixed, not hidden.
+retries = 0
+
+# Use all available CPU threads.
+test-threads = "num-cpus"
+
+[profile.ci]
+# CI profile: fail fast, no retries.
+retries = 0
+fail-fast = true
+slow-timeout = { period = "60s", terminate-after = 2 }

@@ -582,7 +582,7 @@ mod tests {
             // Add a delay longer than our timeout.
             .with_chunked_body(|w| {
                 std::thread::sleep(Duration::from_millis(200));
-                w.write_all(b"").map_err(|e| e.into())
+                w.write_all(b"")
             })
             .create_async()
             .await;

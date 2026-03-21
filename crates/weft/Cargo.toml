@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "weft"
+path = "src/lib.rs"
+
 [[bin]]
 name = "weft"
 path = "src/main.rs"
@@ -45,6 +49,12 @@ weft_eventlog_postgres = ["dep:weft_eventlog_postgres", "dep:sqlx"]
 
 [dev-dependencies]
 weft_hooks = { path = "../weft_hooks", features = ["test-support"] }
+weft_llm = { path = "../weft_llm", features = ["test-support"] }
+weft_router = { path = "../weft_router", features = ["test-support"] }
+weft_commands = { path = "../weft_commands", features = ["test-support"] }
+weft_eventlog_memory = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 mockito = { workspace = true }
 tempfile = { version = "3" }
+pretty_assertions.workspace = true
+rstest.workspace = true

@@ -1183,7 +1183,7 @@ mod tests {
         let proto_msg: proto::WeftMessage = original.clone().into();
         let roundtripped = WeftMessage::try_from(proto_msg).unwrap();
 
-        assert_eq!(roundtripped.delta, true);
+        assert!(roundtripped.delta);
         assert_eq!(roundtripped.message_index, 7);
         assert_eq!(roundtripped.model, Some("gpt-4".to_string()));
     }

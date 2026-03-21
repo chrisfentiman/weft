@@ -638,8 +638,8 @@ mod tests {
         // Average: [0.5, 0.5]
         // L2-norm: sqrt(0.25 + 0.25) = sqrt(0.5) ≈ 0.7071
         // Normalized: [0.5/0.7071, 0.5/0.7071] ≈ [0.7071, 0.7071]
-        let e1 = vec![1.0_f32, 0.0_f32];
-        let e2 = vec![0.0_f32, 1.0_f32];
+        let e1 = [1.0_f32, 0.0_f32];
+        let e2 = [0.0_f32, 1.0_f32];
 
         let mut sum = vec![0.0_f32; 2];
         for s in sum.iter_mut().zip(e1.iter()) {
@@ -786,7 +786,7 @@ mod tests {
 
     #[test]
     fn test_tool_necessity_needs_tools_wins() {
-        let scored = vec![
+        let scored = [
             ScoredCandidate {
                 id: "needs_tools".to_string(),
                 score: 0.8,
@@ -816,7 +816,7 @@ mod tests {
 
     #[test]
     fn test_tool_necessity_no_tools_wins() {
-        let scored = vec![
+        let scored = [
             ScoredCandidate {
                 id: "needs_tools".to_string(),
                 score: 0.2,
@@ -846,7 +846,7 @@ mod tests {
 
     #[test]
     fn test_tool_necessity_only_needs_tools_candidate() {
-        let scored = vec![ScoredCandidate {
+        let scored = [ScoredCandidate {
             id: "needs_tools".to_string(),
             score: 0.5,
         }];
@@ -866,7 +866,7 @@ mod tests {
 
     #[test]
     fn test_tool_necessity_only_no_tools_candidate() {
-        let scored = vec![ScoredCandidate {
+        let scored = [ScoredCandidate {
             id: "no_tools".to_string(),
             score: 0.5,
         }];
@@ -916,7 +916,7 @@ mod tests {
     #[test]
     fn test_cache_key_format_all_domains() {
         let name = "test";
-        let keys: Vec<String> = vec![
+        let keys: Vec<String> = [
             RoutingDomainKind::Commands,
             RoutingDomainKind::Model,
             RoutingDomainKind::ToolNecessity,

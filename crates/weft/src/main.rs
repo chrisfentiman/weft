@@ -3,11 +3,6 @@
 //! Loads configuration, constructs concrete implementations of all components,
 //! wires them into the Reactor, and starts the axum HTTP server.
 
-mod event_log;
-mod grpc;
-mod server;
-mod types;
-
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -21,8 +16,10 @@ use weft_memory::{DefaultMemoryService, GrpcMemoryStoreClient, MemoryStoreMux, S
 use weft_reactor::{
     ActivityRegistry, Reactor, ReactorConfig,
     activities::{
-        AssemblePromptActivity, AssembleResponseActivity, ExecuteCommandActivity, GenerateActivity,
-        HookActivity, RouteActivity, ValidateActivity,
+        AssembleResponseActivity, CommandFormattingActivity, CommandSelectionActivity,
+        ExecuteCommandActivity, GenerateActivity, HookActivity, ModelSelectionActivity,
+        ProviderResolutionActivity, SamplingAdjustmentActivity, SystemPromptAssemblyActivity,
+        ValidateActivity,
     },
     config::{ActivityRef, BudgetConfig, LoopHooks, PipelineConfig, RetryPolicy},
     services::{ReactorHandle, Services},
@@ -32,9 +29,9 @@ use weft_router::{
 };
 use weft_tools::GrpcToolRegistryClient;
 
-use crate::grpc::WeftService;
-use crate::server::build_router;
-use crate::types::BinaryCommandRegistry;
+use weft::grpc::WeftService;
+use weft::server::build_router;
+use weft::types::BinaryCommandRegistry;
 
 /// Weft — AI orchestration gateway
 #[derive(Debug, Parser)]
@@ -458,7 +455,7 @@ async fn main() {
     // Selects InMemoryEventLog or PostgresEventLog based on [event_log] config.
     // Defaults to InMemoryEventLog when the section is absent.
 
-    let event_log = event_log::build_event_log(config.event_log.as_ref())
+    let event_log = weft::event_log::build_event_log(config.event_log.as_ref())
         .await
         .unwrap_or_else(|e| {
             eprintln!("error: event log initialization failed: {e}");
@@ -495,8 +492,7 @@ async fn main() {
     // ── Build ActivityRegistry ─────────────────────────────────────────────
     //
     // Register all built-in activities. Hook activities are registered for each
-    // lifecycle point. PreRoute/PostRoute hooks are handled inside RouteActivity
-    // and are not registered as separate activities.
+    // lifecycle point.
 
     let mut activity_registry = ActivityRegistry::new();
     activity_registry
@@ -506,15 +502,39 @@ async fn main() {
             std::process::exit(1);
         });
     activity_registry
-        .register(Arc::new(RouteActivity))
+        .register(Arc::new(ModelSelectionActivity))
         .unwrap_or_else(|e| {
-            eprintln!("error: failed to register RouteActivity: {e}");
+            eprintln!("error: failed to register ModelSelectionActivity: {e}");
             std::process::exit(1);
         });
     activity_registry
-        .register(Arc::new(AssemblePromptActivity))
+        .register(Arc::new(CommandSelectionActivity))
         .unwrap_or_else(|e| {
-            eprintln!("error: failed to register AssemblePromptActivity: {e}");
+            eprintln!("error: failed to register CommandSelectionActivity: {e}");
+            std::process::exit(1);
+        });
+    activity_registry
+        .register(Arc::new(ProviderResolutionActivity))
+        .unwrap_or_else(|e| {
+            eprintln!("error: failed to register ProviderResolutionActivity: {e}");
+            std::process::exit(1);
+        });
+    activity_registry
+        .register(Arc::new(SystemPromptAssemblyActivity))
+        .unwrap_or_else(|e| {
+            eprintln!("error: failed to register SystemPromptAssemblyActivity: {e}");
+            std::process::exit(1);
+        });
+    activity_registry
+        .register(Arc::new(CommandFormattingActivity))
+        .unwrap_or_else(|e| {
+            eprintln!("error: failed to register CommandFormattingActivity: {e}");
+            std::process::exit(1);
+        });
+    activity_registry
+        .register(Arc::new(SamplingAdjustmentActivity))
+        .unwrap_or_else(|e| {
+            eprintln!("error: failed to register SamplingAdjustmentActivity: {e}");
             std::process::exit(1);
         });
     activity_registry
@@ -555,9 +575,10 @@ async fn main() {
 
     // ── Build ReactorConfig ────────────────────────────────────────────────
     //
-    // Always include all loop hook activities in the pipeline config. HookActivity
-    // for events with no registered hooks calls HookRunner::run_chain which returns
-    // Allowed immediately — the overhead is negligible.
+    // Pre-loop order: validate, hook_request_start, model_selection, command_selection,
+    // provider_resolution, system_prompt_assembly, command_formatting, sampling_adjustment.
+    // Loop hook activities are always included; HookActivity for events with no registered
+    // hooks returns Allowed immediately — the overhead is negligible.
 
     let reactor_config = ReactorConfig {
         pipelines: vec![PipelineConfig {
@@ -565,8 +586,12 @@ async fn main() {
             pre_loop: vec![
                 ActivityRef::Name("validate".to_string()),
                 ActivityRef::Name("hook_request_start".to_string()),
-                ActivityRef::Name("route".to_string()),
-                ActivityRef::Name("assemble_prompt".to_string()),
+                ActivityRef::Name("model_selection".to_string()),
+                ActivityRef::Name("command_selection".to_string()),
+                ActivityRef::Name("provider_resolution".to_string()),
+                ActivityRef::Name("system_prompt_assembly".to_string()),
+                ActivityRef::Name("command_formatting".to_string()),
+                ActivityRef::Name("sampling_adjustment".to_string()),
             ],
             post_loop: vec![
                 ActivityRef::Name("assemble_response".to_string()),
@@ -642,7 +667,7 @@ async fn main() {
     let router = build_router(Arc::clone(&weft_service));
     let bind_address = &config.server.bind_address;
 
-    if let Err(e) = server::serve(router, bind_address).await {
+    if let Err(e) = weft::server::serve(router, bind_address).await {
         eprintln!("error: server failed: {e}");
         std::process::exit(1);
     }
