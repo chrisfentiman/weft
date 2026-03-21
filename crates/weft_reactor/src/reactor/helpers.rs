@@ -234,6 +234,7 @@ pub(super) fn empty_response(execution_id: &ExecutionId) -> weft_core::WeftRespo
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
     use std::sync::Arc;
 
     use crate::activity::{Activity, ActivityInput};
