@@ -43,6 +43,7 @@ uuid = { workspace = true }
 regex = { workspace = true }
 rhai = { workspace = true }
 reqwest = { workspace = true }
+config = "0.14"
 
 [features]
 # Enable Postgres-backed event log. Requires DATABASE_URL at runtime.

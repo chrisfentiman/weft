@@ -16,7 +16,7 @@ use weft_activities::{
     ValidateActivity,
 };
 use weft_commands::ToolRegistryCommandAdapter;
-use weft_core::{HookEvent, WeftConfig, WireFormat};
+use weft_core::{HookEvent, WireFormat};
 use weft_llm::{AnthropicProvider, Capability, OpenAIProvider, ProviderRegistry, RhaiProvider};
 use weft_memory::{DefaultMemoryService, GrpcMemoryStoreClient, MemoryStoreMux, StoreInfo};
 use weft_reactor::{
@@ -29,6 +29,7 @@ use weft_router::{
 };
 use weft_tools::GrpcToolRegistryClient;
 
+use weft::config_loading::load_and_build_store;
 use weft::grpc::WeftService;
 use weft::server::build_router;
 use weft::types::BinaryCommandRegistry;
@@ -59,32 +60,22 @@ async fn main() {
         )
         .init();
 
-    // Load and resolve configuration.
-    let config_str = std::fs::read_to_string(&cli.config).unwrap_or_else(|e| {
+    // Load, resolve, validate, and build ConfigStore.
+    //
+    // load_and_build_store handles TOML loading via config-rs (with env var overrides),
+    // resolve() for env: prefixes, validate() for constraint checks, and ResolvedConfig
+    // construction. The ConfigStore is held for future hot reload support (Phase 3).
+    let config_store = Arc::new(load_and_build_store(&cli.config).unwrap_or_else(|e| {
         eprintln!(
-            "error: failed to read config file '{}': {e}",
+            "error: failed to load config file '{}': {e}",
             cli.config.display()
         );
         std::process::exit(1);
-    });
+    }));
 
-    let mut config: WeftConfig = toml::from_str(&config_str).unwrap_or_else(|e| {
-        eprintln!(
-            "error: failed to parse config file '{}': {e}",
-            cli.config.display()
-        );
-        std::process::exit(1);
-    });
-
-    config.resolve().unwrap_or_else(|e| {
-        eprintln!("error: configuration error: {e}");
-        std::process::exit(1);
-    });
-
-    config.validate().unwrap_or_else(|e| {
-        eprintln!("error: configuration validation error: {e}");
-        std::process::exit(1);
-    });
+    // Obtain the full WeftConfig for startup wiring (provider construction, router init,
+    // semaphore sizing). Activities continue using services.config() for now (Phase 1).
+    let config = config_store.operator_config();
 
     info!(path = %cli.config.display(), "configuration loaded");
 
