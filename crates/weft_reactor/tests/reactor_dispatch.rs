@@ -17,8 +17,9 @@ use weft_reactor::config::{
 };
 use weft_reactor::error::ReactorError;
 use weft_reactor::event::{
-    ActivityEvent, CommandEvent, ContextEvent, ExecutionEvent, GeneratedEvent, GenerationEvent,
-    HookOutcome, PipelineEvent, SignalEvent,
+    ActivityEvent, CommandEvent, CommandFormat, ContextEvent, ExecutionEvent, GeneratedEvent,
+    GenerationEvent, HookOutcome, MessageInjectionSource, PipelineEvent, SelectionEvent,
+    SignalEvent,
 };
 use weft_reactor::event_log::EventLog;
 use weft_reactor::execution::{Execution, ExecutionId, ExecutionStatus};
@@ -2869,21 +2870,304 @@ fn backoff_ms_respects_cap() {
 
 // ── Phase 5: Pre-loop activity wiring integration tests ───────────────────
 
-use weft_activities::{
-    CommandFormattingActivity, CommandSelectionActivity, ModelSelectionActivity,
-    ProviderResolutionActivity, SamplingAdjustmentActivity, SystemPromptAssemblyActivity,
-    ValidateActivity,
-};
+// Stub implementations of the pre-loop activities. These emit the specific
+// events that the reactor integration tests verify, without taking a
+// dev-dependency on weft_activities (per spec Section 10.6).
+
+/// Stub for ValidateActivity: emits ValidationPassed, CommandsAvailable, and Completed.
+struct StubValidateActivity;
+
+#[async_trait::async_trait]
+impl Activity for StubValidateActivity {
+    fn name(&self) -> &str {
+        "validate"
+    }
+
+    async fn execute(
+        &self,
+        _execution_id: &ExecutionId,
+        _input: ActivityInput,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
+        _event_log: &dyn EventLog,
+        event_tx: mpsc::Sender<PipelineEvent>,
+        _cancel: CancellationToken,
+    ) {
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
+                name: self.name().to_string(),
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Execution(ExecutionEvent::ValidationPassed))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Command(CommandEvent::Available {
+                commands: vec![],
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
+                name: self.name().to_string(),
+                idempotency_key: None,
+            }))
+            .await;
+    }
+}
+
+/// Stub for ModelSelectionActivity: emits ModelSelected with a non-empty model name.
+struct StubModelSelectionActivity;
+
+#[async_trait::async_trait]
+impl Activity for StubModelSelectionActivity {
+    fn name(&self) -> &str {
+        "model_selection"
+    }
+
+    async fn execute(
+        &self,
+        _execution_id: &ExecutionId,
+        _input: ActivityInput,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
+        _event_log: &dyn EventLog,
+        event_tx: mpsc::Sender<PipelineEvent>,
+        _cancel: CancellationToken,
+    ) {
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
+                name: self.name().to_string(),
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Selection(SelectionEvent::ModelSelected {
+                model_name: "stub-model".to_string(),
+                score: 0.9,
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
+                name: self.name().to_string(),
+                idempotency_key: None,
+            }))
+            .await;
+    }
+}
+
+/// Stub for CommandSelectionActivity: emits CommandsSelected with an empty list.
+struct StubCommandSelectionActivity;
+
+#[async_trait::async_trait]
+impl Activity for StubCommandSelectionActivity {
+    fn name(&self) -> &str {
+        "command_selection"
+    }
+
+    async fn execute(
+        &self,
+        _execution_id: &ExecutionId,
+        _input: ActivityInput,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
+        _event_log: &dyn EventLog,
+        event_tx: mpsc::Sender<PipelineEvent>,
+        _cancel: CancellationToken,
+    ) {
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
+                name: self.name().to_string(),
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Selection(SelectionEvent::CommandsSelected {
+                selected: vec![],
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
+                name: self.name().to_string(),
+                idempotency_key: None,
+            }))
+            .await;
+    }
+}
+
+/// Stub for ProviderResolutionActivity: emits ProviderResolved with stub values.
+struct StubProviderResolutionActivity;
+
+#[async_trait::async_trait]
+impl Activity for StubProviderResolutionActivity {
+    fn name(&self) -> &str {
+        "provider_resolution"
+    }
+
+    async fn execute(
+        &self,
+        _execution_id: &ExecutionId,
+        _input: ActivityInput,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
+        _event_log: &dyn EventLog,
+        event_tx: mpsc::Sender<PipelineEvent>,
+        _cancel: CancellationToken,
+    ) {
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
+                name: self.name().to_string(),
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Selection(SelectionEvent::ProviderResolved {
+                model_name: "stub-model".to_string(),
+                model_id: "stub-model-v1".to_string(),
+                provider_name: "anthropic".to_string(),
+                capabilities: vec![],
+                max_tokens: 4096,
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
+                name: self.name().to_string(),
+                idempotency_key: None,
+            }))
+            .await;
+    }
+}
+
+/// Stub for SystemPromptAssemblyActivity: emits MessageInjected (SystemPromptAssembly)
+/// and SystemPromptAssembled.
+struct StubSystemPromptAssemblyActivity;
+
+#[async_trait::async_trait]
+impl Activity for StubSystemPromptAssemblyActivity {
+    fn name(&self) -> &str {
+        "system_prompt_assembly"
+    }
+
+    async fn execute(
+        &self,
+        _execution_id: &ExecutionId,
+        _input: ActivityInput,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
+        _event_log: &dyn EventLog,
+        event_tx: mpsc::Sender<PipelineEvent>,
+        _cancel: CancellationToken,
+    ) {
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
+                name: self.name().to_string(),
+            }))
+            .await;
+        let system_message = weft_core::WeftMessage {
+            role: weft_core::Role::System,
+            source: weft_core::Source::Provider,
+            model: None,
+            content: vec![weft_core::ContentPart::Text("You are helpful.".to_string())],
+            delta: false,
+            message_index: 0,
+        };
+        let _ = event_tx
+            .send(PipelineEvent::Context(ContextEvent::MessageInjected {
+                message: system_message,
+                source: MessageInjectionSource::SystemPromptAssembly,
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Context(
+                ContextEvent::SystemPromptAssembled { message_count: 1 },
+            ))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
+                name: self.name().to_string(),
+                idempotency_key: None,
+            }))
+            .await;
+    }
+}
+
+/// Stub for CommandFormattingActivity: emits CommandsFormatted with NoCommands.
+struct StubCommandFormattingActivity;
+
+#[async_trait::async_trait]
+impl Activity for StubCommandFormattingActivity {
+    fn name(&self) -> &str {
+        "command_formatting"
+    }
+
+    async fn execute(
+        &self,
+        _execution_id: &ExecutionId,
+        _input: ActivityInput,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
+        _event_log: &dyn EventLog,
+        event_tx: mpsc::Sender<PipelineEvent>,
+        _cancel: CancellationToken,
+    ) {
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
+                name: self.name().to_string(),
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Context(ContextEvent::CommandsFormatted {
+                format: CommandFormat::NoCommands,
+                command_count: 0,
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
+                name: self.name().to_string(),
+                idempotency_key: None,
+            }))
+            .await;
+    }
+}
+
+/// Stub for SamplingAdjustmentActivity: emits SamplingUpdated with max_tokens 4096.
+struct StubSamplingAdjustmentActivity;
+
+#[async_trait::async_trait]
+impl Activity for StubSamplingAdjustmentActivity {
+    fn name(&self) -> &str {
+        "sampling_adjustment"
+    }
+
+    async fn execute(
+        &self,
+        _execution_id: &ExecutionId,
+        _input: ActivityInput,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
+        _event_log: &dyn EventLog,
+        event_tx: mpsc::Sender<PipelineEvent>,
+        _cancel: CancellationToken,
+    ) {
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
+                name: self.name().to_string(),
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Context(ContextEvent::SamplingUpdated {
+                max_tokens: 4096,
+                temperature: None,
+                top_p: None,
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Completed {
+                name: self.name().to_string(),
+                idempotency_key: None,
+            }))
+            .await;
+    }
+}
 
 fn build_new_preloop_registry(generate_name: &str) -> Arc<ActivityRegistry> {
     build_registry(vec![
-        Arc::new(ValidateActivity),
-        Arc::new(ModelSelectionActivity),
-        Arc::new(CommandSelectionActivity),
-        Arc::new(ProviderResolutionActivity),
-        Arc::new(SystemPromptAssemblyActivity),
-        Arc::new(CommandFormattingActivity),
-        Arc::new(SamplingAdjustmentActivity),
+        Arc::new(StubValidateActivity),
+        Arc::new(StubModelSelectionActivity),
+        Arc::new(StubCommandSelectionActivity),
+        Arc::new(StubProviderResolutionActivity),
+        Arc::new(StubSystemPromptAssemblyActivity),
+        Arc::new(StubCommandFormattingActivity),
+        Arc::new(StubSamplingAdjustmentActivity),
         Arc::new(ImmediateDoneActivity {
             name: generate_name.to_string(),
         }),
@@ -3203,13 +3487,13 @@ async fn pre_loop_activity_failure_terminates_execution() {
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
     let registry = build_registry(vec![
-        Arc::new(ValidateActivity),
+        Arc::new(StubValidateActivity),
         Arc::new(FailingModelSelection),
-        Arc::new(CommandSelectionActivity),
-        Arc::new(ProviderResolutionActivity),
-        Arc::new(SystemPromptAssemblyActivity),
-        Arc::new(CommandFormattingActivity),
-        Arc::new(SamplingAdjustmentActivity),
+        Arc::new(StubCommandSelectionActivity),
+        Arc::new(StubProviderResolutionActivity),
+        Arc::new(StubSystemPromptAssemblyActivity),
+        Arc::new(StubCommandFormattingActivity),
+        Arc::new(StubSamplingAdjustmentActivity),
         Arc::new(ImmediateDoneActivity {
             name: "generate".to_string(),
         }),
