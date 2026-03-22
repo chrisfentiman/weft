@@ -12,7 +12,6 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use weft_reactor::activity::{Activity, ActivityInput};
-use weft_reactor::config::{ActivityRef, LoopHooks, PipelineConfig};
 use weft_reactor::event::{
     ActivityEvent, FailureDetail, GeneratedEvent, GenerationEvent, PipelineEvent,
 };
@@ -25,10 +24,8 @@ use weft_reactor::{ExecutionContext, RequestId, TenantId};
 use weft_core::{CommandAction, CommandInvocation, ContentPart, Role, Source, WeftMessage};
 
 use harness::{
-    ImmediateDoneActivity, StubAssembleResponse, StubCommandFormattingActivity,
-    StubCommandSelectionActivity, StubModelSelectionActivity, StubProviderResolutionActivity,
-    StubSamplingAdjustmentActivity, build_registry, reactor_config, simple_pipeline_config,
-    test_event_log, test_request,
+    StubAssembleResponse, build_registry, reactor_config, simple_pipeline_config, test_event_log,
+    test_request,
 };
 
 #[allow(unused_imports)]
@@ -787,66 +784,3 @@ async fn multiple_command_failures_all_inject_errors_and_continue() {
     );
 }
 
-/// ExecutionResult.degradations is empty on a fully successful execution.
-#[tokio::test]
-async fn execution_result_degradations_empty_on_success() {
-    use pretty_assertions::assert_eq;
-
-    let services = Arc::new(make_test_services());
-    let event_log = test_event_log();
-    let registry = build_registry(vec![
-        Arc::new(StubModelSelectionActivity),
-        Arc::new(StubCommandSelectionActivity),
-        Arc::new(StubProviderResolutionActivity),
-        Arc::new(StubCommandFormattingActivity),
-        Arc::new(StubSamplingAdjustmentActivity),
-        Arc::new(ImmediateDoneActivity {
-            name: "generate".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(harness::StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
-    ]);
-
-    let config = reactor_config(PipelineConfig {
-        name: "default".to_string(),
-        pre_loop: vec![
-            ActivityRef::Name("model_selection".to_string()),
-            ActivityRef::Name("command_selection".to_string()),
-            ActivityRef::Name("provider_resolution".to_string()),
-            ActivityRef::Name("command_formatting".to_string()),
-            ActivityRef::Name("sampling_adjustment".to_string()),
-        ],
-        post_loop: vec![ActivityRef::Name("assemble_response".to_string())],
-        generate: ActivityRef::Name("generate".to_string()),
-        execute_command: ActivityRef::Name("execute_command".to_string()),
-        loop_hooks: LoopHooks::default(),
-    });
-
-    let reactor = Reactor::new(services, event_log.clone(), registry, &config)
-        .expect("reactor should construct");
-
-    let result = reactor
-        .execute(
-            ExecutionContext {
-                request: test_request(),
-                tenant_id: TenantId("t1".to_string()),
-                request_id: RequestId("r1".to_string()),
-                parent_id: None,
-                parent_budget: None,
-                client_tx: None,
-            },
-            None,
-        )
-        .await;
-
-    let (execution_result, _) = result.expect("successful execution should return Ok");
-    assert_eq!(
-        execution_result.degradations.len(),
-        0,
-        "no degradations on a fully successful execution"
-    );
-}

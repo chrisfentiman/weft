@@ -387,6 +387,73 @@ async fn semi_critical_model_selection_uses_default_model() {
     );
 }
 
+/// ExecutionResult.degradations is empty on a fully successful execution.
+///
+/// Verifies that the degradations list is not spuriously populated when all
+/// activities succeed.
+#[tokio::test]
+async fn execution_result_degradations_empty_on_success() {
+    use pretty_assertions::assert_eq;
+
+    let services = Arc::new(make_test_services());
+    let event_log = test_event_log();
+    let registry = build_registry(vec![
+        Arc::new(StubModelSelectionActivity),
+        Arc::new(StubCommandSelectionActivity),
+        Arc::new(StubProviderResolutionActivity),
+        Arc::new(StubCommandFormattingActivity),
+        Arc::new(StubSamplingAdjustmentActivity),
+        Arc::new(ImmediateDoneActivity {
+            name: "generate".to_string(),
+        }),
+        Arc::new(StubAssembleResponse {
+            name: "assemble_response".to_string(),
+        }),
+        Arc::new(StubExecuteCommand {
+            name: "execute_command".to_string(),
+        }),
+    ]);
+
+    let config = reactor_config(PipelineConfig {
+        name: "default".to_string(),
+        pre_loop: vec![
+            ActivityRef::Name("model_selection".to_string()),
+            ActivityRef::Name("command_selection".to_string()),
+            ActivityRef::Name("provider_resolution".to_string()),
+            ActivityRef::Name("command_formatting".to_string()),
+            ActivityRef::Name("sampling_adjustment".to_string()),
+        ],
+        post_loop: vec![ActivityRef::Name("assemble_response".to_string())],
+        generate: ActivityRef::Name("generate".to_string()),
+        execute_command: ActivityRef::Name("execute_command".to_string()),
+        loop_hooks: LoopHooks::default(),
+    });
+
+    let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+        .expect("reactor should construct");
+
+    let result = reactor
+        .execute(
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
+            None,
+        )
+        .await;
+
+    let (execution_result, _) = result.expect("successful execution should return Ok");
+    assert_eq!(
+        execution_result.degradations.len(),
+        0,
+        "no degradations on a fully successful execution"
+    );
+}
+
 /// ExecutionResult.degradations is populated when a non-critical activity fails.
 ///
 /// Verifies Phase 3 spec: degradations accumulated in ExecutionState are moved
