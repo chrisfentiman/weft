@@ -552,6 +552,10 @@ examples = ["test"]
             !err_msg.contains("did you mean"),
             "should NOT contain 'did you mean' for distant field in: {err_msg}"
         );
+        assert!(
+            err_msg.contains("expected fields:"),
+            "should still list expected fields when no close match in: {err_msg}"
+        );
     }
 
     #[test]
