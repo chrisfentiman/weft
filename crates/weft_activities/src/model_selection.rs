@@ -202,7 +202,7 @@ impl Activity for ModelSelectionActivity {
                                     "filter {} model candidates by routing instruction",
                                     models_scored
                                 )),
-                                fallback: None,
+                                fallback: Some("Fall back to default model".to_string()),
                             },
                         }))
                         .await;
