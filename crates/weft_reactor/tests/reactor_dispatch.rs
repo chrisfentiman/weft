@@ -4424,13 +4424,11 @@ async fn command_failure_injects_error_message_and_continues() {
             return false;
         }
         // Source must be CommandError.
-        let source_is_cmd_error = e
-            .payload
+        e.payload
             .get("event")
             .and_then(|v| v.get("source"))
             .and_then(|s| s.get("CommandError"))
-            .is_some();
-        source_is_cmd_error
+            .is_some()
     });
     assert!(
         injected,
