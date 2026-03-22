@@ -11,12 +11,14 @@ use weft_reactor::config::{ActivityRef, LoopHooks, PipelineConfig};
 use weft_reactor::error::ReactorError;
 use weft_reactor::reactor::Reactor;
 use weft_reactor::test_support::{make_test_services, make_test_services_with_blocking_hook};
-use weft_reactor::{EventLog, ExecutionContext, RequestId, TenantId};
+use weft_reactor::{ExecutionContext, RequestId, TenantId};
 
 use weft_core::HookEvent;
 use weft_reactor_trait::Criticality;
 
-use harness::{TestActivity, build_registry, reactor_config, test_event_log, test_request};
+use harness::{
+    EventAssertions, TestActivity, build_registry, reactor_config, test_event_log, test_request,
+};
 
 #[allow(unused_imports)]
 use pretty_assertions::{assert_eq, assert_ne};
@@ -160,15 +162,9 @@ async fn pre_response_hook_block_injects_feedback_and_retries_generation() {
     );
 
     let (exec_result, _) = result.unwrap();
-    let events = event_log
-        .read(&exec_result.execution_id, None::<u64>)
+    EventAssertions::for_execution(&event_log, &exec_result.execution_id)
         .await
-        .unwrap();
-    let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
-    assert!(
-        event_types.contains(&"hook.blocked"),
-        "event log should contain hook.blocked; got: {event_types:?}"
-    );
+        .contains("hook.blocked");
 }
 
 #[tokio::test]
@@ -226,38 +222,15 @@ async fn pre_generate_hook_non_critical_failure_degrades_and_continues() {
     let (exec_result, _) = result
         .expect("non-critical pre_generate hook failure should degrade, not terminate execution");
 
-    // ExecutionEvent::Degraded must be recorded for the hook failure.
-    let events = event_log
-        .read(&exec_result.execution_id, None::<u64>)
+    // ExecutionEvent::Degraded must be recorded for the hook failure,
+    // and must reference hook_pre_generate as the activity that degraded.
+    EventAssertions::for_execution(&event_log, &exec_result.execution_id)
         .await
-        .unwrap_or_default();
-    let degraded_events: Vec<_> = events
-        .iter()
-        .filter(|e| e.event_type == "execution.degraded")
-        .collect();
-
-    assert!(
-        !degraded_events.is_empty(),
-        "should have at least one execution.degraded event; event_types: {:?}",
-        events
-            .iter()
-            .map(|e| e.event_type.as_str())
-            .collect::<Vec<_>>()
-    );
-
-    // The degradation should reference hook_pre_generate.
-    let has_hook_degradation = degraded_events.iter().any(|e| {
-        e.payload
-            .get("event")
-            .and_then(|ev: &serde_json::Value| ev.get("notice"))
-            .and_then(|n: &serde_json::Value| n.get("activity_name"))
-            .and_then(|a: &serde_json::Value| a.as_str())
-            == Some("hook_pre_generate")
-    });
-    assert!(
-        has_hook_degradation,
-        "degradation should be attributed to hook_pre_generate; degraded events: {degraded_events:?}"
-    );
+        .payload_contains(
+            "execution.degraded",
+            "/event/notice/activity_name",
+            &serde_json::json!("hook_pre_generate"),
+        );
 }
 
 #[tokio::test]

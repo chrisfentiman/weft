@@ -11,11 +11,11 @@ use std::time::Duration;
 use weft_reactor::event::FailureDetail;
 use weft_reactor::reactor::Reactor;
 use weft_reactor::test_support::make_test_services;
-use weft_reactor::{EventLog, ExecutionContext, RequestId, TenantId};
+use weft_reactor::{ExecutionContext, RequestId, TenantId};
 
 use harness::{
-    CallAction, TestActivity, build_registry, failing_execute_command, hanging_execute_command,
-    reactor_config, simple_pipeline_config, test_event_log, test_request,
+    CallAction, EventAssertions, TestActivity, build_registry, failing_execute_command,
+    hanging_execute_command, reactor_config, simple_pipeline_config, test_event_log, test_request,
 };
 
 #[allow(unused_imports)]
@@ -67,20 +67,10 @@ async fn command_iteration_loop_executes_command_then_calls_generate_again() {
         "at least one iteration should be recorded"
     );
 
-    let events = event_log
-        .read(&result.execution_id, None::<u64>)
+    EventAssertions::for_execution(&event_log, &result.execution_id)
         .await
-        .unwrap();
-    let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
-
-    assert!(
-        event_types.contains(&"command.completed"),
-        "event log should contain command.completed; got: {event_types:?}"
-    );
-    assert!(
-        event_types.contains(&"execution.iteration_completed"),
-        "event log should contain execution.iteration_completed; got: {event_types:?}"
-    );
+        .contains("command.completed")
+        .contains("execution.iteration_completed");
 }
 
 #[tokio::test]
@@ -148,24 +138,23 @@ async fn command_failure_injects_error_message_and_continues() {
     );
 
     // The error message must be injected into the event log so the LLM sees it on the next call.
-    let events = event_log
-        .read(&execution_result.execution_id, None::<u64>)
+    // Source must be CommandError: payload_contains cannot express "key exists" without a known
+    // value, so use all() as the escape hatch to check for CommandError presence.
+    let assertions = EventAssertions::for_execution(&event_log, &execution_result.execution_id)
         .await
-        .unwrap();
-    let injected = events.iter().any(|e| {
-        if e.event_type != "context.message_injected" {
-            return false;
-        }
-        // Source must be CommandError.
-        e.payload
-            .get("event")
-            .and_then(|v| v.get("source"))
-            .and_then(|s| s.get("CommandError"))
-            .is_some()
+        .contains("context.message_injected");
+    let has_command_error = assertions.all().iter().any(|e| {
+        e.event_type == "context.message_injected"
+            && e.payload
+                .get("event")
+                .and_then(|v| v.get("source"))
+                .and_then(|s| s.get("CommandError"))
+                .is_some()
     });
     assert!(
-        injected,
-        "expected context.message_injected with CommandError source in event log"
+        has_command_error,
+        "expected context.message_injected with CommandError source; events: {:?}",
+        assertions.types()
     );
 
     // Generate was called twice: once to request the command, once after error injection.
@@ -329,12 +318,13 @@ async fn multiple_command_failures_all_inject_errors_and_continue() {
         );
     }
 
-    // Both error messages should appear in the event log as MessageInjected events.
-    let events = event_log
-        .read(&execution_result.execution_id, None::<u64>)
-        .await
-        .unwrap();
-    let injected_count = events
+    // Both error messages should appear in the event log as MessageInjected events with
+    // CommandError source. Use all() to count CommandError injections (payload_contains
+    // cannot express count-with-key-exists without knowing the exact value).
+    let assertions = EventAssertions::for_execution(&event_log, &execution_result.execution_id)
+        .await;
+    let injected_count = assertions
+        .all()
         .iter()
         .filter(|e| {
             e.event_type == "context.message_injected"
