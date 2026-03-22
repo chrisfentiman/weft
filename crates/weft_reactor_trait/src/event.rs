@@ -35,6 +35,11 @@ use serde::{Deserialize, Serialize};
 use crate::execution::ExecutionId;
 use crate::signal::Signal;
 
+// Re-export wire-surface diagnostic types from weft_core so that both
+// weft_core (for WeftResponse) and weft_reactor_trait (for PipelineEvent)
+// use the same concrete types without circular dependencies.
+pub use weft_core::wire::{DegradationNotice, PipelinePhase};
+
 /// Structured diagnostic context for activity failures.
 ///
 /// Carried by `ActivityEvent::Failed`. Follows Temporal's ApplicationFailure
@@ -70,32 +75,6 @@ impl Default for FailureDetail {
             fallback: None,
         }
     }
-}
-
-/// Pipeline phase where an event occurred.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PipelinePhase {
-    PreLoop,
-    Dispatch,
-    PostLoop,
-}
-
-/// Record of a degraded activity: what failed, why, and what the reactor did.
-/// Accumulated during execution and surfaced on ExecutionResult.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DegradationNotice {
-    /// Which activity degraded.
-    pub activity_name: String,
-    /// Pipeline phase where degradation occurred.
-    pub phase: PipelinePhase,
-    /// Machine-readable error code (from FailureDetail::error_code).
-    pub error_code: String,
-    /// Human-readable summary.
-    pub message: String,
-    /// What capability was lost.
-    pub impact: String,
-    /// The fallback that was applied.
-    pub fallback_applied: String,
 }
 
 /// Current event schema version. Increment on breaking changes.
@@ -912,6 +891,7 @@ mod tests {
                 messages: vec![],
                 usage: weft_core::WeftUsage::default(),
                 timing: weft_core::WeftTiming::default(),
+                degradations: vec![],
             },
         }),
         "context.response_assembled",

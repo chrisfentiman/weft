@@ -43,6 +43,11 @@ pub struct ExecutionResult {
     /// The execution's final budget state. Used by spawn_child to deduct
     /// child consumption from the parent via deduct_child_usage.
     pub final_budget: Budget,
+    /// Degradation notices accumulated during execution.
+    ///
+    /// Non-empty when non-critical activities failed and the reactor
+    /// continued with fallback defaults. Empty on fully successful requests.
+    pub degradations: Vec<DegradationNotice>,
 }
 
 /// Summary of resources consumed by an execution.

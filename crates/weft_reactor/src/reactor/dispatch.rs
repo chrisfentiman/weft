@@ -36,7 +36,8 @@ enum IterationControl {
     /// Budget exhausted or generation done with no commands. Exit the loop.
     Break,
     /// Early exit — return this result to the caller immediately.
-    Return(Result<Option<ExecutionResult>, ReactorError>),
+    // Boxed to reduce enum size: ExecutionResult grew after adding degradations.
+    Return(Box<Result<Option<ExecutionResult>, ReactorError>>),
 }
 
 /// Expand `Result<_, E>` where `E: Into<ReactorError>` to `IterationControl::Return(Err(...))`.
@@ -47,7 +48,7 @@ macro_rules! it_try {
     ($e:expr) => {
         match $e {
             Ok(v) => v,
-            Err(e) => return IterationControl::Return(Err(ReactorError::from(e))),
+            Err(e) => return IterationControl::Return(Box::new(Err(ReactorError::from(e)))),
         }
     };
 }
@@ -120,7 +121,7 @@ impl Reactor {
             match control {
                 IterationControl::Continue => continue 'dispatch,
                 IterationControl::Break => break 'dispatch,
-                IterationControl::Return(result) => return result,
+                IterationControl::Return(boxed) => return *boxed,
             }
         }
 
@@ -250,7 +251,7 @@ impl Reactor {
                                 .update_execution_status(lctx.execution_id, ExecutionStatus::Failed)
                                 .await
                         );
-                        return IterationControl::Return(Err(err));
+                        return IterationControl::Return(Box::new(Err(err)));
                     } else {
                         // Non-critical hook: degrade and continue.
                         activity_span.record("activity.status", "degraded");
@@ -298,11 +299,13 @@ impl Reactor {
                             .update_execution_status(lctx.execution_id, ExecutionStatus::Failed)
                             .await
                     );
-                    return IterationControl::Return(Err(err));
+                    return IterationControl::Return(Box::new(Err(err)));
                 }
                 DrainOutcome::Cancelled { reason } => {
                     activity_span.record("activity.status", "error");
-                    return IterationControl::Return(Err(ReactorError::Cancelled { reason }));
+                    return IterationControl::Return(Box::new(Err(ReactorError::Cancelled {
+                        reason,
+                    })));
                 }
             }
         }
@@ -380,9 +383,9 @@ impl Reactor {
                     self.finalize_failed(lctx.execution_id, lctx.state, err)
                         .await
                 );
-                return IterationControl::Return(Err(ReactorError::Cancelled {
+                return IterationControl::Return(Box::new(Err(ReactorError::Cancelled {
                     reason: "command failed".to_string(),
-                }));
+                })));
             }
             it_try!(self.record_iteration(lctx, cmds_this_iter).await);
             return IterationControl::Continue;
@@ -400,13 +403,13 @@ impl Reactor {
         );
 
         match outcome {
-            GenerateOutcome::Cancelled(result) => {
+            GenerateOutcome::Cancelled(boxed_result) => {
                 iteration_span.record("iteration.commands", 0u32);
-                IterationControl::Return(Ok(Some(result)))
+                IterationControl::Return(Box::new(Ok(Some(*boxed_result))))
             }
             GenerateOutcome::ChannelClosed => {
                 iteration_span.record("iteration.commands", 0u32);
-                IterationControl::Return(Err(ReactorError::ChannelClosed))
+                IterationControl::Return(Box::new(Err(ReactorError::ChannelClosed)))
             }
             GenerateOutcome::BudgetExhausted => {
                 iteration_span.record("iteration.commands", 0u32);
@@ -466,9 +469,11 @@ impl Reactor {
                                         duration_ms,
                                     },
                                     final_budget: lctx.state.budget.clone(),
+                                    // Cancellation early return: include any degradations accumulated so far.
+                                    degradations: std::mem::take(&mut lctx.state.degradations),
                                 };
                                 iteration_span.record("iteration.commands", 0u32);
-                                return IterationControl::Return(Ok(Some(result)));
+                                return IterationControl::Return(Box::new(Ok(Some(result))));
                             }
                         }
                         return IterationControl::Continue;
@@ -492,12 +497,12 @@ impl Reactor {
                         .update_execution_status(lctx.execution_id, ExecutionStatus::Failed)
                         .await
                 );
-                IterationControl::Return(Err(ReactorError::ActivityFailed(
+                IterationControl::Return(Box::new(Err(ReactorError::ActivityFailed(
                     crate::activity::ActivityError::Failed {
                         name: lctx.pipeline.generate.activity.name().to_string(),
                         reason: error,
                     },
-                )))
+                ))))
             }
 
             GenerateOutcome::Done {
@@ -603,11 +608,11 @@ impl Reactor {
                                         self.finalize_failed(lctx.execution_id, lctx.state, err)
                                             .await
                                     );
-                                    return IterationControl::Return(Err(
+                                    return IterationControl::Return(Box::new(Err(
                                         ReactorError::Cancelled {
                                             reason: "pre_response hook failed".to_string(),
                                         },
-                                    ));
+                                    )));
                                 } else {
                                     // Non-critical hook: degrade and continue.
                                     activity_span.record("activity.status", "degraded");
@@ -634,9 +639,9 @@ impl Reactor {
                             }
                             DrainOutcome::Cancelled { reason } => {
                                 activity_span.record("activity.status", "error");
-                                return IterationControl::Return(Err(ReactorError::Cancelled {
-                                    reason,
-                                }));
+                                return IterationControl::Return(Box::new(Err(
+                                    ReactorError::Cancelled { reason },
+                                )));
                             }
                         }
                     }
@@ -665,11 +670,11 @@ impl Reactor {
                             self.finalize_failed(lctx.execution_id, lctx.state, err)
                                 .await
                         );
-                        return IterationControl::Return(Err(ReactorError::ActivityFailed(
-                            crate::activity::ActivityError::Failed {
+                        return IterationControl::Return(Box::new(Err(
+                            ReactorError::ActivityFailed(crate::activity::ActivityError::Failed {
                                 name: "execute_command".to_string(),
                                 reason: "command execution failed".to_string(),
-                            },
+                            }),
                         )));
                     }
                 }

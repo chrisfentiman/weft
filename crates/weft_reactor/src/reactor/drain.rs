@@ -466,6 +466,7 @@ mod tests {
             messages: vec![],
             usage: weft_core::WeftUsage::default(),
             timing: weft_core::WeftTiming::default(),
+            degradations: vec![],
         };
 
         drain_single(

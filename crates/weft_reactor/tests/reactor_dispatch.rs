@@ -396,6 +396,7 @@ impl Activity for StubAssembleResponse {
             messages: vec![response_message],
             usage: weft_core::WeftUsage::default(),
             timing: weft_core::WeftTiming::default(),
+            degradations: vec![],
         };
         let _ = event_tx
             .send(PipelineEvent::Context(ContextEvent::ResponseAssembled {
@@ -3911,9 +3912,8 @@ async fn pre_generate_hook_non_critical_failure_degrades_and_continues() {
         .await;
 
     // Non-critical hook failure must not terminate execution.
-    let (exec_result, _) = result.expect(
-        "non-critical pre_generate hook failure should degrade, not terminate execution",
-    );
+    let (exec_result, _) = result
+        .expect("non-critical pre_generate hook failure should degrade, not terminate execution");
 
     // ExecutionEvent::Degraded must be recorded for the hook failure.
     let events = event_log
@@ -4142,5 +4142,151 @@ async fn pre_generate_hook_blocked_terminates_regardless_of_criticality() {
     assert!(
         matches!(result, Err(ReactorError::HookBlocked { .. })),
         "HookOutcome::Blocked from pre_generate hook should terminate execution with HookBlocked error; got: {result:?}"
+    );
+}
+
+// ── Phase 3: ExecutionResult.degradations propagation ─────────────────────
+
+/// ExecutionResult.degradations is populated when a non-critical activity fails.
+///
+/// Verifies Phase 3 spec: degradations accumulated in ExecutionState are moved
+/// to ExecutionResult via std::mem::take.
+#[tokio::test]
+async fn execution_result_degradations_populated_from_state() {
+    use pretty_assertions::assert_eq;
+
+    let services = Arc::new(make_test_services());
+    let event_log = test_event_log();
+    let registry = build_registry(vec![
+        // command_selection fails non-critically → should add a DegradationNotice
+        Arc::new(FailingNonCriticalActivity {
+            activity_name: "command_selection".to_string(),
+            error_code: "classifier_unavailable".to_string(),
+        }),
+        Arc::new(StubModelSelectionActivity),
+        Arc::new(StubProviderResolutionActivity),
+        Arc::new(StubCommandFormattingActivity),
+        Arc::new(StubSamplingAdjustmentActivity),
+        Arc::new(ImmediateDoneActivity {
+            name: "generate".to_string(),
+        }),
+        Arc::new(StubAssembleResponse {
+            name: "assemble_response".to_string(),
+        }),
+        Arc::new(StubExecuteCommand {
+            name: "execute_command".to_string(),
+        }),
+    ]);
+
+    let config = reactor_config(PipelineConfig {
+        name: "default".to_string(),
+        pre_loop: vec![
+            ActivityRef::Name("command_selection".to_string()),
+            ActivityRef::Name("model_selection".to_string()),
+            ActivityRef::Name("provider_resolution".to_string()),
+            ActivityRef::Name("command_formatting".to_string()),
+            ActivityRef::Name("sampling_adjustment".to_string()),
+        ],
+        post_loop: vec![ActivityRef::Name("assemble_response".to_string())],
+        generate: ActivityRef::Name("generate".to_string()),
+        execute_command: ActivityRef::Name("execute_command".to_string()),
+        loop_hooks: LoopHooks::default(),
+    });
+
+    let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+        .expect("reactor should construct");
+
+    let result = reactor
+        .execute(
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
+            None,
+        )
+        .await;
+
+    let (execution_result, _) =
+        result.expect("non-critical failure should not terminate execution");
+    assert_eq!(
+        execution_result.degradations.len(),
+        1,
+        "should have exactly one DegradationNotice for the failed command_selection"
+    );
+    assert_eq!(
+        execution_result.degradations[0].activity_name, "command_selection",
+        "degradation should be for command_selection"
+    );
+    assert_eq!(
+        execution_result.degradations[0].error_code, "classifier_unavailable",
+        "error_code should be propagated from FailureDetail"
+    );
+}
+
+/// ExecutionResult.degradations is empty on a fully successful execution.
+#[tokio::test]
+async fn execution_result_degradations_empty_on_success() {
+    use pretty_assertions::assert_eq;
+
+    let services = Arc::new(make_test_services());
+    let event_log = test_event_log();
+    let registry = build_registry(vec![
+        Arc::new(StubModelSelectionActivity),
+        Arc::new(StubCommandSelectionActivity),
+        Arc::new(StubProviderResolutionActivity),
+        Arc::new(StubCommandFormattingActivity),
+        Arc::new(StubSamplingAdjustmentActivity),
+        Arc::new(ImmediateDoneActivity {
+            name: "generate".to_string(),
+        }),
+        Arc::new(StubAssembleResponse {
+            name: "assemble_response".to_string(),
+        }),
+        Arc::new(StubExecuteCommand {
+            name: "execute_command".to_string(),
+        }),
+    ]);
+
+    let config = reactor_config(PipelineConfig {
+        name: "default".to_string(),
+        pre_loop: vec![
+            ActivityRef::Name("model_selection".to_string()),
+            ActivityRef::Name("command_selection".to_string()),
+            ActivityRef::Name("provider_resolution".to_string()),
+            ActivityRef::Name("command_formatting".to_string()),
+            ActivityRef::Name("sampling_adjustment".to_string()),
+        ],
+        post_loop: vec![ActivityRef::Name("assemble_response".to_string())],
+        generate: ActivityRef::Name("generate".to_string()),
+        execute_command: ActivityRef::Name("execute_command".to_string()),
+        loop_hooks: LoopHooks::default(),
+    });
+
+    let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+        .expect("reactor should construct");
+
+    let result = reactor
+        .execute(
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
+            None,
+        )
+        .await;
+
+    let (execution_result, _) = result.expect("successful execution should return Ok");
+    assert_eq!(
+        execution_result.degradations.len(),
+        0,
+        "no degradations on a fully successful execution"
     );
 }

@@ -92,12 +92,15 @@ impl Activity for AssembleResponseActivity {
         };
 
         // Build the WeftResponse.
+        // degradations is populated later by the reactor (execute.rs) from
+        // ExecutionState, after all activities complete.
         let response = WeftResponse {
             id: execution_id.to_string(),
             model: model.clone(),
             messages: vec![response_message],
             usage: input.accumulated_usage.clone(),
             timing: WeftTiming::default(),
+            degradations: Vec::new(),
         };
 
         debug!(

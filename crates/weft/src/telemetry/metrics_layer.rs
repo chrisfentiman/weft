@@ -56,6 +56,9 @@ pub(crate) enum SpanAttributes {
         pipeline: String,
         /// "ok" | "error" — populated via `on_record` when `otel.status_code` is recorded.
         status: String,
+        /// `true` when `weft.request.degraded = true` is recorded on the span.
+        /// Populated via `on_record`. Drives `weft_requests_degraded_total` counter.
+        degraded: bool,
     },
     /// `activity` span — one activity in pre/dispatch/post phase.
     Activity {
@@ -63,6 +66,12 @@ pub(crate) enum SpanAttributes {
         name: String,
         /// Value of `activity.phase` attribute: "pre_loop" | "dispatch" | "post_loop".
         phase: String,
+        /// "ok" | "error" | "degraded" — populated via `on_record` when `activity.status` is recorded.
+        /// Drives `weft_degradations_total` counter when "degraded".
+        status: String,
+        /// Machine-readable error code from `degradation.error_code` span attribute.
+        /// Populated via `on_record`. Empty when not degraded.
+        error_code: String,
     },
     /// `generate` span — LLM generation call inside an activity.
     Generate {
@@ -159,6 +168,7 @@ where
                 SpanAttributes::Request {
                     pipeline,
                     status: "ok".to_string(), // default; overridden by on_record
+                    degraded: false,          // default; overridden by on_record
                 }
             }
             "activity" => {
@@ -172,7 +182,12 @@ where
                     .get("activity.phase")
                     .unwrap_or("unknown")
                     .to_string();
-                SpanAttributes::Activity { name, phase }
+                SpanAttributes::Activity {
+                    name,
+                    phase,
+                    status: "ok".to_string(), // default; overridden by on_record
+                    error_code: String::new(), // populated by on_record on degradation
+                }
             }
             "generate" => {
                 let mut visitor = StringVisitor::default();
@@ -221,7 +236,9 @@ where
         values.record(&mut visitor);
 
         match &mut metrics.attrs {
-            SpanAttributes::Request { status, .. } => {
+            SpanAttributes::Request {
+                status, degraded, ..
+            } => {
                 // otel.status_code is recorded as "OK" or "ERROR" at span close.
                 if let Some(s) = visitor.get("otel.status_code") {
                     *status = if s.eq_ignore_ascii_case("error") {
@@ -229,6 +246,22 @@ where
                     } else {
                         "ok".to_string()
                     };
+                }
+                // weft.request.degraded = true triggers the degraded request counter.
+                if let Some(b) = visitor.get_bool("weft.request.degraded") {
+                    *degraded = b;
+                }
+            }
+            SpanAttributes::Activity {
+                status, error_code, ..
+            } => {
+                // activity.status = "degraded" triggers the degradation counter.
+                if let Some(s) = visitor.get("activity.status") {
+                    *status = s.to_string();
+                }
+                // degradation.error_code is recorded alongside activity.status = "degraded".
+                if let Some(code) = visitor.get("degradation.error_code") {
+                    *error_code = code.to_string();
                 }
             }
             SpanAttributes::Generate {
@@ -274,7 +307,11 @@ where
         let duration = metrics.start.elapsed().as_secs_f64();
 
         match &metrics.attrs {
-            SpanAttributes::Request { pipeline, status } => {
+            SpanAttributes::Request {
+                pipeline,
+                status,
+                degraded,
+            } => {
                 counter!(
                     "weft_requests_total",
                     "pipeline" => pipeline.clone(),
@@ -287,6 +324,16 @@ where
                 )
                 .record(duration);
                 gauge!("weft_active_requests").decrement(1.0);
+                // Emit the degraded request counter when the request had degradations.
+                // This mirrors Apollo Router's pattern of a separate request-level
+                // degradation counter alongside the main requests counter.
+                if *degraded {
+                    counter!(
+                        "weft_requests_degraded_total",
+                        "pipeline" => pipeline.clone()
+                    )
+                    .increment(1);
+                }
             }
             SpanAttributes::Generate {
                 model,
@@ -319,13 +366,28 @@ where
                     .increment(*output_tokens);
                 }
             }
-            SpanAttributes::Activity { name, phase } => {
+            SpanAttributes::Activity {
+                name,
+                phase,
+                status,
+                error_code,
+            } => {
                 histogram!(
                     "weft_activity_duration_seconds",
                     "activity_name" => name.clone(),
                     "phase" => phase.clone()
                 )
                 .record(duration);
+                // Emit the component-level degradation counter when the activity degraded.
+                // This mirrors Apollo Router's subgraph-level error counter pattern.
+                if status == "degraded" {
+                    counter!(
+                        "weft_degradations_total",
+                        "activity_name" => name.clone(),
+                        "error_code" => error_code.clone()
+                    )
+                    .increment(1);
+                }
             }
             SpanAttributes::ExecuteCommand { name } => {
                 histogram!(
@@ -344,8 +406,8 @@ where
 
 // ── Field visitors ────────────────────────────────────────────────────────────
 
-/// A `tracing::field::Visit` implementation that captures string and numeric
-/// field values by name for attribute extraction in the MetricsLayer.
+/// A `tracing::field::Visit` implementation that captures string, numeric,
+/// and boolean field values by name for attribute extraction in the MetricsLayer.
 #[derive(Default)]
 struct StringVisitor {
     /// String fields keyed by field name.
@@ -354,6 +416,8 @@ struct StringVisitor {
     u64s: Vec<(String, u64)>,
     /// Signed integer fields (also stored as i64).
     i64s: Vec<(String, i64)>,
+    /// Boolean fields keyed by field name.
+    bools: Vec<(String, bool)>,
 }
 
 impl StringVisitor {
@@ -373,6 +437,10 @@ impl StringVisitor {
             return u64::try_from(v).ok();
         }
         None
+    }
+
+    fn get_bool(&self, key: &str) -> Option<bool> {
+        self.bools.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
     }
 }
 
@@ -398,8 +466,8 @@ impl tracing::field::Visit for StringVisitor {
         self.i64s.push((field.name().to_string(), value));
     }
 
-    fn record_bool(&mut self, _field: &tracing::field::Field, _value: bool) {
-        // Boolean fields are not used for metric labels.
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.bools.push((field.name().to_string(), value));
     }
 }
 
@@ -975,6 +1043,214 @@ mod tests {
                         &[("model", "unknown")]
                     ),
                     "metric label must not be 'unknown' when model was recorded late"
+                );
+            },
+        );
+    }
+
+    // ── Phase 3: Degradation counters ─────────────────────────────────────
+
+    /// activity span with activity.status = "degraded" emits weft_degradations_total counter.
+    #[test]
+    fn activity_span_degraded_status_emits_degradations_counter() {
+        with_metrics_layer(
+            || {
+                let span = tracing::info_span!(
+                    "activity",
+                    "activity.name" = "command_selection",
+                    "activity.phase" = "pre_loop",
+                    "activity.status" = tracing::field::Empty,
+                    "degradation.error_code" = tracing::field::Empty,
+                    "otel.status_code" = tracing::field::Empty,
+                );
+                span.record("activity.status", "degraded");
+                span.record("degradation.error_code", "classifier_unavailable");
+                span.record("otel.status_code", "ERROR");
+                drop(span);
+            },
+            |items| {
+                assert!(
+                    snapshot_has(
+                        items,
+                        "weft_degradations_total",
+                        &[
+                            ("activity_name", "command_selection"),
+                            ("error_code", "classifier_unavailable"),
+                        ]
+                    ),
+                    "weft_degradations_total counter not found for degraded activity"
+                );
+                let v = counter_value(
+                    items,
+                    "weft_degradations_total",
+                    &[("activity_name", "command_selection")],
+                );
+                assert_eq!(
+                    v,
+                    Some(1),
+                    "counter should be 1 after one degraded activity span"
+                );
+            },
+        );
+    }
+
+    /// activity span with activity.status = "ok" does NOT emit weft_degradations_total.
+    #[test]
+    fn activity_span_ok_status_does_not_emit_degradations_counter() {
+        with_metrics_layer(
+            || {
+                let span = tracing::info_span!(
+                    "activity",
+                    "activity.name" = "validate",
+                    "activity.phase" = "pre_loop",
+                    "activity.status" = tracing::field::Empty,
+                    "degradation.error_code" = tracing::field::Empty,
+                    "otel.status_code" = tracing::field::Empty,
+                );
+                span.record("activity.status", "ok");
+                drop(span);
+            },
+            |items| {
+                assert!(
+                    !snapshot_has(items, "weft_degradations_total", &[]),
+                    "weft_degradations_total must not be emitted for ok activity"
+                );
+            },
+        );
+    }
+
+    /// activity span with activity.status = "error" does NOT emit weft_degradations_total.
+    #[test]
+    fn activity_span_error_status_does_not_emit_degradations_counter() {
+        with_metrics_layer(
+            || {
+                let span = tracing::info_span!(
+                    "activity",
+                    "activity.name" = "validate",
+                    "activity.phase" = "pre_loop",
+                    "activity.status" = tracing::field::Empty,
+                    "degradation.error_code" = tracing::field::Empty,
+                    "otel.status_code" = tracing::field::Empty,
+                );
+                span.record("activity.status", "error");
+                drop(span);
+            },
+            |items| {
+                assert!(
+                    !snapshot_has(items, "weft_degradations_total", &[]),
+                    "weft_degradations_total must not be emitted for error activity (only degraded)"
+                );
+            },
+        );
+    }
+
+    /// request span with weft.request.degraded = true emits weft_requests_degraded_total counter.
+    #[test]
+    fn request_span_degraded_emits_requests_degraded_total_counter() {
+        with_metrics_layer(
+            || {
+                let span = tracing::info_span!(
+                    "request",
+                    "weft.request_id" = "req-deg",
+                    "weft.tenant_id" = "t",
+                    "weft.pipeline" = "default",
+                    "weft.depth" = 0u32,
+                    "otel.kind" = "server",
+                    "otel.status_code" = tracing::field::Empty,
+                    "weft.request.degraded" = tracing::field::Empty,
+                    "weft.request.degradation_count" = tracing::field::Empty,
+                );
+                span.record("otel.status_code", "OK");
+                span.record("weft.request.degraded", true);
+                span.record("weft.request.degradation_count", 1u64);
+                drop(span);
+            },
+            |items| {
+                assert!(
+                    snapshot_has(
+                        items,
+                        "weft_requests_degraded_total",
+                        &[("pipeline", "default")]
+                    ),
+                    "weft_requests_degraded_total counter not found for degraded request"
+                );
+                let v = counter_value(
+                    items,
+                    "weft_requests_degraded_total",
+                    &[("pipeline", "default")],
+                );
+                assert_eq!(
+                    v,
+                    Some(1),
+                    "counter should be 1 after one degraded request span"
+                );
+            },
+        );
+    }
+
+    /// request span without weft.request.degraded does NOT emit weft_requests_degraded_total.
+    #[test]
+    fn request_span_not_degraded_does_not_emit_requests_degraded_total() {
+        with_metrics_layer(
+            || {
+                let span = tracing::info_span!(
+                    "request",
+                    "weft.request_id" = "req-ok",
+                    "weft.tenant_id" = "t",
+                    "weft.pipeline" = "default",
+                    "weft.depth" = 0u32,
+                    "otel.kind" = "server",
+                    "otel.status_code" = tracing::field::Empty,
+                    "weft.request.degraded" = tracing::field::Empty,
+                    "weft.request.degradation_count" = tracing::field::Empty,
+                );
+                span.record("otel.status_code", "OK");
+                // weft.request.degraded not recorded — should default to false
+                drop(span);
+            },
+            |items| {
+                assert!(
+                    !snapshot_has(items, "weft_requests_degraded_total", &[]),
+                    "weft_requests_degraded_total must not be emitted when request is not degraded"
+                );
+            },
+        );
+    }
+
+    /// Activity span: otel.status_code = ERROR set when degraded (not OK).
+    /// This is a span attribute test confirming the span records the correct value.
+    #[test]
+    fn activity_span_degraded_records_error_otel_status() {
+        // We test that when activity.status = "degraded", the MetricsLayer's
+        // on_record correctly captures "degradation.error_code" (not otel.status_code
+        // — that's a tracing span attribute, not a MetricsLayer concern).
+        // The two-level span status behavior is tested via the degradation counter test above.
+        with_metrics_layer(
+            || {
+                let span = tracing::info_span!(
+                    "activity",
+                    "activity.name" = "model_selection",
+                    "activity.phase" = "pre_loop",
+                    "activity.status" = tracing::field::Empty,
+                    "degradation.error_code" = tracing::field::Empty,
+                    "otel.status_code" = tracing::field::Empty,
+                );
+                span.record("activity.status", "degraded");
+                span.record("degradation.error_code", "no_matching_model");
+                span.record("otel.status_code", "ERROR");
+                drop(span);
+            },
+            |items| {
+                assert!(
+                    snapshot_has(
+                        items,
+                        "weft_degradations_total",
+                        &[
+                            ("activity_name", "model_selection"),
+                            ("error_code", "no_matching_model"),
+                        ]
+                    ),
+                    "weft_degradations_total should use the recorded error_code label"
                 );
             },
         );

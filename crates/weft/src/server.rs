@@ -952,6 +952,7 @@ mod tests {
                 llm_calls: 1,
             },
             timing: WeftTiming::default(),
+            degradations: vec![],
         };
         let openai_resp = weft_to_openai(resp, "gpt-4".to_string());
         assert_eq!(openai_resp.choices[0].message.content, "Hello!");
@@ -970,6 +971,7 @@ mod tests {
             messages: vec![],
             usage: WeftUsage::default(),
             timing: WeftTiming::default(),
+            degradations: vec![],
         };
         let openai_resp = weft_to_openai(resp, "auto".to_string());
         // No assistant message → empty content, not a panic

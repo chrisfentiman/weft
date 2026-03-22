@@ -76,6 +76,8 @@ impl Reactor {
                     activity.name = %activity_name,
                     activity.phase = "pre_loop",
                     activity.status = tracing::field::Empty,
+                    degradation.error_code = tracing::field::Empty,
+                    otel.status_code = tracing::field::Empty,
                 );
 
                 let activity_result = async {
@@ -149,6 +151,12 @@ impl Reactor {
                                 &error,
                                 lctx.state.config.default_model.clone(),
                             );
+                            // Record degradation.error_code as a span attribute so the
+                            // MetricsLayer can include it in the weft_degradations_total counter.
+                            activity_span.record("degradation.error_code", notice.error_code.as_str());
+                            // Set otel.status_code = ERROR on the activity span so trace viewers
+                            // (Jaeger, Zipkin) highlight it. The request span stays OK.
+                            activity_span.record("otel.status_code", "ERROR");
                             // Apply default state for downstream activities.
                             apply_degradation_defaults(&name, lctx.state);
                             // Record Execution(Degraded) event.
@@ -234,6 +242,8 @@ impl Reactor {
                     activity.name = %activity_name,
                     activity.phase = "post_loop",
                     activity.status = tracing::field::Empty,
+                    degradation.error_code = tracing::field::Empty,
+                    otel.status_code = tracing::field::Empty,
                 );
 
                 let activity_result = async {
@@ -285,6 +295,12 @@ impl Reactor {
                                 &error,
                                 lctx.state.config.default_model.clone(),
                             );
+                            // Record error_code on span so MetricsLayer can emit counter.
+                            activity_span
+                                .record("degradation.error_code", notice.error_code.as_str());
+                            // Set otel.status_code = ERROR on the activity span so trace viewers
+                            // highlight the degraded component.
+                            activity_span.record("otel.status_code", "ERROR");
                             apply_degradation_defaults(&name, lctx.state);
                             // Record the degradation event but swallow the error — we're
                             // already past the critical path.

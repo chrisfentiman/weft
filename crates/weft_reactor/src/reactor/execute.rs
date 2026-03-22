@@ -105,6 +105,8 @@ impl Reactor {
             weft.generation_calls = tracing::field::Empty,
             weft.commands_executed = tracing::field::Empty,
             weft.iterations = tracing::field::Empty,
+            weft.request.degraded = tracing::field::Empty,
+            weft.request.degradation_count = tracing::field::Empty,
         );
 
         // Fill parent execution ID when this is a child execution.
@@ -207,6 +209,18 @@ impl Reactor {
             Span::current().record("weft.iterations", lctx.state.iteration);
             Span::current().record("otel.status_code", "OK");
 
+            // Record degradation attributes on the request span.
+            // The request span stays OK (degraded != failed), but operators
+            // can filter for degraded requests via these attributes.
+            let degradation_count = lctx.state.degradations.len();
+            if degradation_count > 0 {
+                Span::current().record("weft.request.degraded", true);
+                Span::current().record("weft.request.degradation_count", degradation_count as u64);
+            } else {
+                Span::current().record("weft.request.degraded", false);
+                Span::current().record("weft.request.degradation_count", 0u64);
+            }
+
             // ExecutionEvent::Completed is now a unit variant (Phase 2 slimming).
             // Observability fields are preserved as _obs_* enrichment in the stored payload.
             self.record_event(
@@ -230,6 +244,9 @@ impl Reactor {
                 .take()
                 .unwrap_or_else(|| empty_response(&execution_id));
 
+            // Take degradations via mem::take to avoid cloning the Vec.
+            let degradations = std::mem::take(&mut lctx.state.degradations);
+
             let result = ExecutionResult {
                 execution_id: execution_id.clone(),
                 response,
@@ -241,6 +258,7 @@ impl Reactor {
                     duration_ms,
                 },
                 final_budget: lctx.state.budget.clone(),
+                degradations,
             };
 
             Ok((result, event_tx))

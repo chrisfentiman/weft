@@ -235,6 +235,7 @@ pub(super) fn empty_response(execution_id: &ExecutionId) -> weft_core::WeftRespo
         messages: vec![],
         usage: weft_core::WeftUsage::default(),
         timing: weft_core::WeftTiming::default(),
+        degradations: Vec::new(),
     }
 }
 
@@ -317,6 +318,7 @@ mod tests {
                 messages: vec![],
                 usage: weft_core::WeftUsage::default(),
                 timing: weft_core::WeftTiming::default(),
+                degradations: vec![],
             };
             let _ = event_tx
                 .send(PipelineEvent::Context(
