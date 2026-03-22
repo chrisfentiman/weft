@@ -4,12 +4,14 @@ mod completions;
 mod grpc;
 mod lint;
 mod run;
+mod schema;
 mod setup;
 mod test;
 mod util;
 mod workspace;
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
@@ -68,6 +70,17 @@ enum Command {
     ///
     /// After generating, restart your shell or source the file.
     Completions(CompletionsArgs),
+
+    /// Generate JSON Schema for weft configuration.
+    ///
+    /// Writes the schema to `config/weft.schema.json` by default. Commit this
+    /// file after regenerating (e.g., when adding or renaming config fields).
+    /// The `ci` command verifies the committed schema matches the current types.
+    ///
+    /// Examples:
+    ///   cargo xtask schema
+    ///   cargo xtask schema --output path/to/custom.schema.json
+    Schema(SchemaArgs),
 }
 
 /// Arguments for `cargo xtask build`.
@@ -207,6 +220,14 @@ pub(crate) struct CompletionsArgs {
     pub(crate) shell: clap_complete::Shell,
 }
 
+/// Arguments for `cargo xtask schema`.
+#[derive(Debug, clap::Args)]
+pub(crate) struct SchemaArgs {
+    /// Output path for the schema file.
+    #[arg(short, long, default_value = "config/weft.schema.json")]
+    pub(crate) output: PathBuf,
+}
+
 fn main() -> util::Result<()> {
     let cli = Cli::parse();
 
@@ -225,5 +246,6 @@ fn main() -> util::Result<()> {
         Command::Grpc(args) => grpc::run(&sh, args),
         Command::Setup => setup::run(&sh),
         Command::Completions(args) => completions::run(args),
+        Command::Schema(args) => schema::cmd_generate(&args.output),
     }
 }

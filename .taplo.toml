@@ -1,0 +1,8 @@
+[rule.formatting]
+align_entries = false
+
+[[rule]]
+include = ["config/weft.toml"]
+
+[rule.schema]
+path = "config/weft.schema.json"

@@ -5,6 +5,7 @@
 
 /// Top-level configuration, deserialized from TOML.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct WeftConfig {
     pub server: ServerConfig,
@@ -36,6 +37,7 @@ pub struct WeftConfig {
 /// Absent or `backend = "memory"` uses `InMemoryEventLog` (no persistence).
 /// `backend = "postgres"` requires `database_url` and uses `PostgresEventLog`.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct EventLogConfig {
     /// Which backend to use: `"memory"` (default) or `"postgres"`.
@@ -199,6 +201,7 @@ pub(crate) fn resolve_env_var(value: &str) -> Result<String, String> {
 
 /// Router configuration — the single source of truth for model routing and classification.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RouterConfig {
     /// Classifier (ONNX bi-encoder) configuration. Previously a top-level [classifier] section.
@@ -363,6 +366,7 @@ impl RouterConfig {
 
 /// Per-domain threshold and enablement overrides.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct DomainsConfig {
     /// Model routing domain config.
@@ -374,6 +378,7 @@ pub struct DomainsConfig {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct DomainConfig {
     /// Score threshold for this domain.
@@ -393,6 +398,7 @@ fn default_enabled() -> bool {
 
 /// An LLM provider -- an API endpoint that serves one or more models.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     /// Unique name for this provider (e.g., "anthropic", "local-ollama").
@@ -420,6 +426,7 @@ pub struct ProviderConfig {
 /// The model inherits the provider's API endpoint (wire_format, api_key, base_url).
 /// The `model` field is sent to the provider API to select which model to use.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ModelEntry {
     /// Unique routing name for this model (e.g., "complex", "fast").
@@ -481,6 +488,7 @@ pub struct ResolvedModel {
 /// Wire format -- determines how requests are serialized and responses are parsed
 /// for a provider's API.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum WireFormat {
     /// OpenAI Chat Completions API format.
@@ -494,6 +502,7 @@ pub enum WireFormat {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ClassifierConfig {
     /// Path to the ONNX model file.
@@ -517,6 +526,7 @@ fn default_max_commands() -> usize {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Bind address, e.g. "0.0.0.0:8080"
@@ -524,6 +534,7 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ToolRegistryConfig {
     /// gRPC endpoint, e.g. "http://localhost:50051"
@@ -545,6 +556,7 @@ fn default_request_timeout_ms() -> u64 {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct GatewayConfig {
     /// System prompt prepended to every conversation.
@@ -571,6 +583,7 @@ fn default_request_timeout_secs() -> u64 {
 
 /// Memory configuration. Optional -- absent means no memory stores.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct MemoryConfig {
     /// Memory stores to connect to.
@@ -633,6 +646,7 @@ impl MemoryConfig {
 /// What a memory store can do. Config-level declaration by the admin --
 /// not part of the gRPC contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum StoreCapability {
     /// Store supports querying/retrieving memories.
@@ -643,6 +657,7 @@ pub enum StoreCapability {
 
 /// A single memory store endpoint.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct MemoryStoreConfig {
     /// Unique name for this store (e.g., "conversations", "code_knowledge").
@@ -713,6 +728,7 @@ fn default_capabilities() -> Vec<StoreCapability> {
 /// deserialization. Placing it in the `weft` binary crate would create a
 /// circular dependency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum HookEvent {
     /// Request arrives at gateway, before any processing.
@@ -763,6 +779,7 @@ impl HookEvent {
 /// Mirrors `RoutingDomainKind` from `weft_router` but lives in `weft_core::config`
 /// to avoid a dependency on `weft_router` from config types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum HookRoutingDomain {
     /// Which model handles this request.
@@ -789,6 +806,7 @@ impl HookRoutingDomain {
 
 /// What triggered this routing decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingTrigger {
     /// Initial routing at request start (model, commands, tool_necessity domains).
@@ -811,6 +829,7 @@ impl RoutingTrigger {
 
 /// Hook type: which execution engine handles this hook.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum HookType {
     /// Rhai embedded scripting language hook.
@@ -823,6 +842,7 @@ pub enum HookType {
 
 /// A single hook configuration entry.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct HookConfig {
     /// Which lifecycle event this hook fires on.
@@ -2560,6 +2580,123 @@ api_key = "sk-test"
         assert!(
             result.is_err(),
             "unknown enum variant 'grpc' must be rejected"
+        );
+    }
+
+    // ── Phase 2: JSON Schema tests ────────────────────────────────────────────
+
+    /// Schema generation must succeed and produce valid JSON.
+    #[cfg(feature = "schema")]
+    #[test]
+    fn test_schema_generation_succeeds() {
+        let schema = schemars::schema_for!(WeftConfig);
+        let json = serde_json::to_string_pretty(&schema);
+        assert!(json.is_ok(), "schema serialization must not fail");
+        let json = json.unwrap();
+        assert!(!json.is_empty(), "schema JSON must not be empty");
+    }
+
+    /// The generated schema must include top-level property keys for the
+    /// required and optional sections of `WeftConfig`.
+    #[cfg(feature = "schema")]
+    #[test]
+    fn test_schema_contains_expected_top_level_keys() {
+        let schema = schemars::schema_for!(WeftConfig);
+        let json = serde_json::to_string_pretty(&schema).unwrap();
+        // Required top-level sections.
+        assert!(
+            json.contains("\"server\""),
+            "schema must contain 'server' property"
+        );
+        assert!(
+            json.contains("\"gateway\""),
+            "schema must contain 'gateway' property"
+        );
+        assert!(
+            json.contains("\"router\""),
+            "schema must contain 'router' property"
+        );
+        // Optional top-level sections.
+        assert!(
+            json.contains("\"memory\""),
+            "schema must contain 'memory' property"
+        );
+        assert!(
+            json.contains("\"hooks\""),
+            "schema must contain 'hooks' property"
+        );
+        assert!(
+            json.contains("\"event_log\""),
+            "schema must contain 'event_log' property"
+        );
+    }
+
+    /// `server`, `gateway`, and `router` must appear in the `required` array.
+    /// `memory`, `hooks`, and `event_log` are optional (have defaults or are Option).
+    #[cfg(feature = "schema")]
+    #[test]
+    fn test_schema_marks_required_fields_correctly() {
+        let schema = schemars::schema_for!(WeftConfig);
+        let value = serde_json::to_value(&schema).unwrap();
+
+        let required = value
+            .get("required")
+            .and_then(|r| r.as_array())
+            .expect("top-level schema must have a 'required' array");
+
+        let required_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+
+        assert!(
+            required_names.contains(&"server"),
+            "server must be required; got: {required_names:?}"
+        );
+        assert!(
+            required_names.contains(&"gateway"),
+            "gateway must be required; got: {required_names:?}"
+        );
+        assert!(
+            required_names.contains(&"router"),
+            "router must be required; got: {required_names:?}"
+        );
+        // Optional fields must NOT appear in required.
+        assert!(
+            !required_names.contains(&"memory"),
+            "memory must NOT be required; got: {required_names:?}"
+        );
+        assert!(
+            !required_names.contains(&"event_log"),
+            "event_log must NOT be required; got: {required_names:?}"
+        );
+    }
+
+    /// The schema must describe nested types — specifically `router.providers[].models[].name`.
+    #[cfg(feature = "schema")]
+    #[test]
+    fn test_schema_describes_nested_types() {
+        let schema = schemars::schema_for!(WeftConfig);
+        let json = serde_json::to_string_pretty(&schema).unwrap();
+
+        // `ProviderConfig` and `ModelEntry` definitions must be present.
+        assert!(
+            json.contains("ProviderConfig"),
+            "schema must reference ProviderConfig definition"
+        );
+        assert!(
+            json.contains("ModelEntry"),
+            "schema must reference ModelEntry definition"
+        );
+        // `name` field must appear inside the ModelEntry definition.
+        let value = serde_json::from_str::<serde_json::Value>(&json).unwrap();
+        let model_entry = value
+            .get("definitions")
+            .and_then(|d| d.get("ModelEntry"))
+            .expect("definitions must contain ModelEntry");
+        let props = model_entry
+            .get("properties")
+            .expect("ModelEntry must have properties");
+        assert!(
+            props.get("name").is_some(),
+            "ModelEntry.properties must contain 'name'"
         );
     }
 }
