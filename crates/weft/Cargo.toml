@@ -51,7 +51,6 @@ regex = { workspace = true }
 rhai = { workspace = true }
 reqwest = { workspace = true }
 config = "0.14"
-strsim = { workspace = true }
 
 [features]
 # Enable Postgres-backed event log. Requires DATABASE_URL at runtime.
