@@ -31,6 +31,125 @@ pub enum ConfigLoadError {
     Validate(String),
     #[error("resolved config validation failed: {0}")]
     ResolvedValidate(#[from] ResolvedConfigError),
+    #[error("{0}")]
+    TomlValidation(String),
+}
+
+/// Pre-validate raw TOML for unknown fields before config-rs processing.
+///
+/// Deserializes the raw TOML string directly into `WeftConfig`. Since all config
+/// structs have `deny_unknown_fields`, this catches typos in field names and
+/// produces errors referencing the TOML source specifically.
+///
+/// Returns `Ok(())` if validation passes. Returns `Err` with an enhanced error
+/// message including field suggestions if an unknown field is found.
+fn pre_validate_toml(raw_toml: &str) -> Result<(), ConfigLoadError> {
+    match toml::from_str::<WeftConfig>(raw_toml) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let enhanced = enhance_toml_error(&e);
+            Err(ConfigLoadError::TomlValidation(enhanced))
+        }
+    }
+}
+
+/// Enhance a TOML deserialization error with field suggestions.
+///
+/// Parses the error message for "unknown field" patterns and adds
+/// Levenshtein-distance-based suggestions for the closest known field.
+/// This is best-effort: if the error message doesn't match the expected pattern,
+/// the raw error string is returned unchanged.
+///
+/// The toml crate (v0.8+) formats deny_unknown_fields errors as:
+/// ```text
+/// TOML parse error at line N, column M
+///   |
+/// N | field_name = value
+///   | ^^^^^^^^^^
+/// unknown field `field_name`, expected one of `field1`, `field2`, ...
+/// ```
+/// The "unknown field" clause is at the END of the message, after the snippet.
+fn enhance_toml_error(err: &toml::de::Error) -> String {
+    let msg = err.to_string();
+
+    // Find the "unknown field `...`" clause anywhere in the message.
+    // It may appear at the end after TOML parse context lines.
+    let unknown_prefix = "unknown field `";
+    let Some(unknown_start) = msg.find(unknown_prefix) else {
+        // Not an unknown-field error — return raw.
+        return msg;
+    };
+
+    let after_unknown = &msg[unknown_start + unknown_prefix.len()..];
+
+    let Some(backtick_end) = after_unknown.find('`') else {
+        return msg;
+    };
+
+    let unknown_field = &after_unknown[..backtick_end];
+    let rest = &after_unknown[backtick_end + 1..];
+
+    // Parse expected fields from ", expected one of `field1`, `field2`, ..."
+    // or ", expected `field1`"
+    let expected_fields: Vec<&str> = if let Some(after_expected) = rest
+        .find(", expected one of ")
+        .map(|i| &rest[i + ", expected one of ".len()..])
+        .or_else(|| {
+            rest.find(", expected `")
+                .map(|i| &rest[i + ", expected ".len()..])
+        }) {
+        // Extract all backtick-delimited field names
+        let mut fields = Vec::new();
+        let mut remaining = after_expected;
+        while let Some(start) = remaining.find('`') {
+            remaining = &remaining[start + 1..];
+            if let Some(end) = remaining.find('`') {
+                fields.push(&remaining[..end]);
+                remaining = &remaining[end + 1..];
+            } else {
+                break;
+            }
+        }
+        fields
+    } else {
+        Vec::new()
+    };
+
+    // Find the closest match using Levenshtein distance, threshold <= 3.
+    let best_match = expected_fields
+        .iter()
+        .min_by_key(|&&field| strsim::levenshtein(unknown_field, field));
+
+    // Extract line/column info from the first line of the toml error.
+    // Toml errors start with "TOML parse error at line N, column M"
+    let location = msg
+        .lines()
+        .next()
+        .and_then(|line| {
+            // "TOML parse error at line N, column M" — extract " at line N, column M"
+            line.find(" at line ").map(|i| &line[i..])
+        })
+        .unwrap_or("");
+
+    // Build the enhanced error message.
+    let mut output = format!("unknown field '{unknown_field}' in configuration");
+
+    if let Some(&closest) = best_match
+        && strsim::levenshtein(unknown_field, closest) <= 3
+    {
+        output.push_str(&format!("\n  -> did you mean '{closest}'?"));
+    }
+
+    if !expected_fields.is_empty() {
+        let fields_list = expected_fields.join(", ");
+        output.push_str(&format!("\n  -> expected fields: {fields_list}"));
+    }
+
+    if !location.is_empty() {
+        output.push_str(&format!("\n  -> location{location}"));
+    }
+
+    output
 }
 
 /// Load `WeftConfig` from a TOML file + environment variables.
@@ -64,12 +183,22 @@ pub fn load_config(path: &Path) -> Result<WeftConfig, ConfigLoadError> {
 /// validated `ConfigStore` ready for sharing.
 ///
 /// Steps:
-/// 1. Load TOML + env var overrides via `load_config`
-/// 2. Resolve `env:VAR_NAME` prefixes in API keys and secrets
-/// 3. Validate `WeftConfig` constraints
-/// 4. Project into `ResolvedConfig` and validate
-/// 5. Construct `ConfigStore` with both configs
+/// 1. Read raw TOML and pre-validate for unknown fields (fast fail with suggestions)
+/// 2. Load TOML + env var overrides via `load_config`
+/// 3. Resolve `env:VAR_NAME` prefixes in API keys and secrets
+/// 4. Validate `WeftConfig` constraints
+/// 5. Project into `ResolvedConfig` and validate
+/// 6. Construct `ConfigStore` with both configs
 pub fn load_and_build_store(path: &Path) -> Result<ConfigStore, ConfigLoadError> {
+    // Pre-validate the raw TOML before config-rs processing to catch unknown
+    // fields with enhanced error messages and "did you mean?" suggestions.
+    let raw_toml = std::fs::read_to_string(path).map_err(|e| {
+        ConfigLoadError::Build(config::ConfigError::Message(format!(
+            "failed to read config file: {e}"
+        )))
+    })?;
+    pre_validate_toml(&raw_toml)?;
+
     let mut config = load_config(path)?;
     config.resolve().map_err(ConfigLoadError::Resolve)?;
     config.validate().map_err(ConfigLoadError::Validate)?;
@@ -294,5 +423,206 @@ capabilities = ["chat_completions"]
 
         let config = result.expect("load must succeed");
         assert_eq!(config.gateway.max_command_iterations, 42_u32);
+    }
+
+    // ── Phase 1: pre_validate_toml and enhance_toml_error tests ────────────────
+
+    #[test]
+    fn test_pre_validate_catches_unknown_field() {
+        let toml = r#"
+[server]
+bind_address = "0.0.0.0:8080"
+
+[gateway]
+system_prompt = "test"
+max_command_iterations = 5
+request_timeout_secs = 30
+unknown_field = "oops"
+
+[router]
+[router.classifier]
+model_path = "models/classifier"
+tokenizer_path = "models/tokenizer"
+threshold = 0.5
+max_commands = 10
+
+[[router.providers]]
+name = "p"
+wire_format = "openai"
+api_key = "sk-test"
+
+[[router.providers.models]]
+name = "m"
+model = "gpt-4"
+max_tokens = 2048
+examples = ["test"]
+capabilities = ["chat_completions"]
+"#;
+        let result = pre_validate_toml(toml);
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), ConfigLoadError::TomlValidation(_)),
+            "expected TomlValidation error"
+        );
+    }
+
+    #[test]
+    fn test_pre_validate_passes_valid_toml() {
+        let result = pre_validate_toml(MINIMAL_TOML);
+        assert!(
+            result.is_ok(),
+            "valid TOML must pass pre-validation: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_error_enhancement_produces_suggestion() {
+        // "systemm_prompt" is within edit distance 1 of "system_prompt"
+        let toml = r#"
+[server]
+bind_address = "0.0.0.0:8080"
+
+[gateway]
+systemm_prompt = "test"
+
+[router]
+[router.classifier]
+model_path = "x"
+tokenizer_path = "x"
+
+[[router.providers]]
+name = "p"
+wire_format = "openai"
+api_key = "k"
+
+[[router.providers.models]]
+name = "m"
+model = "gpt-4"
+examples = ["test"]
+"#;
+        let result = pre_validate_toml(toml);
+        let err_msg = match result {
+            Err(ConfigLoadError::TomlValidation(msg)) => msg,
+            Ok(_) => panic!("expected error, got Ok"),
+            Err(e) => panic!("unexpected error variant: {e}"),
+        };
+        assert!(
+            err_msg.contains("did you mean"),
+            "expected 'did you mean' suggestion in: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("system_prompt"),
+            "expected 'system_prompt' as suggestion in: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_error_enhancement_no_suggestion_for_distant_field() {
+        // "zzzzzzz" has edit distance >> 3 from all known fields
+        let toml = r#"
+[server]
+bind_address = "0.0.0.0:8080"
+
+[gateway]
+system_prompt = "test"
+zzzzzzz = "far away"
+
+[router]
+[router.classifier]
+model_path = "x"
+tokenizer_path = "x"
+
+[[router.providers]]
+name = "p"
+wire_format = "openai"
+api_key = "k"
+
+[[router.providers.models]]
+name = "m"
+model = "gpt-4"
+examples = ["test"]
+"#;
+        let result = pre_validate_toml(toml);
+        let err_msg = match result {
+            Err(ConfigLoadError::TomlValidation(msg)) => msg,
+            Ok(_) => panic!("expected error, got Ok"),
+            Err(e) => panic!("unexpected error variant: {e}"),
+        };
+        assert!(
+            !err_msg.contains("did you mean"),
+            "should NOT contain 'did you mean' for distant field in: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_and_build_store_rejects_unknown_field() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex must not be poisoned");
+        let toml = r#"
+[server]
+bind_address = "0.0.0.0:8080"
+
+[gateway]
+system_prompt = "test"
+max_command_iterations = 5
+request_timeout_secs = 30
+nonexistent_field = true
+
+[router]
+[router.classifier]
+model_path = "models/classifier"
+tokenizer_path = "models/tokenizer"
+threshold = 0.5
+max_commands = 10
+
+[[router.providers]]
+name = "anthropic"
+wire_format = "anthropic"
+api_key = "sk-test"
+
+[[router.providers.models]]
+name = "claude"
+model = "claude-sonnet-4-20250514"
+max_tokens = 4096
+examples = ["Write a poem", "Explain something", "What is X?"]
+capabilities = ["chat_completions"]
+"#;
+        let file = write_toml(toml);
+        let result = load_and_build_store(file.path());
+        assert!(result.is_err(), "must fail with unknown field");
+        match result {
+            Err(ConfigLoadError::TomlValidation(_)) => {}
+            Err(other) => panic!("expected TomlValidation, got: {other}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn test_env_var_unknown_field_rejected() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex must not be poisoned");
+        // WEFT_UNKNOWNFIELD maps to top-level field "unknownfield" via config-rs.
+        // With deny_unknown_fields on WeftConfig, this is rejected at try_deserialize.
+        let env_key = "WEFT_UNKNOWNFIELD";
+        let file = write_toml(MINIMAL_TOML);
+
+        // SAFETY: serialized by ENV_MUTEX; no other test holds this env var concurrently.
+        unsafe {
+            std::env::set_var(env_key, "x");
+        }
+
+        let result = load_config(file.path());
+
+        // SAFETY: cleanup under the same lock.
+        unsafe {
+            std::env::remove_var(env_key);
+        }
+
+        assert!(
+            result.is_err(),
+            "config-rs must reject unknown env var field"
+        );
+        assert!(
+            matches!(result.unwrap_err(), ConfigLoadError::Deserialize(_)),
+            "error must be Deserialize variant (config-rs enforces deny_unknown_fields)"
+        );
     }
 }

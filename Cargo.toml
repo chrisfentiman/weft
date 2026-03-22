@@ -68,3 +68,6 @@ pretty_assertions = { version = "1" }
 
 # xtask dev tool
 xshell = { version = "0.2" }
+
+# String similarity
+strsim = { version = "0.11" }

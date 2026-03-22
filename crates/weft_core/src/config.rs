@@ -5,6 +5,7 @@
 
 /// Top-level configuration, deserialized from TOML.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WeftConfig {
     pub server: ServerConfig,
     pub tool_registry: Option<ToolRegistryConfig>,
@@ -35,6 +36,7 @@ pub struct WeftConfig {
 /// Absent or `backend = "memory"` uses `InMemoryEventLog` (no persistence).
 /// `backend = "postgres"` requires `database_url` and uses `PostgresEventLog`.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EventLogConfig {
     /// Which backend to use: `"memory"` (default) or `"postgres"`.
     #[serde(default = "default_event_log_backend")]
@@ -197,6 +199,7 @@ pub(crate) fn resolve_env_var(value: &str) -> Result<String, String> {
 
 /// Router configuration — the single source of truth for model routing and classification.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouterConfig {
     /// Classifier (ONNX bi-encoder) configuration. Previously a top-level [classifier] section.
     pub classifier: ClassifierConfig,
@@ -360,6 +363,7 @@ impl RouterConfig {
 
 /// Per-domain threshold and enablement overrides.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DomainsConfig {
     /// Model routing domain config.
     pub model: Option<DomainConfig>,
@@ -370,6 +374,7 @@ pub struct DomainsConfig {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DomainConfig {
     /// Score threshold for this domain.
     /// For the Commands domain: overrides `classifier.threshold` for filtering.
@@ -388,6 +393,7 @@ fn default_enabled() -> bool {
 
 /// An LLM provider -- an API endpoint that serves one or more models.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     /// Unique name for this provider (e.g., "anthropic", "local-ollama").
     pub name: String,
@@ -414,6 +420,7 @@ pub struct ProviderConfig {
 /// The model inherits the provider's API endpoint (wire_format, api_key, base_url).
 /// The `model` field is sent to the provider API to select which model to use.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelEntry {
     /// Unique routing name for this model (e.g., "complex", "fast").
     /// Used as the routing candidate ID. Must be globally unique across all providers.
@@ -487,6 +494,7 @@ pub enum WireFormat {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClassifierConfig {
     /// Path to the ONNX model file.
     pub model_path: String,
@@ -509,12 +517,14 @@ fn default_max_commands() -> usize {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Bind address, e.g. "0.0.0.0:8080"
     pub bind_address: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolRegistryConfig {
     /// gRPC endpoint, e.g. "http://localhost:50051"
     pub endpoint: String,
@@ -535,6 +545,7 @@ fn default_request_timeout_ms() -> u64 {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GatewayConfig {
     /// System prompt prepended to every conversation.
     pub system_prompt: String,
@@ -560,6 +571,7 @@ fn default_request_timeout_secs() -> u64 {
 
 /// Memory configuration. Optional -- absent means no memory stores.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryConfig {
     /// Memory stores to connect to.
     pub stores: Vec<MemoryStoreConfig>,
@@ -631,6 +643,7 @@ pub enum StoreCapability {
 
 /// A single memory store endpoint.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryStoreConfig {
     /// Unique name for this store (e.g., "conversations", "code_knowledge").
     /// Used as the routing candidate ID in the Memory domain.
@@ -810,6 +823,7 @@ pub enum HookType {
 
 /// A single hook configuration entry.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HookConfig {
     /// Which lifecycle event this hook fires on.
     pub event: HookEvent,
@@ -2386,6 +2400,166 @@ base_url = "https://api.custom.ai/v1"
             result.is_ok(),
             "custom with wire_script should pass config validation: {:?}",
             result
+        );
+    }
+
+    // ── Phase 1: deny_unknown_fields tests ─────────────────────────────────────
+
+    /// Spec test 1: unknown top-level field (unknown section) is rejected.
+    #[test]
+    fn test_unknown_top_level_section_rejected() {
+        let toml = r#"
+[server]
+bind_address = "0.0.0.0:8080"
+
+[gateway]
+system_prompt = "test"
+max_command_iterations = 10
+request_timeout_secs = 300
+
+[router]
+[router.classifier]
+model_path = "models/classifier"
+tokenizer_path = "models/tokenizer"
+threshold = 0.3
+max_commands = 20
+
+[[router.providers]]
+name = "anthropic"
+wire_format = "anthropic"
+api_key = "sk-test"
+
+  [[router.providers.models]]
+  name = "main"
+  model = "claude-sonnet-4-20250514"
+  max_tokens = 4096
+  examples = ["example"]
+
+[logging]
+level = "debug"
+"#;
+        let result: Result<WeftConfig, _> = toml::from_str(toml);
+        assert!(
+            result.is_err(),
+            "unknown [logging] section must be rejected"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("logging"),
+            "error must mention 'logging': {err_msg}"
+        );
+    }
+
+    /// Spec test 2: unknown nested field is rejected.
+    #[test]
+    fn test_unknown_nested_field_rejected() {
+        let toml = r#"
+[server]
+bind_address = "0.0.0.0:8080"
+
+[gateway]
+system_prompt = "test"
+max_command_iterations = 10
+request_timeout_secs = 300
+systemm_prompt = "typo"
+
+[router]
+[router.classifier]
+model_path = "models/classifier"
+tokenizer_path = "models/tokenizer"
+threshold = 0.3
+max_commands = 20
+
+[[router.providers]]
+name = "anthropic"
+wire_format = "anthropic"
+api_key = "sk-test"
+
+  [[router.providers.models]]
+  name = "main"
+  model = "claude-sonnet-4-20250514"
+  max_tokens = 4096
+  examples = ["example"]
+"#;
+        let result: Result<WeftConfig, _> = toml::from_str(toml);
+        assert!(
+            result.is_err(),
+            "unknown field 'systemm_prompt' must be rejected"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("systemm_prompt"),
+            "error must mention 'systemm_prompt': {err_msg}"
+        );
+    }
+
+    /// Spec test 3: unknown field in array element (provider) is rejected.
+    #[test]
+    fn test_unknown_field_in_array_element_rejected() {
+        let toml = r#"
+[server]
+bind_address = "0.0.0.0:8080"
+
+[gateway]
+system_prompt = "test"
+
+[router]
+[router.classifier]
+model_path = "models/classifier"
+tokenizer_path = "models/tokenizer"
+
+[[router.providers]]
+name = "anthropic"
+namee = "typo"
+wire_format = "anthropic"
+api_key = "sk-test"
+
+  [[router.providers.models]]
+  name = "main"
+  model = "claude-sonnet-4-20250514"
+  examples = ["example"]
+"#;
+        let result: Result<WeftConfig, _> = toml::from_str(toml);
+        assert!(
+            result.is_err(),
+            "unknown field 'namee' in provider must be rejected"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("namee"),
+            "error must mention 'namee': {err_msg}"
+        );
+    }
+
+    /// Spec test 5: unknown enum variant is rejected.
+    #[test]
+    fn test_unknown_enum_variant_rejected() {
+        let toml = r#"
+[server]
+bind_address = "0.0.0.0:8080"
+
+[gateway]
+system_prompt = "test"
+
+[router]
+[router.classifier]
+model_path = "models/classifier"
+tokenizer_path = "models/tokenizer"
+
+[[router.providers]]
+name = "myprovider"
+wire_format = "grpc"
+api_key = "sk-test"
+
+  [[router.providers.models]]
+  name = "main"
+  model = "some-model"
+  examples = ["example"]
+"#;
+        let result: Result<WeftConfig, _> = toml::from_str(toml);
+        assert!(
+            result.is_err(),
+            "unknown enum variant 'grpc' must be rejected"
         );
     }
 }
