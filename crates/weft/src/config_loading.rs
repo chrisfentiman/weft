@@ -214,7 +214,7 @@ pub fn load_and_build_store(path: &Path) -> Result<ConfigStore, ConfigLoadError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pretty_assertions::assert_eq;
+    use pretty_assertions::{assert_eq, assert_ne};
     use std::io::Write;
     use std::sync::Mutex;
     use tempfile::NamedTempFile;

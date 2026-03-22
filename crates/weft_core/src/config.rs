@@ -878,6 +878,7 @@ fn default_hook_priority() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::{assert_eq, assert_ne};
 
     /// Build a minimal valid config TOML with router section.
     fn minimal_router_toml() -> &'static str {
