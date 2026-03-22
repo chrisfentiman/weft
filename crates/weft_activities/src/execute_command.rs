@@ -10,8 +10,8 @@ use weft_commands_trait::CommandError;
 use weft_core::CommandInvocation;
 
 use weft_reactor_trait::{
-    Activity, ActivityEvent, ActivityInput, CommandEvent, EventLog, ExecutionId, PipelineEvent,
-    ServiceLocator,
+    Activity, ActivityEvent, ActivityInput, CommandEvent, EventLog, ExecutionId, FailureDetail,
+    PipelineEvent, ServiceLocator,
 };
 
 /// Executes a single command invocation via the command registry.
@@ -84,6 +84,15 @@ impl Activity for ExecuteCommandActivity {
                     name: self.name().to_string(),
                     error: "cancelled before command execution".to_string(),
                     retryable: false,
+                    detail: FailureDetail {
+                        error_code: "cancelled".to_string(),
+                        detail: serde_json::Value::Null,
+                        cause: Some(
+                            "cancellation token was set before activity started".to_string(),
+                        ),
+                        attempted: Some("execute command from invocation metadata".to_string()),
+                        fallback: None,
+                    },
                 }))
                 .await;
             return;
@@ -98,6 +107,19 @@ impl Activity for ExecuteCommandActivity {
                         name: self.name().to_string(),
                         error: format!("invalid invocation in metadata: {e}"),
                         retryable: false,
+                        detail: FailureDetail {
+                            error_code: "invalid_arguments".to_string(),
+                            detail: serde_json::json!({
+                                "command_name": "(unknown — invocation not parseable)",
+                                "args": serde_json::Value::Null,
+                                "validation_error": e,
+                            }),
+                            cause: Some(e.clone()),
+                            attempted: Some(
+                                "deserialize CommandInvocation from metadata".to_string(),
+                            ),
+                            fallback: None,
+                        },
                     }))
                     .await;
                 return;
@@ -129,6 +151,13 @@ impl Activity for ExecuteCommandActivity {
                         name: self.name().to_string(),
                         error: "cancelled during command execution".to_string(),
                         retryable: false,
+                        detail: FailureDetail {
+                            error_code: "cancelled".to_string(),
+                            detail: serde_json::json!({ "command_name": command_name }),
+                            cause: Some("cancellation token fired during command execution".to_string()),
+                            attempted: Some(format!("execute command '{}'", command_name)),
+                            fallback: None,
+                        },
                     }))
                     .await;
                 return;
@@ -169,11 +198,55 @@ impl Activity for ExecuteCommandActivity {
                         error: e.to_string(),
                     }))
                     .await;
+                let detail = match &e {
+                    CommandError::NotFound(name) => FailureDetail {
+                        error_code: "command_not_found".to_string(),
+                        detail: serde_json::json!({
+                            "command_name": name,
+                            "available_commands": [],
+                        }),
+                        cause: Some(e.to_string()),
+                        attempted: Some(format!("execute command '{}'", command_name)),
+                        fallback: None,
+                    },
+                    CommandError::InvalidArguments { name, reason } => FailureDetail {
+                        error_code: "invalid_arguments".to_string(),
+                        detail: serde_json::json!({
+                            "command_name": name,
+                            "args": serde_json::Value::Null,
+                            "validation_error": reason,
+                        }),
+                        cause: Some(e.to_string()),
+                        attempted: Some(format!("validate and execute command '{}'", command_name)),
+                        fallback: None,
+                    },
+                    CommandError::ExecutionFailed { name, reason } => FailureDetail {
+                        error_code: "execution_error".to_string(),
+                        detail: serde_json::json!({
+                            "command_name": name,
+                            "error": reason,
+                        }),
+                        cause: Some(e.to_string()),
+                        attempted: Some(format!("execute command '{}'", command_name)),
+                        fallback: None,
+                    },
+                    CommandError::RegistryUnavailable(reason) => FailureDetail {
+                        error_code: "execution_error".to_string(),
+                        detail: serde_json::json!({
+                            "command_name": command_name,
+                            "error": reason,
+                        }),
+                        cause: Some(e.to_string()),
+                        attempted: Some(format!("look up and execute command '{}'", command_name)),
+                        fallback: None,
+                    },
+                };
                 let _ = event_tx
                     .send(PipelineEvent::Activity(ActivityEvent::Failed {
                         name: self.name().to_string(),
                         error: e.to_string(),
                         retryable,
+                        detail,
                     }))
                     .await;
                 // No Activity(Completed) on infrastructure failure.
@@ -210,7 +283,7 @@ mod tests {
     use super::*;
     use crate::test_support::{
         NullEventLog, collect_events, make_test_input, make_test_services,
-        make_test_services_with_failed_command,
+        make_test_services_with_command_error, make_test_services_with_failed_command,
     };
     use pretty_assertions::assert_eq;
     use tokio::sync::mpsc;
@@ -485,5 +558,117 @@ mod tests {
                 .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
             "Activity(Failed) must not be pushed for a command-level failure result"
         );
+    }
+
+    // ── FailureDetail enrichment ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn execute_command_registry_error_failure_detail_has_non_unknown_error_code() {
+        use pretty_assertions::assert_ne;
+        use weft_core::{CommandAction, CommandInvocation};
+
+        let mut input = make_test_input();
+        let invocation = CommandInvocation {
+            name: "failing_infra_cmd".to_string(),
+            action: CommandAction::Execute,
+            arguments: serde_json::json!({}),
+        };
+        input.metadata = serde_json::json!({
+            "invocation": serde_json::to_value(&invocation).unwrap()
+        });
+
+        // Use a registry that returns RegistryUnavailable.
+        let services = make_test_services_with_command_error(
+            "failing_infra_cmd",
+            CommandError::RegistryUnavailable("registry down".to_string()),
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let event_log = NullEventLog;
+        let exec_id = ExecutionId::new();
+
+        ExecuteCommandActivity::new()
+            .execute(&exec_id, input, &services, &event_log, tx, cancel)
+            .await;
+
+        let events = collect_events(&mut rx);
+        let failed = events
+            .iter()
+            .find(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. })))
+            .expect("expected Activity(Failed) on registry error");
+
+        match failed {
+            PipelineEvent::Activity(ActivityEvent::Failed { detail, .. }) => {
+                assert_ne!(
+                    detail.error_code, "unknown",
+                    "registry error must have non-unknown error_code"
+                );
+                assert!(
+                    detail.cause.is_some(),
+                    "cause must be populated for registry error"
+                );
+                assert!(
+                    detail.attempted.is_some(),
+                    "attempted must be populated for registry error"
+                );
+                assert!(
+                    detail.detail.get("command_name").is_some(),
+                    "detail must include command_name"
+                );
+            }
+            _ => panic!("expected Activity(Failed)"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_command_not_found_failure_detail_is_command_not_found() {
+        use pretty_assertions::assert_ne;
+        use weft_core::{CommandAction, CommandInvocation};
+
+        let mut input = make_test_input();
+        let invocation = CommandInvocation {
+            name: "missing_cmd".to_string(),
+            action: CommandAction::Execute,
+            arguments: serde_json::json!({}),
+        };
+        input.metadata = serde_json::json!({
+            "invocation": serde_json::to_value(&invocation).unwrap()
+        });
+
+        let services = make_test_services_with_command_error(
+            "missing_cmd",
+            CommandError::NotFound("missing_cmd".to_string()),
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let event_log = NullEventLog;
+        let exec_id = ExecutionId::new();
+
+        ExecuteCommandActivity::new()
+            .execute(&exec_id, input, &services, &event_log, tx, cancel)
+            .await;
+
+        let events = collect_events(&mut rx);
+        let failed = events
+            .iter()
+            .find(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. })))
+            .expect("expected Activity(Failed) for command not found");
+
+        match failed {
+            PipelineEvent::Activity(ActivityEvent::Failed { detail, .. }) => {
+                assert_ne!(
+                    detail.error_code, "unknown",
+                    "command_not_found must have non-unknown error_code"
+                );
+                assert_eq!(detail.error_code, "command_not_found");
+                assert!(
+                    detail.cause.is_some(),
+                    "cause must be populated for command_not_found"
+                );
+            }
+            _ => panic!("expected Activity(Failed)"),
+        }
     }
 }

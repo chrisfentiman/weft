@@ -14,8 +14,8 @@ use tracing::{debug, warn};
 use weft_core::HookEvent;
 use weft_hooks_trait::HookChainResult;
 use weft_reactor_trait::{
-    Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, HookOutcome, PipelineEvent,
-    ServiceLocator,
+    Activity, ActivityEvent, ActivityInput, Criticality, EventLog, ExecutionId, FailureDetail,
+    HookOutcome, PipelineEvent, ServiceLocator,
 };
 
 /// Wraps the `HookRunner` to fire hooks at a specific lifecycle point.
@@ -46,6 +46,11 @@ pub struct HookActivity {
     hooks: Arc<dyn weft_hooks_trait::HookRunner + Send + Sync>,
     /// Semaphore for bounding RequestEnd hook concurrency.
     request_end_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Aggregated criticality from all HookConfig entries for this event.
+    ///
+    /// Conservative aggregation: if ANY hook for this event has `critical: true`,
+    /// the entire HookActivity is critical. Computed at registration time.
+    critical: bool,
 }
 
 impl HookActivity {
@@ -57,6 +62,7 @@ impl HookActivity {
         hook_event: HookEvent,
         hooks: Arc<dyn weft_hooks_trait::HookRunner + Send + Sync>,
         request_end_semaphore: Arc<tokio::sync::Semaphore>,
+        critical: bool,
     ) -> Self {
         let name = format!("hook_{}", hook_event_name_slug(hook_event));
         Self {
@@ -64,6 +70,7 @@ impl HookActivity {
             name,
             hooks,
             request_end_semaphore,
+            critical,
         }
     }
 }
@@ -85,6 +92,14 @@ fn hook_event_name_slug(event: HookEvent) -> &'static str {
 impl Activity for HookActivity {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn criticality(&self) -> Criticality {
+        if self.critical {
+            Criticality::Critical
+        } else {
+            Criticality::NonCritical
+        }
     }
 
     async fn execute(
@@ -110,6 +125,21 @@ impl Activity for HookActivity {
                     name: self.name().to_string(),
                     error: "cancelled before hook execution".to_string(),
                     retryable: false,
+                    detail: FailureDetail {
+                        error_code: "cancelled".to_string(),
+                        detail: serde_json::json!({
+                            "hook_name": self.name(),
+                            "hook_event": hook_event_name_slug(self.hook_event),
+                        }),
+                        cause: Some(
+                            "cancellation token was set before hook activity started".to_string(),
+                        ),
+                        attempted: Some(format!(
+                            "run hook for event '{}'",
+                            hook_event_name_slug(self.hook_event)
+                        )),
+                        fallback: None,
+                    },
                 }))
                 .await;
             return;
@@ -182,6 +212,21 @@ impl Activity for HookActivity {
                             name: self.name().to_string(),
                             error: format!("hook blocked: {reason}"),
                             retryable: false,
+                            detail: FailureDetail {
+                                error_code: "hook_execution_error".to_string(),
+                                detail: serde_json::json!({
+                                    "hook_name": hook_name,
+                                    "hook_event": hook_event_name_slug(hook_event),
+                                    "error": reason,
+                                }),
+                                cause: Some(reason.clone()),
+                                attempted: Some(format!(
+                                    "run hook '{}' for event '{}'",
+                                    hook_name,
+                                    hook_event_name_slug(hook_event)
+                                )),
+                                fallback: None,
+                            },
                         }))
                         .await;
                     debug!(
@@ -237,6 +282,7 @@ mod tests {
             event,
             services.hooks.clone(),
             services.request_end_semaphore.clone(),
+            false,
         )
     }
 
@@ -248,6 +294,7 @@ mod tests {
             event,
             services.hooks.clone(),
             services.request_end_semaphore.clone(),
+            false,
         )
     }
 
@@ -460,5 +507,88 @@ mod tests {
                 .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
             "PostToolUse block should not push Activity(Failed)"
         );
+    }
+
+    // ── Criticality based on critical flag ────────────────────────────────
+
+    #[test]
+    fn hook_activity_non_critical_when_flag_false() {
+        use weft_reactor_trait::Criticality;
+        let services = make_test_services();
+        let activity = HookActivity::new(
+            HookEvent::RequestStart,
+            services.hooks.clone(),
+            services.request_end_semaphore.clone(),
+            false,
+        );
+        assert_eq!(activity.criticality(), Criticality::NonCritical);
+    }
+
+    #[test]
+    fn hook_activity_critical_when_flag_true() {
+        use weft_reactor_trait::Criticality;
+        let services = make_test_services();
+        let activity = HookActivity::new(
+            HookEvent::RequestStart,
+            services.hooks.clone(),
+            services.request_end_semaphore.clone(),
+            true,
+        );
+        assert_eq!(activity.criticality(), Criticality::Critical);
+    }
+
+    // ── FailureDetail enrichment ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn hook_activity_blocked_failure_detail_has_non_unknown_error_code() {
+        use crate::test_support::make_test_services_with_blocking_hook;
+        use pretty_assertions::assert_ne;
+
+        // PreResponse can block — triggers Activity(Failed) with FailureDetail.
+        let services =
+            make_test_services_with_blocking_hook(HookEvent::PreResponse, "blocked by policy");
+        let activity = HookActivity::new(
+            HookEvent::PreResponse,
+            services.hooks.clone(),
+            services.request_end_semaphore.clone(),
+            false,
+        );
+        let input = make_test_input();
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let event_log = NullEventLog;
+        let exec_id = ExecutionId::new();
+
+        activity
+            .execute(&exec_id, input, &services, &event_log, tx, cancel)
+            .await;
+
+        let events = collect_events(&mut rx);
+        let failed = events
+            .iter()
+            .find(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. })))
+            .expect("expected Activity(Failed) when hook blocks on can_block event");
+
+        match failed {
+            PipelineEvent::Activity(ActivityEvent::Failed { detail, .. }) => {
+                assert_ne!(
+                    detail.error_code, "unknown",
+                    "hook block failure must have non-unknown error_code"
+                );
+                assert!(
+                    detail.cause.is_some(),
+                    "cause must be populated for hook block failure"
+                );
+                assert!(
+                    detail.attempted.is_some(),
+                    "attempted must be populated for hook block failure"
+                );
+                assert!(
+                    detail.detail.get("hook_event").is_some(),
+                    "detail must include hook_event"
+                );
+            }
+            _ => panic!("expected Activity(Failed)"),
+        }
     }
 }

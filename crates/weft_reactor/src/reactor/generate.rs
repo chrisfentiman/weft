@@ -37,7 +37,8 @@ pub(super) enum GenerateOutcome {
     /// Channel closed unexpectedly.
     ChannelClosed,
     /// Execution was cancelled; caller should return this result immediately.
-    Cancelled(ExecutionResult),
+    // Boxed to reduce enum size: ExecutionResult grew after adding degradations.
+    Cancelled(Box<ExecutionResult>),
 }
 
 impl Reactor {
@@ -156,8 +157,10 @@ impl Reactor {
                             duration_ms,
                         },
                         final_budget: lctx.state.budget.clone(),
+                        // Cancellation early return: include any degradations accumulated so far.
+                        degradations: std::mem::take(&mut lctx.state.degradations),
                     };
-                    return Ok(GenerateOutcome::Cancelled(result));
+                    return Ok(GenerateOutcome::Cancelled(Box::new(result)));
                 }
 
                 event_opt = lctx.event_rx.recv() => {
@@ -259,8 +262,10 @@ impl Reactor {
                                                     duration_ms,
                                                 },
                                                 final_budget: lctx.state.budget.clone(),
+                                                // Cancellation early return: include degradations accumulated so far.
+                                                degradations: std::mem::take(&mut lctx.state.degradations),
                                             };
-                                            return Ok(GenerateOutcome::Cancelled(result));
+                                            return Ok(GenerateOutcome::Cancelled(Box::new(result)));
                                         }
                                         Signal::InjectContext { messages } => {
                                             for msg in &messages {
@@ -311,8 +316,10 @@ impl Reactor {
                                                                 duration_ms,
                                                             },
                                                             final_budget: lctx.state.budget.clone(),
+                                                            // Cancellation early return: include degradations accumulated so far.
+                                                            degradations: std::mem::take(&mut lctx.state.degradations),
                                                         };
-                                                        return Ok(GenerateOutcome::Cancelled(result));
+                                                        return Ok(GenerateOutcome::Cancelled(Box::new(result)));
                                                     }
                                                     Some(_) => {
                                                         // Discard other events while paused.
@@ -338,7 +345,7 @@ impl Reactor {
                                     // Generate activity finished — exit inner loop.
                                     break 'generate;
                                 }
-                                PipelineEvent::Activity(ActivityEvent::Failed { ref name, ref error, retryable })
+                                PipelineEvent::Activity(ActivityEvent::Failed { ref name, ref error, retryable, .. })
                                     if name == lctx.pipeline.generate.activity.name() =>
                                 {
                                     activity_failed = true;

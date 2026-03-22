@@ -10,8 +10,8 @@ use tracing::debug;
 
 use weft_core::{ContentPart, Role, Source, WeftMessage, WeftResponse, WeftTiming};
 use weft_reactor_trait::{
-    Activity, ActivityEvent, ActivityInput, ContextEvent, EventLog, ExecutionId, PipelineEvent,
-    ServiceLocator,
+    Activity, ActivityEvent, ActivityInput, ContextEvent, EventLog, ExecutionId, FailureDetail,
+    PipelineEvent, ServiceLocator,
 };
 
 /// Constructs the final WeftResponse from accumulated execution state.
@@ -68,6 +68,15 @@ impl Activity for AssembleResponseActivity {
                     name: self.name().to_string(),
                     error: "cancelled before response assembly".to_string(),
                     retryable: false,
+                    detail: FailureDetail {
+                        error_code: "cancelled".to_string(),
+                        detail: serde_json::Value::Null,
+                        cause: Some(
+                            "cancellation token was set before activity started".to_string(),
+                        ),
+                        attempted: Some("assemble response from generated content".to_string()),
+                        fallback: None,
+                    },
                 }))
                 .await;
             return;
@@ -91,12 +100,15 @@ impl Activity for AssembleResponseActivity {
         };
 
         // Build the WeftResponse.
+        // degradations is populated later by the reactor (execute.rs) from
+        // ExecutionState, after all activities complete.
         let response = WeftResponse {
             id: execution_id.to_string(),
             model: model.clone(),
             messages: vec![response_message],
             usage: input.accumulated_usage.clone(),
             timing: WeftTiming::default(),
+            degradations: Vec::new(),
         };
 
         debug!(

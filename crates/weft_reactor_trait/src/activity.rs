@@ -16,6 +16,28 @@ use crate::event_log::{EventLog, EventLogError};
 use crate::execution::ExecutionId;
 use crate::service::{ChildSpawner, ServiceLocator};
 
+/// Whether an activity failure is fatal, semi-critical, or non-critical.
+///
+/// Declared by each activity via `Activity::criticality()`. The default
+/// implementation returns `Critical` (fail-safe: unknown activities kill
+/// the request rather than silently degrading something essential).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Criticality {
+    /// Failure terminates the request.
+    Critical,
+    /// Failure triggers a specific fallback (e.g., default model).
+    SemiCritical,
+    /// Failure is logged and skipped. Execution continues.
+    NonCritical,
+}
+
+impl Criticality {
+    /// Returns `true` if this criticality level should terminate the request on failure.
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, Criticality::Critical)
+    }
+}
+
 /// A unit of side-effecting work within a pipeline.
 ///
 /// Activities are event producers. They receive an `mpsc::Sender<PipelineEvent>`
@@ -39,6 +61,17 @@ pub trait Activity: Send + Sync {
     /// Human-readable name for this activity type.
     /// Used as the key in the ActivityRegistry and in event payloads.
     fn name(&self) -> &str;
+
+    /// Declares how critical this activity is to request completion.
+    ///
+    /// The reactor reads this to decide whether a failure terminates the
+    /// request or degrades gracefully. Default: `Critical` (fail-safe).
+    ///
+    /// Activities override this to declare their actual criticality.
+    /// The reactor never second-guesses the activity's declaration.
+    fn criticality(&self) -> Criticality {
+        Criticality::Critical
+    }
 
     /// Execute the activity, pushing events onto the channel.
     ///
@@ -202,8 +235,32 @@ pub enum ActivityError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pretty_assertions::assert_eq;
+    use pretty_assertions::{assert_eq, assert_ne};
     use std::sync::Arc;
+
+    // ── Criticality ───────────────────────────────────────────────────────
+
+    #[test]
+    fn criticality_critical_is_fatal() {
+        assert!(Criticality::Critical.is_fatal());
+    }
+
+    #[test]
+    fn criticality_semi_critical_not_fatal() {
+        assert!(!Criticality::SemiCritical.is_fatal());
+    }
+
+    #[test]
+    fn criticality_non_critical_not_fatal() {
+        assert!(!Criticality::NonCritical.is_fatal());
+    }
+
+    #[test]
+    fn criticality_equality() {
+        assert_eq!(Criticality::Critical, Criticality::Critical);
+        assert_ne!(Criticality::Critical, Criticality::NonCritical);
+        assert_ne!(Criticality::SemiCritical, Criticality::NonCritical);
+    }
 
     // ── Object safety ─────────────────────────────────────────────────────
 
@@ -236,6 +293,13 @@ mod tests {
     fn activity_name_returns_correct_value() {
         let a = NoOpActivity;
         assert_eq!(a.name(), "noop");
+    }
+
+    #[test]
+    fn activity_default_criticality_is_critical() {
+        // The default implementation must return Critical (fail-safe).
+        let a = NoOpActivity;
+        assert_eq!(a.criticality(), Criticality::Critical);
     }
 
     // ── ActivityInput child_spawner field ─────────────────────────────────

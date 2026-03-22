@@ -34,6 +34,7 @@ pub use message::{
 pub use resolved_config::{ModelCandidate, ResolvedConfig, ResolvedConfigError, TenantOverrides};
 pub use routing::{ModelInfo, ModelRoutingInstruction, RoutingMode};
 pub use wire::{
-    ConversionError, ResponseFormat, SamplingOptions, SourceValidationError, WeftRequest,
-    WeftResponse, WeftTiming, WeftUsage, validate_message_source, validate_request,
+    ConversionError, DegradationNotice, PipelinePhase, ResponseFormat, SamplingOptions,
+    SourceValidationError, WeftRequest, WeftResponse, WeftTiming, WeftUsage,
+    validate_message_source, validate_request,
 };

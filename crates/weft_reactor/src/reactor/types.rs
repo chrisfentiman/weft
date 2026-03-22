@@ -14,8 +14,9 @@ use tokio_util::sync::CancellationToken;
 use crate::activity::{Activity, RoutingSnapshot};
 use crate::budget::Budget;
 use crate::config::{PipelineConfig, RetryPolicy};
-use crate::event::{CommandFormat, PipelineEvent};
+use crate::event::{CommandFormat, DegradationNotice, PipelineEvent};
 use crate::execution::ExecutionId;
+use weft_core::ResolvedConfig;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -42,6 +43,11 @@ pub struct ExecutionResult {
     /// The execution's final budget state. Used by spawn_child to deduct
     /// child consumption from the parent via deduct_child_usage.
     pub final_budget: Budget,
+    /// Degradation notices accumulated during execution.
+    ///
+    /// Non-empty when non-critical activities failed and the reactor
+    /// continued with fallback defaults. Empty on fully successful requests.
+    pub degradations: Vec<DegradationNotice>,
 }
 
 /// Summary of resources consumed by an execution.
@@ -115,6 +121,14 @@ pub(super) struct ExecutionState {
     /// Accumulated token usage across all generation calls.
     pub(super) accumulated_usage: weft_core::WeftUsage,
 
+    // ── Degradation tracking (Phase 2+) ───────────────────────────────
+    /// Degradation notices accumulated during execution.
+    /// Populated by run_pre_loop and run_post_loop when non-critical activities fail.
+    pub(super) degradations: Vec<DegradationNotice>,
+    /// Per-request resolved configuration snapshot. Used by degradation fallback
+    /// logic (e.g., model_selection fallback reads config.default_model).
+    pub(super) config: Arc<ResolvedConfig>,
+
     // ── Fields set by new pre-loop activities (Phase 1+) ─────────────
     /// Selected model routing name. Set by ModelSelectionActivity.
     pub(super) selected_model: Option<String>,
@@ -140,7 +154,7 @@ pub(super) struct ExecutionState {
 }
 
 impl ExecutionState {
-    pub(super) fn new(budget: Budget) -> Self {
+    pub(super) fn new(budget: Budget, config: Arc<ResolvedConfig>) -> Self {
         Self {
             messages: Vec::new(),
             budget,
@@ -155,6 +169,8 @@ impl ExecutionState {
             last_activity_event: HashMap::new(),
             generate_retry_attempt: 0,
             accumulated_usage: weft_core::WeftUsage::default(),
+            degradations: Vec::new(),
+            config,
             selected_model: None,
             selected_model_id: None,
             selected_provider: None,

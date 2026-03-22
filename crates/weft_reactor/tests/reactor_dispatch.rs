@@ -17,9 +17,9 @@ use weft_reactor::config::{
 };
 use weft_reactor::error::ReactorError;
 use weft_reactor::event::{
-    ActivityEvent, CommandEvent, CommandFormat, ContextEvent, ExecutionEvent, GeneratedEvent,
-    GenerationEvent, HookOutcome, MessageInjectionSource, PipelineEvent, SelectionEvent,
-    SignalEvent,
+    ActivityEvent, CommandEvent, CommandFormat, ContextEvent, ExecutionEvent, FailureDetail,
+    GeneratedEvent, GenerationEvent, HookOutcome, MessageInjectionSource, PipelineEvent,
+    SelectionEvent, SignalEvent,
 };
 use weft_reactor::event_log::EventLog;
 use weft_reactor::execution::ExecutionId;
@@ -65,6 +65,7 @@ impl Activity for ImmediateDoneActivity {
                     name: self.name.clone(),
                     error: "cancelled".to_string(),
                     retryable: false,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
             return;
@@ -138,6 +139,7 @@ impl Activity for TextGenerateActivity {
                     name: self.name.clone(),
                     error: "cancelled".to_string(),
                     retryable: false,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
             return;
@@ -223,6 +225,7 @@ impl Activity for AlwaysFailActivity {
                 name: self.name.clone(),
                 error: self.error_msg.clone(),
                 retryable: self.retryable,
+                detail: FailureDetail::default(),
             }))
             .await;
     }
@@ -279,6 +282,7 @@ impl Activity for FailThenSucceedActivity {
                     name: self.name.clone(),
                     error: "transient failure".to_string(),
                     retryable: true,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
         } else {
@@ -392,6 +396,7 @@ impl Activity for StubAssembleResponse {
             messages: vec![response_message],
             usage: weft_core::WeftUsage::default(),
             timing: weft_core::WeftTiming::default(),
+            degradations: vec![],
         };
         let _ = event_tx
             .send(PipelineEvent::Context(ContextEvent::ResponseAssembled {
@@ -1454,6 +1459,7 @@ async fn generation_timeout_fires_after_silence() {
                     name: "generate".to_string(),
                     error: "cancelled".to_string(),
                     retryable: false,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
         }
@@ -1571,6 +1577,7 @@ async fn heartbeat_miss_cancels_activity() {
                     name: "generate".to_string(),
                     error: "cancelled".to_string(),
                     retryable: false,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
         }
@@ -2474,6 +2481,7 @@ async fn cancel_during_retry_backoff_terminates_execution() {
                     name: "generate".to_string(),
                     error: "transient failure".to_string(),
                     retryable: true,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
         }
@@ -2619,6 +2627,7 @@ async fn per_chunk_timeout_resets_after_each_chunk() {
                     name: "generate".to_string(),
                     error: "cancelled".to_string(),
                     retryable: false,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
         }
@@ -3303,6 +3312,7 @@ async fn pre_loop_activity_failure_terminates_execution() {
                     name: self.name().to_string(),
                     error: "model_selection: no eligible models".to_string(),
                     retryable: false,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
         }
@@ -3350,5 +3360,1553 @@ async fn pre_loop_activity_failure_terminates_execution() {
     assert!(
         result.is_err(),
         "execution should fail when model_selection activity fails"
+    );
+}
+
+// ── Phase 2: Reactor Degradation Path integration tests ───────────────────
+
+/// Activity that always fails (non-critical) — for testing degradation.
+struct FailingNonCriticalActivity {
+    activity_name: String,
+    error_code: String,
+}
+
+#[async_trait::async_trait]
+impl Activity for FailingNonCriticalActivity {
+    fn name(&self) -> &str {
+        &self.activity_name
+    }
+
+    fn criticality(&self) -> weft_reactor_trait::Criticality {
+        weft_reactor_trait::Criticality::NonCritical
+    }
+
+    async fn execute(
+        &self,
+        _execution_id: &ExecutionId,
+        _input: ActivityInput,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
+        _event_log: &dyn EventLog,
+        event_tx: mpsc::Sender<PipelineEvent>,
+        _cancel: CancellationToken,
+    ) {
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
+                name: self.activity_name.clone(),
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Failed {
+                name: self.activity_name.clone(),
+                error: format!("{} failed", self.activity_name),
+                retryable: false,
+                detail: FailureDetail {
+                    error_code: self.error_code.clone(),
+                    detail: serde_json::Value::Null,
+                    cause: None,
+                    attempted: None,
+                    fallback: None,
+                },
+            }))
+            .await;
+    }
+}
+
+/// Activity that always fails with SemiCritical criticality.
+struct FailingSemiCriticalActivity {
+    activity_name: String,
+}
+
+#[async_trait::async_trait]
+impl Activity for FailingSemiCriticalActivity {
+    fn name(&self) -> &str {
+        &self.activity_name
+    }
+
+    fn criticality(&self) -> weft_reactor_trait::Criticality {
+        weft_reactor_trait::Criticality::SemiCritical
+    }
+
+    async fn execute(
+        &self,
+        _execution_id: &ExecutionId,
+        _input: ActivityInput,
+        _services: &dyn weft_reactor_trait::ServiceLocator,
+        _event_log: &dyn EventLog,
+        event_tx: mpsc::Sender<PipelineEvent>,
+        _cancel: CancellationToken,
+    ) {
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Started {
+                name: self.activity_name.clone(),
+            }))
+            .await;
+        let _ = event_tx
+            .send(PipelineEvent::Activity(ActivityEvent::Failed {
+                name: self.activity_name.clone(),
+                error: format!("{} failed", self.activity_name),
+                retryable: false,
+                detail: FailureDetail {
+                    error_code: "no_matching_model".to_string(),
+                    detail: serde_json::Value::Null,
+                    cause: None,
+                    attempted: None,
+                    fallback: None,
+                },
+            }))
+            .await;
+    }
+}
+
+/// Non-critical command_selection failure: execution completes with degradation.
+///
+/// Verifies spec Section 4.2: non-critical activity degrades, records
+/// ExecutionEvent::Degraded, and execution continues.
+#[tokio::test]
+async fn non_critical_command_selection_failure_degrades_and_continues() {
+    let services = Arc::new(make_test_services());
+    let event_log = test_event_log();
+    let registry = build_registry(vec![
+        Arc::new(StubValidateActivity),
+        Arc::new(StubModelSelectionActivity),
+        // command_selection fails with NonCritical → should degrade and continue
+        Arc::new(FailingNonCriticalActivity {
+            activity_name: "command_selection".to_string(),
+            error_code: "classifier_unavailable".to_string(),
+        }),
+        Arc::new(StubProviderResolutionActivity),
+        Arc::new(StubSystemPromptAssemblyActivity),
+        Arc::new(StubCommandFormattingActivity),
+        Arc::new(StubSamplingAdjustmentActivity),
+        Arc::new(ImmediateDoneActivity {
+            name: "generate".to_string(),
+        }),
+        Arc::new(StubAssembleResponse {
+            name: "assemble_response".to_string(),
+        }),
+        Arc::new(StubExecuteCommand {
+            name: "execute_command".to_string(),
+        }),
+    ]);
+
+    let config = reactor_config(new_preloop_pipeline_config("generate"));
+    let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+        .expect("reactor should construct");
+
+    let result = reactor
+        .execute(
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
+            None,
+        )
+        .await;
+
+    // Non-critical failure should NOT terminate execution.
+    let result =
+        result.expect("non-critical command_selection failure should not terminate execution");
+
+    // Verify ExecutionEvent::Degraded was recorded.
+    let events = event_log
+        .read(&result.0.execution_id, None::<u64>)
+        .await
+        .unwrap_or_default();
+    let degraded_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == "execution.degraded")
+        .collect();
+    assert!(
+        !degraded_events.is_empty(),
+        "should have at least one execution.degraded event"
+    );
+
+    // The degradation should mention command_selection.
+    // Payload structure: {"category": "Execution", "event": {"type": "Degraded", "notice": {...}}}
+    let has_command_selection_degradation = degraded_events.iter().any(|e| {
+        e.payload
+            .get("event")
+            .and_then(|ev: &serde_json::Value| ev.get("notice"))
+            .and_then(|n: &serde_json::Value| n.get("activity_name"))
+            .and_then(|a: &serde_json::Value| a.as_str())
+            == Some("command_selection")
+    });
+    assert!(
+        has_command_selection_degradation,
+        "degradation should be for command_selection; events: {degraded_events:?}"
+    );
+}
+
+/// Critical activity failure terminates the request.
+///
+/// Verifies spec Section 4.2: Critical activities still fail the request.
+#[tokio::test]
+async fn critical_activity_failure_terminates_execution() {
+    struct FailingCriticalActivity;
+
+    #[async_trait::async_trait]
+    impl Activity for FailingCriticalActivity {
+        fn name(&self) -> &str {
+            "validate"
+        }
+        // criticality() defaults to Critical — no override needed.
+        async fn execute(
+            &self,
+            _execution_id: &ExecutionId,
+            _input: ActivityInput,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
+            _event_log: &dyn EventLog,
+            event_tx: mpsc::Sender<PipelineEvent>,
+            _cancel: CancellationToken,
+        ) {
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
+                    name: "validate".to_string(),
+                    error: "empty messages".to_string(),
+                    retryable: false,
+                    detail: FailureDetail {
+                        error_code: "empty_messages".to_string(),
+                        detail: serde_json::Value::Null,
+                        cause: None,
+                        attempted: None,
+                        fallback: None,
+                    },
+                }))
+                .await;
+        }
+    }
+
+    let services = Arc::new(make_test_services());
+    let event_log = test_event_log();
+    let registry = build_registry(vec![
+        Arc::new(FailingCriticalActivity),
+        Arc::new(StubModelSelectionActivity),
+        Arc::new(StubCommandSelectionActivity),
+        Arc::new(StubProviderResolutionActivity),
+        Arc::new(StubSystemPromptAssemblyActivity),
+        Arc::new(StubCommandFormattingActivity),
+        Arc::new(StubSamplingAdjustmentActivity),
+        Arc::new(ImmediateDoneActivity {
+            name: "generate".to_string(),
+        }),
+        Arc::new(StubAssembleResponse {
+            name: "assemble_response".to_string(),
+        }),
+        Arc::new(StubExecuteCommand {
+            name: "execute_command".to_string(),
+        }),
+    ]);
+
+    let config = reactor_config(new_preloop_pipeline_config("generate"));
+    let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+        .expect("reactor should construct");
+
+    let result = reactor
+        .execute(
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
+            None,
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "critical validate failure should terminate execution"
+    );
+}
+
+/// Multiple non-critical degradations accumulate.
+///
+/// Verifies spec Section 7.3: multiple degradations are recorded separately.
+#[tokio::test]
+async fn multiple_non_critical_degradations_accumulate() {
+    let services = Arc::new(make_test_services());
+    let event_log = test_event_log();
+    let registry = build_registry(vec![
+        Arc::new(StubValidateActivity),
+        Arc::new(StubModelSelectionActivity),
+        // Two non-critical failures.
+        Arc::new(FailingNonCriticalActivity {
+            activity_name: "command_selection".to_string(),
+            error_code: "classifier_unavailable".to_string(),
+        }),
+        Arc::new(StubProviderResolutionActivity),
+        Arc::new(FailingNonCriticalActivity {
+            activity_name: "system_prompt_assembly".to_string(),
+            error_code: "template_error".to_string(),
+        }),
+        Arc::new(StubCommandFormattingActivity),
+        Arc::new(StubSamplingAdjustmentActivity),
+        Arc::new(ImmediateDoneActivity {
+            name: "generate".to_string(),
+        }),
+        Arc::new(StubAssembleResponse {
+            name: "assemble_response".to_string(),
+        }),
+        Arc::new(StubExecuteCommand {
+            name: "execute_command".to_string(),
+        }),
+    ]);
+
+    let config = reactor_config(new_preloop_pipeline_config("generate"));
+    let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+        .expect("reactor should construct");
+
+    let result = reactor
+        .execute(
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
+            None,
+        )
+        .await;
+
+    let result = result.expect("multiple non-critical failures should not terminate execution");
+
+    let events = event_log
+        .read(&result.0.execution_id, None::<u64>)
+        .await
+        .unwrap_or_default();
+    let degraded_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == "execution.degraded")
+        .collect();
+
+    assert_eq!(
+        degraded_events.len(),
+        2,
+        "should have 2 degradation events, one per failed non-critical activity; got: {degraded_events:?}"
+    );
+}
+
+/// Semi-critical model_selection failure uses the default model fallback.
+///
+/// Verifies spec Section 4.3: model_selection degradation sets selected_model
+/// to config.default_model. We verify this indirectly by confirming execution
+/// succeeds (ProviderResolutionActivity receives a non-empty selected_model).
+#[tokio::test]
+async fn semi_critical_model_selection_uses_default_model() {
+    // This ProviderResolutionActivity captures the model_selection result from
+    // metadata injected by the reactor.
+    struct CapturingProviderResolution {
+        received_model: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Activity for CapturingProviderResolution {
+        fn name(&self) -> &str {
+            "provider_resolution"
+        }
+
+        async fn execute(
+            &self,
+            _execution_id: &ExecutionId,
+            input: ActivityInput,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
+            _event_log: &dyn EventLog,
+            event_tx: mpsc::Sender<PipelineEvent>,
+            _cancel: CancellationToken,
+        ) {
+            // Capture what selected_model was injected as metadata.
+            let selected = input
+                .metadata
+                .get("selected_model")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            *self.received_model.lock().unwrap() = selected;
+
+            // Emit ProviderResolved with the received model to allow execution to continue.
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
+                    name: self.name().to_string(),
+                }))
+                .await;
+            let _ = event_tx
+                .send(PipelineEvent::Selection(SelectionEvent::ProviderResolved {
+                    model_name: "stub-model".to_string(),
+                    model_id: "stub-model-v1".to_string(),
+                    provider_name: "stub".to_string(),
+                    capabilities: vec![],
+                    max_tokens: 4096,
+                }))
+                .await;
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Completed {
+                    name: self.name().to_string(),
+                    idempotency_key: None,
+                }))
+                .await;
+        }
+    }
+
+    let received_model = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let received_model_clone = std::sync::Arc::clone(&received_model);
+
+    let services = Arc::new(make_test_services());
+    let event_log = test_event_log();
+    let registry = build_registry(vec![
+        Arc::new(StubValidateActivity),
+        // model_selection fails with SemiCritical → should use default model
+        Arc::new(FailingSemiCriticalActivity {
+            activity_name: "model_selection".to_string(),
+        }),
+        Arc::new(StubCommandSelectionActivity),
+        Arc::new(CapturingProviderResolution {
+            received_model: received_model_clone,
+        }),
+        Arc::new(StubSystemPromptAssemblyActivity),
+        Arc::new(StubCommandFormattingActivity),
+        Arc::new(StubSamplingAdjustmentActivity),
+        Arc::new(ImmediateDoneActivity {
+            name: "generate".to_string(),
+        }),
+        Arc::new(StubAssembleResponse {
+            name: "assemble_response".to_string(),
+        }),
+        Arc::new(StubExecuteCommand {
+            name: "execute_command".to_string(),
+        }),
+    ]);
+
+    let config = reactor_config(new_preloop_pipeline_config("generate"));
+    let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+        .expect("reactor should construct");
+
+    let result = reactor
+        .execute(
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
+            None,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "semi-critical model_selection failure should degrade and continue"
+    );
+
+    // Provider resolution should have received a non-empty model name (the default model).
+    let captured = received_model.lock().unwrap().clone();
+    assert!(
+        captured.is_some() && !captured.as_deref().unwrap_or("").is_empty(),
+        "provider_resolution should receive a non-empty model from default fallback; got: {captured:?}"
+    );
+}
+
+// ── Phase 2: pre_generate hook criticality integration tests ─────────────
+
+/// pre_generate hook with `critical: false` that emits ActivityEvent::Failed:
+/// execution degrades (does not terminate) and ExecutionEvent::Degraded is recorded.
+///
+/// Verifies that pre_generate hook failure is treated identically to other
+/// non-critical activity failures: degrade-and-continue, not abort.
+#[tokio::test]
+async fn pre_generate_hook_non_critical_failure_degrades_and_continues() {
+    /// Stub hook activity: NonCritical, always emits ActivityEvent::Failed.
+    struct NonCriticalFailingHookActivity;
+
+    #[async_trait::async_trait]
+    impl Activity for NonCriticalFailingHookActivity {
+        fn name(&self) -> &str {
+            "hook_pre_generate"
+        }
+
+        fn criticality(&self) -> weft_reactor_trait::Criticality {
+            weft_reactor_trait::Criticality::NonCritical
+        }
+
+        async fn execute(
+            &self,
+            _execution_id: &ExecutionId,
+            _input: ActivityInput,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
+            _event_log: &dyn EventLog,
+            event_tx: mpsc::Sender<PipelineEvent>,
+            _cancel: CancellationToken,
+        ) {
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
+                    name: "hook_pre_generate".to_string(),
+                }))
+                .await;
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
+                    name: "hook_pre_generate".to_string(),
+                    error: "hook runner unavailable".to_string(),
+                    retryable: false,
+                    detail: FailureDetail {
+                        error_code: "hook_runner_error".to_string(),
+                        detail: serde_json::Value::Null,
+                        cause: None,
+                        attempted: None,
+                        fallback: None,
+                    },
+                }))
+                .await;
+        }
+    }
+
+    let services = Arc::new(make_test_services());
+    let event_log = test_event_log();
+    let registry = build_registry(vec![
+        Arc::new(NonCriticalFailingHookActivity),
+        Arc::new(ImmediateDoneActivity {
+            name: "generate".to_string(),
+        }),
+        Arc::new(StubAssembleResponse {
+            name: "assemble_response".to_string(),
+        }),
+        Arc::new(StubExecuteCommand {
+            name: "execute_command".to_string(),
+        }),
+    ]);
+
+    let config = reactor_config(PipelineConfig {
+        name: "default".to_string(),
+        pre_loop: vec![],
+        post_loop: vec![ActivityRef::Name("assemble_response".to_string())],
+        generate: ActivityRef::Name("generate".to_string()),
+        execute_command: ActivityRef::Name("execute_command".to_string()),
+        loop_hooks: LoopHooks {
+            pre_generate: vec![ActivityRef::Name("hook_pre_generate".to_string())],
+            ..LoopHooks::default()
+        },
+    });
+
+    let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+        .expect("reactor should construct");
+
+    let result = reactor
+        .execute(
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
+            None,
+        )
+        .await;
+
+    // Non-critical hook failure must not terminate execution.
+    let (exec_result, _) = result
+        .expect("non-critical pre_generate hook failure should degrade, not terminate execution");
+
+    // ExecutionEvent::Degraded must be recorded for the hook failure.
+    let events = event_log
+        .read(&exec_result.execution_id, None::<u64>)
+        .await
+        .unwrap_or_default();
+    let degraded_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == "execution.degraded")
+        .collect();
+
+    assert!(
+        !degraded_events.is_empty(),
+        "should have at least one execution.degraded event; event_types: {:?}",
+        events
+            .iter()
+            .map(|e| e.event_type.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    // The degradation should reference hook_pre_generate.
+    let has_hook_degradation = degraded_events.iter().any(|e| {
+        e.payload
+            .get("event")
+            .and_then(|ev: &serde_json::Value| ev.get("notice"))
+            .and_then(|n: &serde_json::Value| n.get("activity_name"))
+            .and_then(|a: &serde_json::Value| a.as_str())
+            == Some("hook_pre_generate")
+    });
+    assert!(
+        has_hook_degradation,
+        "degradation should be attributed to hook_pre_generate; degraded events: {degraded_events:?}"
+    );
+}
+
+/// pre_generate hook with `critical: true` that emits ActivityEvent::Failed:
+/// execution terminates with an error.
+///
+/// Verifies that a critical pre_generate hook failure is fatal — the request
+/// is aborted rather than degraded.
+#[tokio::test]
+async fn pre_generate_hook_critical_failure_terminates_execution() {
+    /// Stub hook activity: Critical (default), always emits ActivityEvent::Failed.
+    struct CriticalFailingHookActivity;
+
+    #[async_trait::async_trait]
+    impl Activity for CriticalFailingHookActivity {
+        fn name(&self) -> &str {
+            "hook_pre_generate"
+        }
+
+        // criticality() defaults to Critical — no override needed.
+
+        async fn execute(
+            &self,
+            _execution_id: &ExecutionId,
+            _input: ActivityInput,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
+            _event_log: &dyn EventLog,
+            event_tx: mpsc::Sender<PipelineEvent>,
+            _cancel: CancellationToken,
+        ) {
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
+                    name: "hook_pre_generate".to_string(),
+                }))
+                .await;
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
+                    name: "hook_pre_generate".to_string(),
+                    error: "critical hook failure".to_string(),
+                    retryable: false,
+                    detail: FailureDetail {
+                        error_code: "hook_critical_error".to_string(),
+                        detail: serde_json::Value::Null,
+                        cause: None,
+                        attempted: None,
+                        fallback: None,
+                    },
+                }))
+                .await;
+        }
+    }
+
+    let services = Arc::new(make_test_services());
+    let event_log = test_event_log();
+    let registry = build_registry(vec![
+        Arc::new(CriticalFailingHookActivity),
+        Arc::new(ImmediateDoneActivity {
+            name: "generate".to_string(),
+        }),
+        Arc::new(StubAssembleResponse {
+            name: "assemble_response".to_string(),
+        }),
+        Arc::new(StubExecuteCommand {
+            name: "execute_command".to_string(),
+        }),
+    ]);
+
+    let config = reactor_config(PipelineConfig {
+        name: "default".to_string(),
+        pre_loop: vec![],
+        post_loop: vec![ActivityRef::Name("assemble_response".to_string())],
+        generate: ActivityRef::Name("generate".to_string()),
+        execute_command: ActivityRef::Name("execute_command".to_string()),
+        loop_hooks: LoopHooks {
+            pre_generate: vec![ActivityRef::Name("hook_pre_generate".to_string())],
+            ..LoopHooks::default()
+        },
+    });
+
+    let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+        .expect("reactor should construct");
+
+    let result = reactor
+        .execute(
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
+            None,
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "critical pre_generate hook failure should terminate execution with an error"
+    );
+}
+
+/// pre_generate hook that emits HookOutcome::Blocked terminates execution
+/// regardless of the `critical` field value.
+///
+/// Verifies that HookBlocked is always fatal: the `critical` flag on the
+/// activity is irrelevant when a hook explicitly blocks the request.
+#[tokio::test]
+async fn pre_generate_hook_blocked_terminates_regardless_of_criticality() {
+    /// Stub hook activity: NonCritical, emits HookOutcome::Blocked.
+    ///
+    /// Uses NonCritical to confirm that criticality is irrelevant for blocked events.
+    struct BlockingNonCriticalHookActivity;
+
+    #[async_trait::async_trait]
+    impl Activity for BlockingNonCriticalHookActivity {
+        fn name(&self) -> &str {
+            "hook_pre_generate"
+        }
+
+        fn criticality(&self) -> weft_reactor_trait::Criticality {
+            // Intentionally non-critical to verify that Blocked is always fatal.
+            weft_reactor_trait::Criticality::NonCritical
+        }
+
+        async fn execute(
+            &self,
+            _execution_id: &ExecutionId,
+            _input: ActivityInput,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
+            _event_log: &dyn EventLog,
+            event_tx: mpsc::Sender<PipelineEvent>,
+            _cancel: CancellationToken,
+        ) {
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
+                    name: "hook_pre_generate".to_string(),
+                }))
+                .await;
+            let _ = event_tx
+                .send(PipelineEvent::Hook(HookOutcome::Blocked {
+                    hook_event: "pre_generate".to_string(),
+                    hook_name: "policy_guard".to_string(),
+                    reason: "blocked by pre_generate policy".to_string(),
+                }))
+                .await;
+        }
+    }
+
+    let services = Arc::new(make_test_services());
+    let event_log = test_event_log();
+    let registry = build_registry(vec![
+        Arc::new(BlockingNonCriticalHookActivity),
+        Arc::new(ImmediateDoneActivity {
+            name: "generate".to_string(),
+        }),
+        Arc::new(StubAssembleResponse {
+            name: "assemble_response".to_string(),
+        }),
+        Arc::new(StubExecuteCommand {
+            name: "execute_command".to_string(),
+        }),
+    ]);
+
+    let config = reactor_config(PipelineConfig {
+        name: "default".to_string(),
+        pre_loop: vec![],
+        post_loop: vec![ActivityRef::Name("assemble_response".to_string())],
+        generate: ActivityRef::Name("generate".to_string()),
+        execute_command: ActivityRef::Name("execute_command".to_string()),
+        loop_hooks: LoopHooks {
+            pre_generate: vec![ActivityRef::Name("hook_pre_generate".to_string())],
+            ..LoopHooks::default()
+        },
+    });
+
+    let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+        .expect("reactor should construct");
+
+    let result = reactor
+        .execute(
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
+            None,
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(ReactorError::HookBlocked { .. })),
+        "HookOutcome::Blocked from pre_generate hook should terminate execution with HookBlocked error; got: {result:?}"
+    );
+}
+
+// ── Phase 3: ExecutionResult.degradations propagation ─────────────────────
+
+/// ExecutionResult.degradations is populated when a non-critical activity fails.
+///
+/// Verifies Phase 3 spec: degradations accumulated in ExecutionState are moved
+/// to ExecutionResult via std::mem::take.
+#[tokio::test]
+async fn execution_result_degradations_populated_from_state() {
+    use pretty_assertions::assert_eq;
+
+    let services = Arc::new(make_test_services());
+    let event_log = test_event_log();
+    let registry = build_registry(vec![
+        // command_selection fails non-critically → should add a DegradationNotice
+        Arc::new(FailingNonCriticalActivity {
+            activity_name: "command_selection".to_string(),
+            error_code: "classifier_unavailable".to_string(),
+        }),
+        Arc::new(StubModelSelectionActivity),
+        Arc::new(StubProviderResolutionActivity),
+        Arc::new(StubCommandFormattingActivity),
+        Arc::new(StubSamplingAdjustmentActivity),
+        Arc::new(ImmediateDoneActivity {
+            name: "generate".to_string(),
+        }),
+        Arc::new(StubAssembleResponse {
+            name: "assemble_response".to_string(),
+        }),
+        Arc::new(StubExecuteCommand {
+            name: "execute_command".to_string(),
+        }),
+    ]);
+
+    let config = reactor_config(PipelineConfig {
+        name: "default".to_string(),
+        pre_loop: vec![
+            ActivityRef::Name("command_selection".to_string()),
+            ActivityRef::Name("model_selection".to_string()),
+            ActivityRef::Name("provider_resolution".to_string()),
+            ActivityRef::Name("command_formatting".to_string()),
+            ActivityRef::Name("sampling_adjustment".to_string()),
+        ],
+        post_loop: vec![ActivityRef::Name("assemble_response".to_string())],
+        generate: ActivityRef::Name("generate".to_string()),
+        execute_command: ActivityRef::Name("execute_command".to_string()),
+        loop_hooks: LoopHooks::default(),
+    });
+
+    let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+        .expect("reactor should construct");
+
+    let result = reactor
+        .execute(
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
+            None,
+        )
+        .await;
+
+    let (execution_result, _) =
+        result.expect("non-critical failure should not terminate execution");
+    assert_eq!(
+        execution_result.degradations.len(),
+        1,
+        "should have exactly one DegradationNotice for the failed command_selection"
+    );
+    assert_eq!(
+        execution_result.degradations[0].activity_name, "command_selection",
+        "degradation should be for command_selection"
+    );
+    assert_eq!(
+        execution_result.degradations[0].error_code, "classifier_unavailable",
+        "error_code should be propagated from FailureDetail"
+    );
+}
+
+// ── Phase 4: Command execution isolation ──────────────────────────────────
+
+/// `execute_command` activity pushing `ActivityEvent::Failed` injects an error
+/// message for the LLM and continues — execution completes with `Ok`.
+///
+/// Verifies spec Section 4.6: command execution failure isolation.
+#[tokio::test]
+async fn command_failure_injects_error_message_and_continues() {
+    use pretty_assertions::assert_eq;
+
+    /// Activity that invokes a command on the first generate call, then Done.
+    struct InvokeCommandActivity {
+        call_count: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl Activity for InvokeCommandActivity {
+        fn name(&self) -> &str {
+            "generate"
+        }
+
+        async fn execute(
+            &self,
+            _execution_id: &ExecutionId,
+            input: ActivityInput,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
+            _event_log: &dyn EventLog,
+            event_tx: mpsc::Sender<PipelineEvent>,
+            _cancel: CancellationToken,
+        ) {
+            let call_n = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
+                    name: "generate".to_string(),
+                }))
+                .await;
+            let _ = event_tx
+                .send(PipelineEvent::Generation(GenerationEvent::Started {
+                    model: "stub-model".to_string(),
+                    message_count: input.messages.len(),
+                }))
+                .await;
+
+            if call_n == 0 {
+                // First call: request a command invocation.
+                let _ = event_tx
+                    .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                        GeneratedEvent::CommandInvocation(CommandInvocation {
+                            name: "failing_tool".to_string(),
+                            action: CommandAction::Execute,
+                            arguments: serde_json::json!({}),
+                        }),
+                    )))
+                    .await;
+            }
+
+            let _ = event_tx
+                .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                    GeneratedEvent::Done,
+                )))
+                .await;
+
+            let response_message = WeftMessage {
+                role: Role::Assistant,
+                source: Source::Provider,
+                model: Some("stub-model".to_string()),
+                content: vec![],
+                delta: false,
+                message_index: 0,
+            };
+            let _ = event_tx
+                .send(PipelineEvent::Generation(GenerationEvent::Completed {
+                    model: "stub-model".to_string(),
+                    response_message,
+                    generated_events: vec![GeneratedEvent::Done],
+                    input_tokens: None,
+                    output_tokens: None,
+                }))
+                .await;
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Completed {
+                    name: "generate".to_string(),
+                    idempotency_key: input.idempotency_key.clone(),
+                }))
+                .await;
+        }
+    }
+
+    /// Activity that always pushes `ActivityEvent::Failed` (simulates infrastructure error).
+    struct FailingExecuteCommandActivity;
+
+    #[async_trait::async_trait]
+    impl Activity for FailingExecuteCommandActivity {
+        fn name(&self) -> &str {
+            "execute_command"
+        }
+
+        fn criticality(&self) -> weft_reactor_trait::Criticality {
+            weft_reactor_trait::Criticality::NonCritical
+        }
+
+        async fn execute(
+            &self,
+            _execution_id: &ExecutionId,
+            _input: ActivityInput,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
+            _event_log: &dyn EventLog,
+            event_tx: mpsc::Sender<PipelineEvent>,
+            _cancel: CancellationToken,
+        ) {
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
+                    name: "execute_command".to_string(),
+                }))
+                .await;
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
+                    name: "execute_command".to_string(),
+                    error: "command not found: failing_tool".to_string(),
+                    retryable: false,
+                    detail: FailureDetail {
+                        error_code: "command_not_found".to_string(),
+                        detail: serde_json::json!({ "command_name": "failing_tool" }),
+                        cause: Some("command not found: failing_tool".to_string()),
+                        attempted: Some("execute command failing_tool".to_string()),
+                        fallback: None,
+                    },
+                }))
+                .await;
+        }
+    }
+
+    let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let call_count_clone = Arc::clone(&call_count);
+
+    let services = Arc::new(make_test_services());
+    let event_log = test_event_log();
+    let registry = build_registry(vec![
+        Arc::new(InvokeCommandActivity {
+            call_count: call_count_clone,
+        }),
+        Arc::new(StubAssembleResponse {
+            name: "assemble_response".to_string(),
+        }),
+        Arc::new(FailingExecuteCommandActivity),
+    ]);
+
+    let config = reactor_config(simple_pipeline_config("generate"));
+    let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+        .expect("reactor should construct");
+
+    let result = reactor
+        .execute(
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
+            None,
+        )
+        .await;
+
+    let (execution_result, _) = result.expect(
+        "command ActivityEvent::Failed should not kill the request; execution should complete Ok",
+    );
+
+    // The reactor injects an error message and records a DegradationNotice.
+    assert_eq!(
+        execution_result.degradations.len(),
+        1,
+        "should have one DegradationNotice from the failed execute_command"
+    );
+    assert_eq!(
+        execution_result.degradations[0].activity_name, "execute_command",
+        "degradation should be for execute_command"
+    );
+    assert_eq!(
+        execution_result.degradations[0].error_code, "execution_error",
+        "reactor records execution_error when execute_command fails"
+    );
+
+    // The error message must be injected into the event log so the LLM sees it on the next call.
+    let events = event_log
+        .read(&execution_result.execution_id, None::<u64>)
+        .await
+        .unwrap();
+    let injected = events.iter().any(|e| {
+        if e.event_type != "context.message_injected" {
+            return false;
+        }
+        // Source must be CommandError.
+        e.payload
+            .get("event")
+            .and_then(|v| v.get("source"))
+            .and_then(|s| s.get("CommandError"))
+            .is_some()
+    });
+    assert!(
+        injected,
+        "expected context.message_injected with CommandError source in event log"
+    );
+
+    // Generate was called twice: once to request the command, once after error injection.
+    assert_eq!(
+        call_count.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "generate should be called twice: once before command, once after error injection"
+    );
+}
+
+/// Command timeout injects an error message for the LLM and continues execution.
+///
+/// Uses `tokio::time::pause()` to advance time past the command deadline.
+/// Verifies spec Section 4.6: timeout isolation.
+#[tokio::test(start_paused = true)]
+async fn command_timeout_injects_error_message_and_continues() {
+    use pretty_assertions::assert_eq;
+
+    /// Generate that invokes a command once, then Done.
+    struct InvokeOnceActivity;
+
+    #[async_trait::async_trait]
+    impl Activity for InvokeOnceActivity {
+        fn name(&self) -> &str {
+            "generate"
+        }
+
+        async fn execute(
+            &self,
+            _execution_id: &ExecutionId,
+            input: ActivityInput,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
+            _event_log: &dyn EventLog,
+            event_tx: mpsc::Sender<PipelineEvent>,
+            _cancel: CancellationToken,
+        ) {
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
+                    name: "generate".to_string(),
+                }))
+                .await;
+            let _ = event_tx
+                .send(PipelineEvent::Generation(GenerationEvent::Started {
+                    model: "stub-model".to_string(),
+                    message_count: input.messages.len(),
+                }))
+                .await;
+
+            // Only request command on first call. On the second call just return Done.
+            // We detect "second call" by checking if messages contain the injected error.
+            let already_has_error = input.messages.iter().any(|m| {
+                m.content
+                    .iter()
+                    .any(|c| matches!(c, ContentPart::Text(t) if t.contains("failed")))
+            });
+
+            if !already_has_error {
+                let _ = event_tx
+                    .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                        GeneratedEvent::CommandInvocation(CommandInvocation {
+                            name: "slow_tool".to_string(),
+                            action: CommandAction::Execute,
+                            arguments: serde_json::json!({}),
+                        }),
+                    )))
+                    .await;
+            }
+
+            let _ = event_tx
+                .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                    GeneratedEvent::Done,
+                )))
+                .await;
+            let response_message = WeftMessage {
+                role: Role::Assistant,
+                source: Source::Provider,
+                model: Some("stub-model".to_string()),
+                content: vec![],
+                delta: false,
+                message_index: 0,
+            };
+            let _ = event_tx
+                .send(PipelineEvent::Generation(GenerationEvent::Completed {
+                    model: "stub-model".to_string(),
+                    response_message,
+                    generated_events: vec![GeneratedEvent::Done],
+                    input_tokens: None,
+                    output_tokens: None,
+                }))
+                .await;
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Completed {
+                    name: "generate".to_string(),
+                    idempotency_key: input.idempotency_key.clone(),
+                }))
+                .await;
+        }
+    }
+
+    /// Activity that hangs forever (simulating a slow command — will be timed out).
+    struct HangingExecuteCommandActivity;
+
+    #[async_trait::async_trait]
+    impl Activity for HangingExecuteCommandActivity {
+        fn name(&self) -> &str {
+            "execute_command"
+        }
+
+        fn criticality(&self) -> weft_reactor_trait::Criticality {
+            weft_reactor_trait::Criticality::NonCritical
+        }
+
+        async fn execute(
+            &self,
+            _execution_id: &ExecutionId,
+            _input: ActivityInput,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
+            _event_log: &dyn EventLog,
+            _event_tx: mpsc::Sender<PipelineEvent>,
+            cancel: CancellationToken,
+        ) {
+            // Hang until cancelled (simulates a command that never responds).
+            cancel.cancelled().await;
+        }
+    }
+
+    let services = Arc::new(make_test_services());
+    let event_log = test_event_log();
+    let registry = build_registry(vec![
+        Arc::new(InvokeOnceActivity),
+        Arc::new(StubAssembleResponse {
+            name: "assemble_response".to_string(),
+        }),
+        Arc::new(HangingExecuteCommandActivity),
+    ]);
+
+    // Use the default reactor_config (command_timeout_secs = 10).
+    let config = reactor_config(simple_pipeline_config("generate"));
+
+    let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+        .expect("reactor should construct");
+
+    // Drive the reactor to completion while advancing simulated time past the 10-second deadline.
+    let reactor_fut = reactor.execute(
+        ExecutionContext {
+            request: test_request(),
+            tenant_id: TenantId("t1".to_string()),
+            request_id: RequestId("r1".to_string()),
+            parent_id: None,
+            parent_budget: None,
+            client_tx: None,
+        },
+        None,
+    );
+
+    // Advance time past the 10-second command deadline.
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        let advance_handle = tokio::spawn(async {
+            // Give the reactor a moment to get into the command wait loop.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::advance(Duration::from_secs(15)).await;
+        });
+        let r = reactor_fut.await;
+        let _ = advance_handle.await;
+        r
+    })
+    .await
+    .expect("test should not time out");
+
+    let (execution_result, _) =
+        result.expect("command timeout should not kill the request; execution should complete Ok");
+
+    assert_eq!(
+        execution_result.degradations.len(),
+        1,
+        "should have one DegradationNotice from the timed-out execute_command"
+    );
+    assert_eq!(
+        execution_result.degradations[0].activity_name, "execute_command",
+        "degradation should be for execute_command"
+    );
+    assert!(
+        execution_result.degradations[0]
+            .message
+            .contains("timed out"),
+        "degradation message should mention timeout; got: {}",
+        execution_result.degradations[0].message
+    );
+}
+
+/// Multiple command failures all inject error messages; execution continues and completes.
+///
+/// Verifies spec Section 8.4: "All-commands-fail: LLM sees error messages, execution continues."
+#[tokio::test]
+async fn multiple_command_failures_all_inject_errors_and_continue() {
+    use pretty_assertions::assert_eq;
+
+    /// Generate that invokes two commands on first call, then Done.
+    struct InvokeTwoCommandsActivity {
+        call_count: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl Activity for InvokeTwoCommandsActivity {
+        fn name(&self) -> &str {
+            "generate"
+        }
+
+        async fn execute(
+            &self,
+            _execution_id: &ExecutionId,
+            input: ActivityInput,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
+            _event_log: &dyn EventLog,
+            event_tx: mpsc::Sender<PipelineEvent>,
+            _cancel: CancellationToken,
+        ) {
+            let call_n = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
+                    name: "generate".to_string(),
+                }))
+                .await;
+            let _ = event_tx
+                .send(PipelineEvent::Generation(GenerationEvent::Started {
+                    model: "stub-model".to_string(),
+                    message_count: input.messages.len(),
+                }))
+                .await;
+
+            if call_n == 0 {
+                // First call: invoke two commands.
+                for cmd in &["tool_a", "tool_b"] {
+                    let _ = event_tx
+                        .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                            GeneratedEvent::CommandInvocation(CommandInvocation {
+                                name: cmd.to_string(),
+                                action: CommandAction::Execute,
+                                arguments: serde_json::json!({}),
+                            }),
+                        )))
+                        .await;
+                }
+            }
+
+            let _ = event_tx
+                .send(PipelineEvent::Generation(GenerationEvent::Chunk(
+                    GeneratedEvent::Done,
+                )))
+                .await;
+            let response_message = WeftMessage {
+                role: Role::Assistant,
+                source: Source::Provider,
+                model: Some("stub-model".to_string()),
+                content: vec![],
+                delta: false,
+                message_index: 0,
+            };
+            let _ = event_tx
+                .send(PipelineEvent::Generation(GenerationEvent::Completed {
+                    model: "stub-model".to_string(),
+                    response_message,
+                    generated_events: vec![GeneratedEvent::Done],
+                    input_tokens: None,
+                    output_tokens: None,
+                }))
+                .await;
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Completed {
+                    name: "generate".to_string(),
+                    idempotency_key: input.idempotency_key.clone(),
+                }))
+                .await;
+        }
+    }
+
+    /// Activity that always fails with ActivityEvent::Failed.
+    struct AlwaysFailingExecuteCommandActivity;
+
+    #[async_trait::async_trait]
+    impl Activity for AlwaysFailingExecuteCommandActivity {
+        fn name(&self) -> &str {
+            "execute_command"
+        }
+
+        fn criticality(&self) -> weft_reactor_trait::Criticality {
+            weft_reactor_trait::Criticality::NonCritical
+        }
+
+        async fn execute(
+            &self,
+            _execution_id: &ExecutionId,
+            input: ActivityInput,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
+            _event_log: &dyn EventLog,
+            event_tx: mpsc::Sender<PipelineEvent>,
+            _cancel: CancellationToken,
+        ) {
+            // Extract the command name from metadata so we can echo it back in the error.
+            let cmd_name = input
+                .metadata
+                .get("invocation")
+                .and_then(|v| v.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
+                    name: "execute_command".to_string(),
+                }))
+                .await;
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
+                    name: "execute_command".to_string(),
+                    error: format!("command not found: {cmd_name}"),
+                    retryable: false,
+                    detail: FailureDetail {
+                        error_code: "command_not_found".to_string(),
+                        detail: serde_json::json!({ "command_name": cmd_name }),
+                        cause: Some(format!("command not found: {cmd_name}")),
+                        attempted: Some(format!("execute command {cmd_name}")),
+                        fallback: None,
+                    },
+                }))
+                .await;
+        }
+    }
+
+    let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let call_count_clone = Arc::clone(&call_count);
+
+    let services = Arc::new(make_test_services());
+    let event_log = test_event_log();
+    let registry = build_registry(vec![
+        Arc::new(InvokeTwoCommandsActivity {
+            call_count: call_count_clone,
+        }),
+        Arc::new(StubAssembleResponse {
+            name: "assemble_response".to_string(),
+        }),
+        Arc::new(AlwaysFailingExecuteCommandActivity),
+    ]);
+
+    let config = reactor_config(simple_pipeline_config("generate"));
+    let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+        .expect("reactor should construct");
+
+    let result = reactor
+        .execute(
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
+            None,
+        )
+        .await;
+
+    let (execution_result, _) = result
+        .expect("all-commands-fail should not kill the request; execution should complete Ok");
+
+    // Both commands should produce a degradation notice.
+    assert_eq!(
+        execution_result.degradations.len(),
+        2,
+        "should have two DegradationNotices, one per failed command"
+    );
+    for notice in &execution_result.degradations {
+        assert_eq!(
+            notice.activity_name, "execute_command",
+            "each degradation should be for execute_command"
+        );
+        assert_eq!(
+            notice.error_code, "execution_error",
+            "reactor records execution_error for each failed command"
+        );
+    }
+
+    // Both error messages should appear in the event log as MessageInjected events.
+    let events = event_log
+        .read(&execution_result.execution_id, None::<u64>)
+        .await
+        .unwrap();
+    let injected_count = events
+        .iter()
+        .filter(|e| {
+            e.event_type == "context.message_injected"
+                && e.payload
+                    .get("event")
+                    .and_then(|v| v.get("source"))
+                    .and_then(|s| s.get("CommandError"))
+                    .is_some()
+        })
+        .count();
+    assert_eq!(
+        injected_count, 2,
+        "expected two context.message_injected(CommandError) events, one per failed command; got {injected_count}"
+    );
+
+    // Generate was called twice: once for the two commands, once after error injection.
+    assert_eq!(
+        call_count.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "generate should be called twice: once requesting commands, once after error injection"
+    );
+}
+
+/// ExecutionResult.degradations is empty on a fully successful execution.
+#[tokio::test]
+async fn execution_result_degradations_empty_on_success() {
+    use pretty_assertions::assert_eq;
+
+    let services = Arc::new(make_test_services());
+    let event_log = test_event_log();
+    let registry = build_registry(vec![
+        Arc::new(StubModelSelectionActivity),
+        Arc::new(StubCommandSelectionActivity),
+        Arc::new(StubProviderResolutionActivity),
+        Arc::new(StubCommandFormattingActivity),
+        Arc::new(StubSamplingAdjustmentActivity),
+        Arc::new(ImmediateDoneActivity {
+            name: "generate".to_string(),
+        }),
+        Arc::new(StubAssembleResponse {
+            name: "assemble_response".to_string(),
+        }),
+        Arc::new(StubExecuteCommand {
+            name: "execute_command".to_string(),
+        }),
+    ]);
+
+    let config = reactor_config(PipelineConfig {
+        name: "default".to_string(),
+        pre_loop: vec![
+            ActivityRef::Name("model_selection".to_string()),
+            ActivityRef::Name("command_selection".to_string()),
+            ActivityRef::Name("provider_resolution".to_string()),
+            ActivityRef::Name("command_formatting".to_string()),
+            ActivityRef::Name("sampling_adjustment".to_string()),
+        ],
+        post_loop: vec![ActivityRef::Name("assemble_response".to_string())],
+        generate: ActivityRef::Name("generate".to_string()),
+        execute_command: ActivityRef::Name("execute_command".to_string()),
+        loop_hooks: LoopHooks::default(),
+    });
+
+    let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+        .expect("reactor should construct");
+
+    let result = reactor
+        .execute(
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
+            None,
+        )
+        .await;
+
+    let (execution_result, _) = result.expect("successful execution should return Ok");
+    assert_eq!(
+        execution_result.degradations.len(),
+        0,
+        "no degradations on a fully successful execution"
     );
 }

@@ -15,7 +15,7 @@
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use weft_reactor_trait::{
-    Activity, ActivityEvent, ActivityInput, ContextEvent, EventLog, ExecutionId,
+    Activity, ActivityEvent, ActivityInput, ContextEvent, Criticality, EventLog, ExecutionId,
     MessageInjectionSource, PipelineEvent, ServiceLocator,
 };
 
@@ -47,6 +47,10 @@ impl Default for SystemPromptAssemblyActivity {
 impl Activity for SystemPromptAssemblyActivity {
     fn name(&self) -> &str {
         "system_prompt_assembly"
+    }
+
+    fn criticality(&self) -> Criticality {
+        Criticality::NonCritical
     }
 
     async fn execute(
@@ -183,6 +187,14 @@ mod tests {
         assert_eq!(
             SystemPromptAssemblyActivity::new().name(),
             "system_prompt_assembly"
+        );
+    }
+
+    #[test]
+    fn system_prompt_assembly_criticality_is_non_critical() {
+        assert_eq!(
+            SystemPromptAssemblyActivity::new().criticality(),
+            Criticality::NonCritical
         );
     }
 

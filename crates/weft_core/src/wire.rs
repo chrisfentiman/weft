@@ -46,6 +46,34 @@ pub enum ResponseFormat {
     JsonObject,
 }
 
+/// Pipeline phase where a degradation occurred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PipelinePhase {
+    PreLoop,
+    Dispatch,
+    PostLoop,
+}
+
+/// Record of a degraded activity: what failed, why, and what the reactor did.
+///
+/// Accumulated during execution and surfaced on `ExecutionResult` and
+/// `WeftResponse` for downstream consumers. Exposed as gRPC trailing metadata.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DegradationNotice {
+    /// Which activity degraded.
+    pub activity_name: String,
+    /// Pipeline phase where degradation occurred.
+    pub phase: PipelinePhase,
+    /// Machine-readable error code (from `FailureDetail::error_code`).
+    pub error_code: String,
+    /// Human-readable summary.
+    pub message: String,
+    /// What capability was lost.
+    pub impact: String,
+    /// The fallback that was applied.
+    pub fallback_applied: String,
+}
+
 /// The engine's response, before wire-format conversion.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WeftResponse {
@@ -56,6 +84,12 @@ pub struct WeftResponse {
     pub messages: Vec<WeftMessage>,
     pub usage: WeftUsage,
     pub timing: WeftTiming,
+    /// Degradation notices from non-critical activity failures.
+    ///
+    /// Non-empty when the reactor continued with fallback defaults after
+    /// one or more non-critical activity failures. Empty on fully successful requests.
+    #[serde(default)]
+    pub degradations: Vec<DegradationNotice>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -1704,6 +1738,7 @@ mod tests {
                 routing_ms: 10,
                 llm_ms: 490,
             },
+            degradations: Vec::new(),
         };
 
         let proto_resp: proto::ChatResponse = resp.into();
@@ -1719,5 +1754,90 @@ mod tests {
         assert_eq!(timing.total_ms, 500);
         assert_eq!(timing.routing_ms, 10);
         assert_eq!(timing.llm_ms, 490);
+    }
+
+    // ── Phase 3: WeftResponse.degradations serde ──────────────────────────
+
+    /// WeftResponse with degradations serializes and deserializes correctly.
+    #[test]
+    fn weft_response_serde_round_trip_with_degradations() {
+        use pretty_assertions::assert_eq;
+
+        let resp = WeftResponse {
+            id: "req-degraded".to_string(),
+            model: "auto".to_string(),
+            messages: vec![],
+            usage: WeftUsage::default(),
+            timing: WeftTiming::default(),
+            degradations: vec![DegradationNotice {
+                activity_name: "command_selection".to_string(),
+                phase: PipelinePhase::PreLoop,
+                error_code: "classifier_unavailable".to_string(),
+                message: "Command selection failed; proceeding without commands".to_string(),
+                impact: "Commands will not be available for this request".to_string(),
+                fallback_applied: "empty command list".to_string(),
+            }],
+        };
+
+        let json = serde_json::to_string(&resp).expect("serialization should succeed");
+        let back: WeftResponse =
+            serde_json::from_str(&json).expect("deserialization should succeed");
+
+        assert_eq!(back.id, "req-degraded");
+        assert_eq!(back.degradations.len(), 1);
+        let notice = &back.degradations[0];
+        assert_eq!(notice.activity_name, "command_selection");
+        assert_eq!(notice.phase, PipelinePhase::PreLoop);
+        assert_eq!(notice.error_code, "classifier_unavailable");
+        assert_eq!(notice.fallback_applied, "empty command list");
+    }
+
+    /// WeftResponse without degradations deserializes correctly (backward compat).
+    ///
+    /// The `#[serde(default)]` on `degradations` means JSON without the field
+    /// deserializes to an empty Vec, not an error.
+    #[test]
+    fn weft_response_missing_degradations_field_defaults_to_empty() {
+        use pretty_assertions::assert_eq;
+
+        let json = r#"{
+            "id": "req-old",
+            "model": "auto",
+            "messages": [],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "llm_calls": 0},
+            "timing": {"total_ms": 0, "routing_ms": 0, "llm_ms": 0}
+        }"#;
+
+        let resp: WeftResponse = serde_json::from_str(json)
+            .expect("WeftResponse without degradations field should deserialize successfully");
+        assert_eq!(
+            resp.degradations.len(),
+            0,
+            "missing field should default to empty vec"
+        );
+    }
+
+    /// WeftResponse with empty degradations vec serializes correctly.
+    #[test]
+    fn weft_response_empty_degradations_round_trip() {
+        use pretty_assertions::assert_eq;
+
+        let resp = WeftResponse {
+            id: "req-ok".to_string(),
+            model: "auto".to_string(),
+            messages: vec![],
+            usage: WeftUsage::default(),
+            timing: WeftTiming::default(),
+            degradations: vec![],
+        };
+
+        let json = serde_json::to_string(&resp).expect("serialization should succeed");
+        let back: WeftResponse =
+            serde_json::from_str(&json).expect("deserialization should succeed");
+        assert_eq!(
+            back.degradations.len(),
+            0,
+            "empty degradations should round-trip correctly"
+        );
     }
 }

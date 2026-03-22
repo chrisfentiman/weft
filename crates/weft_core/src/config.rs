@@ -869,6 +869,19 @@ pub struct HookConfig {
     /// Execution priority. Lower values run first. Default: 100.
     #[serde(default = "default_hook_priority")]
     pub priority: u32,
+    /// Whether this hook is critical to request completion.
+    ///
+    /// When `true`, a hook execution failure (crash, timeout) terminates
+    /// the request. When `false` (default), failures are logged and skipped.
+    ///
+    /// This governs *execution failures* only. `HookBlocked` outcomes
+    /// (policy decisions) are always fatal on blocking events regardless
+    /// of this field. A hook that *blocks* is different from one that *crashes*.
+    ///
+    /// Default: `false`. Operators who deploy safety-critical hooks (e.g.,
+    /// content filters, PII detectors) should set `critical = true`.
+    #[serde(default)]
+    pub critical: bool,
 }
 
 fn default_hook_priority() -> u32 {
@@ -878,7 +891,7 @@ fn default_hook_priority() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pretty_assertions::{assert_eq, assert_ne};
+    use pretty_assertions::assert_eq;
 
     /// Build a minimal valid config TOML with router section.
     fn minimal_router_toml() -> &'static str {
@@ -2698,6 +2711,101 @@ api_key = "sk-test"
         assert!(
             props.get("name").is_some(),
             "ModelEntry.properties must contain 'name'"
+        );
+    }
+
+    // ── HookConfig critical field ──────────────────────────────────────────
+
+    #[test]
+    fn hook_config_critical_defaults_to_false() {
+        let toml = format!(
+            r#"{}
+[[hooks]]
+event = "request_start"
+type = "rhai"
+script = "/etc/hooks/auth.rhai"
+"#,
+            minimal_router_toml_str()
+        );
+        let config: WeftConfig = toml::from_str(&toml).unwrap();
+        assert!(!config.hooks[0].critical, "critical must default to false");
+    }
+
+    #[test]
+    fn hook_config_critical_true_parses() {
+        let toml = format!(
+            r#"{}
+[[hooks]]
+event = "request_start"
+type = "rhai"
+script = "/etc/hooks/safety.rhai"
+critical = true
+"#,
+            minimal_router_toml_str()
+        );
+        let config: WeftConfig = toml::from_str(&toml).unwrap();
+        assert!(config.hooks[0].critical, "critical must be true when set");
+    }
+
+    #[test]
+    fn hook_config_conservative_aggregation_mixed_critical() {
+        // When one hook is critical and another is not, the aggregated result is true.
+        let toml = format!(
+            r#"{}
+[[hooks]]
+event = "request_start"
+type = "rhai"
+script = "/etc/hooks/logging.rhai"
+critical = false
+
+[[hooks]]
+event = "request_start"
+type = "rhai"
+script = "/etc/hooks/safety.rhai"
+critical = true
+"#,
+            minimal_router_toml_str()
+        );
+        let config: WeftConfig = toml::from_str(&toml).unwrap();
+        let event = HookEvent::RequestStart;
+        let aggregated_critical = config
+            .hooks
+            .iter()
+            .filter(|h| h.event == event)
+            .any(|h| h.critical);
+        assert!(
+            aggregated_critical,
+            "conservative aggregation: any critical hook makes event critical"
+        );
+    }
+
+    #[test]
+    fn hook_config_conservative_aggregation_all_non_critical() {
+        let toml = format!(
+            r#"{}
+[[hooks]]
+event = "request_start"
+type = "rhai"
+script = "/etc/hooks/logging.rhai"
+critical = false
+
+[[hooks]]
+event = "request_start"
+type = "rhai"
+script = "/etc/hooks/metrics.rhai"
+"#,
+            minimal_router_toml_str()
+        );
+        let config: WeftConfig = toml::from_str(&toml).unwrap();
+        let event = HookEvent::RequestStart;
+        let aggregated_critical = config
+            .hooks
+            .iter()
+            .filter(|h| h.event == event)
+            .any(|h| h.critical);
+        assert!(
+            !aggregated_critical,
+            "all non-critical hooks yield non-critical aggregation"
         );
     }
 }

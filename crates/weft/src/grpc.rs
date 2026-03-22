@@ -17,7 +17,9 @@ use std::sync::Arc;
 
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use weft_core::{WeftConfig, WeftError, WeftRequest, WeftResponse, validate_request};
+use weft_core::{
+    DegradationNotice, WeftConfig, WeftError, WeftRequest, WeftResponse, validate_request,
+};
 use weft_proto::weft::v1 as proto;
 use weft_reactor::{ActivityError, ReactorError};
 
@@ -87,7 +89,12 @@ impl WeftService {
             .await
             .map_err(reactor_error_to_weft_error)?;
 
-        Ok(result.response)
+        // Move degradations from ExecutionResult onto WeftResponse so that
+        // the HTTP handler (and future callers) can inspect what degraded.
+        let mut response = result.response;
+        response.degradations = result.degradations;
+
+        Ok(response)
     }
 
     /// Expose engine configuration for health checks and server diagnostics.
@@ -134,9 +141,17 @@ impl proto::weft_server::Weft for WeftService {
             .await
             .map_err(|e| weft_error_to_status(&e))?;
 
+        // Add degradation trailing metadata before proto conversion consumes the response.
+        let trailing_metadata = build_degradation_metadata(&weft_resp.degradations);
+
         // Convert domain → proto.
         let proto_resp = proto_response_from_weft(weft_resp);
-        Ok(Response::new(proto_resp))
+
+        let mut response = Response::new(proto_resp);
+        if let Some(metadata) = trailing_metadata {
+            *response.metadata_mut() = metadata;
+        }
+        Ok(response)
     }
 
     /// Server-streaming chat RPC.
@@ -939,6 +954,38 @@ fn sampling_options_from_proto(opts: proto::SamplingOptions) -> SamplingOptions 
     }
 }
 
+// ── Degradation metadata ──────────────────────────────────────────────────────
+
+/// Build gRPC trailing metadata for degraded responses.
+///
+/// Returns `Some(MetadataMap)` with `x-weft-degraded` set to a comma-separated
+/// list of activity names when degradations are present, `None` when empty.
+///
+/// Surfaces partial-failure information in trailing metadata alongside a
+/// successful response status.
+fn build_degradation_metadata(
+    degradations: &[DegradationNotice],
+) -> Option<tonic::metadata::MetadataMap> {
+    if degradations.is_empty() {
+        return None;
+    }
+
+    let activity_names: Vec<&str> = degradations
+        .iter()
+        .map(|d| d.activity_name.as_str())
+        .collect();
+    let header_value = activity_names.join(",");
+
+    let mut map = tonic::metadata::MetadataMap::new();
+    // `x-weft-degraded` is a valid ASCII metadata key.
+    // Unwrap is safe: the value is composed only from activity names which
+    // are valid identifiers (alphanumeric + underscore), so no invalid ASCII.
+    if let Ok(value) = tonic::metadata::MetadataValue::try_from(header_value.as_str()) {
+        map.insert("x-weft-degraded", value);
+    }
+    Some(map)
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1399,5 +1446,83 @@ mod tests {
             }
             other => panic!("expected Routing, got {other:?}"),
         }
+    }
+
+    // ── Phase 3: Degradation trailing metadata ────────────────────────────
+
+    /// build_degradation_metadata returns None when there are no degradations.
+    #[test]
+    fn degradation_metadata_absent_when_no_degradations() {
+        let metadata = build_degradation_metadata(&[]);
+        assert!(
+            metadata.is_none(),
+            "should return None when degradations are empty"
+        );
+    }
+
+    /// build_degradation_metadata returns Some with x-weft-degraded header when present.
+    #[test]
+    fn degradation_metadata_present_with_activity_names() {
+        use weft_core::{DegradationNotice, PipelinePhase};
+
+        let degradations = vec![DegradationNotice {
+            activity_name: "command_selection".to_string(),
+            phase: PipelinePhase::PreLoop,
+            error_code: "classifier_unavailable".to_string(),
+            message: "failed".to_string(),
+            impact: "no commands".to_string(),
+            fallback_applied: "empty list".to_string(),
+        }];
+
+        let metadata = build_degradation_metadata(&degradations);
+        assert!(
+            metadata.is_some(),
+            "should return Some(MetadataMap) when degradations are present"
+        );
+        let map = metadata.unwrap();
+        let value = map
+            .get("x-weft-degraded")
+            .expect("x-weft-degraded header should be present");
+        assert_eq!(
+            value.to_str().unwrap(),
+            "command_selection",
+            "header value should be the activity name"
+        );
+    }
+
+    /// Multiple degradations produce comma-separated activity names.
+    #[test]
+    fn degradation_metadata_multiple_activities_comma_separated() {
+        use weft_core::{DegradationNotice, PipelinePhase};
+
+        let degradations = vec![
+            DegradationNotice {
+                activity_name: "command_selection".to_string(),
+                phase: PipelinePhase::PreLoop,
+                error_code: "classifier_unavailable".to_string(),
+                message: "failed".to_string(),
+                impact: "no commands".to_string(),
+                fallback_applied: "empty list".to_string(),
+            },
+            DegradationNotice {
+                activity_name: "sampling_adjustment".to_string(),
+                phase: PipelinePhase::PreLoop,
+                error_code: "invalid_config".to_string(),
+                message: "failed".to_string(),
+                impact: "provider defaults".to_string(),
+                fallback_applied: "provider defaults".to_string(),
+            },
+        ];
+
+        let metadata = build_degradation_metadata(&degradations)
+            .expect("should return Some with two degradations");
+        let value = metadata
+            .get("x-weft-degraded")
+            .expect("x-weft-degraded header should be present");
+        assert_eq!(
+            value.to_str().unwrap(),
+            "command_selection,sampling_adjustment",
+            "multiple activity names should be comma-separated"
+        );
     }
 }

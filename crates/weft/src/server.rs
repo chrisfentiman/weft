@@ -669,11 +669,19 @@ mod tests {
             HookEvent::PreToolUse,
             HookEvent::PostToolUse,
         ] {
+            // Conservative aggregation: if ANY hook for this event has critical: true,
+            // the entire HookActivity for that event is critical.
+            let critical = config
+                .hooks
+                .iter()
+                .filter(|h| h.event == event)
+                .any(|h| h.critical);
             registry
                 .register(Arc::new(HookActivity::new(
                     event,
                     Arc::clone(&services.hooks),
                     Arc::clone(&services.request_end_semaphore),
+                    critical,
                 )))
                 .unwrap();
         }
@@ -944,6 +952,7 @@ mod tests {
                 llm_calls: 1,
             },
             timing: WeftTiming::default(),
+            degradations: vec![],
         };
         let openai_resp = weft_to_openai(resp, "gpt-4".to_string());
         assert_eq!(openai_resp.choices[0].message.content, "Hello!");
@@ -962,6 +971,7 @@ mod tests {
             messages: vec![],
             usage: WeftUsage::default(),
             timing: WeftTiming::default(),
+            degradations: vec![],
         };
         let openai_resp = weft_to_openai(resp, "auto".to_string());
         // No assistant message → empty content, not a panic

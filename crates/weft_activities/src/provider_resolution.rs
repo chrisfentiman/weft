@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use weft_reactor_trait::{
-    Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, PipelineEvent, SelectionEvent,
-    ServiceLocator,
+    Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, FailureDetail, PipelineEvent,
+    SelectionEvent, ServiceLocator,
 };
 
 /// Resolves provider and model capabilities for the model selected by `ModelSelectionActivity`.
@@ -68,6 +68,15 @@ impl Activity for ProviderResolutionActivity {
                     name: self.name().to_string(),
                     error: "cancelled before provider resolution".to_string(),
                     retryable: false,
+                    detail: FailureDetail {
+                        error_code: "cancelled".to_string(),
+                        detail: serde_json::Value::Null,
+                        cause: Some(
+                            "cancellation token was set before activity started".to_string(),
+                        ),
+                        attempted: Some("resolve provider for selected model".to_string()),
+                        fallback: None,
+                    },
                 }))
                 .await;
             return;
@@ -87,6 +96,16 @@ impl Activity for ProviderResolutionActivity {
                         error: "selected_model missing from metadata — reactor wiring error"
                             .to_string(),
                         retryable: false,
+                        detail: FailureDetail {
+                            error_code: "model_not_found".to_string(),
+                            detail: serde_json::json!({
+                                "model_name": "(missing from metadata)",
+                                "providers_checked": [],
+                            }),
+                            cause: Some("selected_model field absent from activity metadata — reactor wiring error".to_string()),
+                            attempted: Some("extract selected_model from activity metadata".to_string()),
+                            fallback: None,
+                        },
                     }))
                     .await;
                 return;
@@ -104,6 +123,18 @@ impl Activity for ProviderResolutionActivity {
                             "model '{selected_model}' has no model_id mapping — configuration error"
                         ),
                         retryable: false,
+                        detail: FailureDetail {
+                            error_code: "model_not_found".to_string(),
+                            detail: serde_json::json!({
+                                "model_name": selected_model,
+                                "providers_checked": [],
+                            }),
+                            cause: Some(format!(
+                                "model '{selected_model}' is not registered in any provider"
+                            )),
+                            attempted: Some(format!("resolve model_id for '{selected_model}'",)),
+                            fallback: None,
+                        },
                     }))
                     .await;
                 return;
@@ -665,5 +696,85 @@ api_key = "sk-test"
             vec!["chat_completions".to_string()],
             "should default to chat_completions when no capabilities registered"
         );
+    }
+
+    // ── FailureDetail enrichment ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn provider_resolution_missing_model_failure_detail_is_model_not_found() {
+        use pretty_assertions::assert_ne;
+
+        // No selected_model in metadata triggers the wiring error path.
+        let input = make_input_with_metadata(serde_json::json!({}));
+        let events = run_provider_resolution(input).await;
+
+        let failed = events
+            .iter()
+            .find(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. })))
+            .expect("expected Activity(Failed) when model missing from metadata");
+
+        match failed {
+            PipelineEvent::Activity(ActivityEvent::Failed { detail, .. }) => {
+                assert_ne!(
+                    detail.error_code, "unknown",
+                    "missing model failure must have non-unknown error_code"
+                );
+                assert_eq!(detail.error_code, "model_not_found");
+                assert!(
+                    detail.cause.is_some(),
+                    "cause must be populated for model_not_found failure"
+                );
+                assert!(
+                    detail.attempted.is_some(),
+                    "attempted must be populated for model_not_found failure"
+                );
+                assert!(
+                    detail.detail.get("model_name").is_some(),
+                    "detail must include model_name"
+                );
+            }
+            _ => panic!("expected Activity(Failed)"),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_resolution_unknown_model_failure_detail_is_model_not_found() {
+        use pretty_assertions::assert_ne;
+
+        // A model name that doesn't exist in the provider registry.
+        let input = make_input_with_metadata(
+            serde_json::json!({ "selected_model": "nonexistent-model-xyz" }),
+        );
+        let events = run_provider_resolution(input).await;
+
+        let failed = events
+            .iter()
+            .find(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. })))
+            .expect("expected Activity(Failed) for unknown model");
+
+        match failed {
+            PipelineEvent::Activity(ActivityEvent::Failed { detail, .. }) => {
+                assert_ne!(
+                    detail.error_code, "unknown",
+                    "unknown model failure must have non-unknown error_code"
+                );
+                assert_eq!(detail.error_code, "model_not_found");
+                assert!(
+                    detail.cause.is_some(),
+                    "cause must be populated for model_not_found failure"
+                );
+                // detail must include model_name
+                let model_name = detail
+                    .detail
+                    .get("model_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                assert_eq!(
+                    model_name, "nonexistent-model-xyz",
+                    "detail.model_name must match the requested model"
+                );
+            }
+            _ => panic!("expected Activity(Failed)"),
+        }
     }
 }

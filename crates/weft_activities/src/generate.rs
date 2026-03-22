@@ -20,8 +20,8 @@ use weft_core::{ContentPart, WeftMessage};
 use weft_llm_trait::{ProviderChunk, ProviderError, ProviderRequest, ProviderResponse};
 
 use weft_reactor_trait::{
-    Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, GeneratedEvent, GenerationEvent,
-    PipelineEvent, ServiceLocator,
+    Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, FailureDetail, GeneratedEvent,
+    GenerationEvent, PipelineEvent, ServiceLocator,
 };
 
 /// Calls the generative source (LLM provider) and streams the response.
@@ -93,6 +93,89 @@ fn is_retryable(err: &ProviderError) -> bool {
     }
 }
 
+/// Build a `FailureDetail` from a `ProviderError` for stream-open failures.
+///
+/// Maps provider error variants to meaningful `error_code` values so operators
+/// can distinguish rate limits, timeouts, and content rejections at 3AM.
+fn provider_error_detail(
+    err: &ProviderError,
+    provider_name: &str,
+    attempted: &str,
+) -> weft_reactor_trait::FailureDetail {
+    use weft_reactor_trait::FailureDetail;
+    match err {
+        ProviderError::RateLimited { retry_after_ms } => FailureDetail {
+            error_code: "provider_rate_limited".to_string(),
+            detail: serde_json::json!({
+                "provider": provider_name,
+                "retry_after_ms": retry_after_ms,
+            }),
+            cause: Some(err.to_string()),
+            attempted: Some(attempted.to_string()),
+            fallback: None,
+        },
+        ProviderError::ProviderHttpError { status, body } if *status == 429 => FailureDetail {
+            error_code: "provider_rate_limited".to_string(),
+            detail: serde_json::json!({
+                "provider": provider_name,
+                "http_status": status,
+                "body": body,
+            }),
+            cause: Some(err.to_string()),
+            attempted: Some(attempted.to_string()),
+            fallback: None,
+        },
+        ProviderError::ProviderHttpError { status, body } if matches!(status, 400 | 401 | 403) => {
+            FailureDetail {
+                error_code: "provider_refused".to_string(),
+                detail: serde_json::json!({
+                    "provider": provider_name,
+                    "http_status": status,
+                    "body": body,
+                }),
+                cause: Some(err.to_string()),
+                attempted: Some(attempted.to_string()),
+                fallback: None,
+            }
+        }
+        ProviderError::ProviderHttpError { status, body } => FailureDetail {
+            error_code: "provider_error".to_string(),
+            detail: serde_json::json!({
+                "provider": provider_name,
+                "http_status": status,
+                "body": body,
+            }),
+            cause: Some(err.to_string()),
+            attempted: Some(attempted.to_string()),
+            fallback: None,
+        },
+        ProviderError::RequestFailed(msg) => FailureDetail {
+            error_code: "provider_error".to_string(),
+            detail: serde_json::json!({
+                "provider": provider_name,
+                "http_status": 0_u16,
+                "body": msg,
+            }),
+            cause: Some(err.to_string()),
+            attempted: Some(attempted.to_string()),
+            fallback: None,
+        },
+        ProviderError::Unsupported(_)
+        | ProviderError::DeserializationError(_)
+        | ProviderError::WireScriptError { .. } => FailureDetail {
+            error_code: "provider_error".to_string(),
+            detail: serde_json::json!({
+                "provider": provider_name,
+                "http_status": 0_u16,
+                "body": err.to_string(),
+            }),
+            cause: Some(err.to_string()),
+            attempted: Some(attempted.to_string()),
+            fallback: None,
+        },
+    }
+}
+
 #[async_trait::async_trait]
 impl Activity for GenerateActivity {
     fn name(&self) -> &str {
@@ -128,6 +211,15 @@ impl Activity for GenerateActivity {
                     name: self.name().to_string(),
                     error: "cancelled before generation".to_string(),
                     retryable: false,
+                    detail: FailureDetail {
+                        error_code: "cancelled".to_string(),
+                        detail: serde_json::json!({ "model": model }),
+                        cause: Some(
+                            "cancellation token was set before activity started".to_string(),
+                        ),
+                        attempted: Some("start generation for model".to_string()),
+                        fallback: None,
+                    },
                 }))
                 .await;
             return;
@@ -233,9 +325,10 @@ impl Activity for GenerateActivity {
 
         // Get the provider and open the streaming request.
         let provider = services.providers().get(&model);
+        let provider_name = provider.name().to_string();
         // Record provider name now that it is known; must happen before the stream
         // is opened so the attribute is present for the full span lifetime.
-        generate_span.record("llm.provider", provider.name());
+        generate_span.record("llm.provider", &provider_name);
 
         // Use tokio::select! to support cancellation while opening the stream.
         let stream_result = tokio::select! {
@@ -257,6 +350,13 @@ impl Activity for GenerateActivity {
                         name: self.name().to_string(),
                         error: "cancelled during generation".to_string(),
                         retryable: false,
+                        detail: FailureDetail {
+                            error_code: "cancelled".to_string(),
+                            detail: serde_json::json!({ "provider": provider_name }),
+                            cause: Some("cancellation token fired while opening provider stream".to_string()),
+                            attempted: Some(format!("open streaming connection to provider '{}'", provider_name)),
+                            fallback: None,
+                        },
                     }))
                     .await;
                 return;
@@ -289,6 +389,11 @@ impl Activity for GenerateActivity {
                         name: self.name().to_string(),
                         error: e.to_string(),
                         retryable,
+                        detail: provider_error_detail(
+                            &e,
+                            &provider_name,
+                            &format!("open streaming connection to provider '{}'", provider_name),
+                        ),
                     }))
                     .await;
                 return;
@@ -331,6 +436,16 @@ impl Activity for GenerateActivity {
                             name: self.name().to_string(),
                             error: "cancelled during streaming".to_string(),
                             retryable: false,
+                            detail: FailureDetail {
+                                error_code: "cancelled".to_string(),
+                                detail: serde_json::json!({
+                                    "provider": provider_name,
+                                    "chunks_received": all_generated_events.len(),
+                                }),
+                                cause: Some("cancellation token fired while consuming provider stream".to_string()),
+                                attempted: Some(format!("consume streaming response from provider '{}'", provider_name)),
+                                fallback: None,
+                            },
                         }))
                         .await;
                     return;
@@ -361,6 +476,7 @@ impl Activity for GenerateActivity {
                         let _ = handle.await;
                     }
                     let retryable = is_retryable(&e);
+                    let chunks_received = all_generated_events.len();
                     warn!(model = %model, error = %e, retryable, "generate: provider stream error");
                     let _ = event_tx
                         .send(PipelineEvent::Generation(GenerationEvent::Failed {
@@ -368,11 +484,29 @@ impl Activity for GenerateActivity {
                             error: e.to_string(),
                         }))
                         .await;
+                    // Mid-stream errors get stream_interrupted code when chunks were already received.
+                    let mut mid_stream_detail = provider_error_detail(
+                        &e,
+                        &provider_name,
+                        &format!(
+                            "consume streaming response from provider '{}'",
+                            provider_name
+                        ),
+                    );
+                    if chunks_received > 0 {
+                        mid_stream_detail.error_code = "stream_interrupted".to_string();
+                        mid_stream_detail.detail = serde_json::json!({
+                            "provider": provider_name,
+                            "chunks_received": chunks_received,
+                            "bytes_received": 0,
+                        });
+                    }
                     let _ = event_tx
                         .send(PipelineEvent::Activity(ActivityEvent::Failed {
                             name: self.name().to_string(),
                             error: e.to_string(),
                             retryable,
+                            detail: mid_stream_detail,
                         }))
                         .await;
                     return;
@@ -667,8 +801,8 @@ mod tests {
     use super::*;
     use crate::test_support::{
         NullEventLog, collect_events, make_test_input, make_test_services_with_chunk_stream,
-        make_test_services_with_mid_stream_error, make_test_services_with_response,
-        make_test_services_with_slow_provider,
+        make_test_services_with_error, make_test_services_with_mid_stream_error,
+        make_test_services_with_response, make_test_services_with_slow_provider,
     };
     use pretty_assertions::assert_eq;
     use tokio::sync::mpsc;
@@ -1298,6 +1432,146 @@ mod tests {
                 assert!(
                     *retryable,
                     "rate limit mid-stream error should be retryable"
+                );
+            }
+            _ => panic!("expected Activity(Failed)"),
+        }
+    }
+
+    // ── FailureDetail enrichment ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn generate_provider_error_failure_detail_has_non_unknown_error_code() {
+        use pretty_assertions::assert_ne;
+
+        let services = make_test_services_with_error(ProviderError::ProviderHttpError {
+            status: 500,
+            body: "internal server error".to_string(),
+        });
+        let input = make_test_input();
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let event_log = NullEventLog;
+        let exec_id = ExecutionId::new();
+
+        GenerateActivity::new()
+            .execute(&exec_id, input, &services, &event_log, tx, cancel)
+            .await;
+
+        let events = collect_events(&mut rx);
+        let failed = events
+            .iter()
+            .find(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. })))
+            .expect("expected Activity(Failed) on provider error");
+
+        match failed {
+            PipelineEvent::Activity(ActivityEvent::Failed { detail, .. }) => {
+                assert_ne!(
+                    detail.error_code, "unknown",
+                    "provider error must have non-unknown error_code"
+                );
+                assert_eq!(detail.error_code, "provider_error");
+                assert!(
+                    detail.cause.is_some(),
+                    "cause must be populated for provider_error failure"
+                );
+                assert!(
+                    detail.attempted.is_some(),
+                    "attempted must be populated for provider_error failure"
+                );
+                assert!(
+                    detail.detail.get("provider").is_some(),
+                    "detail must include provider field"
+                );
+            }
+            _ => panic!("expected Activity(Failed)"),
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_rate_limited_failure_detail_has_provider_rate_limited_code() {
+        use pretty_assertions::assert_ne;
+
+        let services = make_test_services_with_error(ProviderError::RateLimited {
+            retry_after_ms: 5000,
+        });
+        let input = make_test_input();
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let event_log = NullEventLog;
+        let exec_id = ExecutionId::new();
+
+        GenerateActivity::new()
+            .execute(&exec_id, input, &services, &event_log, tx, cancel)
+            .await;
+
+        let events = collect_events(&mut rx);
+        let failed = events
+            .iter()
+            .find(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. })))
+            .expect("expected Activity(Failed) on rate limit");
+
+        match failed {
+            PipelineEvent::Activity(ActivityEvent::Failed { detail, .. }) => {
+                assert_ne!(
+                    detail.error_code, "unknown",
+                    "rate limited failure must have non-unknown error_code"
+                );
+                assert_eq!(detail.error_code, "provider_rate_limited");
+                assert!(
+                    detail.cause.is_some(),
+                    "cause must be populated for provider_rate_limited failure"
+                );
+                assert!(
+                    detail.detail.get("retry_after_ms").is_some(),
+                    "detail must include retry_after_ms for rate limit"
+                );
+            }
+            _ => panic!("expected Activity(Failed)"),
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_mid_stream_error_failure_detail_is_stream_interrupted() {
+        use pretty_assertions::assert_ne;
+
+        let services = make_test_services_with_mid_stream_error(
+            "partial text",
+            ProviderError::RequestFailed("connection reset".to_string()),
+        );
+        let input = make_test_input();
+        let (tx, mut rx) = mpsc::channel(128);
+        let cancel = CancellationToken::new();
+        let event_log = NullEventLog;
+        let exec_id = ExecutionId::new();
+
+        GenerateActivity::new()
+            .execute(&exec_id, input, &services, &event_log, tx, cancel)
+            .await;
+
+        let events = collect_events(&mut rx);
+        let failed = events
+            .iter()
+            .find(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. })))
+            .expect("expected Activity(Failed) on mid-stream error");
+
+        match failed {
+            PipelineEvent::Activity(ActivityEvent::Failed { detail, .. }) => {
+                assert_ne!(
+                    detail.error_code, "unknown",
+                    "mid-stream error must have non-unknown error_code"
+                );
+                assert_eq!(
+                    detail.error_code, "stream_interrupted",
+                    "mid-stream error after chunks received must be stream_interrupted"
+                );
+                assert!(
+                    detail.cause.is_some(),
+                    "cause must be populated for stream_interrupted"
+                );
+                assert!(
+                    detail.detail.get("chunks_received").is_some(),
+                    "detail must include chunks_received for stream_interrupted"
                 );
             }
             _ => panic!("expected Activity(Failed)"),

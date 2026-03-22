@@ -16,8 +16,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use weft_reactor_trait::{
-    Activity, ActivityEvent, ActivityInput, CommandFormat, ContextEvent, EventLog, ExecutionId,
-    MessageInjectionSource, PipelineEvent, ServiceLocator,
+    Activity, ActivityEvent, ActivityInput, CommandFormat, ContextEvent, Criticality, EventLog,
+    ExecutionId, MessageInjectionSource, PipelineEvent, ServiceLocator,
 };
 
 /// Formats selected commands for the target provider based on its capabilities.
@@ -48,6 +48,10 @@ impl Default for CommandFormattingActivity {
 impl Activity for CommandFormattingActivity {
     fn name(&self) -> &str {
         "command_formatting"
+    }
+
+    fn criticality(&self) -> Criticality {
+        Criticality::NonCritical
     }
 
     async fn execute(
@@ -233,6 +237,14 @@ mod tests {
         assert_eq!(
             CommandFormattingActivity::new().name(),
             "command_formatting"
+        );
+    }
+
+    #[test]
+    fn command_formatting_criticality_is_non_critical() {
+        assert_eq!(
+            CommandFormattingActivity::new().criticality(),
+            Criticality::NonCritical
         );
     }
 
