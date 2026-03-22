@@ -230,6 +230,11 @@
             "null"
           ]
         },
+        "critical": {
+          "description": "Whether this hook is critical to request completion.\n\nWhen `true`, a hook execution failure (crash, timeout) terminates the request. When `false` (default), failures are logged and skipped.\n\nThis governs *execution failures* only. `HookBlocked` outcomes (policy decisions) are always fatal on blocking events regardless of this field. A hook that *blocks* is different from one that *crashes*.\n\nDefault: `false`. Operators who deploy safety-critical hooks (e.g., content filters, PII detectors) should set `critical = true`.",
+          "default": false,
+          "type": "boolean"
+        },
         "event": {
           "description": "Which lifecycle event this hook fires on.",
           "allOf": [
