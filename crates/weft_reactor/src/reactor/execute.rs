@@ -7,6 +7,8 @@
 //!
 //! Each phase is implemented in its own submodule; execute() stitches them together.
 
+use std::sync::Arc;
+
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, info_span};
@@ -140,7 +142,9 @@ impl Reactor {
             )
             .await?;
 
-            let mut state = ExecutionState::new(budget);
+            // Snapshot resolved config for this request (used by degradation fallback logic).
+            let resolved_config = Arc::clone(&self.services.resolved_config);
+            let mut state = ExecutionState::new(budget, resolved_config);
             // Seed the message list from the incoming request.
             state.messages = request.messages.clone();
 

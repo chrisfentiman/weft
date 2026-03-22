@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::ReactorError;
 use crate::event::{
-    ActivityEvent, CommandEvent, ContextEvent, HookOutcome, MessageInjectionSource, PipelineEvent,
-    SelectionEvent, SignalEvent,
+    ActivityEvent, CommandEvent, ContextEvent, FailureDetail, HookOutcome, MessageInjectionSource,
+    PipelineEvent, SelectionEvent, SignalEvent,
 };
 use crate::execution::ExecutionId;
 use crate::signal::Signal;
@@ -18,38 +18,67 @@ use crate::signal::Signal;
 use super::Reactor;
 use super::types::ExecutionState;
 
+/// Outcome from draining events after an activity completes.
+///
+/// Separates "what happened" from "what to do about it." The drain function
+/// reports; the caller decides consequences based on activity criticality.
+#[derive(Debug)]
+pub(super) enum DrainOutcome {
+    /// All events processed, execution continues.
+    Continue,
+    /// Activity failed. Caller decides fatal vs. degraded based on criticality.
+    ActivityFailed {
+        name: String,
+        error: String,
+        /// Whether the activity indicated the failure is retryable.
+        /// Preserved for callers that implement retry logic.
+        #[allow(dead_code)]
+        retryable: bool,
+        detail: FailureDetail,
+    },
+    /// Hook blocked the request. Always fatal.
+    HookBlocked { hook_name: String, reason: String },
+    /// Cancellation requested. Always fatal.
+    Cancelled { reason: String },
+}
+
 impl Reactor {
     /// Drain the channel after a synchronous pre/post-loop activity completes.
     ///
-    /// Returns Some(err) if execution should terminate (ActivityFailed or HookBlocked),
-    /// None if execution should continue.
+    /// Returns `DrainOutcome` describing what the drain encountered.
+    /// Returns `Err` only for infrastructure failures (channel closed, event log error).
     pub(super) async fn drain_pre_post_loop(
         &self,
         execution_id: &ExecutionId,
         event_rx: &mut mpsc::Receiver<PipelineEvent>,
         state: &mut ExecutionState,
         cancel: &CancellationToken,
-    ) -> Result<Option<ReactorError>, ReactorError> {
+    ) -> Result<DrainOutcome, ReactorError> {
         loop {
             match event_rx.try_recv() {
                 Ok(event) => {
                     self.record_event(execution_id, &event, None).await?;
                     match &event {
-                        PipelineEvent::Activity(ActivityEvent::Failed { name, error, .. }) => {
-                            return Ok(Some(ReactorError::ActivityFailed(
-                                crate::activity::ActivityError::Failed {
-                                    name: name.clone(),
-                                    reason: error.clone(),
-                                },
-                            )));
+                        PipelineEvent::Activity(ActivityEvent::Failed {
+                            name,
+                            error,
+                            retryable,
+                            detail,
+                        }) => {
+                            return Ok(DrainOutcome::ActivityFailed {
+                                name: name.clone(),
+                                error: error.clone(),
+                                retryable: *retryable,
+                                detail: detail.clone(),
+                            });
                         }
                         PipelineEvent::Hook(HookOutcome::Blocked {
                             hook_name, reason, ..
                         }) => {
-                            return Ok(Some(ReactorError::HookBlocked {
+                            return Ok(DrainOutcome::HookBlocked {
                                 hook_name: hook_name.clone(),
                                 reason: reason.clone(),
-                            }));
+                            });
                         }
                         PipelineEvent::Execution(
                             crate::event::ExecutionEvent::ValidationPassed,
@@ -105,9 +134,9 @@ impl Reactor {
                         }
                         PipelineEvent::Signal(SignalEvent::Received(Signal::Cancel { reason })) => {
                             cancel.cancel();
-                            return Ok(Some(ReactorError::Cancelled {
+                            return Ok(DrainOutcome::Cancelled {
                                 reason: reason.clone(),
-                            }));
+                            });
                         }
                         // ── New pre-loop activity events (Phase 1+) ──────────────
                         PipelineEvent::Selection(SelectionEvent::ModelSelected {
@@ -173,7 +202,7 @@ impl Reactor {
                 }
             }
         }
-        Ok(None)
+        Ok(DrainOutcome::Continue)
     }
 }
 
@@ -260,12 +289,11 @@ mod tests {
     }
 
     fn test_state() -> ExecutionState {
-        ExecutionState::new(Budget::new(
-            5,
-            5,
-            3,
-            chrono::Utc::now() + chrono::Duration::hours(1),
-        ))
+        let services = make_test_services();
+        ExecutionState::new(
+            Budget::new(5, 5, 3, chrono::Utc::now() + chrono::Duration::hours(1)),
+            services.resolved_config,
+        )
     }
 
     async fn setup_execution(event_log: &Arc<TestEventLog>, execution_id: &ExecutionId) {
@@ -296,7 +324,7 @@ mod tests {
         state: &mut ExecutionState,
         cancel: &CancellationToken,
         event: PipelineEvent,
-    ) -> Result<Option<crate::error::ReactorError>, crate::error::ReactorError> {
+    ) -> Result<super::DrainOutcome, crate::error::ReactorError> {
         let (tx, mut rx) = mpsc::channel(8);
         tx.send(event).await.unwrap();
         // Keep `tx` alive so the channel is empty (not disconnected) after
@@ -308,7 +336,7 @@ mod tests {
         result
     }
 
-    // ── ActivityFailed → returns Some(ActivityFailed error) ───────────────
+    // ── ActivityFailed → returns DrainOutcome::ActivityFailed ────────────
 
     #[tokio::test]
     async fn drain_activity_failed_returns_error() {
@@ -335,19 +363,18 @@ mod tests {
         .unwrap();
 
         assert!(
-            result.is_some(),
-            "ActivityFailed should return Some(error) to stop execution"
-        );
-        assert!(
             matches!(
-                result.unwrap(),
-                crate::error::ReactorError::ActivityFailed(_)
+                result,
+                super::DrainOutcome::ActivityFailed {
+                    ref name,
+                    ..
+                } if name == "validate"
             ),
-            "should be ReactorError::ActivityFailed"
+            "ActivityFailed should return DrainOutcome::ActivityFailed"
         );
     }
 
-    // ── HookBlocked → returns Some(HookBlocked error) ─────────────────────
+    // ── HookBlocked → returns DrainOutcome::HookBlocked ───────────────────
 
     #[tokio::test]
     async fn drain_hook_blocked_returns_error() {
@@ -373,15 +400,14 @@ mod tests {
         .unwrap();
 
         assert!(
-            result.is_some(),
-            "HookBlocked should return Some(error) to stop execution"
-        );
-        assert!(
             matches!(
-                result.unwrap(),
-                crate::error::ReactorError::HookBlocked { .. }
+                result,
+                super::DrainOutcome::HookBlocked {
+                    ref hook_name,
+                    ..
+                } if hook_name == "tripwire"
             ),
-            "should be ReactorError::HookBlocked"
+            "HookBlocked should return DrainOutcome::HookBlocked"
         );
     }
 
@@ -415,7 +441,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            result.is_none(),
+            matches!(result, super::DrainOutcome::Continue),
             "Command(Available) should not stop execution"
         );
         assert_eq!(state.available_commands.len(), 1);
@@ -482,13 +508,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(result.is_some(), "Cancel signal should return Some(error)");
         assert!(
             matches!(
-                result.unwrap(),
-                crate::error::ReactorError::Cancelled { .. }
+                result,
+                super::DrainOutcome::Cancelled { ref reason } if reason == "user requested"
             ),
-            "should be ReactorError::Cancelled"
+            "Cancel signal should return DrainOutcome::Cancelled"
         );
         assert!(
             cancel.is_cancelled(),
@@ -917,5 +942,148 @@ mod tests {
             matches!(result, Err(crate::error::ReactorError::ChannelClosed)),
             "disconnected channel should return ChannelClosed error; got: {result:?}"
         );
+    }
+
+    // ── Phase 2 DrainOutcome tests ────────────────────────────────────────
+
+    /// Benign event returns DrainOutcome::Continue.
+    #[tokio::test]
+    async fn drain_benign_event_returns_continue() {
+        let event_log = Arc::new(TestEventLog::new());
+        let reactor = build_reactor(Arc::clone(&event_log));
+        let execution_id = ExecutionId::new();
+        setup_execution(&event_log, &execution_id).await;
+        let mut state = test_state();
+        let cancel = CancellationToken::new();
+
+        let result = drain_single(
+            &reactor,
+            &execution_id,
+            &mut state,
+            &cancel,
+            PipelineEvent::Activity(ActivityEvent::Started {
+                name: "model_selection".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(result, super::DrainOutcome::Continue),
+            "Started event should return DrainOutcome::Continue"
+        );
+    }
+
+    /// ActivityFailed carries name, error, and detail.
+    #[tokio::test]
+    async fn drain_activity_failed_carries_detail() {
+        let event_log = Arc::new(TestEventLog::new());
+        let reactor = build_reactor(Arc::clone(&event_log));
+        let execution_id = ExecutionId::new();
+        setup_execution(&event_log, &execution_id).await;
+        let mut state = test_state();
+        let cancel = CancellationToken::new();
+
+        let detail = crate::event::FailureDetail {
+            error_code: "classifier_unavailable".to_string(),
+            detail: serde_json::json!({ "model_path": "m.onnx" }),
+            cause: Some("io error".to_string()),
+            attempted: Some("score candidates".to_string()),
+            fallback: None,
+        };
+
+        let result = drain_single(
+            &reactor,
+            &execution_id,
+            &mut state,
+            &cancel,
+            PipelineEvent::Activity(ActivityEvent::Failed {
+                name: "command_selection".to_string(),
+                error: "selection failed".to_string(),
+                retryable: false,
+                detail: detail.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        match result {
+            super::DrainOutcome::ActivityFailed {
+                name,
+                error,
+                retryable,
+                detail: d,
+            } => {
+                assert_eq!(name, "command_selection");
+                assert_eq!(error, "selection failed");
+                assert!(!retryable);
+                assert_eq!(d.error_code, "classifier_unavailable");
+            }
+            other => panic!("expected ActivityFailed, got something else: {other:?}"),
+        }
+    }
+
+    /// HookBlocked carries hook_name and reason.
+    #[tokio::test]
+    async fn drain_hook_blocked_carries_hook_name_and_reason() {
+        let event_log = Arc::new(TestEventLog::new());
+        let reactor = build_reactor(Arc::clone(&event_log));
+        let execution_id = ExecutionId::new();
+        setup_execution(&event_log, &execution_id).await;
+        let mut state = test_state();
+        let cancel = CancellationToken::new();
+
+        let result = drain_single(
+            &reactor,
+            &execution_id,
+            &mut state,
+            &cancel,
+            PipelineEvent::Hook(HookOutcome::Blocked {
+                hook_event: "pre_generate".to_string(),
+                hook_name: "content_filter".to_string(),
+                reason: "unsafe content".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        match result {
+            super::DrainOutcome::HookBlocked { hook_name, reason } => {
+                assert_eq!(hook_name, "content_filter");
+                assert_eq!(reason, "unsafe content");
+            }
+            other => panic!("expected HookBlocked, got something else: {other:?}"),
+        }
+    }
+
+    /// Cancelled carries reason and cancels token.
+    #[tokio::test]
+    async fn drain_cancelled_carries_reason() {
+        let event_log = Arc::new(TestEventLog::new());
+        let reactor = build_reactor(Arc::clone(&event_log));
+        let execution_id = ExecutionId::new();
+        setup_execution(&event_log, &execution_id).await;
+        let mut state = test_state();
+        let cancel = CancellationToken::new();
+
+        let result = drain_single(
+            &reactor,
+            &execution_id,
+            &mut state,
+            &cancel,
+            PipelineEvent::Signal(SignalEvent::Received(Signal::Cancel {
+                reason: "deadline exceeded".to_string(),
+            })),
+        )
+        .await
+        .unwrap();
+
+        match result {
+            super::DrainOutcome::Cancelled { reason } => {
+                assert_eq!(reason, "deadline exceeded");
+            }
+            other => panic!("expected Cancelled, got something else: {other:?}"),
+        }
+        assert!(cancel.is_cancelled(), "token should be cancelled");
     }
 }

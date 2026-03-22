@@ -10,8 +10,11 @@ use tracing::{Instrument, info_span, warn};
 
 use crate::error::ReactorError;
 use crate::event::{
-    ActivityEvent, CommandEvent, ContextEvent, MessageInjectionSource, PipelineEvent,
+    ActivityEvent, CommandEvent, ContextEvent, DegradationNotice, ExecutionEvent,
+    MessageInjectionSource, PipelineEvent, PipelinePhase,
 };
+
+use super::drain::DrainOutcome;
 
 use super::Reactor;
 use super::retry::should_retry;
@@ -69,7 +72,7 @@ impl Reactor {
                     activity.status = tracing::field::Empty,
                 );
 
-                let terminate = async {
+                let drain_outcome = async {
                     hook.activity
                         .execute(
                             cmd_ctx.execution_id,
@@ -91,11 +94,54 @@ impl Reactor {
                 .instrument(activity_span.clone())
                 .await?;
 
-                if let Some(err) = terminate {
-                    activity_span.record("activity.status", "error");
-                    return Ok(Some(err));
-                } else {
-                    activity_span.record("activity.status", "ok");
+                match drain_outcome {
+                    DrainOutcome::Continue => {
+                        activity_span.record("activity.status", "ok");
+                    }
+                    DrainOutcome::ActivityFailed {
+                        name,
+                        error,
+                        detail,
+                        ..
+                    } => {
+                        let criticality = hook.activity.criticality();
+                        if criticality.is_fatal() {
+                            activity_span.record("activity.status", "error");
+                            return Ok(Some(ReactorError::ActivityFailed(
+                                crate::activity::ActivityError::Failed {
+                                    name: name.clone(),
+                                    reason: error.clone(),
+                                },
+                            )));
+                        } else {
+                            // Non-critical hook: degrade and continue.
+                            activity_span.record("activity.status", "degraded");
+                            let notice = build_dispatch_degradation_notice(&name, &detail, &error);
+                            let _ = self
+                                .record_event(
+                                    cmd_ctx.execution_id,
+                                    &PipelineEvent::Execution(ExecutionEvent::Degraded {
+                                        notice: notice.clone(),
+                                    }),
+                                    None,
+                                )
+                                .await;
+                            tracing::warn!(
+                                degradation.activity = %notice.activity_name,
+                                degradation.error_code = %notice.error_code,
+                                "Dispatch hook degraded: {}", notice.message,
+                            );
+                            cmd_ctx.state.degradations.push(notice);
+                        }
+                    }
+                    DrainOutcome::HookBlocked { hook_name, reason } => {
+                        activity_span.record("activity.status", "error");
+                        return Ok(Some(ReactorError::HookBlocked { hook_name, reason }));
+                    }
+                    DrainOutcome::Cancelled { reason } => {
+                        activity_span.record("activity.status", "error");
+                        return Ok(Some(ReactorError::Cancelled { reason }));
+                    }
                 }
             }
 
@@ -253,7 +299,9 @@ impl Reactor {
                 }
             }
 
-            // Handle command failure with retry.
+            // Handle command failure via isolation: inject error message for the LLM
+            // and continue to the next command rather than killing the request.
+            // (Spec Section 4.6: command execution failure isolation)
             if cmd_failed {
                 let policy = cmd_ctx.pipeline.execute_command.retry_policy.as_ref();
                 if cmd_failed_retryable
@@ -263,20 +311,62 @@ impl Reactor {
                     // retryable=true, apply retry policy" applies to generation activities.
                     // Command-level retry requires per-command attempt tracking and a retry loop
                     // equivalent to the generate dispatch loop, which is deferred to a future
-                    // phase. For now, log a warning and propagate the failure. Commands that need
-                    // retry should handle it internally (e.g., via idempotent re-submission).
+                    // phase. For now, log a warning and isolate the failure as a degradation.
                     warn!(
                         "command '{}' failed (retryable=true): {}; command retry not yet implemented",
                         cmd_name, cmd_failed_error
                     );
                 }
                 execute_cmd_span.record("command.status", "error");
-                return Ok(Some(ReactorError::ActivityFailed(
-                    crate::activity::ActivityError::Failed {
-                        name: cmd_name,
-                        reason: cmd_failed_error,
-                    },
-                )));
+                // Inject error message so the LLM knows this command failed.
+                let err_msg = weft_core::WeftMessage {
+                    role: weft_core::Role::User,
+                    source: weft_core::Source::Client,
+                    model: None,
+                    content: vec![weft_core::ContentPart::Text(format!(
+                        "Command '{}' failed: {}",
+                        cmd_name, cmd_failed_error
+                    ))],
+                    delta: false,
+                    message_index: cmd_ctx.state.messages.len() as u32,
+                };
+                cmd_ctx.state.messages.push(err_msg.clone());
+                self.record_event(
+                    cmd_ctx.execution_id,
+                    &PipelineEvent::Context(ContextEvent::MessageInjected {
+                        message: err_msg,
+                        source: MessageInjectionSource::CommandError {
+                            command_name: cmd_name.clone(),
+                        },
+                    }),
+                    None,
+                )
+                .await?;
+                // Record degradation for observability.
+                let notice = DegradationNotice {
+                    activity_name: "execute_command".to_string(),
+                    phase: PipelinePhase::Dispatch,
+                    error_code: "execution_error".to_string(),
+                    message: format!("Command '{}' failed: {}", cmd_name, cmd_failed_error),
+                    impact: format!(
+                        "Command '{}' result unavailable; error injected for LLM",
+                        cmd_name
+                    ),
+                    fallback_applied: "error message injected".to_string(),
+                };
+                let _ = self
+                    .record_event(
+                        cmd_ctx.execution_id,
+                        &PipelineEvent::Execution(ExecutionEvent::Degraded {
+                            notice: notice.clone(),
+                        }),
+                        None,
+                    )
+                    .await;
+                cmd_ctx.state.degradations.push(notice);
+                cmd_ctx.state.commands_executed += 1;
+                // Continue to next command instead of returning error.
+                continue;
             }
 
             execute_cmd_span.record("command.status", "ok");
@@ -302,7 +392,7 @@ impl Reactor {
                     activity.status = tracing::field::Empty,
                 );
 
-                let terminate = async {
+                let post_drain_outcome = async {
                     hook.activity
                         .execute(
                             cmd_ctx.execution_id,
@@ -324,14 +414,72 @@ impl Reactor {
                 .instrument(activity_span.clone())
                 .await?;
 
-                if let Some(err) = terminate {
-                    activity_span.record("activity.status", "error");
-                    return Ok(Some(err));
-                } else {
-                    activity_span.record("activity.status", "ok");
+                match post_drain_outcome {
+                    DrainOutcome::Continue => {
+                        activity_span.record("activity.status", "ok");
+                    }
+                    DrainOutcome::ActivityFailed {
+                        name,
+                        error,
+                        detail,
+                        ..
+                    } => {
+                        let criticality = hook.activity.criticality();
+                        if criticality.is_fatal() {
+                            activity_span.record("activity.status", "error");
+                            return Ok(Some(ReactorError::ActivityFailed(
+                                crate::activity::ActivityError::Failed {
+                                    name: name.clone(),
+                                    reason: error.clone(),
+                                },
+                            )));
+                        } else {
+                            activity_span.record("activity.status", "degraded");
+                            let notice = build_dispatch_degradation_notice(&name, &detail, &error);
+                            let _ = self
+                                .record_event(
+                                    cmd_ctx.execution_id,
+                                    &PipelineEvent::Execution(ExecutionEvent::Degraded {
+                                        notice: notice.clone(),
+                                    }),
+                                    None,
+                                )
+                                .await;
+                            tracing::warn!(
+                                degradation.activity = %notice.activity_name,
+                                degradation.error_code = %notice.error_code,
+                                "Dispatch hook degraded: {}", notice.message,
+                            );
+                            cmd_ctx.state.degradations.push(notice);
+                        }
+                    }
+                    DrainOutcome::HookBlocked { hook_name, reason } => {
+                        activity_span.record("activity.status", "error");
+                        return Ok(Some(ReactorError::HookBlocked { hook_name, reason }));
+                    }
+                    DrainOutcome::Cancelled { reason } => {
+                        activity_span.record("activity.status", "error");
+                        return Ok(Some(ReactorError::Cancelled { reason }));
+                    }
                 }
             }
         }
         Ok(None)
+    }
+}
+
+/// Build a `DegradationNotice` for a non-critical dispatch-phase hook failure.
+fn build_dispatch_degradation_notice(
+    activity_name: &str,
+    detail: &crate::event::FailureDetail,
+    _error: &str,
+) -> DegradationNotice {
+    DegradationNotice {
+        activity_name: activity_name.to_string(),
+        phase: PipelinePhase::Dispatch,
+        error_code: detail.error_code.clone(),
+        message: format!("Hook '{activity_name}' failed; skipping"),
+        impact: "Hook effect skipped".to_string(),
+        fallback_applied: "hook skipped".to_string(),
     }
 }

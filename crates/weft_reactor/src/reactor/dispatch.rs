@@ -13,12 +13,13 @@ use tracing::{Instrument, debug, info_span};
 use crate::budget::BudgetCheck;
 use crate::error::ReactorError;
 use crate::event::{
-    ActivityEvent, BudgetEvent, ContextEvent, ExecutionEvent, GeneratedEvent, GenerationEvent,
-    MessageInjectionSource, PipelineEvent,
+    ActivityEvent, BudgetEvent, ContextEvent, DegradationNotice, ExecutionEvent, GeneratedEvent,
+    GenerationEvent, MessageInjectionSource, PipelineEvent, PipelinePhase,
 };
 use crate::execution::ExecutionStatus;
 
 use super::Reactor;
+use super::drain::DrainOutcome;
 use super::generate::GenerateOutcome;
 use super::helpers::empty_response;
 use super::retry::{backoff_ms, should_retry};
@@ -192,7 +193,7 @@ impl Reactor {
                 activity.status = tracing::field::Empty,
             );
 
-            let terminate = it_try!(
+            let pre_gen_drain = it_try!(
                 async {
                     hook.activity
                         .execute(
@@ -216,26 +217,93 @@ impl Reactor {
                 .await
             );
 
-            if let Some(err) = terminate {
-                activity_span.record("activity.status", "error");
-                it_try!(
-                    self.record_event(
-                        lctx.execution_id,
-                        &PipelineEvent::Execution(ExecutionEvent::Failed {
-                            error: err.to_string(),
-                        }),
-                        Some(&serde_json::json!({ "partial_text": lctx.state.accumulated_text }),),
-                    )
-                    .await
-                );
-                it_try!(
-                    self.event_log
-                        .update_execution_status(lctx.execution_id, ExecutionStatus::Failed)
+            match pre_gen_drain {
+                DrainOutcome::Continue => {
+                    activity_span.record("activity.status", "ok");
+                }
+                DrainOutcome::ActivityFailed {
+                    name,
+                    error,
+                    detail,
+                    ..
+                } => {
+                    let criticality = hook.activity.criticality();
+                    if criticality.is_fatal() {
+                        activity_span.record("activity.status", "error");
+                        let err =
+                            ReactorError::ActivityFailed(crate::activity::ActivityError::Failed {
+                                name: name.clone(),
+                                reason: error.clone(),
+                            });
+                        it_try!(
+                            self.record_event(
+                                lctx.execution_id,
+                                &PipelineEvent::Execution(ExecutionEvent::Failed {
+                                    error: err.to_string(),
+                                }),
+                                Some(&serde_json::json!({ "partial_text": lctx.state.accumulated_text }),),
+                            )
+                            .await
+                        );
+                        it_try!(
+                            self.event_log
+                                .update_execution_status(lctx.execution_id, ExecutionStatus::Failed)
+                                .await
+                        );
+                        return IterationControl::Return(Err(err));
+                    } else {
+                        // Non-critical hook: degrade and continue.
+                        activity_span.record("activity.status", "degraded");
+                        let notice = DegradationNotice {
+                            activity_name: name.clone(),
+                            phase: PipelinePhase::Dispatch,
+                            error_code: detail.error_code.clone(),
+                            message: format!("Hook '{name}' failed; skipping"),
+                            impact: "Hook effect skipped".to_string(),
+                            fallback_applied: "hook skipped".to_string(),
+                        };
+                        it_try!(
+                            self.record_event(
+                                lctx.execution_id,
+                                &PipelineEvent::Execution(ExecutionEvent::Degraded {
+                                    notice: notice.clone(),
+                                }),
+                                None,
+                            )
+                            .await
+                        );
+                        lctx.state.degradations.push(notice);
+                    }
+                }
+                DrainOutcome::HookBlocked { hook_name, reason } => {
+                    activity_span.record("activity.status", "error");
+                    let err = ReactorError::HookBlocked {
+                        hook_name: hook_name.clone(),
+                        reason: reason.clone(),
+                    };
+                    it_try!(
+                        self.record_event(
+                            lctx.execution_id,
+                            &PipelineEvent::Execution(ExecutionEvent::Failed {
+                                error: err.to_string(),
+                            }),
+                            Some(
+                                &serde_json::json!({ "partial_text": lctx.state.accumulated_text }),
+                            ),
+                        )
                         .await
-                );
-                return IterationControl::Return(Err(err));
-            } else {
-                activity_span.record("activity.status", "ok");
+                    );
+                    it_try!(
+                        self.event_log
+                            .update_execution_status(lctx.execution_id, ExecutionStatus::Failed)
+                            .await
+                    );
+                    return IterationControl::Return(Err(err));
+                }
+                DrainOutcome::Cancelled { reason } => {
+                    activity_span.record("activity.status", "error");
+                    return IterationControl::Return(Err(ReactorError::Cancelled { reason }));
+                }
             }
         }
 
@@ -459,7 +527,7 @@ impl Reactor {
                             activity.status = tracing::field::Empty,
                         );
 
-                        let terminate = it_try!(
+                        let pre_resp_drain = it_try!(
                             async {
                                 hook.activity
                                     .execute(
@@ -483,9 +551,12 @@ impl Reactor {
                             .await
                         );
 
-                        if let Some(err) = terminate {
-                            // Hook blocked with feedback: inject and retry generation.
-                            if let ReactorError::HookBlocked { hook_name, reason } = &err {
+                        match pre_resp_drain {
+                            DrainOutcome::Continue => {
+                                activity_span.record("activity.status", "ok");
+                            }
+                            DrainOutcome::HookBlocked { hook_name, reason } => {
+                                // Hook blocked with feedback: inject and retry generation.
                                 activity_span.record("activity.status", "ok");
                                 let feedback_msg = weft_core::WeftMessage {
                                     role: weft_core::Role::User,
@@ -512,17 +583,61 @@ impl Reactor {
                                 lctx.state.generate_retry_attempt = 0;
                                 return IterationControl::Continue;
                             }
-                            // Any other error terminates.
-                            activity_span.record("activity.status", "error");
-                            it_try!(
-                                self.finalize_failed(lctx.execution_id, lctx.state, err)
-                                    .await
-                            );
-                            return IterationControl::Return(Err(ReactorError::Cancelled {
-                                reason: "pre_response hook failed".to_string(),
-                            }));
-                        } else {
-                            activity_span.record("activity.status", "ok");
+                            DrainOutcome::ActivityFailed {
+                                name,
+                                error,
+                                detail,
+                                ..
+                            } => {
+                                let criticality = hook.activity.criticality();
+                                if criticality.is_fatal() {
+                                    // Fatal hook failure: terminate.
+                                    activity_span.record("activity.status", "error");
+                                    let err = ReactorError::ActivityFailed(
+                                        crate::activity::ActivityError::Failed {
+                                            name: name.clone(),
+                                            reason: error.clone(),
+                                        },
+                                    );
+                                    it_try!(
+                                        self.finalize_failed(lctx.execution_id, lctx.state, err)
+                                            .await
+                                    );
+                                    return IterationControl::Return(Err(
+                                        ReactorError::Cancelled {
+                                            reason: "pre_response hook failed".to_string(),
+                                        },
+                                    ));
+                                } else {
+                                    // Non-critical hook: degrade and continue.
+                                    activity_span.record("activity.status", "degraded");
+                                    let notice = DegradationNotice {
+                                        activity_name: name.clone(),
+                                        phase: PipelinePhase::Dispatch,
+                                        error_code: detail.error_code.clone(),
+                                        message: format!("Hook '{name}' failed; skipping"),
+                                        impact: "Hook effect skipped".to_string(),
+                                        fallback_applied: "hook skipped".to_string(),
+                                    };
+                                    it_try!(
+                                        self.record_event(
+                                            lctx.execution_id,
+                                            &PipelineEvent::Execution(ExecutionEvent::Degraded {
+                                                notice: notice.clone(),
+                                            }),
+                                            None,
+                                        )
+                                        .await
+                                    );
+                                    lctx.state.degradations.push(notice);
+                                }
+                            }
+                            DrainOutcome::Cancelled { reason } => {
+                                activity_span.record("activity.status", "error");
+                                return IterationControl::Return(Err(ReactorError::Cancelled {
+                                    reason,
+                                }));
+                            }
                         }
                     }
 

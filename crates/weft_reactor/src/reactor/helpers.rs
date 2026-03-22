@@ -521,12 +521,11 @@ mod tests {
         let reactor = build_test_reactor(Arc::clone(&event_log));
         let execution_id = ExecutionId::new();
 
-        let mut state = ExecutionState::new(Budget::new(
-            5,
-            5,
-            3,
-            chrono::Utc::now() + chrono::Duration::hours(1),
-        ));
+        let test_services = make_test_services();
+        let mut state = ExecutionState::new(
+            Budget::new(5, 5, 3, chrono::Utc::now() + chrono::Duration::hours(1)),
+            test_services.resolved_config,
+        );
         let override_config = serde_json::json!({ "model": "override-model", "temperature": 0.5 });
         state.generation_config_override = Some(override_config.clone());
         state.selected_model = Some("selected-model".to_string());
@@ -570,12 +569,11 @@ mod tests {
         let reactor = build_test_reactor(Arc::clone(&event_log));
         let execution_id = ExecutionId::new();
 
-        let mut state = ExecutionState::new(Budget::new(
-            5,
-            5,
-            3,
-            chrono::Utc::now() + chrono::Duration::hours(1),
-        ));
+        let test_services = make_test_services();
+        let mut state = ExecutionState::new(
+            Budget::new(5, 5, 3, chrono::Utc::now() + chrono::Duration::hours(1)),
+            test_services.resolved_config,
+        );
         state.generation_config_override = None;
         state.selected_model = Some("claude-3".to_string());
 
@@ -615,12 +613,11 @@ mod tests {
         let reactor = build_test_reactor(Arc::clone(&event_log));
         let execution_id = ExecutionId::new();
 
-        let mut state = ExecutionState::new(Budget::new(
-            5,
-            5,
-            3,
-            chrono::Utc::now() + chrono::Duration::hours(1),
-        ));
+        let test_services = make_test_services();
+        let mut state = ExecutionState::new(
+            Budget::new(5, 5, 3, chrono::Utc::now() + chrono::Duration::hours(1)),
+            test_services.resolved_config,
+        );
         state.generation_config_override = None;
         state.selected_model = None;
         state.routing = Some(RoutingSnapshot {
@@ -668,12 +665,11 @@ mod tests {
         let reactor = build_test_reactor(Arc::clone(&event_log));
         let execution_id = ExecutionId::new();
 
-        let state = ExecutionState::new(Budget::new(
-            5,
-            5,
-            3,
-            chrono::Utc::now() + chrono::Duration::hours(1),
-        ));
+        let test_services = make_test_services();
+        let state = ExecutionState::new(
+            Budget::new(5, 5, 3, chrono::Utc::now() + chrono::Duration::hours(1)),
+            test_services.resolved_config,
+        );
         // All sources absent: override=None, selected_model=None, routing=None
 
         let request = WeftRequest {
