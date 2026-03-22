@@ -125,7 +125,21 @@ impl Activity for HookActivity {
                     name: self.name().to_string(),
                     error: "cancelled before hook execution".to_string(),
                     retryable: false,
-                    detail: FailureDetail::default(),
+                    detail: FailureDetail {
+                        error_code: "cancelled".to_string(),
+                        detail: serde_json::json!({
+                            "hook_name": self.name(),
+                            "hook_event": hook_event_name_slug(self.hook_event),
+                        }),
+                        cause: Some(
+                            "cancellation token was set before hook activity started".to_string(),
+                        ),
+                        attempted: Some(format!(
+                            "run hook for event '{}'",
+                            hook_event_name_slug(self.hook_event)
+                        )),
+                        fallback: None,
+                    },
                 }))
                 .await;
             return;
@@ -198,7 +212,21 @@ impl Activity for HookActivity {
                             name: self.name().to_string(),
                             error: format!("hook blocked: {reason}"),
                             retryable: false,
-                            detail: FailureDetail::default(),
+                            detail: FailureDetail {
+                                error_code: "hook_execution_error".to_string(),
+                                detail: serde_json::json!({
+                                    "hook_name": hook_name,
+                                    "hook_event": hook_event_name_slug(hook_event),
+                                    "error": reason,
+                                }),
+                                cause: Some(reason.clone()),
+                                attempted: Some(format!(
+                                    "run hook '{}' for event '{}'",
+                                    hook_name,
+                                    hook_event_name_slug(hook_event)
+                                )),
+                                fallback: None,
+                            },
                         }))
                         .await;
                     debug!(
@@ -507,5 +535,60 @@ mod tests {
             true,
         );
         assert_eq!(activity.criticality(), Criticality::Critical);
+    }
+
+    // ── FailureDetail enrichment ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn hook_activity_blocked_failure_detail_has_non_unknown_error_code() {
+        use crate::test_support::make_test_services_with_blocking_hook;
+        use pretty_assertions::assert_ne;
+
+        // PreResponse can block — triggers Activity(Failed) with FailureDetail.
+        let services =
+            make_test_services_with_blocking_hook(HookEvent::PreResponse, "blocked by policy");
+        let activity = HookActivity::new(
+            HookEvent::PreResponse,
+            services.hooks.clone(),
+            services.request_end_semaphore.clone(),
+            false,
+        );
+        let input = make_test_input();
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let event_log = NullEventLog;
+        let exec_id = ExecutionId::new();
+
+        activity
+            .execute(&exec_id, input, &services, &event_log, tx, cancel)
+            .await;
+
+        let events = collect_events(&mut rx);
+        let failed = events
+            .iter()
+            .find(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. })))
+            .expect("expected Activity(Failed) when hook blocks on can_block event");
+
+        match failed {
+            PipelineEvent::Activity(ActivityEvent::Failed { detail, .. }) => {
+                assert_ne!(
+                    detail.error_code, "unknown",
+                    "hook block failure must have non-unknown error_code"
+                );
+                assert!(
+                    detail.cause.is_some(),
+                    "cause must be populated for hook block failure"
+                );
+                assert!(
+                    detail.attempted.is_some(),
+                    "attempted must be populated for hook block failure"
+                );
+                assert!(
+                    detail.detail.get("hook_event").is_some(),
+                    "detail must include hook_event"
+                );
+            }
+            _ => panic!("expected Activity(Failed)"),
+        }
     }
 }

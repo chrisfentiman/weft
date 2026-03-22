@@ -68,7 +68,15 @@ impl Activity for AssembleResponseActivity {
                     name: self.name().to_string(),
                     error: "cancelled before response assembly".to_string(),
                     retryable: false,
-                    detail: FailureDetail::default(),
+                    detail: FailureDetail {
+                        error_code: "cancelled".to_string(),
+                        detail: serde_json::Value::Null,
+                        cause: Some(
+                            "cancellation token was set before activity started".to_string(),
+                        ),
+                        attempted: Some("assemble response from generated content".to_string()),
+                        fallback: None,
+                    },
                 }))
                 .await;
             return;

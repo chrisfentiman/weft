@@ -86,7 +86,15 @@ impl Activity for ModelSelectionActivity {
                     name: self.name().to_string(),
                     error: "cancelled before model selection".to_string(),
                     retryable: false,
-                    detail: FailureDetail::default(),
+                    detail: FailureDetail {
+                        error_code: "cancelled".to_string(),
+                        detail: serde_json::Value::Null,
+                        cause: Some(
+                            "cancellation token was set before activity started".to_string(),
+                        ),
+                        attempted: Some("select model for request".to_string()),
+                        fallback: None,
+                    },
                 }))
                 .await;
             return;
@@ -137,7 +145,13 @@ impl Activity for ModelSelectionActivity {
                         name: self.name().to_string(),
                         error: format!("pre_route hook blocked model selection: {reason}"),
                         retryable: false,
-                        detail: FailureDetail::default(),
+                        detail: FailureDetail {
+                            error_code: "hook_blocked".to_string(),
+                            detail: serde_json::json!({ "hook_event": "pre_route", "reason": reason }),
+                            cause: Some(reason.clone()),
+                            attempted: Some("run pre_route hook before model scoring".to_string()),
+                            fallback: None,
+                        },
                     }))
                     .await;
                 debug!("model_selection: blocked by pre_route hook");
@@ -169,12 +183,27 @@ impl Activity for ModelSelectionActivity {
                 if surviving_names.is_empty() {
                     // Zero survivors: fail closed.
                     let filter_str = instruction.filters.join("/");
+                    let models_scored = all_candidates.len();
                     let _ = event_tx
                         .send(PipelineEvent::Activity(ActivityEvent::Failed {
                             name: self.name().to_string(),
                             error: format!("no models match routing instruction '{filter_str}'"),
                             retryable: false,
-                            detail: FailureDetail::default(),
+                            detail: FailureDetail {
+                                error_code: "no_matching_model".to_string(),
+                                detail: serde_json::json!({
+                                    "models_scored": models_scored,
+                                    "best_score": 0.0_f32,
+                                    "threshold": 1.0_f32,
+                                    "filters": instruction.filters,
+                                }),
+                                cause: Some(format!("no models match filters: {filter_str}")),
+                                attempted: Some(format!(
+                                    "filter {} model candidates by routing instruction",
+                                    models_scored
+                                )),
+                                fallback: None,
+                            },
                         }))
                         .await;
                     return;
@@ -292,7 +321,13 @@ impl Activity for ModelSelectionActivity {
                         name: self.name().to_string(),
                         error: format!("post_route hook blocked model selection: {reason}"),
                         retryable: false,
-                        detail: FailureDetail::default(),
+                        detail: FailureDetail {
+                            error_code: "hook_blocked".to_string(),
+                            detail: serde_json::json!({ "hook_event": "post_route", "reason": reason }),
+                            cause: Some(reason.clone()),
+                            attempted: Some("run post_route hook after model scoring".to_string()),
+                            fallback: None,
+                        },
                     }))
                     .await;
                 debug!("model_selection: blocked by post_route hook");
@@ -350,7 +385,20 @@ async fn semantic_score(
                             "router failed and default model '{default_name}' is not registered"
                         ),
                         retryable: false,
-                        detail: FailureDetail::default(),
+                        detail: FailureDetail {
+                            error_code: "classifier_unavailable".to_string(),
+                            detail: serde_json::json!({
+                                "model_path": "unknown",
+                                "error": e.to_string(),
+                                "default_model": default_name,
+                            }),
+                            cause: Some(e.to_string()),
+                            attempted: Some(format!(
+                                "score {} candidates semantically",
+                                candidates.len()
+                            )),
+                            fallback: None,
+                        },
                     }))
                     .await;
                 return None;
@@ -938,5 +986,48 @@ api_key = "sk-test"
                 .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
             "Auto mode empty candidates must not push Activity(Failed)"
         );
+    }
+
+    // ── FailureDetail enrichment ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn model_selection_direct_zero_survivors_failure_detail_has_no_matching_model() {
+        use pretty_assertions::assert_ne;
+
+        let mut input = make_test_input();
+        input.request.routing =
+            weft_core::ModelRoutingInstruction::parse("nonexistent-provider-xyz");
+        assert_eq!(input.request.routing.mode, weft_core::RoutingMode::Direct);
+
+        let events = run_model_selection(input).await;
+
+        let failed = events
+            .iter()
+            .find(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. })))
+            .expect("expected Activity(Failed) for zero survivors");
+
+        match failed {
+            PipelineEvent::Activity(ActivityEvent::Failed { detail, .. }) => {
+                assert_ne!(
+                    detail.error_code, "unknown",
+                    "zero survivors failure must have non-unknown error_code"
+                );
+                assert_eq!(detail.error_code, "no_matching_model");
+                assert!(
+                    detail.cause.is_some(),
+                    "cause must be populated for no_matching_model failure"
+                );
+                assert!(
+                    detail.attempted.is_some(),
+                    "attempted must be populated for no_matching_model failure"
+                );
+                // detail JSON must include models_scored
+                assert!(
+                    detail.detail.get("models_scored").is_some(),
+                    "detail must include models_scored"
+                );
+            }
+            _ => panic!("expected Activity(Failed)"),
+        }
     }
 }

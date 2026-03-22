@@ -78,7 +78,15 @@ impl Activity for ValidateActivity {
                     name: self.name().to_string(),
                     error: "cancelled before validation".to_string(),
                     retryable: false,
-                    detail: FailureDetail::default(),
+                    detail: FailureDetail {
+                        error_code: "cancelled".to_string(),
+                        detail: serde_json::Value::Null,
+                        cause: Some(
+                            "cancellation token was set before activity started".to_string(),
+                        ),
+                        attempted: Some("validate request messages".to_string()),
+                        fallback: None,
+                    },
                 }))
                 .await;
             debug!(duration_ms, "validate: cancelled");
@@ -98,7 +106,13 @@ impl Activity for ValidateActivity {
                     name: self.name().to_string(),
                     error: "validation failed: messages must not be empty".to_string(),
                     retryable: false,
-                    detail: FailureDetail::default(),
+                    detail: FailureDetail {
+                        error_code: "empty_messages".to_string(),
+                        detail: serde_json::json!({}),
+                        cause: Some("request contained zero messages".to_string()),
+                        attempted: Some("validate that messages list is non-empty".to_string()),
+                        fallback: None,
+                    },
                 }))
                 .await;
             debug!(duration_ms, "validate: failed (empty messages)");
@@ -416,5 +430,40 @@ mod tests {
                 .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
             "should not push Activity(Failed) when list_commands fails (fail-open)"
         );
+    }
+
+    // ── FailureDetail enrichment ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn validate_empty_messages_failure_detail_has_non_unknown_error_code() {
+        use pretty_assertions::assert_ne;
+
+        let mut input = make_test_input();
+        input.messages.clear();
+        let events = run_validate(input).await;
+
+        let failed = events
+            .iter()
+            .find(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. })))
+            .expect("expected Activity(Failed)");
+
+        match failed {
+            PipelineEvent::Activity(ActivityEvent::Failed { detail, .. }) => {
+                assert_ne!(
+                    detail.error_code, "unknown",
+                    "empty_messages failure must have a non-unknown error_code"
+                );
+                assert_eq!(detail.error_code, "empty_messages");
+                assert!(
+                    detail.cause.is_some(),
+                    "cause must be populated for empty_messages failure"
+                );
+                assert!(
+                    detail.attempted.is_some(),
+                    "attempted must be populated for empty_messages failure"
+                );
+            }
+            _ => panic!("expected Activity(Failed)"),
+        }
     }
 }
