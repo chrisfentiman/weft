@@ -81,7 +81,7 @@ pub fn load_config(path: &Path) -> Result<WeftConfig, ConfigLoadError> {
 /// validated `ConfigStore` ready for sharing.
 ///
 /// Steps:
-/// 1. Read raw TOML and pre-validate for unknown fields (fast fail with suggestions)
+/// 1. Read raw TOML and pre-validate for unknown fields (fast fail)
 /// 2. Load TOML + env var overrides via `load_config`
 /// 3. Resolve `env:VAR_NAME` prefixes in API keys and secrets
 /// 4. Validate `WeftConfig` constraints
@@ -89,7 +89,7 @@ pub fn load_config(path: &Path) -> Result<WeftConfig, ConfigLoadError> {
 /// 6. Construct `ConfigStore` with both configs
 pub fn load_and_build_store(path: &Path) -> Result<ConfigStore, ConfigLoadError> {
     // Pre-validate the raw TOML before config-rs processing to catch unknown
-    // fields with enhanced error messages and "did you mean?" suggestions.
+    // fields via deny_unknown_fields.
     let raw_toml = std::fs::read_to_string(path).map_err(|e| {
         ConfigLoadError::Build(config::ConfigError::Message(format!(
             "failed to read config file: {e}"
