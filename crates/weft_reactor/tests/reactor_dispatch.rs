@@ -3812,3 +3812,335 @@ async fn semi_critical_model_selection_uses_default_model() {
         "provider_resolution should receive a non-empty model from default fallback; got: {captured:?}"
     );
 }
+
+// ── Phase 2: pre_generate hook criticality integration tests ─────────────
+
+/// pre_generate hook with `critical: false` that emits ActivityEvent::Failed:
+/// execution degrades (does not terminate) and ExecutionEvent::Degraded is recorded.
+///
+/// Verifies that pre_generate hook failure is treated identically to other
+/// non-critical activity failures: degrade-and-continue, not abort.
+#[tokio::test]
+async fn pre_generate_hook_non_critical_failure_degrades_and_continues() {
+    /// Stub hook activity: NonCritical, always emits ActivityEvent::Failed.
+    struct NonCriticalFailingHookActivity;
+
+    #[async_trait::async_trait]
+    impl Activity for NonCriticalFailingHookActivity {
+        fn name(&self) -> &str {
+            "hook_pre_generate"
+        }
+
+        fn criticality(&self) -> weft_reactor_trait::Criticality {
+            weft_reactor_trait::Criticality::NonCritical
+        }
+
+        async fn execute(
+            &self,
+            _execution_id: &ExecutionId,
+            _input: ActivityInput,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
+            _event_log: &dyn EventLog,
+            event_tx: mpsc::Sender<PipelineEvent>,
+            _cancel: CancellationToken,
+        ) {
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
+                    name: "hook_pre_generate".to_string(),
+                }))
+                .await;
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
+                    name: "hook_pre_generate".to_string(),
+                    error: "hook runner unavailable".to_string(),
+                    retryable: false,
+                    detail: FailureDetail {
+                        error_code: "hook_runner_error".to_string(),
+                        detail: serde_json::Value::Null,
+                        cause: None,
+                        attempted: None,
+                        fallback: None,
+                    },
+                }))
+                .await;
+        }
+    }
+
+    let services = Arc::new(make_test_services());
+    let event_log = test_event_log();
+    let registry = build_registry(vec![
+        Arc::new(NonCriticalFailingHookActivity),
+        Arc::new(ImmediateDoneActivity {
+            name: "generate".to_string(),
+        }),
+        Arc::new(StubAssembleResponse {
+            name: "assemble_response".to_string(),
+        }),
+        Arc::new(StubExecuteCommand {
+            name: "execute_command".to_string(),
+        }),
+    ]);
+
+    let config = reactor_config(PipelineConfig {
+        name: "default".to_string(),
+        pre_loop: vec![],
+        post_loop: vec![ActivityRef::Name("assemble_response".to_string())],
+        generate: ActivityRef::Name("generate".to_string()),
+        execute_command: ActivityRef::Name("execute_command".to_string()),
+        loop_hooks: LoopHooks {
+            pre_generate: vec![ActivityRef::Name("hook_pre_generate".to_string())],
+            ..LoopHooks::default()
+        },
+    });
+
+    let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+        .expect("reactor should construct");
+
+    let result = reactor
+        .execute(
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
+            None,
+        )
+        .await;
+
+    // Non-critical hook failure must not terminate execution.
+    let (exec_result, _) = result.expect(
+        "non-critical pre_generate hook failure should degrade, not terminate execution",
+    );
+
+    // ExecutionEvent::Degraded must be recorded for the hook failure.
+    let events = event_log
+        .read(&exec_result.execution_id, None::<u64>)
+        .await
+        .unwrap_or_default();
+    let degraded_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == "execution.degraded")
+        .collect();
+
+    assert!(
+        !degraded_events.is_empty(),
+        "should have at least one execution.degraded event; event_types: {:?}",
+        events
+            .iter()
+            .map(|e| e.event_type.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    // The degradation should reference hook_pre_generate.
+    let has_hook_degradation = degraded_events.iter().any(|e| {
+        e.payload
+            .get("event")
+            .and_then(|ev: &serde_json::Value| ev.get("notice"))
+            .and_then(|n: &serde_json::Value| n.get("activity_name"))
+            .and_then(|a: &serde_json::Value| a.as_str())
+            == Some("hook_pre_generate")
+    });
+    assert!(
+        has_hook_degradation,
+        "degradation should be attributed to hook_pre_generate; degraded events: {degraded_events:?}"
+    );
+}
+
+/// pre_generate hook with `critical: true` that emits ActivityEvent::Failed:
+/// execution terminates with an error.
+///
+/// Verifies that a critical pre_generate hook failure is fatal — the request
+/// is aborted rather than degraded.
+#[tokio::test]
+async fn pre_generate_hook_critical_failure_terminates_execution() {
+    /// Stub hook activity: Critical (default), always emits ActivityEvent::Failed.
+    struct CriticalFailingHookActivity;
+
+    #[async_trait::async_trait]
+    impl Activity for CriticalFailingHookActivity {
+        fn name(&self) -> &str {
+            "hook_pre_generate"
+        }
+
+        // criticality() defaults to Critical — no override needed.
+
+        async fn execute(
+            &self,
+            _execution_id: &ExecutionId,
+            _input: ActivityInput,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
+            _event_log: &dyn EventLog,
+            event_tx: mpsc::Sender<PipelineEvent>,
+            _cancel: CancellationToken,
+        ) {
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
+                    name: "hook_pre_generate".to_string(),
+                }))
+                .await;
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Failed {
+                    name: "hook_pre_generate".to_string(),
+                    error: "critical hook failure".to_string(),
+                    retryable: false,
+                    detail: FailureDetail {
+                        error_code: "hook_critical_error".to_string(),
+                        detail: serde_json::Value::Null,
+                        cause: None,
+                        attempted: None,
+                        fallback: None,
+                    },
+                }))
+                .await;
+        }
+    }
+
+    let services = Arc::new(make_test_services());
+    let event_log = test_event_log();
+    let registry = build_registry(vec![
+        Arc::new(CriticalFailingHookActivity),
+        Arc::new(ImmediateDoneActivity {
+            name: "generate".to_string(),
+        }),
+        Arc::new(StubAssembleResponse {
+            name: "assemble_response".to_string(),
+        }),
+        Arc::new(StubExecuteCommand {
+            name: "execute_command".to_string(),
+        }),
+    ]);
+
+    let config = reactor_config(PipelineConfig {
+        name: "default".to_string(),
+        pre_loop: vec![],
+        post_loop: vec![ActivityRef::Name("assemble_response".to_string())],
+        generate: ActivityRef::Name("generate".to_string()),
+        execute_command: ActivityRef::Name("execute_command".to_string()),
+        loop_hooks: LoopHooks {
+            pre_generate: vec![ActivityRef::Name("hook_pre_generate".to_string())],
+            ..LoopHooks::default()
+        },
+    });
+
+    let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+        .expect("reactor should construct");
+
+    let result = reactor
+        .execute(
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
+            None,
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "critical pre_generate hook failure should terminate execution with an error"
+    );
+}
+
+/// pre_generate hook that emits HookOutcome::Blocked terminates execution
+/// regardless of the `critical` field value.
+///
+/// Verifies that HookBlocked is always fatal: the `critical` flag on the
+/// activity is irrelevant when a hook explicitly blocks the request.
+#[tokio::test]
+async fn pre_generate_hook_blocked_terminates_regardless_of_criticality() {
+    /// Stub hook activity: NonCritical, emits HookOutcome::Blocked.
+    ///
+    /// Uses NonCritical to confirm that criticality is irrelevant for blocked events.
+    struct BlockingNonCriticalHookActivity;
+
+    #[async_trait::async_trait]
+    impl Activity for BlockingNonCriticalHookActivity {
+        fn name(&self) -> &str {
+            "hook_pre_generate"
+        }
+
+        fn criticality(&self) -> weft_reactor_trait::Criticality {
+            // Intentionally non-critical to verify that Blocked is always fatal.
+            weft_reactor_trait::Criticality::NonCritical
+        }
+
+        async fn execute(
+            &self,
+            _execution_id: &ExecutionId,
+            _input: ActivityInput,
+            _services: &dyn weft_reactor_trait::ServiceLocator,
+            _event_log: &dyn EventLog,
+            event_tx: mpsc::Sender<PipelineEvent>,
+            _cancel: CancellationToken,
+        ) {
+            let _ = event_tx
+                .send(PipelineEvent::Activity(ActivityEvent::Started {
+                    name: "hook_pre_generate".to_string(),
+                }))
+                .await;
+            let _ = event_tx
+                .send(PipelineEvent::Hook(HookOutcome::Blocked {
+                    hook_event: "pre_generate".to_string(),
+                    hook_name: "policy_guard".to_string(),
+                    reason: "blocked by pre_generate policy".to_string(),
+                }))
+                .await;
+        }
+    }
+
+    let services = Arc::new(make_test_services());
+    let event_log = test_event_log();
+    let registry = build_registry(vec![
+        Arc::new(BlockingNonCriticalHookActivity),
+        Arc::new(ImmediateDoneActivity {
+            name: "generate".to_string(),
+        }),
+        Arc::new(StubAssembleResponse {
+            name: "assemble_response".to_string(),
+        }),
+        Arc::new(StubExecuteCommand {
+            name: "execute_command".to_string(),
+        }),
+    ]);
+
+    let config = reactor_config(PipelineConfig {
+        name: "default".to_string(),
+        pre_loop: vec![],
+        post_loop: vec![ActivityRef::Name("assemble_response".to_string())],
+        generate: ActivityRef::Name("generate".to_string()),
+        execute_command: ActivityRef::Name("execute_command".to_string()),
+        loop_hooks: LoopHooks {
+            pre_generate: vec![ActivityRef::Name("hook_pre_generate".to_string())],
+            ..LoopHooks::default()
+        },
+    });
+
+    let reactor = Reactor::new(services, event_log.clone(), registry, &config)
+        .expect("reactor should construct");
+
+    let result = reactor
+        .execute(
+            ExecutionContext {
+                request: test_request(),
+                tenant_id: TenantId("t1".to_string()),
+                request_id: RequestId("r1".to_string()),
+                parent_id: None,
+                parent_budget: None,
+                client_tx: None,
+            },
+            None,
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(ReactorError::HookBlocked { .. })),
+        "HookOutcome::Blocked from pre_generate hook should terminate execution with HookBlocked error; got: {result:?}"
+    );
+}
