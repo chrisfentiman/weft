@@ -227,7 +227,7 @@ impl Reactor {
                                         cmd_ctx.state.commands_executed += 1;
                                         cmd_completed = true;
                                     }
-                                    PipelineEvent::Activity(ActivityEvent::Failed { name, error, retryable }) if name == cmd_ctx.pipeline.execute_command.activity.name() => {
+                                    PipelineEvent::Activity(ActivityEvent::Failed { name, error, retryable, .. }) if name == cmd_ctx.pipeline.execute_command.activity.name() => {
                                         cmd_failed = true;
                                         cmd_failed_error = error.clone();
                                         cmd_failed_retryable = *retryable;

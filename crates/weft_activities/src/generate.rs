@@ -20,8 +20,8 @@ use weft_core::{ContentPart, WeftMessage};
 use weft_llm_trait::{ProviderChunk, ProviderError, ProviderRequest, ProviderResponse};
 
 use weft_reactor_trait::{
-    Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, GeneratedEvent, GenerationEvent,
-    PipelineEvent, ServiceLocator,
+    Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, FailureDetail, GeneratedEvent,
+    GenerationEvent, PipelineEvent, ServiceLocator,
 };
 
 /// Calls the generative source (LLM provider) and streams the response.
@@ -128,6 +128,7 @@ impl Activity for GenerateActivity {
                     name: self.name().to_string(),
                     error: "cancelled before generation".to_string(),
                     retryable: false,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
             return;
@@ -257,6 +258,7 @@ impl Activity for GenerateActivity {
                         name: self.name().to_string(),
                         error: "cancelled during generation".to_string(),
                         retryable: false,
+                        detail: FailureDetail::default(),
                     }))
                     .await;
                 return;
@@ -289,6 +291,7 @@ impl Activity for GenerateActivity {
                         name: self.name().to_string(),
                         error: e.to_string(),
                         retryable,
+                        detail: FailureDetail::default(),
                     }))
                     .await;
                 return;
@@ -331,6 +334,7 @@ impl Activity for GenerateActivity {
                             name: self.name().to_string(),
                             error: "cancelled during streaming".to_string(),
                             retryable: false,
+                            detail: FailureDetail::default(),
                         }))
                         .await;
                     return;
@@ -373,6 +377,7 @@ impl Activity for GenerateActivity {
                             name: self.name().to_string(),
                             error: e.to_string(),
                             retryable,
+                            detail: FailureDetail::default(),
                         }))
                         .await;
                     return;

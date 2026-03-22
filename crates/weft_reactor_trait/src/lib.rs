@@ -37,12 +37,15 @@ pub mod signal;
 
 // ── Public re-exports ──────────────────────────────────────────────────────
 
-pub use activity::{Activity, ActivityError, ActivityInput, RoutingSnapshot, SemanticSelection};
+pub use activity::{
+    Activity, ActivityError, ActivityInput, Criticality, RoutingSnapshot, SemanticSelection,
+};
 pub use budget::{Budget, BudgetCheck, BudgetExhaustedReason, BudgetWarningInfo, RetryPolicy};
 pub use event::{
     ActivityEvent, BudgetEvent, BudgetSnapshot, ChildEvent, CommandEvent, CommandFormat,
-    ContextEvent, EVENT_SCHEMA_VERSION, Event, ExecutionEvent, GeneratedEvent, GenerationEvent,
-    HookOutcome, MessageInjectionSource, PipelineEvent, SelectionEvent, SignalEvent,
+    ContextEvent, DegradationNotice, EVENT_SCHEMA_VERSION, Event, ExecutionEvent, FailureDetail,
+    GeneratedEvent, GenerationEvent, HookOutcome, MessageInjectionSource, PipelineEvent,
+    PipelinePhase, SelectionEvent, SignalEvent,
 };
 pub use event_log::{EventLog, EventLogError};
 pub use execution::{Execution, ExecutionId, ExecutionStatus, RequestId, TenantId};

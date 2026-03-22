@@ -17,8 +17,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use weft_reactor_trait::{
-    Activity, ActivityEvent, ActivityInput, ContextEvent, EventLog, ExecutionId, PipelineEvent,
-    ServiceLocator,
+    Activity, ActivityEvent, ActivityInput, ContextEvent, Criticality, EventLog, ExecutionId,
+    PipelineEvent, ServiceLocator,
 };
 
 /// The default model max_tokens when the metadata value is missing.
@@ -51,6 +51,10 @@ impl Default for SamplingAdjustmentActivity {
 impl Activity for SamplingAdjustmentActivity {
     fn name(&self) -> &str {
         "sampling_adjustment"
+    }
+
+    fn criticality(&self) -> Criticality {
+        Criticality::NonCritical
     }
 
     async fn execute(
@@ -160,6 +164,14 @@ mod tests {
         assert_eq!(
             SamplingAdjustmentActivity::new().name(),
             "sampling_adjustment"
+        );
+    }
+
+    #[test]
+    fn sampling_adjustment_criticality_is_non_critical() {
+        assert_eq!(
+            SamplingAdjustmentActivity::new().criticality(),
+            Criticality::NonCritical
         );
     }
 

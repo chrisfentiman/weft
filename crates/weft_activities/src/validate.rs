@@ -12,7 +12,7 @@ use tracing::debug;
 
 use weft_reactor_trait::{
     Activity, ActivityEvent, ActivityInput, CommandEvent, EventLog, ExecutionEvent, ExecutionId,
-    PipelineEvent, ServiceLocator,
+    FailureDetail, PipelineEvent, ServiceLocator,
 };
 
 /// Validates the incoming request.
@@ -78,6 +78,7 @@ impl Activity for ValidateActivity {
                     name: self.name().to_string(),
                     error: "cancelled before validation".to_string(),
                     retryable: false,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
             debug!(duration_ms, "validate: cancelled");
@@ -97,6 +98,7 @@ impl Activity for ValidateActivity {
                     name: self.name().to_string(),
                     error: "validation failed: messages must not be empty".to_string(),
                     retryable: false,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
             debug!(duration_ms, "validate: failed (empty messages)");

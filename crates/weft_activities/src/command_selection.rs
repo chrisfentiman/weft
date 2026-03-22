@@ -18,8 +18,8 @@ use weft_router_trait::{RoutingCandidate, RoutingDomainKind, filter_by_threshold
 
 use super::selection_util::extract_user_message;
 use weft_reactor_trait::{
-    Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, HookOutcome, PipelineEvent,
-    SelectionEvent, SemanticSelection, ServiceLocator,
+    Activity, ActivityEvent, ActivityInput, Criticality, EventLog, ExecutionId, HookOutcome,
+    PipelineEvent, SelectionEvent, SemanticSelection, ServiceLocator,
 };
 
 /// Selects the commands relevant to the current turn via semantic routing.
@@ -66,6 +66,10 @@ const REMEMBER_DESC: &str = "Store information in memory stores";
 impl Activity for CommandSelectionActivity {
     fn name(&self) -> &str {
         "command_selection"
+    }
+
+    fn criticality(&self) -> Criticality {
+        Criticality::NonCritical
     }
 
     async fn execute(
@@ -319,6 +323,15 @@ mod tests {
         assert_eq!(
             CommandSelectionActivity::new().selection_domain(),
             "commands"
+        );
+    }
+
+    #[test]
+    fn command_selection_criticality_is_non_critical() {
+        use weft_reactor_trait::Criticality;
+        assert_eq!(
+            CommandSelectionActivity::new().criticality(),
+            Criticality::NonCritical
         );
     }
 

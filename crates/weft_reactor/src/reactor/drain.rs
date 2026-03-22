@@ -328,6 +328,7 @@ mod tests {
                 name: "validate".to_string(),
                 error: "bad input".to_string(),
                 retryable: false,
+                detail: crate::event::FailureDetail::default(),
             }),
         )
         .await

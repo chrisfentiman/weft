@@ -338,7 +338,7 @@ impl Reactor {
                                     // Generate activity finished — exit inner loop.
                                     break 'generate;
                                 }
-                                PipelineEvent::Activity(ActivityEvent::Failed { ref name, ref error, retryable })
+                                PipelineEvent::Activity(ActivityEvent::Failed { ref name, ref error, retryable, .. })
                                     if name == lctx.pipeline.generate.activity.name() =>
                                 {
                                     activity_failed = true;

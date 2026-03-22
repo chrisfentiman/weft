@@ -5,6 +5,7 @@
 
 pub use weft_reactor_trait::{
     ActivityEvent, BudgetEvent, BudgetSnapshot, ChildEvent, CommandEvent, CommandFormat,
-    ContextEvent, EVENT_SCHEMA_VERSION, Event, ExecutionEvent, GeneratedEvent, GenerationEvent,
-    HookOutcome, MessageInjectionSource, PipelineEvent, SelectionEvent, SignalEvent,
+    ContextEvent, DegradationNotice, EVENT_SCHEMA_VERSION, Event, ExecutionEvent, FailureDetail,
+    GeneratedEvent, GenerationEvent, HookOutcome, MessageInjectionSource, PipelineEvent,
+    PipelinePhase, SelectionEvent, SignalEvent,
 };

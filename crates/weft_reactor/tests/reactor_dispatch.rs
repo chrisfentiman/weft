@@ -17,9 +17,9 @@ use weft_reactor::config::{
 };
 use weft_reactor::error::ReactorError;
 use weft_reactor::event::{
-    ActivityEvent, CommandEvent, CommandFormat, ContextEvent, ExecutionEvent, GeneratedEvent,
-    GenerationEvent, HookOutcome, MessageInjectionSource, PipelineEvent, SelectionEvent,
-    SignalEvent,
+    ActivityEvent, CommandEvent, CommandFormat, ContextEvent, ExecutionEvent, FailureDetail,
+    GeneratedEvent, GenerationEvent, HookOutcome, MessageInjectionSource, PipelineEvent,
+    SelectionEvent, SignalEvent,
 };
 use weft_reactor::event_log::EventLog;
 use weft_reactor::execution::ExecutionId;
@@ -65,6 +65,7 @@ impl Activity for ImmediateDoneActivity {
                     name: self.name.clone(),
                     error: "cancelled".to_string(),
                     retryable: false,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
             return;
@@ -138,6 +139,7 @@ impl Activity for TextGenerateActivity {
                     name: self.name.clone(),
                     error: "cancelled".to_string(),
                     retryable: false,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
             return;
@@ -223,6 +225,7 @@ impl Activity for AlwaysFailActivity {
                 name: self.name.clone(),
                 error: self.error_msg.clone(),
                 retryable: self.retryable,
+                detail: FailureDetail::default(),
             }))
             .await;
     }
@@ -279,6 +282,7 @@ impl Activity for FailThenSucceedActivity {
                     name: self.name.clone(),
                     error: "transient failure".to_string(),
                     retryable: true,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
         } else {
@@ -1454,6 +1458,7 @@ async fn generation_timeout_fires_after_silence() {
                     name: "generate".to_string(),
                     error: "cancelled".to_string(),
                     retryable: false,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
         }
@@ -1571,6 +1576,7 @@ async fn heartbeat_miss_cancels_activity() {
                     name: "generate".to_string(),
                     error: "cancelled".to_string(),
                     retryable: false,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
         }
@@ -2474,6 +2480,7 @@ async fn cancel_during_retry_backoff_terminates_execution() {
                     name: "generate".to_string(),
                     error: "transient failure".to_string(),
                     retryable: true,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
         }
@@ -2619,6 +2626,7 @@ async fn per_chunk_timeout_resets_after_each_chunk() {
                     name: "generate".to_string(),
                     error: "cancelled".to_string(),
                     retryable: false,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
         }
@@ -3303,6 +3311,7 @@ async fn pre_loop_activity_failure_terminates_execution() {
                     name: self.name().to_string(),
                     error: "model_selection: no eligible models".to_string(),
                     retryable: false,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
         }

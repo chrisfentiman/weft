@@ -669,11 +669,19 @@ mod tests {
             HookEvent::PreToolUse,
             HookEvent::PostToolUse,
         ] {
+            // Conservative aggregation: if ANY hook for this event has critical: true,
+            // the entire HookActivity for that event is critical.
+            let critical = config
+                .hooks
+                .iter()
+                .filter(|h| h.event == event)
+                .any(|h| h.critical);
             registry
                 .register(Arc::new(HookActivity::new(
                     event,
                     Arc::clone(&services.hooks),
                     Arc::clone(&services.request_end_semaphore),
+                    critical,
                 )))
                 .unwrap();
         }

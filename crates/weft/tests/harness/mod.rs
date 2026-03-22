@@ -220,6 +220,7 @@ pub fn build_test_activity_registry(services: &Services) -> ActivityRegistry {
                 event,
                 Arc::clone(&services.hooks),
                 Arc::clone(&services.request_end_semaphore),
+                false,
             )))
             .unwrap();
     }

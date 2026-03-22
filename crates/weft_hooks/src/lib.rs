@@ -454,6 +454,7 @@ mod tests {
             timeout_ms: None,
             secret: None,
             priority: 100,
+            critical: false,
         }];
         let result = HookRegistry::from_config(&config, test_http_client());
         assert!(result.is_err());
@@ -471,6 +472,7 @@ mod tests {
             timeout_ms: None,
             secret: None,
             priority: 100,
+            critical: false,
         }];
         let registry = HookRegistry::from_config(&config, test_http_client()).unwrap();
         // Weft hook skipped — no hooks registered.
@@ -489,6 +491,7 @@ mod tests {
             timeout_ms: None,
             secret: None,
             priority: 100,
+            critical: false,
         }];
         let result = HookRegistry::from_config(&config, test_http_client());
         assert!(result.is_err());
@@ -510,6 +513,7 @@ mod tests {
             timeout_ms: None,
             secret: None,
             priority: 100,
+            critical: false,
         }];
         let registry = HookRegistry::from_config(&config, test_http_client()).unwrap();
         assert_eq!(registry.hook_count(HookEvent::PreToolUse), 1);
@@ -530,6 +534,7 @@ mod tests {
             timeout_ms: None,
             secret: None,
             priority: 100,
+            critical: false,
         }];
         let result = HookRegistry::from_config(&config, test_http_client());
         assert!(result.is_err(), "syntax error should fail construction");
@@ -551,6 +556,7 @@ mod tests {
             timeout_ms: None,
             secret: None,
             priority: 100,
+            critical: false,
         }];
         let registry = HookRegistry::from_config(&config, test_http_client()).unwrap();
         let payload = serde_json::json!({"messages": []});
@@ -575,6 +581,7 @@ mod tests {
             timeout_ms: None,
             secret: None,
             priority: 100,
+            critical: false,
         }];
         let registry = HookRegistry::from_config(&config, test_http_client()).unwrap();
         assert_eq!(registry.hook_count(HookEvent::PreToolUse), 1);
@@ -909,6 +916,7 @@ mod tests {
                 timeout_ms: None,
                 secret: None,
                 priority: 200,
+                critical: false,
             },
             HookConfig {
                 event: HookEvent::RequestStart,
@@ -920,6 +928,7 @@ mod tests {
                 timeout_ms: None,
                 secret: None,
                 priority: 50,
+                critical: false,
             },
             HookConfig {
                 event: HookEvent::RequestStart,
@@ -931,6 +940,7 @@ mod tests {
                 timeout_ms: None,
                 secret: None,
                 priority: 100,
+                critical: false,
             },
         ];
 

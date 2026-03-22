@@ -14,8 +14,8 @@ use tracing::{debug, warn};
 use weft_core::HookEvent;
 use weft_hooks_trait::HookChainResult;
 use weft_reactor_trait::{
-    Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, HookOutcome, PipelineEvent,
-    ServiceLocator,
+    Activity, ActivityEvent, ActivityInput, Criticality, EventLog, ExecutionId, FailureDetail,
+    HookOutcome, PipelineEvent, ServiceLocator,
 };
 
 /// Wraps the `HookRunner` to fire hooks at a specific lifecycle point.
@@ -46,6 +46,11 @@ pub struct HookActivity {
     hooks: Arc<dyn weft_hooks_trait::HookRunner + Send + Sync>,
     /// Semaphore for bounding RequestEnd hook concurrency.
     request_end_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Aggregated criticality from all HookConfig entries for this event.
+    ///
+    /// Conservative aggregation: if ANY hook for this event has `critical: true`,
+    /// the entire HookActivity is critical. Computed at registration time.
+    critical: bool,
 }
 
 impl HookActivity {
@@ -57,6 +62,7 @@ impl HookActivity {
         hook_event: HookEvent,
         hooks: Arc<dyn weft_hooks_trait::HookRunner + Send + Sync>,
         request_end_semaphore: Arc<tokio::sync::Semaphore>,
+        critical: bool,
     ) -> Self {
         let name = format!("hook_{}", hook_event_name_slug(hook_event));
         Self {
@@ -64,6 +70,7 @@ impl HookActivity {
             name,
             hooks,
             request_end_semaphore,
+            critical,
         }
     }
 }
@@ -85,6 +92,14 @@ fn hook_event_name_slug(event: HookEvent) -> &'static str {
 impl Activity for HookActivity {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn criticality(&self) -> Criticality {
+        if self.critical {
+            Criticality::Critical
+        } else {
+            Criticality::NonCritical
+        }
     }
 
     async fn execute(
@@ -110,6 +125,7 @@ impl Activity for HookActivity {
                     name: self.name().to_string(),
                     error: "cancelled before hook execution".to_string(),
                     retryable: false,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
             return;
@@ -182,6 +198,7 @@ impl Activity for HookActivity {
                             name: self.name().to_string(),
                             error: format!("hook blocked: {reason}"),
                             retryable: false,
+                            detail: FailureDetail::default(),
                         }))
                         .await;
                     debug!(
@@ -237,6 +254,7 @@ mod tests {
             event,
             services.hooks.clone(),
             services.request_end_semaphore.clone(),
+            false,
         )
     }
 
@@ -248,6 +266,7 @@ mod tests {
             event,
             services.hooks.clone(),
             services.request_end_semaphore.clone(),
+            false,
         )
     }
 
@@ -460,5 +479,33 @@ mod tests {
                 .any(|e| matches!(e, PipelineEvent::Activity(ActivityEvent::Failed { .. }))),
             "PostToolUse block should not push Activity(Failed)"
         );
+    }
+
+    // ── Criticality based on critical flag ────────────────────────────────
+
+    #[test]
+    fn hook_activity_non_critical_when_flag_false() {
+        use weft_reactor_trait::Criticality;
+        let services = make_test_services();
+        let activity = HookActivity::new(
+            HookEvent::RequestStart,
+            services.hooks.clone(),
+            services.request_end_semaphore.clone(),
+            false,
+        );
+        assert_eq!(activity.criticality(), Criticality::NonCritical);
+    }
+
+    #[test]
+    fn hook_activity_critical_when_flag_true() {
+        use weft_reactor_trait::Criticality;
+        let services = make_test_services();
+        let activity = HookActivity::new(
+            HookEvent::RequestStart,
+            services.hooks.clone(),
+            services.request_end_semaphore.clone(),
+            true,
+        );
+        assert_eq!(activity.criticality(), Criticality::Critical);
     }
 }

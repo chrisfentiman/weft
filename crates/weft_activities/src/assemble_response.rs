@@ -10,8 +10,8 @@ use tracing::debug;
 
 use weft_core::{ContentPart, Role, Source, WeftMessage, WeftResponse, WeftTiming};
 use weft_reactor_trait::{
-    Activity, ActivityEvent, ActivityInput, ContextEvent, EventLog, ExecutionId, PipelineEvent,
-    ServiceLocator,
+    Activity, ActivityEvent, ActivityInput, ContextEvent, EventLog, ExecutionId, FailureDetail,
+    PipelineEvent, ServiceLocator,
 };
 
 /// Constructs the final WeftResponse from accumulated execution state.
@@ -68,6 +68,7 @@ impl Activity for AssembleResponseActivity {
                     name: self.name().to_string(),
                     error: "cancelled before response assembly".to_string(),
                     retryable: false,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
             return;

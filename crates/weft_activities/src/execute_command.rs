@@ -10,8 +10,8 @@ use weft_commands_trait::CommandError;
 use weft_core::CommandInvocation;
 
 use weft_reactor_trait::{
-    Activity, ActivityEvent, ActivityInput, CommandEvent, EventLog, ExecutionId, PipelineEvent,
-    ServiceLocator,
+    Activity, ActivityEvent, ActivityInput, CommandEvent, EventLog, ExecutionId, FailureDetail,
+    PipelineEvent, ServiceLocator,
 };
 
 /// Executes a single command invocation via the command registry.
@@ -84,6 +84,7 @@ impl Activity for ExecuteCommandActivity {
                     name: self.name().to_string(),
                     error: "cancelled before command execution".to_string(),
                     retryable: false,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
             return;
@@ -98,6 +99,7 @@ impl Activity for ExecuteCommandActivity {
                         name: self.name().to_string(),
                         error: format!("invalid invocation in metadata: {e}"),
                         retryable: false,
+                        detail: FailureDetail::default(),
                     }))
                     .await;
                 return;
@@ -129,6 +131,7 @@ impl Activity for ExecuteCommandActivity {
                         name: self.name().to_string(),
                         error: "cancelled during command execution".to_string(),
                         retryable: false,
+                        detail: FailureDetail::default(),
                     }))
                     .await;
                 return;
@@ -174,6 +177,7 @@ impl Activity for ExecuteCommandActivity {
                         name: self.name().to_string(),
                         error: e.to_string(),
                         retryable,
+                        detail: FailureDetail::default(),
                     }))
                     .await;
                 // No Activity(Completed) on infrastructure failure.

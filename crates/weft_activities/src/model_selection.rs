@@ -17,8 +17,8 @@ use weft_core::routing::resolve_filters;
 use weft_core::{HookEvent, ModelInfo, RoutingMode};
 use weft_hooks_trait::HookChainResult;
 use weft_reactor_trait::{
-    Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, HookOutcome, PipelineEvent,
-    SelectionEvent, SemanticSelection, ServiceLocator,
+    Activity, ActivityEvent, ActivityInput, Criticality, EventLog, ExecutionId, FailureDetail,
+    HookOutcome, PipelineEvent, SelectionEvent, SemanticSelection, ServiceLocator,
 };
 use weft_router_trait::{RoutingCandidate, RoutingDomainKind};
 
@@ -61,6 +61,10 @@ impl Activity for ModelSelectionActivity {
         "model_selection"
     }
 
+    fn criticality(&self) -> Criticality {
+        Criticality::SemiCritical
+    }
+
     async fn execute(
         &self,
         _execution_id: &ExecutionId,
@@ -82,6 +86,7 @@ impl Activity for ModelSelectionActivity {
                     name: self.name().to_string(),
                     error: "cancelled before model selection".to_string(),
                     retryable: false,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
             return;
@@ -132,6 +137,7 @@ impl Activity for ModelSelectionActivity {
                         name: self.name().to_string(),
                         error: format!("pre_route hook blocked model selection: {reason}"),
                         retryable: false,
+                        detail: FailureDetail::default(),
                     }))
                     .await;
                 debug!("model_selection: blocked by pre_route hook");
@@ -168,6 +174,7 @@ impl Activity for ModelSelectionActivity {
                             name: self.name().to_string(),
                             error: format!("no models match routing instruction '{filter_str}'"),
                             retryable: false,
+                            detail: FailureDetail::default(),
                         }))
                         .await;
                     return;
@@ -285,6 +292,7 @@ impl Activity for ModelSelectionActivity {
                         name: self.name().to_string(),
                         error: format!("post_route hook blocked model selection: {reason}"),
                         retryable: false,
+                        detail: FailureDetail::default(),
                     }))
                     .await;
                 debug!("model_selection: blocked by post_route hook");
@@ -342,6 +350,7 @@ async fn semantic_score(
                             "router failed and default model '{default_name}' is not registered"
                         ),
                         retryable: false,
+                        detail: FailureDetail::default(),
                     }))
                     .await;
                 return None;
@@ -446,6 +455,17 @@ mod tests {
     #[test]
     fn model_selection_domain() {
         assert_eq!(ModelSelectionActivity::new().selection_domain(), "model");
+    }
+
+    // ── Criticality ──────────────────────────────────────────────────────
+
+    #[test]
+    fn model_selection_criticality_is_semi_critical() {
+        use weft_reactor_trait::Criticality;
+        assert_eq!(
+            ModelSelectionActivity::new().criticality(),
+            Criticality::SemiCritical
+        );
     }
 
     // ── Happy path: emits ModelSelected ──────────────────────────────────────

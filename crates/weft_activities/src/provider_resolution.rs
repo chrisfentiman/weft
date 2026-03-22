@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use weft_reactor_trait::{
-    Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, PipelineEvent, SelectionEvent,
-    ServiceLocator,
+    Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, FailureDetail, PipelineEvent,
+    SelectionEvent, ServiceLocator,
 };
 
 /// Resolves provider and model capabilities for the model selected by `ModelSelectionActivity`.
@@ -68,6 +68,7 @@ impl Activity for ProviderResolutionActivity {
                     name: self.name().to_string(),
                     error: "cancelled before provider resolution".to_string(),
                     retryable: false,
+                    detail: FailureDetail::default(),
                 }))
                 .await;
             return;
@@ -87,6 +88,7 @@ impl Activity for ProviderResolutionActivity {
                         error: "selected_model missing from metadata — reactor wiring error"
                             .to_string(),
                         retryable: false,
+                        detail: FailureDetail::default(),
                     }))
                     .await;
                 return;
@@ -104,6 +106,7 @@ impl Activity for ProviderResolutionActivity {
                             "model '{selected_model}' has no model_id mapping — configuration error"
                         ),
                         retryable: false,
+                        detail: FailureDetail::default(),
                     }))
                     .await;
                 return;

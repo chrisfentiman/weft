@@ -35,6 +35,69 @@ use serde::{Deserialize, Serialize};
 use crate::execution::ExecutionId;
 use crate::signal::Signal;
 
+/// Structured diagnostic context for activity failures.
+///
+/// Carried by `ActivityEvent::Failed`. Follows Temporal's ApplicationFailure
+/// model with GraphQL-style extensions. `error_code` is the machine-readable
+/// discriminant for observability. `detail` is the escape hatch for
+/// activity-specific structured context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailureDetail {
+    /// Machine-readable error code (`snake_case`). Activities define their own.
+    /// Examples: `classifier_unavailable`, `provider_timeout`, `invalid_config`.
+    pub error_code: String,
+
+    /// Activity-specific structured payload. `Value::Null` when unavailable.
+    pub detail: serde_json::Value,
+
+    /// Raw upstream error message. Separate from `error` (activity summary).
+    pub cause: Option<String>,
+
+    /// What the activity was attempting when it failed.
+    pub attempted: Option<String>,
+
+    /// Available fallback, if any.
+    pub fallback: Option<String>,
+}
+
+impl Default for FailureDetail {
+    fn default() -> Self {
+        Self {
+            error_code: "unknown".to_string(),
+            detail: serde_json::Value::Null,
+            cause: None,
+            attempted: None,
+            fallback: None,
+        }
+    }
+}
+
+/// Pipeline phase where an event occurred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PipelinePhase {
+    PreLoop,
+    Dispatch,
+    PostLoop,
+}
+
+/// Record of a degraded activity: what failed, why, and what the reactor did.
+/// Accumulated during execution and surfaced on ExecutionResult.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DegradationNotice {
+    /// Which activity degraded.
+    pub activity_name: String,
+    /// Pipeline phase where degradation occurred.
+    pub phase: PipelinePhase,
+    /// Machine-readable error code (from FailureDetail::error_code).
+    pub error_code: String,
+    /// Human-readable summary.
+    pub message: String,
+    /// What capability was lost.
+    pub impact: String,
+    /// The fallback that was applied.
+    pub fallback_applied: String,
+}
+
 /// Current event schema version. Increment on breaking changes.
 ///
 /// See spec Section 3.8 for the versioning strategy:
@@ -139,6 +202,10 @@ pub enum ExecutionEvent {
     ValidationFailed {
         reason: String,
     },
+    /// Activity degraded: failed but non-critical, reactor continued with fallback.
+    Degraded {
+        notice: DegradationNotice,
+    },
 }
 
 /// LLM generation events.
@@ -213,6 +280,9 @@ pub enum ActivityEvent {
         name: String,
         error: String,
         retryable: bool,
+        /// Structured diagnostic context. Defaults to unknown/empty.
+        #[serde(default)]
+        detail: FailureDetail,
     },
     /// Activity is being retried after failure. `backoff_ms` is available via
     /// enrichment as `_obs_backoff_ms` in the stored payload.
@@ -373,6 +443,7 @@ impl PipelineEvent {
                 ExecutionEvent::IterationCompleted { .. } => "execution.iteration_completed",
                 ExecutionEvent::ValidationPassed => "execution.validation_passed",
                 ExecutionEvent::ValidationFailed { .. } => "execution.validation_failed",
+                ExecutionEvent::Degraded { .. } => "execution.degraded",
             },
             PipelineEvent::Generation(e) => match e {
                 GenerationEvent::Chunk(_) => "generation.chunk",
@@ -499,7 +570,7 @@ pub enum CommandFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pretty_assertions::assert_eq;
+    use pretty_assertions::{assert_eq, assert_ne};
     use rstest::rstest;
 
     fn make_message() -> weft_core::WeftMessage {
@@ -706,6 +777,7 @@ mod tests {
             name: "generate".to_string(),
             error: "timeout".to_string(),
             retryable: true,
+            detail: FailureDetail::default(),
         }),
         "activity.failed",
         "Activity",
@@ -1362,5 +1434,151 @@ mod tests {
         assert_eq!(stored["event"]["_obs_partial_text"], "hello world");
         assert_eq!(stored["event"]["_obs_chars_produced"], 11);
         assert_eq!(stored["event"]["reason"], "user requested");
+    }
+
+    // ── FailureDetail ─────────────────────────────────────────────────────
+
+    #[test]
+    fn failure_detail_default_has_unknown_error_code() {
+        let d = FailureDetail::default();
+        assert_eq!(d.error_code, "unknown");
+        assert_eq!(d.detail, serde_json::Value::Null);
+        assert!(d.cause.is_none());
+        assert!(d.attempted.is_none());
+        assert!(d.fallback.is_none());
+    }
+
+    #[test]
+    fn failure_detail_serde_round_trip() {
+        let d = FailureDetail {
+            error_code: "classifier_unavailable".to_string(),
+            detail: serde_json::json!({ "model_path": "/models/foo.onnx" }),
+            cause: Some("ONNX runtime error".to_string()),
+            attempted: Some("classify user message".to_string()),
+            fallback: Some("empty command list".to_string()),
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        let back: FailureDetail = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.error_code, "classifier_unavailable");
+        assert_eq!(back.detail["model_path"], "/models/foo.onnx");
+        assert_eq!(back.cause.as_deref(), Some("ONNX runtime error"));
+        assert_eq!(back.attempted.as_deref(), Some("classify user message"));
+        assert_eq!(back.fallback.as_deref(), Some("empty command list"));
+    }
+
+    #[test]
+    fn failure_detail_backward_compat_missing_detail_field() {
+        // JSON without `detail` field must deserialize using the Default.
+        let json = r#"{"error_code":"provider_timeout","detail":null}"#;
+        let d: FailureDetail = serde_json::from_str(json).unwrap();
+        assert_eq!(d.error_code, "provider_timeout");
+        assert!(d.cause.is_none());
+        assert!(d.attempted.is_none());
+        assert!(d.fallback.is_none());
+    }
+
+    #[test]
+    fn activity_event_failed_with_default_detail_deserializes_without_detail_field() {
+        // Backward compat: old JSON without `detail` must deserialize via #[serde(default)].
+        let json =
+            r#"{"type":"Failed","name":"validate","error":"empty messages","retryable":false}"#;
+        let ev: ActivityEvent = serde_json::from_str(json).unwrap();
+        match ev {
+            ActivityEvent::Failed {
+                name,
+                error,
+                retryable,
+                detail,
+            } => {
+                assert_eq!(name, "validate");
+                assert_eq!(error, "empty messages");
+                assert!(!retryable);
+                assert_eq!(detail.error_code, "unknown");
+            }
+            _ => panic!("expected ActivityEvent::Failed"),
+        }
+    }
+
+    // ── DegradationNotice ─────────────────────────────────────────────────
+
+    #[test]
+    fn degradation_notice_serde_round_trip() {
+        let notice = DegradationNotice {
+            activity_name: "command_selection".to_string(),
+            phase: PipelinePhase::PreLoop,
+            error_code: "classifier_unavailable".to_string(),
+            message: "Command selection failed; proceeding without commands".to_string(),
+            impact: "Commands will not be available for this request".to_string(),
+            fallback_applied: "empty command list".to_string(),
+        };
+        let json = serde_json::to_string(&notice).unwrap();
+        let back: DegradationNotice = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.activity_name, "command_selection");
+        assert_eq!(back.phase, PipelinePhase::PreLoop);
+        assert_eq!(back.error_code, "classifier_unavailable");
+    }
+
+    // ── PipelinePhase ─────────────────────────────────────────────────────
+
+    #[test]
+    fn pipeline_phase_serde_round_trip() {
+        for phase in [
+            PipelinePhase::PreLoop,
+            PipelinePhase::Dispatch,
+            PipelinePhase::PostLoop,
+        ] {
+            let json = serde_json::to_string(&phase).unwrap();
+            let back: PipelinePhase = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, phase);
+        }
+    }
+
+    #[test]
+    fn pipeline_phase_equality() {
+        assert_eq!(PipelinePhase::PreLoop, PipelinePhase::PreLoop);
+        assert_ne!(PipelinePhase::PreLoop, PipelinePhase::Dispatch);
+    }
+
+    // ── ExecutionEvent::Degraded ──────────────────────────────────────────
+
+    #[test]
+    fn execution_event_degraded_event_type_string() {
+        let notice = DegradationNotice {
+            activity_name: "command_selection".to_string(),
+            phase: PipelinePhase::PreLoop,
+            error_code: "classifier_unavailable".to_string(),
+            message: "test".to_string(),
+            impact: "no commands".to_string(),
+            fallback_applied: "empty list".to_string(),
+        };
+        let event = PipelineEvent::Execution(ExecutionEvent::Degraded {
+            notice: notice.clone(),
+        });
+        assert_eq!(event.event_type_string(), "execution.degraded");
+    }
+
+    #[test]
+    fn execution_event_degraded_serde_round_trip() {
+        let notice = DegradationNotice {
+            activity_name: "sampling_adjustment".to_string(),
+            phase: PipelinePhase::PostLoop,
+            error_code: "invalid_config".to_string(),
+            message: "Sampling adjustment failed".to_string(),
+            impact: "uses provider defaults".to_string(),
+            fallback_applied: "provider defaults".to_string(),
+        };
+        let event = PipelineEvent::Execution(ExecutionEvent::Degraded {
+            notice: notice.clone(),
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            PipelineEvent::Execution(ExecutionEvent::Degraded { notice: n }) => {
+                assert_eq!(n.activity_name, "sampling_adjustment");
+                assert_eq!(n.phase, PipelinePhase::PostLoop);
+                assert_eq!(n.error_code, "invalid_config");
+            }
+            _ => panic!("expected PipelineEvent::Execution(Degraded)"),
+        }
     }
 }
