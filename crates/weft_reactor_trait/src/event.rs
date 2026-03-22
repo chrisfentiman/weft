@@ -3,7 +3,7 @@
 //! # Grouped structure
 //!
 //! `PipelineEvent` is a 10-variant outer enum. Each outer variant wraps a
-//! category-specific inner enum with typed sub-variants. The total is 39 leaf
+//! category-specific inner enum with typed sub-variants. The total is 40 leaf
 //! variants across the two levels.
 //!
 //! # Serde format
@@ -26,7 +26,7 @@
 //!
 //! # event_type_string()
 //!
-//! Returns `"category.variant"` dot-delimited strings for all 39 variants.
+//! Returns `"category.variant"` dot-delimited strings for all 40 variants.
 //! These strings are written to `Event::event_type` in the EventLog.
 
 use chrono::{DateTime, Utc};
@@ -431,7 +431,7 @@ pub enum BudgetEvent {
 impl PipelineEvent {
     /// Returns the dot-delimited event type string for storage and querying.
     ///
-    /// Format: `"category.variant"` for all 39 variants.
+    /// Format: `"category.variant"` for all 40 variants.
     /// Used to populate `Event::event_type` in the EventLog.
     pub fn event_type_string(&self) -> &'static str {
         match self {

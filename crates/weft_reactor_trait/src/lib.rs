@@ -6,7 +6,7 @@
 //!
 //! # What lives here
 //!
-//! - **`PipelineEvent`** — grouped 10-outer / 39-leaf event enum (adjacently-tagged serde)
+//! - **`PipelineEvent`** — grouped 10-outer / 40-leaf event enum (adjacently-tagged serde)
 //! - **`EventLog`** trait — durable event store interface
 //! - **`Activity`** trait — event-producing unit of work
 //! - **`ServiceLocator`** trait — infrastructure abstraction for activities
