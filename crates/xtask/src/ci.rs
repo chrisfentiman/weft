@@ -1,5 +1,6 @@
 use xshell::{Shell, cmd};
 
+use crate::schema;
 use crate::util::Result;
 
 /// Run `cargo xtask ci`: the full CI gate in order.
@@ -51,6 +52,13 @@ pub(crate) fn run(sh: &Shell) -> Result<()> {
     if let Err(e) = cmd!(sh, "cargo build --workspace").run() {
         eprintln!("[xtask] FAILED: build");
         return Err(e.into());
+    }
+
+    // Step 5: verify committed JSON Schema matches current config types.
+    eprintln!("[xtask] verifying config schema...");
+    if let Err(e) = schema::cmd_verify(&schema::default_schema_path()) {
+        eprintln!("[xtask] FAILED: schema");
+        return Err(e);
     }
 
     eprintln!("[xtask] CI checks passed");

@@ -68,3 +68,6 @@ pretty_assertions = { version = "1" }
 
 # xtask dev tool
 xshell = { version = "0.2" }
+
+# Schema generation
+schemars = { version = "0.8" }

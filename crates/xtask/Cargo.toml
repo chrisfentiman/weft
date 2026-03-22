@@ -11,4 +11,7 @@ license = "AGPL-3.0"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
+schemars = { version = "0.8" }
+serde_json = { version = "1" }
+weft_core = { path = "../weft_core", features = ["schema"] }
 xshell = "0.2"

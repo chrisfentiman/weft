@@ -1,0 +1,673 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WeftConfig",
+  "description": "Top-level configuration, deserialized from TOML.",
+  "type": "object",
+  "required": [
+    "gateway",
+    "router",
+    "server"
+  ],
+  "properties": {
+    "event_log": {
+      "description": "Event log backend selection. Optional — absent defaults to in-memory.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/EventLogConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "gateway": {
+      "$ref": "#/definitions/GatewayConfig"
+    },
+    "hooks": {
+      "description": "Hook configuration. Empty vec means no hooks.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/HookConfig"
+      }
+    },
+    "max_pre_response_retries": {
+      "description": "Maximum number of LLM regeneration attempts when a PreResponse hook blocks. Default: 2. Max: 5.",
+      "default": 2,
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "memory": {
+      "description": "Memory store configuration. Optional -- absent means no memory stores.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/MemoryConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "request_end_concurrency": {
+      "description": "Maximum concurrent RequestEnd hook tasks. Excess tasks are dropped with a warning. Default: 64.",
+      "default": 64,
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0.0
+    },
+    "router": {
+      "description": "Router configuration — the single source of truth for model routing and classification. Replaces the old `[llm]` and `[classifier]` sections.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/RouterConfig"
+        }
+      ]
+    },
+    "server": {
+      "$ref": "#/definitions/ServerConfig"
+    },
+    "tool_registry": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ToolRegistryConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "ClassifierConfig": {
+      "type": "object",
+      "required": [
+        "model_path",
+        "tokenizer_path"
+      ],
+      "properties": {
+        "max_commands": {
+          "description": "Maximum number of commands to include regardless of threshold.",
+          "default": 20,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "model_path": {
+          "description": "Path to the ONNX model file.",
+          "type": "string"
+        },
+        "threshold": {
+          "description": "Relevance score threshold. Commands scoring below this are excluded.",
+          "default": 0.30000001192092896,
+          "type": "number",
+          "format": "float"
+        },
+        "tokenizer_path": {
+          "description": "Path to the tokenizer JSON file.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "DomainConfig": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Whether this domain is enabled. Default: true.",
+          "default": true,
+          "type": "boolean"
+        },
+        "threshold": {
+          "description": "Score threshold for this domain. For the Commands domain: overrides `classifier.threshold` for filtering. For the Model domain: acts as a confidence gate -- if no model scores above this threshold, the default model is used instead. If absent, always pick the highest-scoring model. For ToolNecessity/Memory: overrides classifier.threshold.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        }
+      },
+      "additionalProperties": false
+    },
+    "DomainsConfig": {
+      "description": "Per-domain threshold and enablement overrides.",
+      "type": "object",
+      "properties": {
+        "memory": {
+          "description": "Memory routing domain config (interface only -- no memory stores yet).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DomainConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model": {
+          "description": "Model routing domain config.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DomainConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tool_necessity": {
+          "description": "Tool necessity domain config.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DomainConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "EventLogConfig": {
+      "description": "Event log backend configuration.\n\nControls which `EventLog` implementation the binary constructs at startup. Absent or `backend = \"memory\"` uses `InMemoryEventLog` (no persistence). `backend = \"postgres\"` requires `database_url` and uses `PostgresEventLog`.",
+      "type": "object",
+      "properties": {
+        "backend": {
+          "description": "Which backend to use: `\"memory\"` (default) or `\"postgres\"`.",
+          "default": "memory",
+          "type": "string"
+        },
+        "database_url": {
+          "description": "PostgreSQL connection URL. Required when `backend = \"postgres\"`. Supports `env:VAR_NAME` prefix for loading from the environment.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "GatewayConfig": {
+      "type": "object",
+      "required": [
+        "system_prompt"
+      ],
+      "properties": {
+        "max_command_iterations": {
+          "description": "Maximum iterations of the command loop before giving up.",
+          "default": 10,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "request_timeout_secs": {
+          "description": "Overall request timeout in seconds. Covers the entire gateway loop including all LLM calls and command executions. Default: 300 (5 minutes).",
+          "default": 300,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "system_prompt": {
+          "description": "System prompt prepended to every conversation.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "HookConfig": {
+      "description": "A single hook configuration entry.",
+      "type": "object",
+      "required": [
+        "event",
+        "type"
+      ],
+      "properties": {
+        "agent": {
+          "description": "Agent name for Weft hook. Required when `hook_type` is `weft`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "event": {
+          "description": "Which lifecycle event this hook fires on.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/HookEvent"
+            }
+          ]
+        },
+        "matcher": {
+          "description": "Optional regex matcher. Absence means \"fire on all events of this type.\"",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "priority": {
+          "description": "Execution priority. Lower values run first. Default: 100.",
+          "default": 100,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "script": {
+          "description": "Path to Rhai script file. Required when `hook_type` is `rhai`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "secret": {
+          "description": "Optional shared secret for HTTP hook authentication. Sent as `Authorization: Bearer <secret>` header. Supports `env:VAR_NAME` syntax for environment variable resolution. Only applicable to HTTP hooks; ignored for other types.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout_ms": {
+          "description": "Execution timeout in milliseconds. Default: 100 for Rhai, 5000 for HTTP. Max: 5000 for Rhai, 30000 for HTTP.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "type": {
+          "description": "Hook type: \"rhai\", \"http\", or \"weft\".",
+          "allOf": [
+            {
+              "$ref": "#/definitions/HookType"
+            }
+          ]
+        },
+        "url": {
+          "description": "URL for HTTP webhook. Required when `hook_type` is `http`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "HookEvent": {
+      "description": "Lifecycle events that hooks can attach to.\n\nLives in `weft_core::config` so `HookConfig` can reference it for deserialization. Placing it in the `weft` binary crate would create a circular dependency.",
+      "oneOf": [
+        {
+          "description": "Request arrives at gateway, before any processing.",
+          "type": "string",
+          "enum": [
+            "request_start"
+          ]
+        },
+        {
+          "description": "Before each routing decision (fires per domain).",
+          "type": "string",
+          "enum": [
+            "pre_route"
+          ]
+        },
+        {
+          "description": "After each routing decision (fires per domain).",
+          "type": "string",
+          "enum": [
+            "post_route"
+          ]
+        },
+        {
+          "description": "Before executing a single command invocation.",
+          "type": "string",
+          "enum": [
+            "pre_tool_use"
+          ]
+        },
+        {
+          "description": "After command returns, before result injection. Cannot block.",
+          "type": "string",
+          "enum": [
+            "post_tool_use"
+          ]
+        },
+        {
+          "description": "Before building the final HTTP response.",
+          "type": "string",
+          "enum": [
+            "pre_response"
+          ]
+        },
+        {
+          "description": "After response sent to client. Cannot block. Fire-and-forget.",
+          "type": "string",
+          "enum": [
+            "request_end"
+          ]
+        }
+      ]
+    },
+    "HookType": {
+      "description": "Hook type: which execution engine handles this hook.",
+      "oneOf": [
+        {
+          "description": "Rhai embedded scripting language hook.",
+          "type": "string",
+          "enum": [
+            "rhai"
+          ]
+        },
+        {
+          "description": "HTTP webhook hook.",
+          "type": "string",
+          "enum": [
+            "http"
+          ]
+        },
+        {
+          "description": "Weft-type hook (reserved for future implementation).",
+          "type": "string",
+          "enum": [
+            "weft"
+          ]
+        }
+      ]
+    },
+    "MemoryConfig": {
+      "description": "Memory configuration. Optional -- absent means no memory stores.",
+      "type": "object",
+      "required": [
+        "stores"
+      ],
+      "properties": {
+        "stores": {
+          "description": "Memory stores to connect to.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/MemoryStoreConfig"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "MemoryStoreConfig": {
+      "description": "A single memory store endpoint.",
+      "type": "object",
+      "required": [
+        "endpoint",
+        "examples",
+        "name"
+      ],
+      "properties": {
+        "capabilities": {
+          "description": "What this store can do: `read`, `write`, or both. Determines whether the store is eligible for `/recall` (read) and `/remember` (write) operations. Defaults to `[\"read\", \"write\"]` if omitted.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/StoreCapability"
+          }
+        },
+        "connect_timeout_ms": {
+          "description": "Connection timeout in milliseconds.",
+          "default": 5000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "endpoint": {
+          "description": "gRPC endpoint (e.g., \"http://localhost:50052\").",
+          "type": "string"
+        },
+        "examples": {
+          "description": "Example queries that this store is best suited for. Used by the semantic router to build centroid embeddings for the Memory domain. Must contain at least one example.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "max_results": {
+          "description": "Maximum number of memories to retrieve per query.",
+          "default": 5,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "name": {
+          "description": "Unique name for this store (e.g., \"conversations\", \"code_knowledge\"). Used as the routing candidate ID in the Memory domain.",
+          "type": "string"
+        },
+        "request_timeout_ms": {
+          "description": "Request timeout in milliseconds.\n\n**Deferred (v1):** This field is parsed and stored but NOT enforced per-request on the gRPC client. The overall gateway request timeout (`gateway.request_timeout_secs`) is the safety net. The field exists for forward compatibility: when per-store timeouts are implemented (via tonic's `timeout()` on the channel or per-request deadline), existing configs will already have the value.",
+          "default": 10000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "ModelEntry": {
+      "description": "A model available for routing, nested under a provider.\n\nThe model inherits the provider's API endpoint (wire_format, api_key, base_url). The `model` field is sent to the provider API to select which model to use.",
+      "type": "object",
+      "required": [
+        "examples",
+        "model",
+        "name"
+      ],
+      "properties": {
+        "capabilities": {
+          "description": "Capabilities this model supports. Default: `[\"chat_completions\"]` -- a model that doesn't declare capabilities is assumed to support chat completions only.",
+          "default": [
+            "chat_completions"
+          ],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "examples": {
+          "description": "Example queries that this model is best suited for. The router embeds all examples, averages them into a centroid vector, and routes based on distance to the centroid. Must contain at least one example.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "max_tokens": {
+          "description": "Maximum tokens in response.",
+          "default": 4096,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "model": {
+          "description": "Model identifier sent to the provider API. e.g., \"claude-sonnet-4-20250514\", \"gpt-4o\", \"llama3.2\"",
+          "type": "string"
+        },
+        "name": {
+          "description": "Unique routing name for this model (e.g., \"complex\", \"fast\"). Used as the routing candidate ID. Must be globally unique across all providers.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProviderConfig": {
+      "description": "An LLM provider -- an API endpoint that serves one or more models.",
+      "type": "object",
+      "required": [
+        "api_key",
+        "models",
+        "name",
+        "wire_format"
+      ],
+      "properties": {
+        "api_key": {
+          "description": "API key for this provider. Supports `env:VAR_NAME` prefix. For local providers (e.g., Ollama) that don't require authentication, use a literal string like `\"unused\"`. The value is passed through to the provider's HTTP client (e.g., `Authorization: Bearer unused`). Local providers typically ignore this header, so any non-empty string is acceptable. The field is required (not Optional) to keep the config schema simple.",
+          "type": "string"
+        },
+        "base_url": {
+          "description": "Optional base URL override. Required for local/custom endpoints (e.g., Ollama).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "models": {
+          "description": "Models served by this provider. Must have at least one.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ModelEntry"
+          }
+        },
+        "name": {
+          "description": "Unique name for this provider (e.g., \"anthropic\", \"local-ollama\").",
+          "type": "string"
+        },
+        "wire_format": {
+          "description": "Wire format -- determines the API protocol used.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/WireFormat"
+            }
+          ]
+        },
+        "wire_script": {
+          "description": "Path to Rhai wire format script. Required when `wire_format` is `custom`. Relative paths are resolved from the current working directory at startup.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "RouterConfig": {
+      "description": "Router configuration — the single source of truth for model routing and classification.",
+      "type": "object",
+      "required": [
+        "classifier"
+      ],
+      "properties": {
+        "classifier": {
+          "description": "Classifier (ONNX bi-encoder) configuration. Previously a top-level [classifier] section.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ClassifierConfig"
+            }
+          ]
+        },
+        "default_model": {
+          "description": "Default model name. Must reference a model name from one of the providers. If absent, the first model of the first provider is the default.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "domains": {
+          "description": "Per-domain configuration overrides.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/DomainsConfig"
+            }
+          ]
+        },
+        "providers": {
+          "description": "Provider definitions. Each provider is an API endpoint with one or more models. Defaults to empty — validation enforces at least one provider.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ProviderConfig"
+          }
+        },
+        "skip_tools_when_unnecessary": {
+          "description": "Whether to skip command injection when the router determines tools aren't needed. Default: true.",
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ServerConfig": {
+      "type": "object",
+      "required": [
+        "bind_address"
+      ],
+      "properties": {
+        "bind_address": {
+          "description": "Bind address, e.g. \"0.0.0.0:8080\"",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "StoreCapability": {
+      "description": "What a memory store can do. Config-level declaration by the admin -- not part of the gRPC contract.",
+      "oneOf": [
+        {
+          "description": "Store supports querying/retrieving memories.",
+          "type": "string",
+          "enum": [
+            "read"
+          ]
+        },
+        {
+          "description": "Store supports persisting new memories.",
+          "type": "string",
+          "enum": [
+            "write"
+          ]
+        }
+      ]
+    },
+    "ToolRegistryConfig": {
+      "type": "object",
+      "required": [
+        "endpoint"
+      ],
+      "properties": {
+        "connect_timeout_ms": {
+          "description": "Connection timeout in milliseconds.",
+          "default": 5000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "endpoint": {
+          "description": "gRPC endpoint, e.g. \"http://localhost:50051\"",
+          "type": "string"
+        },
+        "request_timeout_ms": {
+          "description": "Request timeout in milliseconds.",
+          "default": 30000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "WireFormat": {
+      "description": "Wire format -- determines how requests are serialized and responses are parsed for a provider's API.",
+      "oneOf": [
+        {
+          "description": "OpenAI Chat Completions API format. Used by OpenAI, Azure OpenAI, Ollama, vLLM, and most OpenAI-compatible providers.",
+          "type": "string",
+          "enum": [
+            "openai"
+          ]
+        },
+        {
+          "description": "Anthropic Messages API format.",
+          "type": "string",
+          "enum": [
+            "anthropic"
+          ]
+        },
+        {
+          "description": "Custom wire format defined by a Rhai script.",
+          "type": "string",
+          "enum": [
+            "custom"
+          ]
+        }
+      ]
+    }
+  }
+}
