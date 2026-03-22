@@ -7,23 +7,13 @@ mod harness;
 
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
-
-use weft_reactor::activity::{Activity, ActivityInput};
-use weft_reactor::event::{ActivityEvent, FailureDetail, PipelineEvent};
-use weft_reactor::event_log::EventLog;
-use weft_reactor::execution::ExecutionId;
 use weft_reactor::reactor::Reactor;
 use weft_reactor::test_support::make_test_services;
-use weft_reactor::{ExecutionContext, RequestId, TenantId};
+use weft_reactor::{EventLog, ExecutionContext, RequestId, TenantId};
 
 use harness::{
-    ImmediateDoneActivity, StubAssembleResponse, StubCommandFormattingActivity,
-    StubCommandSelectionActivity, StubExecuteCommand, StubProviderResolutionActivity,
-    StubSamplingAdjustmentActivity, StubSystemPromptAssemblyActivity, StubValidateActivity,
-    build_new_preloop_registry, build_registry, new_preloop_pipeline_config, reactor_config,
-    test_event_log, test_request,
+    TestActivity, build_new_preloop_registry, build_registry, new_preloop_pipeline_config,
+    pipeline_with_validate, reactor_config, test_event_log, test_request,
 };
 
 #[allow(unused_imports)]
@@ -282,60 +272,24 @@ async fn pre_loop_generation_config_includes_model() {
 
 #[tokio::test]
 async fn pre_loop_activity_failure_terminates_execution() {
-    struct FailingModelSelection;
-
-    #[async_trait::async_trait]
-    impl Activity for FailingModelSelection {
-        fn name(&self) -> &str {
-            "model_selection"
-        }
-
-        async fn execute(
-            &self,
-            _execution_id: &ExecutionId,
-            _input: ActivityInput,
-            _services: &dyn weft_reactor_trait::ServiceLocator,
-            _event_log: &dyn weft_reactor::event_log::EventLog,
-            event_tx: mpsc::Sender<PipelineEvent>,
-            _cancel: CancellationToken,
-        ) {
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Started {
-                    name: self.name().to_string(),
-                }))
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Failed {
-                    name: self.name().to_string(),
-                    error: "model_selection: no eligible models".to_string(),
-                    retryable: false,
-                    detail: FailureDetail::default(),
-                }))
-                .await;
-        }
-    }
+    // FailingModelSelection: Critical (default), emits Started then Failed.
+    let registry = build_registry(vec![
+        TestActivity::validate_stub(),
+        TestActivity::failing("model_selection")
+            .with_error("model_selection: no eligible models")
+            .build(),
+        TestActivity::command_selection_stub(),
+        TestActivity::provider_resolution_stub(),
+        TestActivity::system_prompt_assembly_stub(),
+        TestActivity::command_formatting_stub(),
+        TestActivity::sampling_adjustment_stub(),
+        TestActivity::generate("generate").build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
+    ]);
 
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
-    let registry = build_registry(vec![
-        Arc::new(StubValidateActivity),
-        Arc::new(FailingModelSelection),
-        Arc::new(StubCommandSelectionActivity),
-        Arc::new(StubProviderResolutionActivity),
-        Arc::new(StubSystemPromptAssemblyActivity),
-        Arc::new(StubCommandFormattingActivity),
-        Arc::new(StubSamplingAdjustmentActivity),
-        Arc::new(ImmediateDoneActivity {
-            name: "generate".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
-    ]);
-
     let config = reactor_config(new_preloop_pipeline_config("generate"));
     let reactor = Reactor::new(services, event_log.clone(), registry, &config)
         .expect("reactor should construct");
@@ -365,21 +319,13 @@ async fn pre_loop_activity_runs_before_generate() {
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
     let registry = build_registry(vec![
-        Arc::new(harness::NoOpActivity {
-            name: "validate".to_string(),
-        }),
-        Arc::new(ImmediateDoneActivity {
-            name: "generate".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::noop("validate").into(),
+        TestActivity::generate("generate").build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
-    let config = reactor_config(harness::pipeline_with_validate("generate"));
+    let config = reactor_config(pipeline_with_validate("generate"));
     let reactor = Reactor::new(services, event_log.clone(), registry, &config)
         .expect("reactor should construct");
 

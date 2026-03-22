@@ -8,26 +8,18 @@ mod harness;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
-
-use weft_reactor::activity::{Activity, ActivityInput};
 use weft_reactor::config::{ActivityRef, BudgetConfig, LoopHooks, PipelineConfig, ReactorConfig};
-use weft_reactor::event::{
-    ActivityEvent, FailureDetail, GeneratedEvent, GenerationEvent, PipelineEvent, SignalEvent,
-};
-use weft_reactor::event_log::EventLog;
-use weft_reactor::execution::ExecutionId;
+use weft_reactor::event::{GeneratedEvent, GenerationEvent, PipelineEvent};
 use weft_reactor::reactor::Reactor;
-use weft_reactor::signal::Signal;
 use weft_reactor::test_support::{make_test_services, make_test_services_with_response};
-use weft_reactor::{ExecutionContext, RequestId, TenantId};
+use weft_reactor::{EventLog, ExecutionContext, RequestId, TenantId};
 
+use tokio::sync::mpsc;
 use weft_core::ContentPart;
 
 use harness::{
-    ImmediateDoneActivity, StubAssembleResponse, StubExecuteCommand, TextGenerateActivity,
-    build_registry, reactor_config, simple_pipeline_config, test_event_log, test_request,
+    TestActivity, build_registry, reactor_config, simple_pipeline_config, test_event_log,
+    test_request,
 };
 
 #[allow(unused_imports)]
@@ -38,16 +30,11 @@ async fn simple_request_response_completes() {
     let services = Arc::new(make_test_services_with_response("Hello, world!"));
     let event_log = test_event_log();
     let registry = build_registry(vec![
-        Arc::new(TextGenerateActivity {
-            name: "generate".to_string(),
-            response_text: "Hello, world!".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::generate("generate")
+            .with_text("Hello, world!")
+            .build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = reactor_config(simple_pipeline_config("generate"));
@@ -99,15 +86,9 @@ async fn budget_exhaustion_terminates_gracefully() {
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
     let registry = build_registry(vec![
-        Arc::new(ImmediateDoneActivity {
-            name: "generate".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::generate("generate").build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     // max_generation_calls = 1 means after 1 call, budget is exhausted.
@@ -156,46 +137,10 @@ async fn cancel_signal_terminates_execution() {
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
 
-    struct CancelViaChannelActivity;
-
-    #[async_trait::async_trait]
-    impl Activity for CancelViaChannelActivity {
-        fn name(&self) -> &str {
-            "generate"
-        }
-
-        async fn execute(
-            &self,
-            _execution_id: &ExecutionId,
-            _input: ActivityInput,
-            _services: &dyn weft_reactor_trait::ServiceLocator,
-            _event_log: &dyn EventLog,
-            event_tx: mpsc::Sender<PipelineEvent>,
-            _cancel: CancellationToken,
-        ) {
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Started {
-                    name: "generate".to_string(),
-                }))
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Signal(SignalEvent::Received(
-                    Signal::Cancel {
-                        reason: "test cancel via channel".to_string(),
-                    },
-                )))
-                .await;
-        }
-    }
-
     let registry = build_registry(vec![
-        Arc::new(CancelViaChannelActivity),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::cancelling("generate", "test cancel via channel").into(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = reactor_config(simple_pipeline_config("generate"));
@@ -235,47 +180,11 @@ async fn cancel_signal_on_channel_terminates_execution() {
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
 
-    struct CancellingGenerateActivity;
-
-    #[async_trait::async_trait]
-    impl Activity for CancellingGenerateActivity {
-        fn name(&self) -> &str {
-            "generate"
-        }
-
-        async fn execute(
-            &self,
-            _execution_id: &ExecutionId,
-            _input: ActivityInput,
-            _services: &dyn weft_reactor_trait::ServiceLocator,
-            _event_log: &dyn EventLog,
-            event_tx: mpsc::Sender<PipelineEvent>,
-            _cancel: CancellationToken,
-        ) {
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Started {
-                    name: "generate".to_string(),
-                }))
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Signal(SignalEvent::Received(
-                    Signal::Cancel {
-                        reason: "test cancel".to_string(),
-                    },
-                )))
-                .await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-
     let registry = build_registry(vec![
-        Arc::new(CancellingGenerateActivity),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::cancelling_with_sleep("generate", "test cancel", Duration::from_millis(100))
+            .into(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = reactor_config(simple_pipeline_config("generate"));
@@ -316,48 +225,10 @@ async fn generation_timeout_fires_after_silence() {
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
 
-    struct StallActivity;
-
-    #[async_trait::async_trait]
-    impl Activity for StallActivity {
-        fn name(&self) -> &str {
-            "generate"
-        }
-
-        async fn execute(
-            &self,
-            _execution_id: &ExecutionId,
-            _input: ActivityInput,
-            _services: &dyn weft_reactor_trait::ServiceLocator,
-            _event_log: &dyn EventLog,
-            event_tx: mpsc::Sender<PipelineEvent>,
-            cancel: CancellationToken,
-        ) {
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Started {
-                    name: "generate".to_string(),
-                }))
-                .await;
-            cancel.cancelled().await;
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Failed {
-                    name: "generate".to_string(),
-                    error: "cancelled".to_string(),
-                    retryable: false,
-                    detail: FailureDetail::default(),
-                }))
-                .await;
-        }
-    }
-
     let registry = build_registry(vec![
-        Arc::new(StallActivity),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::stalling("generate").into(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = ReactorConfig {
@@ -422,58 +293,10 @@ async fn heartbeat_miss_cancels_activity() {
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
 
-    struct HeartbeatThenStallActivity;
-
-    #[async_trait::async_trait]
-    impl Activity for HeartbeatThenStallActivity {
-        fn name(&self) -> &str {
-            "generate"
-        }
-
-        async fn execute(
-            &self,
-            _execution_id: &ExecutionId,
-            _input: ActivityInput,
-            _services: &dyn weft_reactor_trait::ServiceLocator,
-            _event_log: &dyn EventLog,
-            event_tx: mpsc::Sender<PipelineEvent>,
-            cancel: CancellationToken,
-        ) {
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Started {
-                    name: "generate".to_string(),
-                }))
-                .await;
-
-            for _ in 0..2 {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let _ = event_tx
-                    .send(PipelineEvent::Activity(ActivityEvent::Heartbeat {
-                        activity_name: "generate".to_string(),
-                    }))
-                    .await;
-            }
-
-            cancel.cancelled().await;
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Failed {
-                    name: "generate".to_string(),
-                    error: "cancelled".to_string(),
-                    retryable: false,
-                    detail: FailureDetail::default(),
-                }))
-                .await;
-        }
-    }
-
     let registry = build_registry(vec![
-        Arc::new(HeartbeatThenStallActivity),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::stalling_with_heartbeats("generate", 2, Duration::from_secs(1)).into(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = ReactorConfig {
@@ -539,16 +362,11 @@ async fn generated_content_events_forwarded_to_client_tx() {
     let event_log = test_event_log();
 
     let registry = build_registry(vec![
-        Arc::new(TextGenerateActivity {
-            name: "generate".to_string(),
-            response_text: "streaming token".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::generate("generate")
+            .with_text("streaming token")
+            .build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = reactor_config(simple_pipeline_config("generate"));
@@ -599,16 +417,11 @@ async fn event_log_contains_complete_execution_trace() {
     let event_log = test_event_log();
 
     let registry = build_registry(vec![
-        Arc::new(TextGenerateActivity {
-            name: "generate".to_string(),
-            response_text: "test response".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::generate("generate")
+            .with_text("test response")
+            .build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = reactor_config(simple_pipeline_config("generate"));

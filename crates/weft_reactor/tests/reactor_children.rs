@@ -15,8 +15,8 @@ use weft_reactor::reactor::Reactor;
 use weft_reactor::{RequestId, TenantId};
 
 use harness::{
-    ImmediateDoneActivity, StubAssembleResponse, StubExecuteCommand, TextGenerateActivity,
-    build_registry, reactor_config, simple_pipeline_config, test_event_log, test_request,
+    TestActivity, build_registry, reactor_config, simple_pipeline_config, test_event_log,
+    test_request,
 };
 
 #[allow(unused_imports)]
@@ -33,15 +33,9 @@ fn oncelock_none_before_set_some_after() {
     let event_log: Arc<dyn weft_reactor::event_log::EventLog> =
         Arc::new(weft_reactor::test_support::NullEventLog);
     let registry = build_registry(vec![
-        Arc::new(ImmediateDoneActivity {
-            name: "generate".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::generate("generate").build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
     let services_arc = Arc::new(services);
     let config = reactor_config(simple_pipeline_config("generate"));
@@ -67,15 +61,9 @@ fn oncelock_second_set_returns_err() {
     let event_log: Arc<dyn weft_reactor::event_log::EventLog> =
         Arc::new(weft_reactor::test_support::NullEventLog);
     let registry = build_registry(vec![
-        Arc::new(ImmediateDoneActivity {
-            name: "generate".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::generate("generate").build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
     let services_arc = Arc::new(services);
     let config = reactor_config(simple_pipeline_config("generate"));
@@ -116,15 +104,9 @@ async fn spawn_child_returns_err_at_depth_limit() {
     let event_log: Arc<dyn weft_reactor::event_log::EventLog> =
         Arc::new(weft_reactor::test_support::NullEventLog);
     let registry = build_registry(vec![
-        Arc::new(ImmediateDoneActivity {
-            name: "generate".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::generate("generate").build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
     let config = reactor_config(simple_pipeline_config("generate"));
     let reactor = Reactor::new(Arc::clone(&services), event_log, registry, &config).unwrap();
@@ -167,16 +149,11 @@ async fn spawn_child_creates_child_with_correct_parent_id_and_depth() {
         Arc::new(weft_reactor::test_support::make_test_services_with_response("child response"));
     let event_log = test_event_log();
     let registry = build_registry(vec![
-        Arc::new(TextGenerateActivity {
-            name: "generate".to_string(),
-            response_text: "child response".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::generate("generate")
+            .with_text("child response")
+            .build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
     let config = reactor_config(simple_pipeline_config("generate"));
     let reactor =
@@ -291,16 +268,11 @@ async fn spawn_child_with_cancelled_parent_fails_or_cancels() {
         Arc::new(weft_reactor::test_support::make_test_services_with_response("child response"));
     let event_log = test_event_log();
     let registry = build_registry(vec![
-        Arc::new(TextGenerateActivity {
-            name: "generate".to_string(),
-            response_text: "child response".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::generate("generate")
+            .with_text("child response")
+            .build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
     let config = reactor_config(simple_pipeline_config("generate"));
     let reactor =
@@ -332,4 +304,5 @@ async fn spawn_child_with_cancelled_parent_fails_or_cancels() {
         .await;
 
     let _ = result;
+    // Test passes regardless of result — cancelled parent may succeed or return cancelled.
 }

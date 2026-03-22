@@ -7,27 +7,16 @@ mod harness;
 
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
-
-use weft_reactor::activity::{Activity, ActivityInput};
 use weft_reactor::config::{ActivityRef, LoopHooks, PipelineConfig};
 use weft_reactor::error::ReactorError;
-use weft_reactor::event::{
-    ActivityEvent, FailureDetail, GeneratedEvent, GenerationEvent, HookOutcome, PipelineEvent,
-};
-use weft_reactor::event_log::EventLog;
-use weft_reactor::execution::ExecutionId;
 use weft_reactor::reactor::Reactor;
 use weft_reactor::test_support::{make_test_services, make_test_services_with_blocking_hook};
-use weft_reactor::{ExecutionContext, RequestId, TenantId};
+use weft_reactor::{EventLog, ExecutionContext, RequestId, TenantId};
 
-use weft_core::{HookEvent, Role, Source, WeftMessage};
+use weft_core::HookEvent;
+use weft_reactor_trait::Criticality;
 
-use harness::{
-    ImmediateDoneActivity, StubAssembleResponse, StubExecuteCommand, build_registry,
-    reactor_config, test_event_log, test_request,
-};
+use harness::{TestActivity, build_registry, reactor_config, test_event_log, test_request};
 
 #[allow(unused_imports)]
 use pretty_assertions::{assert_eq, assert_ne};
@@ -40,67 +29,19 @@ async fn hook_block_in_pre_loop_returns_hook_blocked_error() {
     ));
     let event_log = test_event_log();
 
-    struct HookStartActivity;
-
-    #[async_trait::async_trait]
-    impl Activity for HookStartActivity {
-        fn name(&self) -> &str {
-            "hook_request_start"
-        }
-
-        async fn execute(
-            &self,
-            _execution_id: &ExecutionId,
-            _input: ActivityInput,
-            services: &dyn weft_reactor_trait::ServiceLocator,
-            _event_log: &dyn EventLog,
-            event_tx: mpsc::Sender<PipelineEvent>,
-            _cancel: CancellationToken,
-        ) {
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Started {
-                    name: self.name().to_string(),
-                }))
-                .await;
-
-            let result = services
-                .hooks()
-                .run_chain(HookEvent::RequestStart, serde_json::json!({}), None)
-                .await;
-
-            match result {
-                weft_hooks::HookChainResult::Blocked { hook_name, reason } => {
-                    let _ = event_tx
-                        .send(PipelineEvent::Hook(HookOutcome::Blocked {
-                            hook_event: "request_start".to_string(),
-                            hook_name,
-                            reason,
-                        }))
-                        .await;
-                }
-                weft_hooks::HookChainResult::Allowed { .. } => {
-                    let _ = event_tx
-                        .send(PipelineEvent::Activity(ActivityEvent::Completed {
-                            name: self.name().to_string(),
-                            idempotency_key: None,
-                        }))
-                        .await;
-                }
-            }
-        }
-    }
-
+    // HookStartActivity: runs hook chain, emits Blocked or Completed based on result.
     let registry = build_registry(vec![
-        Arc::new(HookStartActivity),
-        Arc::new(ImmediateDoneActivity {
-            name: "generate".to_string(),
+        Arc::new(harness::TestActivity {
+            activity_name: "hook_request_start".to_string(),
+            criticality: Criticality::Critical,
+            behavior: harness::Behavior::RunHook {
+                hook_event: HookEvent::RequestStart,
+                hook_event_name: "request_start".to_string(),
+            },
         }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::generate("generate").build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = reactor_config(PipelineConfig {
@@ -142,117 +83,7 @@ async fn pre_response_hook_block_injects_feedback_and_retries_generation() {
     let event_log = test_event_log();
 
     let gen_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let gen_calls_clone = Arc::clone(&gen_calls);
     let hook_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let hook_calls_clone = Arc::clone(&hook_calls);
-
-    struct CountingDoneActivity {
-        name: String,
-        call_count: Arc<std::sync::atomic::AtomicU32>,
-    }
-
-    #[async_trait::async_trait]
-    impl Activity for CountingDoneActivity {
-        fn name(&self) -> &str {
-            &self.name
-        }
-
-        async fn execute(
-            &self,
-            _execution_id: &ExecutionId,
-            input: ActivityInput,
-            _services: &dyn weft_reactor_trait::ServiceLocator,
-            _event_log: &dyn EventLog,
-            event_tx: mpsc::Sender<PipelineEvent>,
-            _cancel: CancellationToken,
-        ) {
-            self.call_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Started {
-                    name: self.name.clone(),
-                }))
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Generation(GenerationEvent::Chunk(
-                    GeneratedEvent::Done,
-                )))
-                .await;
-            let response_message = WeftMessage {
-                role: Role::Assistant,
-                source: Source::Provider,
-                model: Some("stub-model".to_string()),
-                content: vec![],
-                delta: false,
-                message_index: 0,
-            };
-            let _ = event_tx
-                .send(PipelineEvent::Generation(GenerationEvent::Completed {
-                    model: "stub-model".to_string(),
-                    response_message,
-                    generated_events: vec![GeneratedEvent::Done],
-                    input_tokens: None,
-                    output_tokens: None,
-                }))
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Completed {
-                    name: self.name.clone(),
-                    idempotency_key: input.idempotency_key.clone(),
-                }))
-                .await;
-        }
-    }
-
-    struct BlockOnceThenAllowHook {
-        name: String,
-        call_count: Arc<std::sync::atomic::AtomicU32>,
-        block_reason: String,
-    }
-
-    #[async_trait::async_trait]
-    impl Activity for BlockOnceThenAllowHook {
-        fn name(&self) -> &str {
-            &self.name
-        }
-
-        async fn execute(
-            &self,
-            _execution_id: &ExecutionId,
-            input: ActivityInput,
-            _services: &dyn weft_reactor_trait::ServiceLocator,
-            _event_log: &dyn EventLog,
-            event_tx: mpsc::Sender<PipelineEvent>,
-            _cancel: CancellationToken,
-        ) {
-            let call_n = self
-                .call_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Started {
-                    name: self.name.clone(),
-                }))
-                .await;
-
-            if call_n == 0 {
-                let _ = event_tx
-                    .send(PipelineEvent::Hook(HookOutcome::Blocked {
-                        hook_event: "pre_response".to_string(),
-                        hook_name: self.name.clone(),
-                        reason: self.block_reason.clone(),
-                    }))
-                    .await;
-            } else {
-                let _ = event_tx
-                    .send(PipelineEvent::Activity(ActivityEvent::Completed {
-                        name: self.name.clone(),
-                        idempotency_key: input.idempotency_key.clone(),
-                    }))
-                    .await;
-            }
-        }
-    }
 
     let pipeline_config = PipelineConfig {
         name: "default".to_string(),
@@ -267,20 +98,28 @@ async fn pre_response_hook_block_injects_feedback_and_retries_generation() {
     };
 
     let registry = build_registry(vec![
-        Arc::new(CountingDoneActivity {
-            name: "generate".to_string(),
-            call_count: gen_calls_clone,
+        // CountingDoneActivity: increments call_count, emits Generate Done.
+        Arc::new(harness::TestActivity {
+            activity_name: "generate".to_string(),
+            criticality: Criticality::Critical,
+            behavior: harness::Behavior::PerCall {
+                call_count: Arc::clone(&gen_calls),
+                actions: vec![],
+                default_action: harness::CallAction::Done,
+            },
         }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
-        Arc::new(BlockOnceThenAllowHook {
-            name: "pre_response_hook".to_string(),
-            call_count: hook_calls_clone,
-            block_reason: "content policy violation: try again".to_string(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
+        // BlockOnceThenAllowHook: blocks on first call, allows on subsequent calls.
+        Arc::new(harness::TestActivity {
+            activity_name: "pre_response_hook".to_string(),
+            criticality: Criticality::Critical,
+            behavior: harness::Behavior::HookBlockOnce {
+                hook_event: "pre_response".to_string(),
+                hook_name: "pre_response_hook".to_string(),
+                block_reason: "content policy violation: try again".to_string(),
+                call_count: Arc::clone(&hook_calls),
+            },
         }),
     ]);
 
@@ -334,63 +173,24 @@ async fn pre_response_hook_block_injects_feedback_and_retries_generation() {
 
 #[tokio::test]
 async fn pre_generate_hook_non_critical_failure_degrades_and_continues() {
-    /// Stub hook activity: NonCritical, always emits ActivityEvent::Failed.
-    struct NonCriticalFailingHookActivity;
-
-    #[async_trait::async_trait]
-    impl Activity for NonCriticalFailingHookActivity {
-        fn name(&self) -> &str {
-            "hook_pre_generate"
-        }
-
-        fn criticality(&self) -> weft_reactor_trait::Criticality {
-            weft_reactor_trait::Criticality::NonCritical
-        }
-
-        async fn execute(
-            &self,
-            _execution_id: &ExecutionId,
-            _input: ActivityInput,
-            _services: &dyn weft_reactor_trait::ServiceLocator,
-            _event_log: &dyn EventLog,
-            event_tx: mpsc::Sender<PipelineEvent>,
-            _cancel: CancellationToken,
-        ) {
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Started {
-                    name: "hook_pre_generate".to_string(),
-                }))
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Failed {
-                    name: "hook_pre_generate".to_string(),
-                    error: "hook runner unavailable".to_string(),
-                    retryable: false,
-                    detail: FailureDetail {
-                        error_code: "hook_runner_error".to_string(),
-                        detail: serde_json::Value::Null,
-                        cause: None,
-                        attempted: None,
-                        fallback: None,
-                    },
-                }))
-                .await;
-        }
-    }
-
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
     let registry = build_registry(vec![
-        Arc::new(NonCriticalFailingHookActivity),
-        Arc::new(ImmediateDoneActivity {
-            name: "generate".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        // NonCriticalFailingHookActivity: NonCritical, always emits ActivityEvent::Failed.
+        TestActivity::failing("hook_pre_generate")
+            .with_criticality(Criticality::NonCritical)
+            .with_error("hook runner unavailable")
+            .with_detail(weft_reactor::event::FailureDetail {
+                error_code: "hook_runner_error".to_string(),
+                detail: serde_json::Value::Null,
+                cause: None,
+                attempted: None,
+                fallback: None,
+            })
+            .build(),
+        TestActivity::generate("generate").build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = reactor_config(PipelineConfig {
@@ -462,61 +262,23 @@ async fn pre_generate_hook_non_critical_failure_degrades_and_continues() {
 
 #[tokio::test]
 async fn pre_generate_hook_critical_failure_terminates_execution() {
-    /// Stub hook activity: Critical (default), always emits ActivityEvent::Failed.
-    struct CriticalFailingHookActivity;
-
-    #[async_trait::async_trait]
-    impl Activity for CriticalFailingHookActivity {
-        fn name(&self) -> &str {
-            "hook_pre_generate"
-        }
-
-        // criticality() defaults to Critical — no override needed.
-
-        async fn execute(
-            &self,
-            _execution_id: &ExecutionId,
-            _input: ActivityInput,
-            _services: &dyn weft_reactor_trait::ServiceLocator,
-            _event_log: &dyn EventLog,
-            event_tx: mpsc::Sender<PipelineEvent>,
-            _cancel: CancellationToken,
-        ) {
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Started {
-                    name: "hook_pre_generate".to_string(),
-                }))
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Failed {
-                    name: "hook_pre_generate".to_string(),
-                    error: "critical hook failure".to_string(),
-                    retryable: false,
-                    detail: FailureDetail {
-                        error_code: "hook_critical_error".to_string(),
-                        detail: serde_json::Value::Null,
-                        cause: None,
-                        attempted: None,
-                        fallback: None,
-                    },
-                }))
-                .await;
-        }
-    }
-
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
     let registry = build_registry(vec![
-        Arc::new(CriticalFailingHookActivity),
-        Arc::new(ImmediateDoneActivity {
-            name: "generate".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        // CriticalFailingHookActivity: Critical (default), always emits ActivityEvent::Failed.
+        TestActivity::failing("hook_pre_generate")
+            .with_error("critical hook failure")
+            .with_detail(weft_reactor::event::FailureDetail {
+                error_code: "hook_critical_error".to_string(),
+                detail: serde_json::Value::Null,
+                cause: None,
+                attempted: None,
+                fallback: None,
+            })
+            .build(),
+        TestActivity::generate("generate").build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = reactor_config(PipelineConfig {
@@ -556,59 +318,25 @@ async fn pre_generate_hook_critical_failure_terminates_execution() {
 
 #[tokio::test]
 async fn pre_generate_hook_blocked_terminates_regardless_of_criticality() {
-    /// Stub hook activity: NonCritical, emits HookOutcome::Blocked.
-    ///
-    /// Uses NonCritical to confirm that criticality is irrelevant for blocked events.
-    struct BlockingNonCriticalHookActivity;
-
-    #[async_trait::async_trait]
-    impl Activity for BlockingNonCriticalHookActivity {
-        fn name(&self) -> &str {
-            "hook_pre_generate"
-        }
-
-        fn criticality(&self) -> weft_reactor_trait::Criticality {
-            // Intentionally non-critical to verify that Blocked is always fatal.
-            weft_reactor_trait::Criticality::NonCritical
-        }
-
-        async fn execute(
-            &self,
-            _execution_id: &ExecutionId,
-            _input: ActivityInput,
-            _services: &dyn weft_reactor_trait::ServiceLocator,
-            _event_log: &dyn EventLog,
-            event_tx: mpsc::Sender<PipelineEvent>,
-            _cancel: CancellationToken,
-        ) {
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Started {
-                    name: "hook_pre_generate".to_string(),
-                }))
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Hook(HookOutcome::Blocked {
-                    hook_event: "pre_generate".to_string(),
-                    hook_name: "policy_guard".to_string(),
-                    reason: "blocked by pre_generate policy".to_string(),
-                }))
-                .await;
-        }
-    }
-
+    // BlockingNonCriticalHookActivity: NonCritical, emits HookOutcome::Blocked.
+    // Uses NonCritical to confirm that criticality is irrelevant for blocked events.
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
     let registry = build_registry(vec![
-        Arc::new(BlockingNonCriticalHookActivity),
-        Arc::new(ImmediateDoneActivity {
-            name: "generate".to_string(),
+        Arc::new(harness::TestActivity {
+            activity_name: "hook_pre_generate".to_string(),
+            criticality: Criticality::NonCritical,
+            behavior: harness::Behavior::HookBlockOnce {
+                hook_event: "pre_generate".to_string(),
+                hook_name: "policy_guard".to_string(),
+                block_reason: "blocked by pre_generate policy".to_string(),
+                // Always block (call_count never reaches 1 because test ends on first block).
+                call_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            },
         }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::generate("generate").build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = reactor_config(PipelineConfig {

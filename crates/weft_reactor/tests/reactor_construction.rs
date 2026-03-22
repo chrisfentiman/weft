@@ -14,10 +14,7 @@ use weft_reactor::error::ReactorError;
 use weft_reactor::reactor::Reactor;
 use weft_reactor::test_support::make_test_services;
 
-use harness::{
-    ImmediateDoneActivity, StubAssembleResponse, StubExecuteCommand, build_registry,
-    reactor_config, test_event_log,
-};
+use harness::{TestActivity, build_registry, reactor_config, test_event_log};
 
 #[allow(unused_imports)]
 use pretty_assertions::{assert_eq, assert_ne};
@@ -27,15 +24,9 @@ fn reactor_new_missing_default_pipeline_returns_error() {
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
     let registry = build_registry(vec![
-        Arc::new(ImmediateDoneActivity {
-            name: "generate".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::generate("generate").build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
     let config = ReactorConfig {
         pipelines: vec![PipelineConfig {
@@ -69,12 +60,8 @@ fn reactor_new_unknown_activity_returns_error() {
     let event_log = test_event_log();
     // Registry has no "nonexistent" activity.
     let registry = build_registry(vec![
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
     let config = reactor_config(PipelineConfig {
         name: "default".to_string(),
@@ -97,15 +84,9 @@ fn reactor_new_activity_with_retry_resolves_correctly() {
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
     let registry = build_registry(vec![
-        Arc::new(ImmediateDoneActivity {
-            name: "generate".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::generate("generate").build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
     let config = ReactorConfig {
         pipelines: vec![PipelineConfig {

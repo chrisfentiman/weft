@@ -6,26 +6,18 @@
 
 mod harness;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
-
-use weft_reactor::activity::{Activity, ActivityInput};
 use weft_reactor::config::{ActivityRef, LoopHooks, PipelineConfig};
-use weft_reactor::event::{ActivityEvent, FailureDetail, PipelineEvent, SelectionEvent};
-use weft_reactor::event_log::EventLog;
-use weft_reactor::execution::ExecutionId;
+use weft_reactor::event::{FailureDetail, PipelineEvent, SelectionEvent};
 use weft_reactor::reactor::Reactor;
 use weft_reactor::test_support::make_test_services;
-use weft_reactor::{ExecutionContext, RequestId, TenantId};
+use weft_reactor::{EventLog, ExecutionContext, RequestId, TenantId};
+use weft_reactor_trait::Criticality;
 
 use harness::{
-    FailingNonCriticalActivity, FailingSemiCriticalActivity, ImmediateDoneActivity,
-    StubAssembleResponse, StubCommandFormattingActivity, StubCommandSelectionActivity,
-    StubExecuteCommand, StubModelSelectionActivity, StubProviderResolutionActivity,
-    StubSamplingAdjustmentActivity, StubSystemPromptAssemblyActivity, StubValidateActivity,
-    build_registry, new_preloop_pipeline_config, reactor_config, test_event_log, test_request,
+    TestActivity, build_registry, new_preloop_pipeline_config, reactor_config, test_event_log,
+    test_request,
 };
 
 #[allow(unused_imports)]
@@ -40,26 +32,26 @@ async fn non_critical_command_selection_failure_degrades_and_continues() {
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
     let registry = build_registry(vec![
-        Arc::new(StubValidateActivity),
-        Arc::new(StubModelSelectionActivity),
+        TestActivity::validate_stub(),
+        TestActivity::model_selection_stub(),
         // command_selection fails with NonCritical → should degrade and continue
-        Arc::new(FailingNonCriticalActivity {
-            activity_name: "command_selection".to_string(),
-            error_code: "classifier_unavailable".to_string(),
-        }),
-        Arc::new(StubProviderResolutionActivity),
-        Arc::new(StubSystemPromptAssemblyActivity),
-        Arc::new(StubCommandFormattingActivity),
-        Arc::new(StubSamplingAdjustmentActivity),
-        Arc::new(ImmediateDoneActivity {
-            name: "generate".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::failing("command_selection")
+            .with_criticality(Criticality::NonCritical)
+            .with_detail(FailureDetail {
+                error_code: "classifier_unavailable".to_string(),
+                detail: serde_json::Value::Null,
+                cause: None,
+                attempted: None,
+                fallback: None,
+            })
+            .build(),
+        TestActivity::provider_resolution_stub(),
+        TestActivity::system_prompt_assembly_stub(),
+        TestActivity::command_formatting_stub(),
+        TestActivity::sampling_adjustment_stub(),
+        TestActivity::generate("generate").build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = reactor_config(new_preloop_pipeline_config("generate"));
@@ -99,7 +91,6 @@ async fn non_critical_command_selection_failure_degrades_and_continues() {
     );
 
     // The degradation should mention command_selection.
-    // Payload structure: {"category": "Execution", "event": {"type": "Degraded", "notice": {...}}}
     let has_command_selection_degradation = degraded_events.iter().any(|e| {
         e.payload
             .get("event")
@@ -119,59 +110,29 @@ async fn non_critical_command_selection_failure_degrades_and_continues() {
 /// Verifies spec Section 4.2: Critical activities still fail the request.
 #[tokio::test]
 async fn critical_activity_failure_terminates_execution() {
-    struct FailingCriticalActivity;
-
-    #[async_trait::async_trait]
-    impl Activity for FailingCriticalActivity {
-        fn name(&self) -> &str {
-            "validate"
-        }
-        // criticality() defaults to Critical — no override needed.
-        async fn execute(
-            &self,
-            _execution_id: &ExecutionId,
-            _input: ActivityInput,
-            _services: &dyn weft_reactor_trait::ServiceLocator,
-            _event_log: &dyn EventLog,
-            event_tx: mpsc::Sender<PipelineEvent>,
-            _cancel: CancellationToken,
-        ) {
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Failed {
-                    name: "validate".to_string(),
-                    error: "empty messages".to_string(),
-                    retryable: false,
-                    detail: FailureDetail {
-                        error_code: "empty_messages".to_string(),
-                        detail: serde_json::Value::Null,
-                        cause: None,
-                        attempted: None,
-                        fallback: None,
-                    },
-                }))
-                .await;
-        }
-    }
-
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
     let registry = build_registry(vec![
-        Arc::new(FailingCriticalActivity),
-        Arc::new(StubModelSelectionActivity),
-        Arc::new(StubCommandSelectionActivity),
-        Arc::new(StubProviderResolutionActivity),
-        Arc::new(StubSystemPromptAssemblyActivity),
-        Arc::new(StubCommandFormattingActivity),
-        Arc::new(StubSamplingAdjustmentActivity),
-        Arc::new(ImmediateDoneActivity {
-            name: "generate".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        // FailingCriticalActivity: Critical (default), emits Failed.
+        TestActivity::failing("validate")
+            .with_error("empty messages")
+            .with_detail(FailureDetail {
+                error_code: "empty_messages".to_string(),
+                detail: serde_json::Value::Null,
+                cause: None,
+                attempted: None,
+                fallback: None,
+            })
+            .build(),
+        TestActivity::model_selection_stub(),
+        TestActivity::command_selection_stub(),
+        TestActivity::provider_resolution_stub(),
+        TestActivity::system_prompt_assembly_stub(),
+        TestActivity::command_formatting_stub(),
+        TestActivity::sampling_adjustment_stub(),
+        TestActivity::generate("generate").build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = reactor_config(new_preloop_pipeline_config("generate"));
@@ -206,29 +167,35 @@ async fn multiple_non_critical_degradations_accumulate() {
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
     let registry = build_registry(vec![
-        Arc::new(StubValidateActivity),
-        Arc::new(StubModelSelectionActivity),
+        TestActivity::validate_stub(),
+        TestActivity::model_selection_stub(),
         // Two non-critical failures.
-        Arc::new(FailingNonCriticalActivity {
-            activity_name: "command_selection".to_string(),
-            error_code: "classifier_unavailable".to_string(),
-        }),
-        Arc::new(StubProviderResolutionActivity),
-        Arc::new(FailingNonCriticalActivity {
-            activity_name: "system_prompt_assembly".to_string(),
-            error_code: "template_error".to_string(),
-        }),
-        Arc::new(StubCommandFormattingActivity),
-        Arc::new(StubSamplingAdjustmentActivity),
-        Arc::new(ImmediateDoneActivity {
-            name: "generate".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::failing("command_selection")
+            .with_criticality(Criticality::NonCritical)
+            .with_detail(FailureDetail {
+                error_code: "classifier_unavailable".to_string(),
+                detail: serde_json::Value::Null,
+                cause: None,
+                attempted: None,
+                fallback: None,
+            })
+            .build(),
+        TestActivity::provider_resolution_stub(),
+        TestActivity::failing("system_prompt_assembly")
+            .with_criticality(Criticality::NonCritical)
+            .with_detail(FailureDetail {
+                error_code: "template_error".to_string(),
+                detail: serde_json::Value::Null,
+                cause: None,
+                attempted: None,
+                fallback: None,
+            })
+            .build(),
+        TestActivity::command_formatting_stub(),
+        TestActivity::sampling_adjustment_stub(),
+        TestActivity::generate("generate").build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = reactor_config(new_preloop_pipeline_config("generate"));
@@ -274,86 +241,49 @@ async fn multiple_non_critical_degradations_accumulate() {
 /// succeeds (ProviderResolutionActivity receives a non-empty selected_model).
 #[tokio::test]
 async fn semi_critical_model_selection_uses_default_model() {
-    // This ProviderResolutionActivity captures the model_selection result from
-    // metadata injected by the reactor.
-    struct CapturingProviderResolution {
-        received_model: std::sync::Arc<std::sync::Mutex<Option<String>>>,
-    }
+    let received_model = Arc::new(Mutex::new(None::<String>));
+    let received_model_clone = Arc::clone(&received_model);
 
-    #[async_trait::async_trait]
-    impl Activity for CapturingProviderResolution {
-        fn name(&self) -> &str {
-            "provider_resolution"
-        }
-
-        async fn execute(
-            &self,
-            _execution_id: &ExecutionId,
-            input: ActivityInput,
-            _services: &dyn weft_reactor_trait::ServiceLocator,
-            _event_log: &dyn EventLog,
-            event_tx: mpsc::Sender<PipelineEvent>,
-            _cancel: CancellationToken,
-        ) {
-            // Capture what selected_model was injected as metadata.
-            let selected = input
-                .metadata
-                .get("selected_model")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            *self.received_model.lock().unwrap() = selected;
-
-            // Emit ProviderResolved with the received model to allow execution to continue.
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Started {
-                    name: self.name().to_string(),
-                }))
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Selection(SelectionEvent::ProviderResolved {
-                    model_name: "stub-model".to_string(),
-                    model_id: "stub-model-v1".to_string(),
-                    provider_name: "stub".to_string(),
-                    capabilities: vec![],
-                    max_tokens: 4096,
-                }))
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Completed {
-                    name: self.name().to_string(),
-                    idempotency_key: None,
-                }))
-                .await;
-        }
-    }
-
-    let received_model = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
-    let received_model_clone = std::sync::Arc::clone(&received_model);
+    // CaptureAndEmit: captures selected_model from metadata, emits ProviderResolved.
+    let provider_resolution = Arc::new(harness::TestActivity {
+        activity_name: "provider_resolution".to_string(),
+        criticality: Criticality::Critical,
+        behavior: harness::Behavior::CaptureAndEmit {
+            capture_field: "selected_model".to_string(),
+            captured: received_model_clone,
+            events: vec![PipelineEvent::Selection(SelectionEvent::ProviderResolved {
+                model_name: "stub-model".to_string(),
+                model_id: "stub-model-v1".to_string(),
+                provider_name: "stub".to_string(),
+                capabilities: vec![],
+                max_tokens: 4096,
+            })],
+        },
+    });
 
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
     let registry = build_registry(vec![
-        Arc::new(StubValidateActivity),
+        TestActivity::validate_stub(),
         // model_selection fails with SemiCritical → should use default model
-        Arc::new(FailingSemiCriticalActivity {
-            activity_name: "model_selection".to_string(),
-        }),
-        Arc::new(StubCommandSelectionActivity),
-        Arc::new(CapturingProviderResolution {
-            received_model: received_model_clone,
-        }),
-        Arc::new(StubSystemPromptAssemblyActivity),
-        Arc::new(StubCommandFormattingActivity),
-        Arc::new(StubSamplingAdjustmentActivity),
-        Arc::new(ImmediateDoneActivity {
-            name: "generate".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::failing("model_selection")
+            .with_criticality(Criticality::SemiCritical)
+            .with_detail(FailureDetail {
+                error_code: "no_matching_model".to_string(),
+                detail: serde_json::Value::Null,
+                cause: None,
+                attempted: None,
+                fallback: None,
+            })
+            .build(),
+        TestActivity::command_selection_stub(),
+        provider_resolution,
+        TestActivity::system_prompt_assembly_stub(),
+        TestActivity::command_formatting_stub(),
+        TestActivity::sampling_adjustment_stub(),
+        TestActivity::generate("generate").build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = reactor_config(new_preloop_pipeline_config("generate"));
@@ -398,20 +328,14 @@ async fn execution_result_degradations_empty_on_success() {
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
     let registry = build_registry(vec![
-        Arc::new(StubModelSelectionActivity),
-        Arc::new(StubCommandSelectionActivity),
-        Arc::new(StubProviderResolutionActivity),
-        Arc::new(StubCommandFormattingActivity),
-        Arc::new(StubSamplingAdjustmentActivity),
-        Arc::new(ImmediateDoneActivity {
-            name: "generate".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::model_selection_stub(),
+        TestActivity::command_selection_stub(),
+        TestActivity::provider_resolution_stub(),
+        TestActivity::command_formatting_stub(),
+        TestActivity::sampling_adjustment_stub(),
+        TestActivity::generate("generate").build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = reactor_config(PipelineConfig {
@@ -466,23 +390,23 @@ async fn execution_result_degradations_populated_from_state() {
     let event_log = test_event_log();
     let registry = build_registry(vec![
         // command_selection fails non-critically → should add a DegradationNotice
-        Arc::new(FailingNonCriticalActivity {
-            activity_name: "command_selection".to_string(),
-            error_code: "classifier_unavailable".to_string(),
-        }),
-        Arc::new(StubModelSelectionActivity),
-        Arc::new(StubProviderResolutionActivity),
-        Arc::new(StubCommandFormattingActivity),
-        Arc::new(StubSamplingAdjustmentActivity),
-        Arc::new(ImmediateDoneActivity {
-            name: "generate".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::failing("command_selection")
+            .with_criticality(Criticality::NonCritical)
+            .with_detail(FailureDetail {
+                error_code: "classifier_unavailable".to_string(),
+                detail: serde_json::Value::Null,
+                cause: None,
+                attempted: None,
+                fallback: None,
+            })
+            .build(),
+        TestActivity::model_selection_stub(),
+        TestActivity::provider_resolution_stub(),
+        TestActivity::command_formatting_stub(),
+        TestActivity::sampling_adjustment_stub(),
+        TestActivity::generate("generate").build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = reactor_config(PipelineConfig {

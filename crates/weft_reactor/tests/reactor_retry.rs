@@ -8,30 +8,15 @@ mod harness;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
-
-use weft_reactor::activity::{Activity, ActivityInput};
 use weft_reactor::budget::Budget;
 use weft_reactor::config::{
     ActivityRef, BudgetConfig, LoopHooks, PipelineConfig, ReactorConfig, RetryPolicy,
 };
-use weft_reactor::event::{
-    ActivityEvent, FailureDetail, GeneratedEvent, GenerationEvent, PipelineEvent, SignalEvent,
-};
-use weft_reactor::event_log::EventLog;
-use weft_reactor::execution::ExecutionId;
 use weft_reactor::reactor::Reactor;
-use weft_reactor::signal::Signal;
 use weft_reactor::test_support::make_test_services;
-use weft_reactor::{ExecutionContext, RequestId, TenantId};
+use weft_reactor::{EventLog, ExecutionContext, RequestId, TenantId};
 
-use weft_core::ContentPart;
-
-use harness::{
-    AlwaysFailActivity, FailThenSucceedActivity, StubAssembleResponse, StubExecuteCommand,
-    build_registry, test_event_log, test_request,
-};
+use harness::{TestActivity, build_registry, test_event_log, test_request};
 
 #[allow(unused_imports)]
 use pretty_assertions::{assert_eq, assert_ne};
@@ -42,13 +27,9 @@ async fn generate_fails_once_then_succeeds_with_retry() {
     let event_log = test_event_log();
 
     let registry = build_registry(vec![
-        Arc::new(FailThenSucceedActivity::new("generate", 1)),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::generate("generate").fails_then_succeeds(1),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = ReactorConfig {
@@ -116,17 +97,12 @@ async fn generate_not_retried_when_retryable_false() {
     let event_log = test_event_log();
 
     let registry = build_registry(vec![
-        Arc::new(AlwaysFailActivity {
-            name: "generate".to_string(),
-            retryable: false,
-            error_msg: "auth error".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::failing("generate")
+            .with_error("auth error")
+            .retryable(false)
+            .build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = ReactorConfig {
@@ -185,17 +161,12 @@ async fn retry_exhaustion_returns_error() {
     let event_log = test_event_log();
 
     let registry = build_registry(vec![
-        Arc::new(AlwaysFailActivity {
-            name: "generate".to_string(),
-            retryable: true,
-            error_msg: "transient error".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::failing("generate")
+            .with_error("transient error")
+            .retryable(true)
+            .build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = ReactorConfig {
@@ -254,17 +225,12 @@ async fn retry_skipped_when_budget_exhausted() {
     let event_log = test_event_log();
 
     let registry = build_registry(vec![
-        Arc::new(AlwaysFailActivity {
-            name: "generate".to_string(),
-            retryable: true,
-            error_msg: "transient error".to_string(),
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::failing("generate")
+            .with_error("transient error")
+            .retryable(true)
+            .build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = ReactorConfig {
@@ -346,6 +312,16 @@ async fn cancel_during_retry_backoff_terminates_execution() {
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
 
+    // Activity that emits cancel signal then fails with retryable=true.
+    // The cancel fires before the retry backoff can complete.
+    use std::sync::Arc as StdArc;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+    use weft_reactor::activity::{Activity, ActivityInput};
+    use weft_reactor::event::{ActivityEvent, FailureDetail, PipelineEvent as PE, SignalEvent};
+    use weft_reactor::execution::ExecutionId;
+    use weft_reactor::signal::Signal;
+
     struct FailWithCancelActivity;
 
     #[async_trait::async_trait]
@@ -360,23 +336,21 @@ async fn cancel_during_retry_backoff_terminates_execution() {
             _input: ActivityInput,
             _services: &dyn weft_reactor_trait::ServiceLocator,
             _event_log: &dyn EventLog,
-            event_tx: mpsc::Sender<PipelineEvent>,
+            event_tx: mpsc::Sender<PE>,
             _cancel: CancellationToken,
         ) {
             let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Started {
+                .send(PE::Activity(ActivityEvent::Started {
                     name: "generate".to_string(),
                 }))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::Signal(SignalEvent::Received(
-                    Signal::Cancel {
-                        reason: "cancel during backoff".to_string(),
-                    },
-                )))
+                .send(PE::Signal(SignalEvent::Received(Signal::Cancel {
+                    reason: "cancel during backoff".to_string(),
+                })))
                 .await;
             let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Failed {
+                .send(PE::Activity(ActivityEvent::Failed {
                     name: "generate".to_string(),
                     error: "transient failure".to_string(),
                     retryable: true,
@@ -387,13 +361,9 @@ async fn cancel_during_retry_backoff_terminates_execution() {
     }
 
     let registry = build_registry(vec![
-        Arc::new(FailWithCancelActivity),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        StdArc::new(FailWithCancelActivity),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = ReactorConfig {
@@ -429,8 +399,8 @@ async fn cancel_during_retry_backoff_terminates_execution() {
     let reactor = Reactor::new(services, event_log.clone(), registry, &config)
         .expect("reactor should construct");
 
-    let reactor_arc = Arc::new(reactor);
-    let reactor_ref = Arc::clone(&reactor_arc);
+    let reactor_arc = StdArc::new(reactor);
+    let reactor_ref = StdArc::clone(&reactor_arc);
 
     let handle = tokio::spawn(async move {
         reactor_ref
@@ -481,63 +451,10 @@ async fn per_chunk_timeout_resets_after_each_chunk() {
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
 
-    struct OneChunkThenStallActivity;
-
-    #[async_trait::async_trait]
-    impl Activity for OneChunkThenStallActivity {
-        fn name(&self) -> &str {
-            "generate"
-        }
-
-        async fn execute(
-            &self,
-            _execution_id: &ExecutionId,
-            _input: ActivityInput,
-            _services: &dyn weft_reactor_trait::ServiceLocator,
-            _event_log: &dyn EventLog,
-            event_tx: mpsc::Sender<PipelineEvent>,
-            cancel: CancellationToken,
-        ) {
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Started {
-                    name: "generate".to_string(),
-                }))
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Generation(GenerationEvent::Started {
-                    model: "stub-model".to_string(),
-                    message_count: 1,
-                }))
-                .await;
-
-            let _ = event_tx
-                .send(PipelineEvent::Generation(GenerationEvent::Chunk(
-                    GeneratedEvent::Content {
-                        part: ContentPart::Text("first chunk".to_string()),
-                    },
-                )))
-                .await;
-
-            cancel.cancelled().await;
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Failed {
-                    name: "generate".to_string(),
-                    error: "cancelled".to_string(),
-                    retryable: false,
-                    detail: FailureDetail::default(),
-                }))
-                .await;
-        }
-    }
-
     let registry = build_registry(vec![
-        Arc::new(OneChunkThenStallActivity),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::stalling_after_chunk("generate", "first chunk").into(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = ReactorConfig {

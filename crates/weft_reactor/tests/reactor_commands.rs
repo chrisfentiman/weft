@@ -8,24 +8,14 @@ mod harness;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
-
-use weft_reactor::activity::{Activity, ActivityInput};
-use weft_reactor::event::{
-    ActivityEvent, FailureDetail, GeneratedEvent, GenerationEvent, PipelineEvent,
-};
-use weft_reactor::event_log::EventLog;
-use weft_reactor::execution::ExecutionId;
+use weft_reactor::event::FailureDetail;
 use weft_reactor::reactor::Reactor;
 use weft_reactor::test_support::make_test_services;
-use weft_reactor::{ExecutionContext, RequestId, TenantId};
-
-use weft_core::{CommandAction, CommandInvocation, ContentPart, Role, Source, WeftMessage};
+use weft_reactor::{EventLog, ExecutionContext, RequestId, TenantId};
 
 use harness::{
-    StubAssembleResponse, build_registry, reactor_config, simple_pipeline_config, test_event_log,
-    test_request,
+    CallAction, TestActivity, build_registry, failing_execute_command, hanging_execute_command,
+    reactor_config, simple_pipeline_config, test_event_log, test_request,
 };
 
 #[allow(unused_imports)]
@@ -37,98 +27,14 @@ async fn command_iteration_loop_executes_command_then_calls_generate_again() {
     let event_log = test_event_log();
 
     let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let call_count_clone = Arc::clone(&call_count);
-
-    struct CommandThenDoneActivity {
-        call_count: Arc<std::sync::atomic::AtomicU32>,
-    }
-
-    #[async_trait::async_trait]
-    impl Activity for CommandThenDoneActivity {
-        fn name(&self) -> &str {
-            "generate"
-        }
-
-        async fn execute(
-            &self,
-            _execution_id: &ExecutionId,
-            input: ActivityInput,
-            _services: &dyn weft_reactor_trait::ServiceLocator,
-            _event_log: &dyn EventLog,
-            event_tx: mpsc::Sender<PipelineEvent>,
-            _cancel: CancellationToken,
-        ) {
-            let call_n = self
-                .call_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Started {
-                    name: "generate".to_string(),
-                }))
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Generation(GenerationEvent::Started {
-                    model: "stub-model".to_string(),
-                    message_count: input.messages.len(),
-                }))
-                .await;
-
-            if call_n == 0 {
-                let invocation = CommandInvocation {
-                    name: "test_command".to_string(),
-                    action: CommandAction::Execute,
-                    arguments: serde_json::json!({"arg": "value"}),
-                };
-                let _ = event_tx
-                    .send(PipelineEvent::Generation(GenerationEvent::Chunk(
-                        GeneratedEvent::CommandInvocation(invocation),
-                    )))
-                    .await;
-            }
-
-            let _ = event_tx
-                .send(PipelineEvent::Generation(GenerationEvent::Chunk(
-                    GeneratedEvent::Done,
-                )))
-                .await;
-
-            let response_message = WeftMessage {
-                role: Role::Assistant,
-                source: Source::Provider,
-                model: Some("stub-model".to_string()),
-                content: vec![],
-                delta: false,
-                message_index: 0,
-            };
-            let _ = event_tx
-                .send(PipelineEvent::Generation(GenerationEvent::Completed {
-                    model: "stub-model".to_string(),
-                    response_message,
-                    generated_events: vec![GeneratedEvent::Done],
-                    input_tokens: None,
-                    output_tokens: None,
-                }))
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Completed {
-                    name: "generate".to_string(),
-                    idempotency_key: input.idempotency_key.clone(),
-                }))
-                .await;
-        }
-    }
 
     let registry = build_registry(vec![
-        Arc::new(CommandThenDoneActivity {
-            call_count: call_count_clone,
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(harness::StubExecuteCommand {
-            name: "execute_command".to_string(),
-        }),
+        TestActivity::generate("generate")
+            .invokes_commands(vec!["test_command"])
+            .with_call_count(Arc::clone(&call_count))
+            .build(),
+        TestActivity::assemble_response().into(),
+        TestActivity::execute_command().into(),
     ]);
 
     let config = reactor_config(simple_pipeline_config("generate"));
@@ -181,144 +87,27 @@ async fn command_iteration_loop_executes_command_then_calls_generate_again() {
 async fn command_failure_injects_error_message_and_continues() {
     use pretty_assertions::assert_eq;
 
-    /// Activity that invokes a command on the first generate call, then Done.
-    struct InvokeCommandActivity {
-        call_count: Arc<std::sync::atomic::AtomicU32>,
-    }
-
-    #[async_trait::async_trait]
-    impl Activity for InvokeCommandActivity {
-        fn name(&self) -> &str {
-            "generate"
-        }
-
-        async fn execute(
-            &self,
-            _execution_id: &ExecutionId,
-            input: ActivityInput,
-            _services: &dyn weft_reactor_trait::ServiceLocator,
-            _event_log: &dyn EventLog,
-            event_tx: mpsc::Sender<PipelineEvent>,
-            _cancel: CancellationToken,
-        ) {
-            let call_n = self
-                .call_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Started {
-                    name: "generate".to_string(),
-                }))
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Generation(GenerationEvent::Started {
-                    model: "stub-model".to_string(),
-                    message_count: input.messages.len(),
-                }))
-                .await;
-
-            if call_n == 0 {
-                // First call: request a command invocation.
-                let _ = event_tx
-                    .send(PipelineEvent::Generation(GenerationEvent::Chunk(
-                        GeneratedEvent::CommandInvocation(CommandInvocation {
-                            name: "failing_tool".to_string(),
-                            action: CommandAction::Execute,
-                            arguments: serde_json::json!({}),
-                        }),
-                    )))
-                    .await;
-            }
-
-            let _ = event_tx
-                .send(PipelineEvent::Generation(GenerationEvent::Chunk(
-                    GeneratedEvent::Done,
-                )))
-                .await;
-
-            let response_message = WeftMessage {
-                role: Role::Assistant,
-                source: Source::Provider,
-                model: Some("stub-model".to_string()),
-                content: vec![],
-                delta: false,
-                message_index: 0,
-            };
-            let _ = event_tx
-                .send(PipelineEvent::Generation(GenerationEvent::Completed {
-                    model: "stub-model".to_string(),
-                    response_message,
-                    generated_events: vec![GeneratedEvent::Done],
-                    input_tokens: None,
-                    output_tokens: None,
-                }))
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Completed {
-                    name: "generate".to_string(),
-                    idempotency_key: input.idempotency_key.clone(),
-                }))
-                .await;
-        }
-    }
-
-    /// Activity that always pushes `ActivityEvent::Failed` (simulates infrastructure error).
-    struct FailingExecuteCommandActivity;
-
-    #[async_trait::async_trait]
-    impl Activity for FailingExecuteCommandActivity {
-        fn name(&self) -> &str {
-            "execute_command"
-        }
-
-        fn criticality(&self) -> weft_reactor_trait::Criticality {
-            weft_reactor_trait::Criticality::NonCritical
-        }
-
-        async fn execute(
-            &self,
-            _execution_id: &ExecutionId,
-            _input: ActivityInput,
-            _services: &dyn weft_reactor_trait::ServiceLocator,
-            _event_log: &dyn EventLog,
-            event_tx: mpsc::Sender<PipelineEvent>,
-            _cancel: CancellationToken,
-        ) {
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Started {
-                    name: "execute_command".to_string(),
-                }))
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Failed {
-                    name: "execute_command".to_string(),
-                    error: "command not found: failing_tool".to_string(),
-                    retryable: false,
-                    detail: FailureDetail {
-                        error_code: "command_not_found".to_string(),
-                        detail: serde_json::json!({ "command_name": "failing_tool" }),
-                        cause: Some("command not found: failing_tool".to_string()),
-                        attempted: Some("execute command failing_tool".to_string()),
-                        fallback: None,
-                    },
-                }))
-                .await;
-        }
-    }
-
     let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let call_count_clone = Arc::clone(&call_count);
 
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
     let registry = build_registry(vec![
-        Arc::new(InvokeCommandActivity {
-            call_count: call_count_clone,
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(FailingExecuteCommandActivity),
+        // First call invokes a command; second call returns Done.
+        TestActivity::generate("generate")
+            .invokes_commands(vec!["failing_tool"])
+            .with_call_count(Arc::clone(&call_count))
+            .build(),
+        TestActivity::assemble_response().into(),
+        failing_execute_command(
+            "command not found: failing_tool",
+            FailureDetail {
+                error_code: "command_not_found".to_string(),
+                detail: serde_json::json!({ "command_name": "failing_tool" }),
+                cause: Some("command not found: failing_tool".to_string()),
+                attempted: Some("execute command failing_tool".to_string()),
+                fallback: None,
+            },
+        ),
     ]);
 
     let config = reactor_config(simple_pipeline_config("generate"));
@@ -391,126 +180,28 @@ async fn command_failure_injects_error_message_and_continues() {
 async fn command_timeout_injects_error_message_and_continues() {
     use pretty_assertions::assert_eq;
 
-    /// Generate that invokes a command once, then Done.
-    struct InvokeOnceActivity;
-
-    #[async_trait::async_trait]
-    impl Activity for InvokeOnceActivity {
-        fn name(&self) -> &str {
-            "generate"
-        }
-
-        async fn execute(
-            &self,
-            _execution_id: &ExecutionId,
-            input: ActivityInput,
-            _services: &dyn weft_reactor_trait::ServiceLocator,
-            _event_log: &dyn EventLog,
-            event_tx: mpsc::Sender<PipelineEvent>,
-            _cancel: CancellationToken,
-        ) {
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Started {
-                    name: "generate".to_string(),
-                }))
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Generation(GenerationEvent::Started {
-                    model: "stub-model".to_string(),
-                    message_count: input.messages.len(),
-                }))
-                .await;
-
-            // Only request command on first call. On the second call just return Done.
-            // We detect "second call" by checking if messages contain the injected error.
-            let already_has_error = input.messages.iter().any(|m| {
-                m.content
-                    .iter()
-                    .any(|c| matches!(c, ContentPart::Text(t) if t.contains("failed")))
-            });
-
-            if !already_has_error {
-                let _ = event_tx
-                    .send(PipelineEvent::Generation(GenerationEvent::Chunk(
-                        GeneratedEvent::CommandInvocation(CommandInvocation {
-                            name: "slow_tool".to_string(),
-                            action: CommandAction::Execute,
-                            arguments: serde_json::json!({}),
-                        }),
-                    )))
-                    .await;
-            }
-
-            let _ = event_tx
-                .send(PipelineEvent::Generation(GenerationEvent::Chunk(
-                    GeneratedEvent::Done,
-                )))
-                .await;
-            let response_message = WeftMessage {
-                role: Role::Assistant,
-                source: Source::Provider,
-                model: Some("stub-model".to_string()),
-                content: vec![],
-                delta: false,
-                message_index: 0,
-            };
-            let _ = event_tx
-                .send(PipelineEvent::Generation(GenerationEvent::Completed {
-                    model: "stub-model".to_string(),
-                    response_message,
-                    generated_events: vec![GeneratedEvent::Done],
-                    input_tokens: None,
-                    output_tokens: None,
-                }))
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Completed {
-                    name: "generate".to_string(),
-                    idempotency_key: input.idempotency_key.clone(),
-                }))
-                .await;
-        }
-    }
-
-    /// Activity that hangs forever (simulating a slow command — will be timed out).
-    struct HangingExecuteCommandActivity;
-
-    #[async_trait::async_trait]
-    impl Activity for HangingExecuteCommandActivity {
-        fn name(&self) -> &str {
-            "execute_command"
-        }
-
-        fn criticality(&self) -> weft_reactor_trait::Criticality {
-            weft_reactor_trait::Criticality::NonCritical
-        }
-
-        async fn execute(
-            &self,
-            _execution_id: &ExecutionId,
-            _input: ActivityInput,
-            _services: &dyn weft_reactor_trait::ServiceLocator,
-            _event_log: &dyn EventLog,
-            _event_tx: mpsc::Sender<PipelineEvent>,
-            cancel: CancellationToken,
-        ) {
-            // Hang until cancelled (simulates a command that never responds).
-            cancel.cancelled().await;
-        }
-    }
-
-    let services = Arc::new(make_test_services());
-    let event_log = test_event_log();
+    // Invoke slow_tool on first call; on subsequent calls check for injected error before invoking.
     let registry = build_registry(vec![
-        Arc::new(InvokeOnceActivity),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
+        Arc::new(harness::TestActivity {
+            activity_name: "generate".to_string(),
+            criticality: weft_reactor_trait::Criticality::Critical,
+            behavior: harness::Behavior::PerCall {
+                call_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                actions: vec![CallAction::WithCommands {
+                    commands: vec!["slow_tool".to_string()],
+                }],
+                default_action: CallAction::UnlessErrorSeen,
+            },
         }),
-        Arc::new(HangingExecuteCommandActivity),
+        TestActivity::assemble_response().into(),
+        hanging_execute_command(),
     ]);
 
     // Use the default reactor_config (command_timeout_secs = 10).
     let config = reactor_config(simple_pipeline_config("generate"));
+
+    let services = Arc::new(make_test_services());
+    let event_log = test_event_log();
 
     let reactor = Reactor::new(services, event_log.clone(), registry, &config)
         .expect("reactor should construct");
@@ -567,155 +258,38 @@ async fn command_timeout_injects_error_message_and_continues() {
 async fn multiple_command_failures_all_inject_errors_and_continue() {
     use pretty_assertions::assert_eq;
 
-    /// Generate that invokes two commands on first call, then Done.
-    struct InvokeTwoCommandsActivity {
-        call_count: Arc<std::sync::atomic::AtomicU32>,
-    }
-
-    #[async_trait::async_trait]
-    impl Activity for InvokeTwoCommandsActivity {
-        fn name(&self) -> &str {
-            "generate"
-        }
-
-        async fn execute(
-            &self,
-            _execution_id: &ExecutionId,
-            input: ActivityInput,
-            _services: &dyn weft_reactor_trait::ServiceLocator,
-            _event_log: &dyn EventLog,
-            event_tx: mpsc::Sender<PipelineEvent>,
-            _cancel: CancellationToken,
-        ) {
-            let call_n = self
-                .call_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Started {
-                    name: "generate".to_string(),
-                }))
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Generation(GenerationEvent::Started {
-                    model: "stub-model".to_string(),
-                    message_count: input.messages.len(),
-                }))
-                .await;
-
-            if call_n == 0 {
-                // First call: invoke two commands.
-                for cmd in &["tool_a", "tool_b"] {
-                    let _ = event_tx
-                        .send(PipelineEvent::Generation(GenerationEvent::Chunk(
-                            GeneratedEvent::CommandInvocation(CommandInvocation {
-                                name: cmd.to_string(),
-                                action: CommandAction::Execute,
-                                arguments: serde_json::json!({}),
-                            }),
-                        )))
-                        .await;
-                }
-            }
-
-            let _ = event_tx
-                .send(PipelineEvent::Generation(GenerationEvent::Chunk(
-                    GeneratedEvent::Done,
-                )))
-                .await;
-            let response_message = WeftMessage {
-                role: Role::Assistant,
-                source: Source::Provider,
-                model: Some("stub-model".to_string()),
-                content: vec![],
-                delta: false,
-                message_index: 0,
-            };
-            let _ = event_tx
-                .send(PipelineEvent::Generation(GenerationEvent::Completed {
-                    model: "stub-model".to_string(),
-                    response_message,
-                    generated_events: vec![GeneratedEvent::Done],
-                    input_tokens: None,
-                    output_tokens: None,
-                }))
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Completed {
-                    name: "generate".to_string(),
-                    idempotency_key: input.idempotency_key.clone(),
-                }))
-                .await;
-        }
-    }
-
-    /// Activity that always fails with ActivityEvent::Failed.
-    struct AlwaysFailingExecuteCommandActivity;
-
-    #[async_trait::async_trait]
-    impl Activity for AlwaysFailingExecuteCommandActivity {
-        fn name(&self) -> &str {
-            "execute_command"
-        }
-
-        fn criticality(&self) -> weft_reactor_trait::Criticality {
-            weft_reactor_trait::Criticality::NonCritical
-        }
-
-        async fn execute(
-            &self,
-            _execution_id: &ExecutionId,
-            input: ActivityInput,
-            _services: &dyn weft_reactor_trait::ServiceLocator,
-            _event_log: &dyn EventLog,
-            event_tx: mpsc::Sender<PipelineEvent>,
-            _cancel: CancellationToken,
-        ) {
-            // Extract the command name from metadata so we can echo it back in the error.
-            let cmd_name = input
-                .metadata
-                .get("invocation")
-                .and_then(|v| v.get("name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Started {
-                    name: "execute_command".to_string(),
-                }))
-                .await;
-            let _ = event_tx
-                .send(PipelineEvent::Activity(ActivityEvent::Failed {
-                    name: "execute_command".to_string(),
-                    error: format!("command not found: {cmd_name}"),
-                    retryable: false,
-                    detail: FailureDetail {
-                        error_code: "command_not_found".to_string(),
-                        detail: serde_json::json!({ "command_name": cmd_name }),
-                        cause: Some(format!("command not found: {cmd_name}")),
-                        attempted: Some(format!("execute command {cmd_name}")),
-                        fallback: None,
-                    },
-                }))
-                .await;
-        }
-    }
-
     let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let call_count_clone = Arc::clone(&call_count);
+
+    // InvokeTwoCommandsActivity: first call invokes two commands, subsequent calls return Done.
+    let registry = build_registry(vec![
+        Arc::new(harness::TestActivity {
+            activity_name: "generate".to_string(),
+            criticality: weft_reactor_trait::Criticality::Critical,
+            behavior: harness::Behavior::PerCall {
+                call_count: Arc::clone(&call_count),
+                actions: vec![CallAction::WithCommands {
+                    commands: vec!["tool_a".to_string(), "tool_b".to_string()],
+                }],
+                default_action: CallAction::Done,
+            },
+        }),
+        TestActivity::assemble_response().into(),
+        // Always-failing execute_command (NonCritical). Error message is static here;
+        // the test validates error count and CommandError injection, not the message content.
+        failing_execute_command(
+            "command not found",
+            FailureDetail {
+                error_code: "command_not_found".to_string(),
+                detail: serde_json::Value::Null,
+                cause: Some("command not found".to_string()),
+                attempted: None,
+                fallback: None,
+            },
+        ),
+    ]);
 
     let services = Arc::new(make_test_services());
     let event_log = test_event_log();
-    let registry = build_registry(vec![
-        Arc::new(InvokeTwoCommandsActivity {
-            call_count: call_count_clone,
-        }),
-        Arc::new(StubAssembleResponse {
-            name: "assemble_response".to_string(),
-        }),
-        Arc::new(AlwaysFailingExecuteCommandActivity),
-    ]);
 
     let config = reactor_config(simple_pipeline_config("generate"));
     let reactor = Reactor::new(services, event_log.clone(), registry, &config)
@@ -783,4 +357,3 @@ async fn multiple_command_failures_all_inject_errors_and_continue() {
         "generate should be called twice: once requesting commands, once after error injection"
     );
 }
-
