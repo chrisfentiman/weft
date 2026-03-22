@@ -254,6 +254,12 @@ async fn run_fail_then_succeed(
             .await;
     } else {
         let _ = event_tx
+            .send(PipelineEvent::Generation(GenerationEvent::Started {
+                model: "stub-model".to_string(),
+                message_count: input.messages.len(),
+            }))
+            .await;
+        let _ = event_tx
             .send(PipelineEvent::Generation(GenerationEvent::Chunk(
                 GeneratedEvent::Done,
             )))
@@ -509,7 +515,7 @@ async fn run_per_call(
                             None
                         }
                     })
-                    .unwrap_or_else(|| "slow_tool".to_string());
+                    .unwrap_or_else(|| panic!("UnlessErrorSeen requires a WithCommands action in the actions list to determine the tool name"));
                 let _ = event_tx
                     .send(PipelineEvent::Generation(GenerationEvent::Chunk(
                         GeneratedEvent::CommandInvocation(CommandInvocation {
