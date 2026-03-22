@@ -961,8 +961,8 @@ fn sampling_options_from_proto(opts: proto::SamplingOptions) -> SamplingOptions 
 /// Returns `Some(MetadataMap)` with `x-weft-degraded` set to a comma-separated
 /// list of activity names when degradations are present, `None` when empty.
 ///
-/// The trailing metadata pattern follows the Apollo Router convention of surfacing
-/// partial-failure information in headers alongside a successful response status.
+/// Surfaces partial-failure information in trailing metadata alongside a
+/// successful response status.
 fn build_degradation_metadata(
     degradations: &[DegradationNotice],
 ) -> Option<tonic::metadata::MetadataMap> {

@@ -2,7 +2,7 @@
 //!
 //! Application code creates tracing spans; this layer observes span lifecycle
 //! and emits counters, histograms, and gauges via the `metrics` crate. This
-//! follows the Apollo Router pattern: single instrumentation point with metrics
+//! follows a metrics-from-spans pattern: single instrumentation point with metrics
 //! derived automatically from spans rather than maintained in parallel.
 //!
 //! # Metrics emitted
@@ -325,8 +325,8 @@ where
                 .record(duration);
                 gauge!("weft_active_requests").decrement(1.0);
                 // Emit the degraded request counter when the request had degradations.
-                // This mirrors Apollo Router's pattern of a separate request-level
-                // degradation counter alongside the main requests counter.
+                // Separate request-level degradation counter alongside the main
+                // requests counter.
                 if *degraded {
                     counter!("weft_requests_degraded_total").increment(1);
                 }
@@ -375,7 +375,7 @@ where
                 )
                 .record(duration);
                 // Emit the component-level degradation counter when the activity degraded.
-                // This mirrors Apollo Router's subgraph-level error counter pattern.
+                // Per-activity degradation counter.
                 if status == "degraded" {
                     counter!(
                         "weft_degradations_total",
