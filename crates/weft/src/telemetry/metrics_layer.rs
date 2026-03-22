@@ -328,11 +328,7 @@ where
                 // This mirrors Apollo Router's pattern of a separate request-level
                 // degradation counter alongside the main requests counter.
                 if *degraded {
-                    counter!(
-                        "weft_requests_degraded_total",
-                        "pipeline" => pipeline.clone()
-                    )
-                    .increment(1);
+                    counter!("weft_requests_degraded_total").increment(1);
                 }
             }
             SpanAttributes::Generate {
@@ -1167,18 +1163,10 @@ mod tests {
             },
             |items| {
                 assert!(
-                    snapshot_has(
-                        items,
-                        "weft_requests_degraded_total",
-                        &[("pipeline", "default")]
-                    ),
+                    snapshot_has(items, "weft_requests_degraded_total", &[]),
                     "weft_requests_degraded_total counter not found for degraded request"
                 );
-                let v = counter_value(
-                    items,
-                    "weft_requests_degraded_total",
-                    &[("pipeline", "default")],
-                );
+                let v = counter_value(items, "weft_requests_degraded_total", &[]);
                 assert_eq!(
                     v,
                     Some(1),
