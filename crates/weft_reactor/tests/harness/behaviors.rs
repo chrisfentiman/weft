@@ -9,9 +9,7 @@ use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use weft_core::{
-    CommandAction, CommandInvocation, ContentPart, Role, Source, WeftMessage,
-};
+use weft_core::{CommandAction, CommandInvocation, ContentPart, Role, Source, WeftMessage};
 use weft_reactor::activity::ActivityInput;
 use weft_reactor::event::{
     ActivityEvent, CommandEvent, ContextEvent, ExecutionEvent, FailureDetail, GeneratedEvent,

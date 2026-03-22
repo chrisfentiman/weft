@@ -4,10 +4,7 @@
 //! `TestActivity` in `mod.rs`, not these structs directly.
 #![allow(dead_code)]
 
-use std::sync::{
-    Arc,
-    atomic::AtomicU32,
-};
+use std::sync::{Arc, atomic::AtomicU32};
 
 use weft_core::{
     ContentPart, ModelRoutingInstruction, Role, SamplingOptions, Source, WeftMessage, WeftRequest,
@@ -15,8 +12,8 @@ use weft_core::{
 use weft_reactor::activity::Activity;
 use weft_reactor::config::{ActivityRef, BudgetConfig, LoopHooks, PipelineConfig, ReactorConfig};
 use weft_reactor::event::{
-    CommandEvent, CommandFormat, ContextEvent, ExecutionEvent, FailureDetail, MessageInjectionSource,
-    PipelineEvent, SelectionEvent,
+    CommandEvent, CommandFormat, ContextEvent, ExecutionEvent, FailureDetail,
+    MessageInjectionSource, PipelineEvent, SelectionEvent,
 };
 use weft_reactor::registry::ActivityRegistry;
 use weft_reactor::test_support::TestEventLog;

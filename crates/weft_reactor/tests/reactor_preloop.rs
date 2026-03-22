@@ -12,8 +12,9 @@ use weft_reactor::test_support::make_test_services;
 use weft_reactor::{EventLog, ExecutionContext, RequestId, TenantId};
 
 use harness::{
-    TestActivity, build_new_preloop_registry, build_registry, new_preloop_pipeline_config,
-    pipeline_with_validate, reactor_config, test_event_log, test_request,
+    EventAssertions, EventPredicate, TestActivity, build_new_preloop_registry, build_registry,
+    new_preloop_pipeline_config, pipeline_with_validate, reactor_config, test_event_log,
+    test_request,
 };
 
 #[allow(unused_imports)]
@@ -44,36 +45,14 @@ async fn pre_loop_all_six_activities_produce_expected_events() {
         .await
         .expect("execution should succeed");
 
-    let events = event_log
-        .read(&result.execution_id, None::<u64>)
+    EventAssertions::for_execution(&event_log, &result.execution_id)
         .await
-        .unwrap();
-    let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
-
-    assert!(
-        event_types.contains(&"selection.model_selected"),
-        "missing selection.model_selected event; got: {event_types:?}"
-    );
-    assert!(
-        event_types.contains(&"selection.commands_selected"),
-        "missing selection.commands_selected event; got: {event_types:?}"
-    );
-    assert!(
-        event_types.contains(&"selection.provider_resolved"),
-        "missing selection.provider_resolved event; got: {event_types:?}"
-    );
-    assert!(
-        event_types.contains(&"context.system_prompt_assembled"),
-        "missing context.system_prompt_assembled event; got: {event_types:?}"
-    );
-    assert!(
-        event_types.contains(&"context.commands_formatted"),
-        "missing context.commands_formatted event; got: {event_types:?}"
-    );
-    assert!(
-        event_types.contains(&"context.sampling_updated"),
-        "missing context.sampling_updated event; got: {event_types:?}"
-    );
+        .contains("selection.model_selected")
+        .contains("selection.commands_selected")
+        .contains("selection.provider_resolved")
+        .contains("context.system_prompt_assembled")
+        .contains("context.commands_formatted")
+        .contains("context.sampling_updated");
 }
 
 #[tokio::test]
@@ -344,27 +323,16 @@ async fn pre_loop_activity_runs_before_generate() {
         .await
         .expect("execution should succeed");
 
-    let events = event_log
-        .read(&result.execution_id, None::<u64>)
-        .await
-        .unwrap();
     // validate should come before generation.started in the log.
-    let validate_pos = events.iter().position(|e| {
-        e.event_type == "activity.started"
-            && e.payload
-                .get("event")
-                .and_then(|v| v.get("name"))
-                .and_then(|v| v.as_str())
-                == Some("validate")
-    });
-    let gen_pos = events
-        .iter()
-        .position(|e| e.event_type == "generation.started");
-
-    assert!(validate_pos.is_some(), "validate activity should be in log");
-    assert!(gen_pos.is_some(), "generation.started should be in log");
-    assert!(
-        validate_pos.unwrap() < gen_pos.unwrap(),
-        "validate should run before generation"
-    );
+    // Use in_order_with to distinguish the validate activity.started from others.
+    let validate_pred = |e: &weft_reactor::Event| {
+        e.payload.pointer("/event/name").and_then(|v| v.as_str()) == Some("validate")
+    };
+    let gen_pred = |_: &weft_reactor::Event| true;
+    EventAssertions::for_execution(&event_log, &result.execution_id)
+        .await
+        .in_order_with(&[
+            ("activity.started", &validate_pred as EventPredicate<'_>),
+            ("generation.started", &gen_pred),
+        ]);
 }

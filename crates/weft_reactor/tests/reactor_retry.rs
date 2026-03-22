@@ -16,7 +16,7 @@ use weft_reactor::reactor::Reactor;
 use weft_reactor::test_support::make_test_services;
 use weft_reactor::{EventLog, ExecutionContext, RequestId, TenantId};
 
-use harness::{TestActivity, build_registry, test_event_log, test_request};
+use harness::{EventAssertions, TestActivity, build_registry, test_event_log, test_request};
 
 #[allow(unused_imports)]
 use pretty_assertions::{assert_eq, assert_ne};
@@ -86,9 +86,9 @@ async fn generate_fails_once_then_succeeds_with_retry() {
     );
 
     let exec_id = result.unwrap().0.execution_id;
-    let events = event_log.read(&exec_id, None::<u64>).await.unwrap();
-    let retried = events.iter().any(|e| e.event_type == "activity.retried");
-    assert!(retried, "event log should contain activity.retried event");
+    EventAssertions::for_execution(&event_log, &exec_id)
+        .await
+        .contains("activity.retried");
 }
 
 #[tokio::test]
@@ -290,21 +290,10 @@ async fn retry_skipped_when_budget_exhausted() {
 
     let (exec_result, _) = result.expect("budget exhaustion should return Ok gracefully");
 
-    let events = event_log
-        .read(&exec_result.execution_id, None::<u64>)
+    EventAssertions::for_execution(&event_log, &exec_result.execution_id)
         .await
-        .unwrap();
-    let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
-
-    assert!(
-        event_types.contains(&"budget.exhausted"),
-        "event log should contain budget.exhausted when deadline is past; got: {event_types:?}"
-    );
-
-    assert!(
-        !event_types.contains(&"activity.retried"),
-        "no activity.retried should appear when budget is exhausted before generation; got: {event_types:?}"
-    );
+        .contains("budget.exhausted")
+        .does_not_contain("activity.retried");
 }
 
 #[tokio::test(start_paused = true)]
@@ -430,20 +419,10 @@ async fn cancel_during_retry_backoff_terminates_execution() {
 
     let (exec_result, _) = result.unwrap();
 
-    let events = event_log
-        .read(&exec_result.execution_id, None::<u64>)
+    EventAssertions::for_execution(&event_log, &exec_result.execution_id)
         .await
-        .unwrap();
-    let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
-    assert!(
-        event_types.contains(&"execution.cancelled"),
-        "event log should contain execution.cancelled; got: {event_types:?}"
-    );
-
-    assert!(
-        !event_types.contains(&"activity.retried"),
-        "no activity.retried should appear when cancel fires before retry; got: {event_types:?}"
-    );
+        .contains("execution.cancelled")
+        .does_not_contain("activity.retried");
 }
 
 #[tokio::test(start_paused = true)]

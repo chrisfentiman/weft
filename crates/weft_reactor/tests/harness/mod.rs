@@ -10,11 +10,9 @@
 
 mod behaviors;
 mod builders;
+pub mod events;
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::AtomicU32,
-};
+use std::sync::{Arc, Mutex, atomic::AtomicU32};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -26,20 +24,38 @@ use weft_reactor::event_log::EventLog;
 use weft_reactor::execution::ExecutionId;
 use weft_reactor_trait::{Criticality, ServiceLocator};
 
+// Re-export event assertion helpers.
+pub use events::{EventAssertions, EventPredicate, TestEventLogAssertExt};
+
 // Re-export everything from submodules so `use harness::*` in test files
 // gets the full public API without any import changes.
 pub use builders::{
-    EmittingBuilder, FailBuilder, GenerateBuilder, PerCallBuilder,
-    // Pre-loop stubs
-    command_formatting_stub, command_selection_stub, model_selection_stub,
-    provider_resolution_stub, sampling_adjustment_stub, system_prompt_assembly_stub,
-    validate_stub,
-    // execute_command helpers
-    failing_execute_command, hanging_execute_command,
+    EmittingBuilder,
+    FailBuilder,
+    GenerateBuilder,
+    PerCallBuilder,
     // Registry / config helpers
-    build_new_preloop_registry, build_registry, new_preloop_pipeline_config, pipeline_with_validate,
-    preloop_registry, reactor_config, simple_pipeline_config, simple_registry, test_event_log,
+    build_new_preloop_registry,
+    build_registry,
+    // Pre-loop stubs
+    command_formatting_stub,
+    command_selection_stub,
+    // execute_command helpers
+    failing_execute_command,
+    hanging_execute_command,
+    model_selection_stub,
+    new_preloop_pipeline_config,
+    pipeline_with_validate,
+    preloop_registry,
+    provider_resolution_stub,
+    reactor_config,
+    sampling_adjustment_stub,
+    simple_pipeline_config,
+    simple_registry,
+    system_prompt_assembly_stub,
+    test_event_log,
     test_request,
+    validate_stub,
 };
 
 // ── TestActivity ──────────────────────────────────────────────────────────────

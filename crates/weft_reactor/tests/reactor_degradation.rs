@@ -12,12 +12,12 @@ use weft_reactor::config::{ActivityRef, LoopHooks, PipelineConfig};
 use weft_reactor::event::{FailureDetail, PipelineEvent, SelectionEvent};
 use weft_reactor::reactor::Reactor;
 use weft_reactor::test_support::make_test_services;
-use weft_reactor::{EventLog, ExecutionContext, RequestId, TenantId};
+use weft_reactor::{ExecutionContext, RequestId, TenantId};
 use weft_reactor_trait::Criticality;
 
 use harness::{
-    TestActivity, build_registry, new_preloop_pipeline_config, reactor_config, test_event_log,
-    test_request,
+    EventAssertions, TestActivity, build_registry, new_preloop_pipeline_config, reactor_config,
+    test_event_log, test_request,
 };
 
 #[allow(unused_imports)]
@@ -76,33 +76,14 @@ async fn non_critical_command_selection_failure_degrades_and_continues() {
     let result =
         result.expect("non-critical command_selection failure should not terminate execution");
 
-    // Verify ExecutionEvent::Degraded was recorded.
-    let events = event_log
-        .read(&result.0.execution_id, None::<u64>)
+    // Verify ExecutionEvent::Degraded was recorded and mentions command_selection.
+    EventAssertions::for_execution(&event_log, &result.0.execution_id)
         .await
-        .unwrap_or_default();
-    let degraded_events: Vec<_> = events
-        .iter()
-        .filter(|e| e.event_type == "execution.degraded")
-        .collect();
-    assert!(
-        !degraded_events.is_empty(),
-        "should have at least one execution.degraded event"
-    );
-
-    // The degradation should mention command_selection.
-    let has_command_selection_degradation = degraded_events.iter().any(|e| {
-        e.payload
-            .get("event")
-            .and_then(|ev: &serde_json::Value| ev.get("notice"))
-            .and_then(|n: &serde_json::Value| n.get("activity_name"))
-            .and_then(|a: &serde_json::Value| a.as_str())
-            == Some("command_selection")
-    });
-    assert!(
-        has_command_selection_degradation,
-        "degradation should be for command_selection; events: {degraded_events:?}"
-    );
+        .payload_contains(
+            "execution.degraded",
+            "/event/notice/activity_name",
+            &serde_json::json!("command_selection"),
+        );
 }
 
 /// Critical activity failure terminates the request.
@@ -218,20 +199,9 @@ async fn multiple_non_critical_degradations_accumulate() {
 
     let result = result.expect("multiple non-critical failures should not terminate execution");
 
-    let events = event_log
-        .read(&result.0.execution_id, None::<u64>)
+    EventAssertions::for_execution(&event_log, &result.0.execution_id)
         .await
-        .unwrap_or_default();
-    let degraded_events: Vec<_> = events
-        .iter()
-        .filter(|e| e.event_type == "execution.degraded")
-        .collect();
-
-    assert_eq!(
-        degraded_events.len(),
-        2,
-        "should have 2 degradation events, one per failed non-critical activity; got: {degraded_events:?}"
-    );
+        .count_of("execution.degraded", 2);
 }
 
 /// Semi-critical model_selection failure uses the default model fallback.

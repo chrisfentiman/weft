@@ -12,14 +12,14 @@ use weft_reactor::config::{ActivityRef, BudgetConfig, LoopHooks, PipelineConfig,
 use weft_reactor::event::{GeneratedEvent, GenerationEvent, PipelineEvent};
 use weft_reactor::reactor::Reactor;
 use weft_reactor::test_support::{make_test_services, make_test_services_with_response};
-use weft_reactor::{EventLog, ExecutionContext, RequestId, TenantId};
+use weft_reactor::{ExecutionContext, RequestId, TenantId};
 
 use tokio::sync::mpsc;
 use weft_core::ContentPart;
 
 use harness::{
-    TestActivity, build_registry, reactor_config, simple_pipeline_config, test_event_log,
-    test_request,
+    EventAssertions, TestActivity, build_registry, reactor_config, simple_pipeline_config,
+    test_event_log, test_request,
 };
 
 #[allow(unused_imports)]
@@ -68,17 +68,10 @@ async fn simple_request_response_completes() {
     assert_eq!(result.budget_used.generation_calls, 1);
 
     // Verify event log contains execution.started and execution.completed.
-    let events = event_log
-        .read(&result.execution_id, None::<u64>)
+    EventAssertions::for_execution(&event_log, &result.execution_id)
         .await
-        .unwrap();
-    let has_started = events.iter().any(|e| e.event_type == "execution.started");
-    let has_completed = events.iter().any(|e| e.event_type == "execution.completed");
-    assert!(has_started, "event log should contain execution.started");
-    assert!(
-        has_completed,
-        "event log should contain execution.completed"
-    );
+        .contains("execution.started")
+        .contains("execution.completed");
 }
 
 #[tokio::test]
@@ -162,16 +155,9 @@ async fn cancel_signal_terminates_execution() {
         .await
         .expect("cancelled execution should return Ok");
 
-    let events = event_log
-        .read(&result.execution_id, None::<u64>)
+    EventAssertions::for_execution(&event_log, &result.execution_id)
         .await
-        .unwrap();
-    let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
-    assert!(
-        event_types.contains(&"execution.cancelled"),
-        "event log should contain execution.cancelled; got: {:?}",
-        event_types
-    );
+        .contains("execution.cancelled");
 }
 
 /// Cancellation via Signal::Cancel sent on the event channel.
@@ -212,12 +198,9 @@ async fn cancel_signal_on_channel_terminates_execution() {
     );
 
     let (exec_result, _) = result.unwrap();
-    let events = event_log
-        .read(&exec_result.execution_id, None::<u64>)
+    EventAssertions::for_execution(&event_log, &exec_result.execution_id)
         .await
-        .unwrap();
-    let cancelled = events.iter().any(|e| e.event_type == "execution.cancelled");
-    assert!(cancelled, "event log should contain execution.cancelled");
+        .contains("execution.cancelled");
 }
 
 #[tokio::test(start_paused = true)]
@@ -443,31 +426,17 @@ async fn event_log_contains_complete_execution_trace() {
         .await
         .expect("execution should succeed");
 
-    let events = event_log
-        .read(&result.execution_id, None::<u64>)
-        .await
-        .unwrap();
-    let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    let assertions = EventAssertions::for_execution(&event_log, &result.execution_id).await;
 
-    assert!(
-        event_types.contains(&"execution.started"),
-        "missing execution.started"
-    );
-    assert!(
-        event_types.contains(&"generation.started"),
-        "missing generation.started"
-    );
-    assert!(
-        event_types.contains(&"generation.chunk"),
-        "missing generation.chunk (content)"
-    );
-    assert!(
-        event_types.contains(&"execution.completed"),
-        "missing execution.completed"
-    );
-
-    let seqs: Vec<u64> = events.iter().map(|e| e.sequence).collect();
+    // Verify sequences are strictly increasing (requires raw events before consuming by value).
+    let seqs: Vec<u64> = assertions.all().iter().map(|e| e.sequence).collect();
     for w in seqs.windows(2) {
         assert!(w[0] < w[1], "event sequences should be strictly increasing");
     }
+
+    assertions
+        .contains("execution.started")
+        .contains("generation.started")
+        .contains("generation.chunk")
+        .contains("execution.completed");
 }
