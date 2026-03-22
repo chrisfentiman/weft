@@ -321,8 +321,8 @@ async fn multiple_command_failures_all_inject_errors_and_continue() {
     // Both error messages should appear in the event log as MessageInjected events with
     // CommandError source. Use all() to count CommandError injections (payload_contains
     // cannot express count-with-key-exists without knowing the exact value).
-    let assertions = EventAssertions::for_execution(&event_log, &execution_result.execution_id)
-        .await;
+    let assertions =
+        EventAssertions::for_execution(&event_log, &execution_result.execution_id).await;
     let injected_count = assertions
         .all()
         .iter()
