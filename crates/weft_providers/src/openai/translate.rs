@@ -6,8 +6,30 @@
 
 use weft_core::{ContentPart, ModelRoutingInstruction, Role, SamplingOptions, Source, WeftMessage};
 
-use super::wire::{OpenAIChoice, OpenAIMessage, OpenAIRequest, OpenAIResponse, OpenAIUsage};
+use super::wire::{
+    OpenAIChoice, OpenAIContent, OpenAIMessage, OpenAIRequest, OpenAIResponse, OpenAIUsage,
+};
 use crate::{TokenUsage, provider::extract_text_messages, translate::TranslationError};
+
+// ── Content flattening ───────────────────────────────────────────────────────
+
+/// Flatten an `OpenAIContent` value into a plain text string.
+///
+/// - `Text(s)` → returns `s` directly.
+/// - `Blocks(blocks)` → concatenates the `text` field of all `type: "text"` blocks,
+///   joined by newline. Non-text block types (e.g. `image_url`) are silently ignored
+///   because this compat endpoint handles text completions only.
+fn flatten_content(content: OpenAIContent) -> String {
+    match content {
+        OpenAIContent::Text(s) => s,
+        OpenAIContent::Blocks(blocks) => blocks
+            .into_iter()
+            .filter(|b| b.content_type == "text")
+            .map(|b| b.text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
 
 // ── Outbound (Weft -> OpenAI) ────────────────────────────────────────────────
 
@@ -39,7 +61,7 @@ pub fn build_outbound_request(
         if !system_text.is_empty() {
             wire_messages.push(OpenAIMessage {
                 role: "system".to_string(),
-                content: system_text,
+                content: OpenAIContent::Text(system_text),
             });
         }
         1
@@ -56,7 +78,7 @@ pub fn build_outbound_request(
         };
         wire_messages.push(OpenAIMessage {
             role: role_str.to_string(),
-            content: text,
+            content: OpenAIContent::Text(text),
         });
     }
 
@@ -89,7 +111,7 @@ pub fn parse_outbound_response(
     let text = response
         .choices
         .first()
-        .map(|c| c.message.content.clone())
+        .map(|c| flatten_content(c.message.content.clone()))
         .unwrap_or_default();
 
     let usage = response.usage.as_ref().map(|u| TokenUsage {
@@ -132,11 +154,13 @@ pub fn parse_inbound_request(
             unknown => return Err(TranslationError::UnrecognizedRole(unknown.to_string())),
         };
 
+        let text = flatten_content(msg.content);
+
         messages.push(WeftMessage {
             role,
             source,
             model: None,
-            content: vec![ContentPart::Text(msg.content)],
+            content: vec![ContentPart::Text(text)],
             delta: false,
             message_index: 0,
         });
@@ -201,7 +225,7 @@ pub fn build_inbound_response(
             index: 0,
             message: OpenAIMessage {
                 role: "assistant".to_string(),
-                content: assistant_text,
+                content: OpenAIContent::Text(assistant_text),
             },
             finish_reason: Some("stop".to_string()),
         }],
@@ -265,9 +289,15 @@ mod tests {
         let req = build_outbound_request(&messages, "gpt-4", &SamplingOptions::default());
         assert_eq!(req.messages.len(), 2);
         assert_eq!(req.messages[0].role, "system");
-        assert_eq!(req.messages[0].content, "You are helpful.");
+        assert_eq!(
+            req.messages[0].content,
+            OpenAIContent::Text("You are helpful.".to_string())
+        );
         assert_eq!(req.messages[1].role, "user");
-        assert_eq!(req.messages[1].content, "Hello");
+        assert_eq!(
+            req.messages[1].content,
+            OpenAIContent::Text("Hello".to_string())
+        );
     }
 
     #[test]
@@ -350,7 +380,7 @@ mod tests {
                 index: 0,
                 message: OpenAIMessage {
                     role: "assistant".to_string(),
-                    content: "Hello!".to_string(),
+                    content: OpenAIContent::Text("Hello!".to_string()),
                 },
                 finish_reason: Some("stop".to_string()),
             }],
@@ -402,15 +432,15 @@ mod tests {
             messages: vec![
                 OpenAIMessage {
                     role: "system".to_string(),
-                    content: "sys".to_string(),
+                    content: OpenAIContent::Text("sys".to_string()),
                 },
                 OpenAIMessage {
                     role: "user".to_string(),
-                    content: "hello".to_string(),
+                    content: OpenAIContent::Text("hello".to_string()),
                 },
                 OpenAIMessage {
                     role: "assistant".to_string(),
-                    content: "hi".to_string(),
+                    content: OpenAIContent::Text("hi".to_string()),
                 },
             ],
             max_tokens: None,
@@ -437,7 +467,7 @@ mod tests {
             model: "gpt-4".to_string(),
             messages: vec![OpenAIMessage {
                 role: "tool".to_string(),
-                content: "some tool result".to_string(),
+                content: OpenAIContent::Text("some tool result".to_string()),
             }],
             max_tokens: None,
             temperature: None,
@@ -461,7 +491,7 @@ mod tests {
             model: "gpt-4".to_string(),
             messages: vec![OpenAIMessage {
                 role: "function".to_string(),
-                content: "".to_string(),
+                content: OpenAIContent::Text(String::new()),
             }],
             max_tokens: None,
             temperature: None,
@@ -486,7 +516,7 @@ mod tests {
             model: "auto".to_string(),
             messages: vec![OpenAIMessage {
                 role: "user".to_string(),
-                content: "hi".to_string(),
+                content: OpenAIContent::Text("hi".to_string()),
             }],
             max_tokens: None,
             temperature: None,
@@ -507,7 +537,7 @@ mod tests {
             model: "gpt-4".to_string(),
             messages: vec![OpenAIMessage {
                 role: "user".to_string(),
-                content: "hi".to_string(),
+                content: OpenAIContent::Text("hi".to_string()),
             }],
             max_tokens: Some(256),
             temperature: Some(0.5),
@@ -534,7 +564,10 @@ mod tests {
     fn test_build_inbound_response_extracts_assistant_text() {
         let resp = make_weft_response("test-id", "Hello!");
         let openai_resp = build_inbound_response(resp, "gpt-4".to_string());
-        assert_eq!(openai_resp.choices[0].message.content, "Hello!");
+        assert_eq!(
+            openai_resp.choices[0].message.content,
+            OpenAIContent::Text("Hello!".to_string())
+        );
         assert_eq!(openai_resp.choices[0].message.role, "assistant");
         assert_eq!(openai_resp.object, Some("chat.completion".to_string()));
         let usage = openai_resp.usage.expect("usage must be present");
@@ -571,7 +604,10 @@ mod tests {
             degradations: vec![],
         };
         let openai_resp = build_inbound_response(resp, "auto".to_string());
-        assert_eq!(openai_resp.choices[0].message.content, "");
+        assert_eq!(
+            openai_resp.choices[0].message.content,
+            OpenAIContent::Text(String::new())
+        );
     }
 
     #[test]
@@ -601,5 +637,123 @@ mod tests {
         assert_eq!(deserialized.model, "gpt-4");
         assert_eq!(deserialized.messages.len(), 2);
         assert_eq!(deserialized.max_tokens, Some(100));
+    }
+
+    // ── flatten_content ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_flatten_content_text_passthrough() {
+        let result = flatten_content(OpenAIContent::Text("hello".to_string()));
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_flatten_content_blocks_joins_text_blocks() {
+        use super::super::wire::OpenAIContentBlock;
+        let content = OpenAIContent::Blocks(vec![
+            OpenAIContentBlock {
+                content_type: "text".to_string(),
+                text: "first".to_string(),
+            },
+            OpenAIContentBlock {
+                content_type: "text".to_string(),
+                text: "second".to_string(),
+            },
+        ]);
+        let result = flatten_content(content);
+        assert_eq!(result, "first\nsecond");
+    }
+
+    #[test]
+    fn test_flatten_content_blocks_ignores_non_text() {
+        use super::super::wire::OpenAIContentBlock;
+        // image_url blocks are silently dropped; only text blocks are extracted.
+        let content = OpenAIContent::Blocks(vec![
+            OpenAIContentBlock {
+                content_type: "image_url".to_string(),
+                text: String::new(),
+            },
+            OpenAIContentBlock {
+                content_type: "text".to_string(),
+                text: "Describe this image".to_string(),
+            },
+        ]);
+        let result = flatten_content(content);
+        assert_eq!(result, "Describe this image");
+    }
+
+    #[test]
+    fn test_flatten_content_empty_blocks() {
+        let result = flatten_content(OpenAIContent::Blocks(vec![]));
+        assert_eq!(result, "");
+    }
+
+    // ── OpenAIContent serde ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_openai_content_deserializes_string_form() {
+        let json = r#""Hello, world!""#;
+        let content: OpenAIContent = serde_json::from_str(json).expect("must deserialize");
+        assert_eq!(content, OpenAIContent::Text("Hello, world!".to_string()));
+    }
+
+    #[test]
+    fn test_openai_content_deserializes_array_form() {
+        use super::super::wire::OpenAIContentBlock;
+        let json = r#"[{"type":"text","text":"Describe this image"}]"#;
+        let content: OpenAIContent = serde_json::from_str(json).expect("must deserialize");
+        assert_eq!(
+            content,
+            OpenAIContent::Blocks(vec![OpenAIContentBlock {
+                content_type: "text".to_string(),
+                text: "Describe this image".to_string(),
+            }])
+        );
+    }
+
+    #[test]
+    fn test_parse_inbound_array_content_extracted() {
+        // Simulates a GPT-4-Vision style request where content is an array.
+        let json = r#"{
+            "model": "gpt-4o",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Describe this image"}]
+                }
+            ]
+        }"#;
+        let req: OpenAIRequest = serde_json::from_str(json).expect("must deserialize");
+        let weft_req = parse_inbound_request(req).expect("should succeed");
+        assert_eq!(weft_req.messages.len(), 1);
+        let text = match &weft_req.messages[0].content[0] {
+            ContentPart::Text(t) => t.as_str(),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(text, "Describe this image");
+    }
+
+    #[test]
+    fn test_parse_inbound_array_content_multi_text_blocks_joined() {
+        let json = r#"{
+            "model": "gpt-4o",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "First part"},
+                        {"type": "image_url", "text": ""},
+                        {"type": "text", "text": "Second part"}
+                    ]
+                }
+            ]
+        }"#;
+        let req: OpenAIRequest = serde_json::from_str(json).expect("must deserialize");
+        let weft_req = parse_inbound_request(req).expect("should succeed");
+        let text = match &weft_req.messages[0].content[0] {
+            ContentPart::Text(t) => t.as_str(),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(text, "First part\nSecond part");
     }
 }

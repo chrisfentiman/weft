@@ -35,6 +35,39 @@ pub struct OpenAIRequest {
     pub stream: Option<bool>,
 }
 
+/// Content of an OpenAI message.
+///
+/// The OpenAI API accepts content as either a plain string or an array of
+/// typed content blocks. Both forms carry the same semantic meaning; the array
+/// form is used by newer clients (GPT-4-Vision and later SDKs) and the string
+/// form by older/simpler ones.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OpenAIContent {
+    /// Plain-text string content (legacy/simple form).
+    Text(String),
+    /// Array of typed content blocks (structured form).
+    Blocks(Vec<OpenAIContentBlock>),
+}
+
+impl Default for OpenAIContent {
+    fn default() -> Self {
+        Self::Text(String::new())
+    }
+}
+
+/// A content block inside an OpenAI message.
+///
+/// Only `type: "text"` blocks are extracted for inbound requests.
+/// Other block types (image_url, etc.) are ignored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpenAIContentBlock {
+    #[serde(rename = "type")]
+    pub content_type: String,
+    #[serde(default)]
+    pub text: String,
+}
+
 /// An OpenAI-format message.
 ///
 /// The `role` field uses `String` for both directions. Translation functions
@@ -44,7 +77,7 @@ pub struct OpenAIRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OpenAIMessage {
     pub role: String,
-    pub content: String,
+    pub content: OpenAIContent,
 }
 
 /// OpenAI-format chat completion response body.
