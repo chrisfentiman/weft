@@ -172,7 +172,7 @@ impl RhaiProvider {
 /// Convert a `ScriptError` from `weft_rhai` into a `ProviderError::WireScriptError`.
 ///
 /// This maps the shared infrastructure error into the domain error type for
-/// `weft_llm`, preserving the script path and message for diagnostics.
+/// `weft_providers`, preserving the script path and message for diagnostics.
 fn script_error_to_provider(e: ScriptError, script_path: &str) -> ProviderError {
     match &e {
         ScriptError::FileNotFound { path, source } => ProviderError::WireScriptError {

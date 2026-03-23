@@ -1,5 +1,5 @@
 [package]
-name = "weft_llm_trait"
+name = "weft_provider_trait"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

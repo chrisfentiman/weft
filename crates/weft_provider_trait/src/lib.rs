@@ -1,8 +1,8 @@
-//! `weft_llm_trait` — LLM provider trait and associated types.
+//! `weft_provider_trait` -- Provider trait and associated types.
 //!
-//! This crate contains the trait contract for LLM providers: `Provider`,
+//! This crate contains the trait contract for providers: `Provider`,
 //! `ProviderService`, and all request/response/error types. The implementations
-//! live in `weft_llm`, which depends on this crate.
+//! live in `weft_providers`, which depends on this crate.
 //!
 //! Consumers that need the trait boundary without the implementation (e.g.
 //! `weft_reactor_trait`) depend on this crate directly.
@@ -197,7 +197,7 @@ pub trait Provider: Send + Sync + 'static {
 /// Provider service trait. Abstracts the provider registry for the engine.
 ///
 /// The engine uses this to look up providers, model identifiers, token limits,
-/// and capabilities. `ProviderRegistry` in `weft_llm` is the production implementation.
+/// and capabilities. `ProviderRegistry` in `weft_providers` is the production implementation.
 ///
 /// `Send + Sync + 'static`: shared via `Arc` across async request handlers.
 pub trait ProviderService: Send + Sync + 'static {

@@ -1,5 +1,5 @@
 [package]
-name = "weft_llm"
+name = "weft_providers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,7 +10,7 @@ telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
 
 [dependencies]
 weft_core = { path = "../weft_core" }
-weft_llm_trait = { path = "../weft_llm_trait" }
+weft_provider_trait = { path = "../weft_provider_trait" }
 weft_rhai = { path = "../weft_rhai" }
 async-trait = { workspace = true }
 futures = { workspace = true }

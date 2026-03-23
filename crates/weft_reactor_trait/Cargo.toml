@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 weft_core = { path = "../weft_core" }
-weft_llm_trait = { path = "../weft_llm_trait" }
+weft_provider_trait = { path = "../weft_provider_trait" }
 weft_router_trait = { path = "../weft_router_trait" }
 weft_commands_trait = { path = "../weft_commands_trait" }
 weft_hooks_trait = { path = "../weft_hooks_trait" }

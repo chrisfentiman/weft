@@ -27,8 +27,8 @@ use crate::execution::{ExecutionId, RequestId, TenantId};
 /// of the hot path. `memory()` returns `Option<&dyn MemoryService>` because
 /// memory is optional — activities that use memory must handle the None case.
 pub trait ServiceLocator: Send + Sync {
-    /// LLM provider service: look up providers by model name, get capabilities.
-    fn providers(&self) -> &dyn weft_llm_trait::ProviderService;
+    /// Provider service: look up providers by model name, get capabilities.
+    fn providers(&self) -> &dyn weft_provider_trait::ProviderService;
 
     /// Semantic router: score requests against routing candidates.
     fn router(&self) -> &dyn weft_router_trait::SemanticRouter;
@@ -104,8 +104,8 @@ mod tests {
     // The spec (Section 10.3) requires: verify with `let _: &dyn ServiceLocator = ...;`
 
     struct MockProviders;
-    impl weft_llm_trait::ProviderService for MockProviders {
-        fn get(&self, _: &str) -> &Arc<dyn weft_llm_trait::Provider> {
+    impl weft_provider_trait::ProviderService for MockProviders {
+        fn get(&self, _: &str) -> &Arc<dyn weft_provider_trait::Provider> {
             unimplemented!("mock")
         }
         fn model_id(&self, _: &str) -> Option<&str> {
@@ -114,7 +114,7 @@ mod tests {
         fn max_tokens_for(&self, _: &str) -> Option<u32> {
             None
         }
-        fn default_provider(&self) -> &Arc<dyn weft_llm_trait::Provider> {
+        fn default_provider(&self) -> &Arc<dyn weft_provider_trait::Provider> {
             unimplemented!("mock")
         }
         fn default_name(&self) -> &str {
@@ -122,17 +122,17 @@ mod tests {
         }
         fn models_with_capability(
             &self,
-            _: &weft_llm_trait::Capability,
+            _: &weft_provider_trait::Capability,
         ) -> &std::collections::HashSet<String> {
             unimplemented!("mock")
         }
-        fn model_has_capability(&self, _: &str, _: &weft_llm_trait::Capability) -> bool {
+        fn model_has_capability(&self, _: &str, _: &weft_provider_trait::Capability) -> bool {
             false
         }
         fn model_capabilities(
             &self,
             _: &str,
-        ) -> Option<&std::collections::HashSet<weft_llm_trait::Capability>> {
+        ) -> Option<&std::collections::HashSet<weft_provider_trait::Capability>> {
             None
         }
     }
@@ -278,7 +278,7 @@ api_key = "sk-test"
     }
 
     impl ServiceLocator for MockServiceLocator {
-        fn providers(&self) -> &dyn weft_llm_trait::ProviderService {
+        fn providers(&self) -> &dyn weft_provider_trait::ProviderService {
             &self.providers
         }
 

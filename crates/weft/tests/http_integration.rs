@@ -14,8 +14,8 @@ use axum::{body::Body, http::Request, http::StatusCode};
 use serde_json::json;
 use tower::ServiceExt;
 use weft::server::build_router;
-use weft_llm::ProviderError;
-use weft_llm::test_support::SingleUseErrorProvider;
+use weft_providers::ProviderError;
+use weft_providers::test_support::SingleUseErrorProvider;
 
 use harness::{TestProvider, make_router, make_weft_service, post_json};
 
@@ -426,4 +426,157 @@ fn test_metrics_populated_after_request() {
             });
         });
     });
+}
+
+// ── Anthropic compat endpoint tests ───────────────────────────────────────────
+
+/// Helper: POST JSON to `/v1/messages` and return (status, parsed body).
+async fn post_anthropic(
+    router: axum::Router,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let resp = tower::ServiceExt::oneshot(router, req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+/// A valid Anthropic Messages API request returns HTTP 200 with an Anthropic-shaped
+/// response body. Verifies end-to-end translation through the Anthropic compat path.
+#[tokio::test]
+async fn test_anthropic_valid_request_returns_200() {
+    let router = make_router(TestProvider::ok("Hello from Anthropic compat!"));
+    let body = json!({
+        "model": "claude-3-opus-20240229",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "max_tokens": 1024
+    });
+    let (status, resp) = post_anthropic(router, body).await;
+    assert_eq!(status, StatusCode::OK);
+    // Must use Anthropic response shape, not OpenAI choices
+    assert_eq!(resp["type"], "message");
+    assert_eq!(resp["role"], "assistant");
+    assert_eq!(resp["stop_reason"], "end_turn");
+    assert!(
+        resp["choices"].is_null(),
+        "response must not use OpenAI choices shape"
+    );
+}
+
+/// The Anthropic compat response uses `content` array of content blocks,
+/// not the OpenAI `choices` array.
+#[tokio::test]
+async fn test_anthropic_response_uses_content_blocks() {
+    let router = make_router(TestProvider::ok("Response text here"));
+    let body = json!({
+        "model": "claude-3-opus-20240229",
+        "messages": [{"role": "user", "content": "Test"}],
+        "max_tokens": 1024
+    });
+    let (status, resp) = post_anthropic(router, body).await;
+    assert_eq!(status, StatusCode::OK);
+    // content[0].type must be "text"
+    assert_eq!(resp["content"][0]["type"], "text");
+    // content[0].text must contain the response
+    assert_eq!(resp["content"][0]["text"], "Response text here");
+}
+
+/// The Anthropic compat response includes usage statistics with Anthropic field names.
+#[tokio::test]
+async fn test_anthropic_response_contains_usage() {
+    let router = make_router(TestProvider::ok("Done"));
+    let body = json!({
+        "model": "claude-3-opus-20240229",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "max_tokens": 1024
+    });
+    let (status, resp) = post_anthropic(router, body).await;
+    assert_eq!(status, StatusCode::OK);
+    // Anthropic field names: input_tokens and output_tokens (not prompt_tokens/completion_tokens)
+    assert!(resp["usage"]["input_tokens"].is_number());
+    assert!(resp["usage"]["output_tokens"].is_number());
+}
+
+/// The `model` field is echoed from the request in the Anthropic response.
+#[tokio::test]
+async fn test_anthropic_response_model_echoed() {
+    let router = make_router(TestProvider::ok("Hi"));
+    let body = json!({
+        "model": "claude-3-haiku-20240307",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "max_tokens": 512
+    });
+    let (status, resp) = post_anthropic(router, body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resp["model"], "claude-3-haiku-20240307");
+}
+
+/// Anthropic error responses use the Anthropic error shape, not the OpenAI shape.
+#[tokio::test]
+async fn test_anthropic_error_uses_anthropic_shape() {
+    let router = make_router(TestProvider::ok("irrelevant"));
+    // Empty messages → 400 with Anthropic error shape
+    let body = json!({
+        "model": "claude-3-opus-20240229",
+        "messages": [],
+        "max_tokens": 1024
+    });
+    let (status, resp) = post_anthropic(router, body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Anthropic error shape: { type: "error", error: { type: "...", message: "..." } }
+    assert_eq!(resp["type"], "error");
+    assert!(resp["error"]["type"].is_string());
+    assert!(resp["error"]["message"].is_string());
+    // Must NOT use OpenAI error shape
+    assert!(
+        resp["error"]["code"].is_null()
+            || !resp
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .is_some_and(|c| c.is_string())
+    );
+}
+
+/// The Anthropic compat endpoint and OpenAI compat endpoint work independently
+/// on the same `WeftService` instance.
+#[tokio::test]
+async fn test_both_endpoints_work_independently() {
+    let svc = make_weft_service(TestProvider::ok("response text"));
+    let router = build_router(std::sync::Arc::clone(&svc), None);
+
+    // OpenAI endpoint still works
+    let openai_body = json!({
+        "model": "auto",
+        "messages": [{"role": "user", "content": "Hello OpenAI path"}]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&openai_body).unwrap()))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(router.clone(), req)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Anthropic endpoint also works on the same service
+    let anthropic_body = json!({
+        "model": "claude-3-opus-20240229",
+        "messages": [{"role": "user", "content": "Hello Anthropic path"}],
+        "max_tokens": 1024
+    });
+    let (anthropic_status, anthropic_resp) = post_anthropic(router, anthropic_body).await;
+    assert_eq!(anthropic_status, StatusCode::OK);
+    assert_eq!(anthropic_resp["type"], "message");
 }

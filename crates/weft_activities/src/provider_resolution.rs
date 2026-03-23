@@ -557,11 +557,11 @@ api_key = "sk-test"
 
         // Build a custom provider service where the model has no capabilities registered.
         struct NoCapProviderService {
-            provider: Arc<dyn weft_llm::Provider>,
+            provider: Arc<dyn weft_providers::Provider>,
         }
 
-        impl weft_llm::ProviderService for NoCapProviderService {
-            fn get(&self, _name: &str) -> &Arc<dyn weft_llm::Provider> {
+        impl weft_providers::ProviderService for NoCapProviderService {
+            fn get(&self, _name: &str) -> &Arc<dyn weft_providers::Provider> {
                 &self.provider
             }
 
@@ -581,7 +581,7 @@ api_key = "sk-test"
                 }
             }
 
-            fn default_provider(&self) -> &Arc<dyn weft_llm::Provider> {
+            fn default_provider(&self) -> &Arc<dyn weft_providers::Provider> {
                 &self.provider
             }
 
@@ -591,7 +591,7 @@ api_key = "sk-test"
 
             fn models_with_capability(
                 &self,
-                _capability: &weft_llm::Capability,
+                _capability: &weft_providers::Capability,
             ) -> &HashSet<String> {
                 // Return a reference to a leaked empty set for simplicity.
                 Box::leak(Box::new(HashSet::new()))
@@ -600,7 +600,7 @@ api_key = "sk-test"
             fn model_has_capability(
                 &self,
                 _model_name: &str,
-                _capability: &weft_llm::Capability,
+                _capability: &weft_providers::Capability,
             ) -> bool {
                 false
             }
@@ -608,7 +608,7 @@ api_key = "sk-test"
             fn model_capabilities(
                 &self,
                 _model_name: &str,
-            ) -> Option<&HashSet<weft_llm::Capability>> {
+            ) -> Option<&HashSet<weft_providers::Capability>> {
                 // None means no capabilities registered — activity should default.
                 None
             }
@@ -617,12 +617,15 @@ api_key = "sk-test"
         // Build a stub provider.
         struct StubProv;
         #[async_trait::async_trait]
-        impl weft_llm::Provider for StubProv {
+        impl weft_providers::Provider for StubProv {
             async fn execute(
                 &self,
-                _req: weft_llm::ProviderRequest,
-            ) -> Result<weft_llm::ProviderResponse, weft_llm::ProviderError> {
-                Err(weft_llm::ProviderError::Unsupported("stub".to_string()))
+                _req: weft_providers::ProviderRequest,
+            ) -> Result<weft_providers::ProviderResponse, weft_providers::ProviderError>
+            {
+                Err(weft_providers::ProviderError::Unsupported(
+                    "stub".to_string(),
+                ))
             }
             fn name(&self) -> &str {
                 "stub"
@@ -651,7 +654,7 @@ api_key = "sk-test"
         )
         .expect("config parse");
 
-        let provider_arc: Arc<dyn weft_llm::Provider> = Arc::new(StubProv);
+        let provider_arc: Arc<dyn weft_providers::Provider> = Arc::new(StubProv);
         let svc_impl = NoCapProviderService {
             provider: provider_arc,
         };

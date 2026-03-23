@@ -20,7 +20,7 @@ use harness::{
     make_router_with_event_log, make_weft_service_with_event_log, post_json,
 };
 use weft::server::build_router;
-use weft_llm::{ProviderError, test_support::SingleUseErrorProvider};
+use weft_providers::{ProviderError, test_support::SingleUseErrorProvider};
 
 // ── Helper ─────────────────────────────────────────────────────────────────────
 
@@ -234,7 +234,7 @@ async fn test_empty_provider_response_returns_200() {
 /// which would cause provider API errors at runtime.
 #[tokio::test]
 async fn test_sampling_parameters_clamped_and_passed() {
-    use weft_llm::ProviderRequest;
+    use weft_providers::ProviderRequest;
 
     let commands = weft_commands::test_support::StubCommandRegistry::new();
     let provider = SharedSequencedProvider::new(SequencedProvider::single("Done"));

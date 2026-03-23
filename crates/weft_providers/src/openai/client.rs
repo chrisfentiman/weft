@@ -1,60 +1,30 @@
-use tracing::{Instrument, debug, info_span, warn};
-use weft_core::{ContentPart, Role, SamplingOptions, Source, WeftMessage};
+use tracing::{Instrument, debug, info_span};
+use weft_core::{SamplingOptions, WeftMessage};
 
-use super::wire::{AnthropicMessage, AnthropicRequest, AnthropicResponse};
+use super::translate;
 use crate::{
-    Provider, ProviderError, ProviderRequest, ProviderResponse, TokenUsage,
-    provider::extract_text_messages,
+    Provider, ProviderError, ProviderRequest, ProviderResponse, TokenUsage, http::check_response,
 };
 
-/// Inject W3C TraceContext into outgoing HTTP request headers.
-///
-/// See `openai/client.rs` for the full rationale. Compiled only when the
-/// `telemetry` feature is enabled.
-#[cfg(feature = "telemetry")]
-fn inject_trace_context(headers: &mut reqwest::header::HeaderMap) {
-    use opentelemetry::propagation::{Injector, TextMapPropagator};
-    use opentelemetry_sdk::propagation::TraceContextPropagator;
+const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
 
-    struct HeaderInjector<'a>(&'a mut reqwest::header::HeaderMap);
-
-    impl Injector for HeaderInjector<'_> {
-        fn set(&mut self, key: &str, value: String) {
-            if let Ok(name) = reqwest::header::HeaderName::from_bytes(key.as_bytes())
-                && let Ok(val) = reqwest::header::HeaderValue::from_str(&value)
-            {
-                self.0.insert(name, val);
-            }
-        }
-    }
-
-    let propagator = TraceContextPropagator::new();
-    propagator.inject_context(
-        &opentelemetry::Context::current(),
-        &mut HeaderInjector(headers),
-    );
-}
-
-const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_VERSION: &str = "2023-06-01";
-
-/// Anthropic Messages API provider.
+/// OpenAI Chat Completions API provider.
 ///
 /// One provider instance corresponds to one API endpoint (credentials + base_url).
 /// The model identifier is passed per-request via `ProviderRequest::ChatCompletion.model`.
-pub struct AnthropicProvider {
+pub struct OpenAIProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
 }
 
-impl AnthropicProvider {
-    /// Create a new `AnthropicProvider` from connection info.
+impl OpenAIProvider {
+    /// Create a new `OpenAIProvider` from connection info.
     ///
     /// `api_key` must already be resolved (env: prefix expanded).
-    /// `base_url` overrides the default Anthropic API URL if provided.
+    /// `base_url` overrides the default OpenAI API URL if provided.
     pub fn new(api_key: String, base_url: Option<String>) -> Self {
-        let base_url = base_url.unwrap_or_else(|| ANTHROPIC_API_URL.to_string());
+        let base_url = base_url.unwrap_or_else(|| OPENAI_API_URL.to_string());
         Self {
             client: reqwest::Client::new(),
             api_key,
@@ -67,64 +37,10 @@ impl AnthropicProvider {
         messages: Vec<WeftMessage>,
         model: String,
         options: SamplingOptions,
-    ) -> Result<(WeftMessage, Option<TokenUsage>), ProviderError> {
-        let mut system_parts: Vec<String> = Vec::new();
-        let mut wire_messages = Vec::new();
+    ) -> Result<(weft_core::WeftMessage, Option<TokenUsage>), ProviderError> {
+        let request = translate::build_outbound_request(&messages, &model, &options);
 
-        // Extract system prompt from messages[0] if present.
-        // Anthropic requires the system prompt in a dedicated top-level `system` field,
-        // NOT in the messages array.
-        let conversation_start = if messages.first().map(|m| m.role) == Some(Role::System) {
-            let system_text: String = messages[0]
-                .content
-                .iter()
-                .filter_map(|p| match p {
-                    ContentPart::Text(t) => Some(t.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !system_text.is_empty() {
-                system_parts.push(system_text);
-            }
-            1 // skip messages[0] in the remaining extraction
-        } else {
-            0 // no system prompt
-        };
-
-        // Process remaining messages. System-role messages that survive the gateway
-        // activity filter are concatenated into the system field (Anthropic does not
-        // allow system role in the messages array).
-        for (role, text) in extract_text_messages(&messages[conversation_start..]) {
-            match role {
-                Role::System => system_parts.push(text),
-                Role::User => wire_messages.push(AnthropicMessage {
-                    role: "user".to_string(),
-                    content: text,
-                }),
-                Role::Assistant => wire_messages.push(AnthropicMessage {
-                    role: "assistant".to_string(),
-                    content: text,
-                }),
-            }
-        }
-
-        let system = system_parts.join("\n\n");
-
-        // Anthropic requires max_tokens; default to 4096 if not specified.
-        let max_tokens = options.max_tokens.unwrap_or(4096);
-
-        let request = AnthropicRequest {
-            model: model.clone(),
-            system,
-            messages: wire_messages,
-            max_tokens,
-            temperature: options.temperature,
-            top_p: options.top_p,
-            top_k: options.top_k,
-        };
-
-        debug!(model = %model, max_tokens, "sending Anthropic request");
+        debug!(model = %model, "sending OpenAI request");
 
         // Wrap the HTTP round-trip in a `provider_call` span so downstream
         // telemetry can observe provider latency independently of generation logic.
@@ -137,12 +53,12 @@ impl AnthropicProvider {
         );
 
         let response = async {
+            // Build the request with content-type and auth headers first.
             #[cfg_attr(not(feature = "telemetry"), allow(unused_mut))]
             let mut req_builder = self
                 .client
                 .post(&self.base_url)
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", ANTHROPIC_VERSION)
+                .bearer_auth(&self.api_key)
                 .header("content-type", "application/json")
                 .json(&request);
 
@@ -153,7 +69,7 @@ impl AnthropicProvider {
             #[cfg(feature = "telemetry")]
             {
                 let mut extra_headers = reqwest::header::HeaderMap::new();
-                inject_trace_context(&mut extra_headers);
+                crate::http::inject_trace_context(&mut extra_headers);
                 for (k, v) in extra_headers {
                     if let Some(name) = k {
                         req_builder = req_builder.header(name, v);
@@ -172,63 +88,17 @@ impl AnthropicProvider {
         let status = response.status().as_u16();
         provider_call_span.record("http.response.status_code", status as i64);
 
-        if status == 429 {
-            // Extract Retry-After header if present
-            let retry_after_ms = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(|secs| secs * 1000)
-                .unwrap_or(60_000);
-            return Err(ProviderError::RateLimited { retry_after_ms });
-        }
+        let body_text = check_response(response, "openai").await?;
 
-        if status != 200 {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<failed to read body>".to_string());
-            warn!(status, "Anthropic API returned non-200");
-            return Err(ProviderError::ProviderHttpError { status, body });
-        }
-
-        let body_text = response
-            .text()
-            .await
-            .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
-
-        let anthropic_response: AnthropicResponse = serde_json::from_str(&body_text)
+        let wire_response: super::wire::OpenAIResponse = serde_json::from_str(&body_text)
             .map_err(|e| ProviderError::DeserializationError(e.to_string()))?;
 
-        // Extract text from the first text content block
-        let text = anthropic_response
-            .content
-            .iter()
-            .find(|b| b.kind == "text")
-            .and_then(|b| b.text.clone())
-            .unwrap_or_default();
-
-        let usage = anthropic_response.usage.map(|u| TokenUsage {
-            prompt_tokens: u.input_tokens,
-            completion_tokens: u.output_tokens,
-        });
-
-        let response_message = WeftMessage {
-            role: Role::Assistant,
-            source: Source::Provider,
-            model: Some(model),
-            content: vec![ContentPart::Text(text)],
-            delta: false,
-            message_index: 0,
-        };
-
-        Ok((response_message, usage))
+        Ok(translate::parse_outbound_response(&wire_response, model))
     }
 }
 
 #[async_trait::async_trait]
-impl Provider for AnthropicProvider {
+impl Provider for OpenAIProvider {
     async fn execute(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         match request {
             ProviderRequest::ChatCompletion {
@@ -242,13 +112,13 @@ impl Provider for AnthropicProvider {
             // For now, only ChatCompletion is implemented.
             #[allow(unreachable_patterns)]
             _ => Err(ProviderError::Unsupported(
-                "Anthropic provider currently supports chat_completions only".to_string(),
+                "OpenAI provider currently supports chat_completions only".to_string(),
             )),
         }
     }
 
     fn name(&self) -> &str {
-        "anthropic"
+        "openai"
     }
 }
 
@@ -258,8 +128,8 @@ mod tests {
     use serde_json::json;
     use weft_core::{ContentPart, Role, Source, WeftMessage};
 
-    fn make_provider(base_url: &str) -> AnthropicProvider {
-        AnthropicProvider::new("test-key".to_string(), Some(base_url.to_string()))
+    fn make_provider(base_url: &str) -> OpenAIProvider {
+        OpenAIProvider::new("test-key".to_string(), Some(base_url.to_string()))
     }
 
     /// Build a WeftMessage with a single text content part.
@@ -294,11 +164,13 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(
                 json!({
-                    "id": "msg_01",
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": "Hello! How can I help?"}],
-                    "usage": {"input_tokens": 10, "output_tokens": 8}
+                    "id": "chatcmpl-01",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Hello! How can I help?"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 9}
                 })
                 .to_string(),
             )
@@ -307,7 +179,7 @@ mod tests {
 
         let provider = make_provider(&server.url());
         let result = provider
-            .execute(make_request("claude-test"))
+            .execute(make_request("gpt-test"))
             .await
             .expect("should succeed");
 
@@ -315,7 +187,6 @@ mod tests {
         let ProviderResponse::ChatCompletion { message, usage } = result else {
             panic!("expected ChatCompletion response");
         };
-        // Extract text from WeftMessage content parts
         let text = message
             .content
             .iter()
@@ -332,8 +203,8 @@ mod tests {
         assert_eq!(message.role, Role::Assistant);
         assert_eq!(message.source, Source::Provider);
         let u = usage.expect("usage should be present");
-        assert_eq!(u.prompt_tokens, 10);
-        assert_eq!(u.completion_tokens, 8);
+        assert_eq!(u.prompt_tokens, 12);
+        assert_eq!(u.completion_tokens, 9);
         mock.assert_async().await;
     }
 
@@ -343,12 +214,12 @@ mod tests {
         let _mock = server
             .mock("POST", "/")
             .with_status(400)
-            .with_body(r#"{"error": {"type": "invalid_request_error", "message": "bad request"}}"#)
+            .with_body(r#"{"error": {"message": "bad request", "type": "invalid_request_error"}}"#)
             .create_async()
             .await;
 
         let provider = make_provider(&server.url());
-        let result = provider.execute(make_request("claude-test")).await;
+        let result = provider.execute(make_request("gpt-test")).await;
 
         assert!(matches!(
             result,
@@ -362,26 +233,24 @@ mod tests {
         let _mock = server
             .mock("POST", "/")
             .with_status(429)
-            .with_header("retry-after", "30")
-            .with_body(r#"{"error": {"type": "rate_limit_error"}}"#)
+            .with_header("retry-after", "60")
+            .with_body("{}")
             .create_async()
             .await;
 
         let provider = make_provider(&server.url());
-        let result = provider.execute(make_request("claude-test")).await;
+        let result = provider.execute(make_request("gpt-test")).await;
 
         assert!(matches!(
             result,
             Err(ProviderError::RateLimited {
-                retry_after_ms: 30_000
+                retry_after_ms: 60_000
             })
         ));
     }
 
     #[tokio::test]
-    async fn test_system_prompt_from_messages_0_extracted_to_system_field() {
-        // System prompt at messages[0] (Role::System, Source::Gateway) is extracted
-        // to Anthropic's top-level `system` field.
+    async fn test_system_prompt_from_messages_0_as_system_message() {
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("POST", "/")
@@ -389,14 +258,17 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(
                 json!({
-                    "content": [{"type": "text", "text": "ok"}],
-                    "usage": {"input_tokens": 5, "output_tokens": 2}
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                    "usage": null
                 })
                 .to_string(),
             )
             .match_body(mockito::Matcher::PartialJsonString(
                 json!({
-                    "system": "You are a helpful assistant."
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": "Hello"}
+                    ]
                 })
                 .to_string(),
             ))
@@ -413,17 +285,17 @@ mod tests {
                 ),
                 make_weft_message(Role::User, Source::Client, "Hello"),
             ],
-            model: "claude-test".to_string(),
+            model: "gpt-test".to_string(),
             options: SamplingOptions::default(),
         };
         let result = provider.execute(request).await;
+
         assert!(result.is_ok());
         mock.assert_async().await;
     }
 
     #[tokio::test]
-    async fn test_no_system_prompt_produces_empty_system_field() {
-        // When messages[0] is Role::User (not System), system field is empty string.
+    async fn test_no_system_prompt_when_messages_0_is_user() {
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("POST", "/")
@@ -431,14 +303,16 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(
                 json!({
-                    "content": [{"type": "text", "text": "ok"}],
-                    "usage": {"input_tokens": 3, "output_tokens": 1}
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                    "usage": null
                 })
                 .to_string(),
             )
             .match_body(mockito::Matcher::PartialJsonString(
                 json!({
-                    "system": ""
+                    "messages": [
+                        {"role": "user", "content": "Hello"}
+                    ]
                 })
                 .to_string(),
             ))
@@ -448,18 +322,17 @@ mod tests {
         let provider = make_provider(&server.url());
         let request = ProviderRequest::ChatCompletion {
             messages: vec![make_weft_message(Role::User, Source::Client, "Hello")],
-            model: "claude-test".to_string(),
+            model: "gpt-test".to_string(),
             options: SamplingOptions::default(),
         };
         let result = provider.execute(request).await;
+
         assert!(result.is_ok());
         mock.assert_async().await;
     }
 
     #[tokio::test]
-    async fn test_additional_client_system_messages_concatenated() {
-        // After extracting messages[0] as system prompt, additional Role::System
-        // messages (e.g. Source::Client) are concatenated into the system field.
+    async fn test_gateway_activity_messages_not_sent() {
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("POST", "/")
@@ -467,87 +340,40 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(
                 json!({
-                    "content": [{"type": "text", "text": "ok"}],
-                    "usage": {"input_tokens": 5, "output_tokens": 2}
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                    "usage": null
                 })
                 .to_string(),
             )
             .match_body(mockito::Matcher::PartialJsonString(
                 json!({
-                    "system": "base system\n\nYou are a helpful assistant."
+                    "messages": [
+                        {"role": "system", "content": "sys prompt"},
+                        {"role": "user", "content": "Hello"}
+                    ]
                 })
                 .to_string(),
             ))
             .create_async()
             .await;
 
-        // System messages with source Client are included and concatenated.
-        let messages = vec![
-            // System prompt at messages[0]
-            make_weft_message(Role::System, Source::Gateway, "base system"),
-            // Additional system message from client (not gateway activity -- passes filter)
-            make_weft_message(Role::System, Source::Client, "You are a helpful assistant."),
-            make_weft_message(Role::User, Source::Client, "Hello"),
-        ];
-
-        let provider = make_provider(&server.url());
-        let request = ProviderRequest::ChatCompletion {
-            messages,
-            model: "claude-test".to_string(),
-            options: SamplingOptions::default(),
-        };
-        let result = provider.execute(request).await;
-        assert!(result.is_ok());
-        mock.assert_async().await;
-    }
-
-    #[tokio::test]
-    async fn test_gateway_activity_messages_not_in_system_field() {
-        // Gateway activity messages (Role::System, Source::Gateway) with non-text content
-        // only are filtered out by extract_text_messages and do NOT pollute system field.
-        // Activity telemetry (routing events, hook results) carries no text parts.
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("POST", "/")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                json!({
-                    "content": [{"type": "text", "text": "ok"}],
-                    "usage": {"input_tokens": 5, "output_tokens": 2}
-                })
-                .to_string(),
-            )
-            .match_body(mockito::Matcher::PartialJsonString(
-                json!({
-                    "system": "sys prompt"
-                })
-                .to_string(),
-            ))
-            .create_async()
-            .await;
-
-        // Activity telemetry message: System+Gateway with NO text content parts.
         let activity_msg = WeftMessage {
             role: Role::System,
             source: Source::Gateway,
             model: None,
-            content: vec![], // no text -- pure telemetry, must be filtered
+            content: vec![],
             delta: false,
             message_index: 0,
         };
 
-        let messages = vec![
-            make_weft_message(Role::System, Source::Gateway, "sys prompt"),
-            // This gateway activity message (no text) must NOT appear in system field
-            activity_msg,
-            make_weft_message(Role::User, Source::Client, "Hello"),
-        ];
-
         let provider = make_provider(&server.url());
         let request = ProviderRequest::ChatCompletion {
-            messages,
-            model: "claude-test".to_string(),
+            messages: vec![
+                make_weft_message(Role::System, Source::Gateway, "sys prompt"),
+                activity_msg,
+                make_weft_message(Role::User, Source::Client, "Hello"),
+            ],
+            model: "gpt-test".to_string(),
             options: SamplingOptions::default(),
         };
         let result = provider.execute(request).await;
@@ -564,18 +390,18 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(
                 json!({
-                    "content": [{"type": "text", "text": "response"}],
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}],
                     "usage": null
                 })
                 .to_string(),
             )
             .match_body(mockito::Matcher::AllOf(vec![
-                mockito::Matcher::PartialJsonString(json!({"max_tokens": 512}).to_string()),
-                // top_k is an integer, safe for PartialJsonString
-                mockito::Matcher::PartialJsonString(json!({"top_k": 50_u32}).to_string()),
-                // temperature and top_p are floats -- use regex to avoid precision issues
+                mockito::Matcher::PartialJsonString(json!({"max_tokens": 256}).to_string()),
+                mockito::Matcher::PartialJsonString(json!({"seed": 42_i64}).to_string()),
                 mockito::Matcher::Regex(r#""temperature"\s*:"#.to_string()),
                 mockito::Matcher::Regex(r#""top_p"\s*:"#.to_string()),
+                mockito::Matcher::Regex(r#""frequency_penalty"\s*:"#.to_string()),
+                mockito::Matcher::Regex(r#""presence_penalty"\s*:"#.to_string()),
             ]))
             .create_async()
             .await;
@@ -583,16 +409,16 @@ mod tests {
         let provider = make_provider(&server.url());
         let request = ProviderRequest::ChatCompletion {
             messages: vec![make_weft_message(Role::User, Source::Client, "Hello")],
-            model: "claude-test".to_string(),
+            model: "gpt-test".to_string(),
             options: SamplingOptions {
-                max_tokens: Some(512),
-                temperature: Some(0.7),
-                top_p: Some(0.95),
-                top_k: Some(50),
+                max_tokens: Some(256),
+                temperature: Some(0.5),
+                top_p: Some(0.9),
+                top_k: None,
                 stop: vec![],
-                frequency_penalty: None,
-                presence_penalty: None,
-                seed: None,
+                frequency_penalty: Some(0.1),
+                presence_penalty: Some(0.2),
+                seed: Some(42),
                 response_format: None,
                 activity: false,
             },
@@ -603,9 +429,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_max_tokens_defaults_to_4096_when_none() {
-        // Anthropic requires max_tokens; when SamplingOptions.max_tokens is None,
-        // the provider defaults to 4096.
+    async fn test_stop_sequences_forwarded() {
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("POST", "/")
@@ -613,13 +437,16 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(
                 json!({
-                    "content": [{"type": "text", "text": "ok"}],
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}],
                     "usage": null
                 })
                 .to_string(),
             )
             .match_body(mockito::Matcher::PartialJsonString(
-                json!({"max_tokens": 4096}).to_string(),
+                json!({
+                    "stop": ["STOP", "END"]
+                })
+                .to_string(),
             ))
             .create_async()
             .await;
@@ -627,10 +454,18 @@ mod tests {
         let provider = make_provider(&server.url());
         let request = ProviderRequest::ChatCompletion {
             messages: vec![make_weft_message(Role::User, Source::Client, "Hello")],
-            model: "claude-test".to_string(),
+            model: "gpt-test".to_string(),
             options: SamplingOptions {
-                max_tokens: None, // None => default 4096
-                ..SamplingOptions::default()
+                max_tokens: None,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                stop: vec!["STOP".to_string(), "END".to_string()],
+                frequency_penalty: None,
+                presence_penalty: None,
+                seed: None,
+                response_format: None,
+                activity: false,
             },
         };
         let result = provider.execute(request).await;
@@ -647,8 +482,8 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(
                 json!({
-                    "content": [{"type": "text", "text": "Hi there!"}],
-                    "usage": {"input_tokens": 5, "output_tokens": 3}
+                    "choices": [{"message": {"role": "assistant", "content": "Hi there!"}}],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 3}
                 })
                 .to_string(),
             )
@@ -659,7 +494,7 @@ mod tests {
         let result = provider
             .execute(ProviderRequest::ChatCompletion {
                 messages: vec![make_weft_message(Role::User, Source::Client, "Hello")],
-                model: "claude-3-5-sonnet".to_string(),
+                model: "gpt-4".to_string(),
                 options: SamplingOptions::default(),
             })
             .await
@@ -671,7 +506,7 @@ mod tests {
         };
         assert_eq!(message.role, Role::Assistant);
         assert_eq!(message.source, Source::Provider);
-        assert_eq!(message.model, Some("claude-3-5-sonnet".to_string()));
+        assert_eq!(message.model, Some("gpt-4".to_string()));
         assert!(!message.delta);
     }
 
@@ -687,7 +522,7 @@ mod tests {
             .await;
 
         let provider = make_provider(&server.url());
-        let result = provider.execute(make_request("claude-test")).await;
+        let result = provider.execute(make_request("gpt-test")).await;
 
         assert!(matches!(
             result,
@@ -697,7 +532,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_unsupported_variant_returns_unsupported() {
-        // ChatCompletion should succeed — not unsupported.
         let mut server = mockito::Server::new_async().await;
         let _mock = server
             .mock("POST", "/")
@@ -705,8 +539,8 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(
                 json!({
-                    "content": [{"type": "text", "text": "ok"}],
-                    "usage": {"input_tokens": 5, "output_tokens": 2}
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                    "usage": null
                 })
                 .to_string(),
             )
@@ -714,7 +548,7 @@ mod tests {
             .await;
 
         let provider = make_provider(&server.url());
-        let result = provider.execute(make_request("claude-test")).await;
+        let result = provider.execute(make_request("gpt-test")).await;
         assert!(
             result.is_ok(),
             "ChatCompletion should not return Unsupported"
@@ -723,7 +557,7 @@ mod tests {
 
     #[test]
     fn test_provider_name() {
-        let provider = AnthropicProvider::new("key".to_string(), None);
-        assert_eq!(provider.name(), "anthropic");
+        let provider = OpenAIProvider::new("key".to_string(), None);
+        assert_eq!(provider.name(), "openai");
     }
 }

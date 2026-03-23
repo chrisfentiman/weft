@@ -2,7 +2,7 @@
 //!
 //! Verifies the span tree produced by a request through the pipeline:
 //! - Span hierarchy: `request > pre_loop > activity*`, `request > dispatch_loop > iteration > generate`, etc.
-//! - Span attributes: `request_id`, `activity.name`, `llm.model` are populated.
+//! - Span attributes: `request_id`, `activity.name`, `provider.model` are populated.
 //!
 //! # Design
 //!
@@ -239,7 +239,7 @@ fn init_global_subscriber() {
 /// Run a request with span collection. Serializes via `TEST_MUTEX` to prevent
 /// parallel tests from interfering with the global `ACTIVE_STORE`.
 async fn run_with_span_collection(
-    llm: impl weft_llm::Provider + 'static,
+    llm: impl weft_providers::Provider + 'static,
     commands: impl weft_commands::CommandRegistry + 'static,
     body: serde_json::Value,
 ) -> (
@@ -331,7 +331,7 @@ async fn test_span_hierarchy_simple_request() {
 /// Verify that span attributes are populated.
 ///
 /// - `request` span: `request_id` must be a non-empty string.
-/// - `generate` span: `llm.model` must be populated.
+/// - `generate` span: `provider.model` must be populated.
 /// - `activity` spans: `activity.name` must be populated.
 #[tokio::test]
 async fn test_span_attributes_populated() {
@@ -377,7 +377,7 @@ async fn test_span_attributes_populated() {
         "`request` span `weft.request_id` must be non-empty"
     );
 
-    // `generate` span must have `llm.model`.
+    // `generate` span must have `provider.model`.
     let generate_spans = store.find_by_name("generate");
     assert!(
         !generate_spans.is_empty(),
@@ -385,14 +385,14 @@ async fn test_span_attributes_populated() {
         store.all_names()
     );
     for span in &generate_spans {
-        let llm_model = span
+        let provider_model = span
             .attrs
-            .get("llm.model")
+            .get("provider.model")
             .map(|s| s.as_str())
             .unwrap_or("");
         assert!(
-            !llm_model.is_empty(),
-            "`generate` span must have non-empty `llm.model`. attrs: {:?}",
+            !provider_model.is_empty(),
+            "`generate` span must have non-empty `provider.model`. attrs: {:?}",
             span.attrs
         );
     }

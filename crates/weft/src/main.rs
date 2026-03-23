@@ -17,8 +17,10 @@ use weft_activities::{
 };
 use weft_commands::ToolRegistryCommandAdapter;
 use weft_core::{HookEvent, WireFormat};
-use weft_llm::{AnthropicProvider, Capability, OpenAIProvider, ProviderRegistry, RhaiProvider};
 use weft_memory::{DefaultMemoryService, GrpcMemoryStoreClient, MemoryStoreMux, StoreInfo};
+use weft_providers::{
+    AnthropicProvider, Capability, OpenAIProvider, ProviderRegistry, RhaiProvider,
+};
 use weft_reactor::{
     ActivityRegistry, Reactor, ReactorConfig,
     config::{ActivityRef, BudgetConfig, LoopHooks, PipelineConfig, RetryPolicy},
@@ -165,9 +167,9 @@ async fn main() {
     let resolved_models = config.router.resolve_models();
 
     // One provider instance per unique provider name.
-    let mut provider_instances: HashMap<String, Arc<dyn weft_llm::Provider>> = HashMap::new();
+    let mut provider_instances: HashMap<String, Arc<dyn weft_providers::Provider>> = HashMap::new();
     for provider_config in &config.router.providers {
-        let instance: Arc<dyn weft_llm::Provider> = match &provider_config.wire_format {
+        let instance: Arc<dyn weft_providers::Provider> = match &provider_config.wire_format {
             WireFormat::Anthropic => Arc::new(AnthropicProvider::new(
                 provider_config.api_key.clone(),
                 provider_config.base_url.clone(),
@@ -209,7 +211,7 @@ async fn main() {
     }
 
     // Build registry maps: model routing name -> provider/model_id/max_tokens/capabilities.
-    let mut registry_providers: HashMap<String, Arc<dyn weft_llm::Provider>> = HashMap::new();
+    let mut registry_providers: HashMap<String, Arc<dyn weft_providers::Provider>> = HashMap::new();
     let mut registry_model_ids: HashMap<String, String> = HashMap::new();
     let mut registry_max_tokens: HashMap<String, u32> = HashMap::new();
     let mut registry_capabilities: HashMap<String, HashSet<Capability>> = HashMap::new();
@@ -472,7 +474,7 @@ async fn main() {
     let services = Arc::new(Services {
         config_store: Arc::clone(&config_store),
         resolved_config,
-        providers: provider_registry as Arc<dyn weft_llm::ProviderService + Send + Sync>,
+        providers: provider_registry as Arc<dyn weft_providers::ProviderService + Send + Sync>,
         router: router as Arc<dyn weft_router::SemanticRouter + Send + Sync>,
         commands: command_registry as Arc<dyn weft_commands::CommandRegistry + Send + Sync>,
         memory: memory_service.map(|m| m as Arc<dyn weft_memory::MemoryService + Send + Sync>),

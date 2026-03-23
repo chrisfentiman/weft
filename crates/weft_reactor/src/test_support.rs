@@ -30,11 +30,11 @@ use weft_core::{
     Source, WeftMessage, WeftRequest,
 };
 use weft_hooks::{HookChainResult, HookRunner};
-use weft_llm::{Provider, ProviderError};
+use weft_providers::{Provider, ProviderError};
 
 // Import stub types from trait crates instead of defining locally.
 pub use weft_commands::test_support::{StubCommandRegistry, reconstruct_command_error};
-pub use weft_llm::test_support::{
+pub use weft_providers::test_support::{
     ChunkStreamProvider, MidStreamErrorProvider, SingleUseErrorProvider, SlowProvider,
     StubProvider, StubProviderService,
 };
@@ -355,8 +355,8 @@ fn build_services_full_ext(
     fail_list_commands: bool,
 ) -> Services {
     let weft_config = make_test_config();
-    // StubProviderService (renamed from StubProviderServiceV2) comes from weft_llm::test_support.
-    let providers: Arc<dyn weft_llm::ProviderService + Send + Sync> =
+    // StubProviderService (renamed from StubProviderServiceV2) comes from weft_providers::test_support.
+    let providers: Arc<dyn weft_providers::ProviderService + Send + Sync> =
         Arc::new(StubProviderService::new(provider));
     // StubRouter comes from weft_router::test_support.
     let router: Arc<dyn weft_router::SemanticRouter + Send + Sync> = Arc::new(StubRouter);
@@ -488,7 +488,7 @@ pub fn make_test_services_with_failing_router() -> Services {
     let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(weft_hooks::NullHookRunner);
 
     let weft_config = make_test_config();
-    let providers: Arc<dyn weft_llm::ProviderService + Send + Sync> =
+    let providers: Arc<dyn weft_providers::ProviderService + Send + Sync> =
         Arc::new(StubProviderService::new(provider));
     // ErrorRouter comes from weft_router::test_support.
     let router: Arc<dyn weft_router::SemanticRouter + Send + Sync> =

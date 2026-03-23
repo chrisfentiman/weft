@@ -2,6 +2,7 @@
 //!
 //! Endpoints:
 //! - `POST /v1/chat/completions` — OpenAI-compatible chat completions
+//! - `POST /v1/messages`         — Anthropic-compatible Messages API
 //! - `GET /health`               — Health check for load balancers
 //! - `GET /metrics`              — Prometheus metrics (when enabled)
 //!
@@ -22,164 +23,9 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use serde::{Deserialize, Serialize};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
-use weft_core::{
-    ContentPart, ModelRoutingInstruction, Role, SamplingOptions, Source, WeftError, WeftMessage,
-    WeftRequest,
-};
 use weft_proto::weft::v1 as proto;
 
-use crate::grpc::WeftService;
-
-// ── OpenAI compat types (local to this module) ─────────────────────────────
-//
-// These are wire-format types for the /v1/chat/completions translation layer.
-// They are NOT domain types. The domain types are WeftRequest/WeftResponse in weft_core.
-
-/// OpenAI-format chat completion request body.
-#[derive(Debug, Deserialize)]
-struct OpenAiChatRequest {
-    model: String,
-    messages: Vec<OpenAiMessage>,
-    #[serde(default)]
-    stream: Option<bool>,
-    #[serde(default)]
-    temperature: Option<f32>,
-    #[serde(default)]
-    max_tokens: Option<u32>,
-}
-
-/// An OpenAI-format message with role and string content.
-#[derive(Debug, Serialize, Deserialize)]
-struct OpenAiMessage {
-    role: Role,
-    content: String,
-}
-
-/// OpenAI-format chat completion response body.
-#[derive(Debug, Serialize)]
-struct OpenAiChatResponse {
-    id: String,
-    object: String,
-    created: u64,
-    model: String,
-    choices: Vec<OpenAiChoice>,
-    usage: OpenAiUsage,
-}
-
-#[derive(Debug, Serialize)]
-struct OpenAiChoice {
-    index: u32,
-    message: OpenAiMessage,
-    finish_reason: String,
-}
-
-#[derive(Debug, Serialize)]
-struct OpenAiUsage {
-    prompt_tokens: u32,
-    completion_tokens: u32,
-    total_tokens: u32,
-}
-
-// ── Translation functions ───────────────────────────────────────────────────
-
-/// Translate an OpenAI-format request into a domain `WeftRequest`.
-///
-/// All messages are assigned `Source::Client` since this is the OpenAI compat
-/// layer and there is no source attribution in the OpenAI format.
-///
-/// Intentionally infallible: every field in `OpenAiChatRequest` maps cleanly to
-/// `WeftRequest` without conditions that can fail at translation time. Validation
-/// (empty messages, missing user role, streaming) is performed by the axum handler
-/// before this function is called.
-fn openai_to_weft(req: OpenAiChatRequest) -> WeftRequest {
-    let messages: Vec<WeftMessage> = req
-        .messages
-        .into_iter()
-        .map(|m| WeftMessage {
-            source: match m.role {
-                Role::User => Source::Client,
-                Role::Assistant => Source::Provider,
-                Role::System => Source::Gateway,
-            },
-            role: m.role,
-            model: None,
-            content: vec![ContentPart::Text(m.content)],
-            delta: false,
-            message_index: 0,
-        })
-        .collect();
-
-    let routing = ModelRoutingInstruction::parse(&req.model);
-
-    let options = SamplingOptions {
-        temperature: req.temperature,
-        max_tokens: req.max_tokens,
-        ..Default::default()
-    };
-
-    WeftRequest {
-        messages,
-        routing,
-        options,
-    }
-}
-
-/// Translate a domain `WeftResponse` into an OpenAI-format response.
-///
-/// `request_model` is the model string from the original OpenAI request and is
-/// echoed back verbatim so clients see the model they asked for, not the
-/// internal routing name. The response id is prefixed with `chatcmpl-` to
-/// match the OpenAI wire format.
-fn weft_to_openai(resp: weft_core::WeftResponse, request_model: String) -> OpenAiChatResponse {
-    // Extract the last assistant/provider text message.
-    let assistant_text = resp
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == Role::Assistant && m.source == Source::Provider)
-        .and_then(|m| {
-            m.content.iter().find_map(|part| match part {
-                ContentPart::Text(text) => Some(text.clone()),
-                _ => None,
-            })
-        })
-        .unwrap_or_default();
-
-    // Prefix id with "chatcmpl-" to match OpenAI wire format.
-    let id = if resp.id.starts_with("chatcmpl-") {
-        resp.id
-    } else {
-        format!("chatcmpl-{}", resp.id)
-    };
-
-    OpenAiChatResponse {
-        id,
-        object: "chat.completion".to_string(),
-        created: unix_timestamp(),
-        model: request_model,
-        choices: vec![OpenAiChoice {
-            index: 0,
-            message: OpenAiMessage {
-                role: Role::Assistant,
-                content: assistant_text,
-            },
-            finish_reason: "stop".to_string(),
-        }],
-        usage: OpenAiUsage {
-            prompt_tokens: resp.usage.prompt_tokens,
-            completion_tokens: resp.usage.completion_tokens,
-            total_tokens: resp.usage.total_tokens,
-        },
-    }
-}
-
-/// Return the current Unix timestamp in seconds.
-fn unix_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
+use crate::{compat::CompatError, grpc::WeftService};
 
 // ── Router ──────────────────────────────────────────────────────────────────
 
@@ -207,9 +53,10 @@ pub fn build_router(
     ))
     .into_axum_router();
 
-    // Build the HTTP axum router for OpenAI compat + health.
+    // Build the HTTP axum router for OpenAI compat, Anthropic compat, and health.
     let mut http_router = Router::new()
         .route("/v1/chat/completions", post(chat_completions_handler))
+        .route("/v1/messages", post(anthropic_messages_handler))
         .route("/health", get(health_handler))
         .with_state(Arc::clone(&weft_service));
 
@@ -289,34 +136,23 @@ async fn shutdown_signal() {
 async fn chat_completions_handler(
     State(weft_service): State<Arc<WeftService>>,
     headers: HeaderMap,
-    Json(openai_req): Json<OpenAiChatRequest>,
-) -> Result<Json<OpenAiChatResponse>, ApiError> {
+    Json(openai_req): Json<weft_providers::openai::wire::OpenAIRequest>,
+) -> Result<Json<weft_providers::openai::wire::OpenAIResponse>, ApiError> {
     // Extract W3C TraceContext from incoming headers and set it on the current span.
     // tower-http's TraceLayer has already created a span for this request — by setting
     // its OTel parent here, child spans inherit the incoming distributed trace.
-    // `set_parent` does not use thread-local storage and is safe across await points.
     {
         use tracing_opentelemetry::OpenTelemetrySpanExt;
         let parent_ctx = crate::telemetry::propagation::extract_from_headers(&headers);
         tracing::Span::current().set_parent(parent_ctx);
     }
 
-    // Validate: must have at least one message.
-    if openai_req.messages.is_empty() {
-        return Err(ApiError::bad_request("messages array must not be empty"));
-    }
-
-    // Validate: must have at least one user message.
-    if !openai_req.messages.iter().any(|m| m.role == Role::User) {
-        return Err(ApiError::bad_request(
-            "messages must contain at least one user message",
-        ));
-    }
-
-    // Reject streaming explicitly.
-    if openai_req.stream == Some(true) {
-        return Err(ApiError::bad_request("streaming is not supported in v1"));
-    }
+    crate::compat::validate_compat_request(
+        openai_req.messages.is_empty(),
+        openai_req.messages.iter().any(|m| m.role == "user"),
+        openai_req.stream,
+    )
+    .map_err(ApiError::bad_request)?;
 
     info!(
         model = %openai_req.model,
@@ -324,17 +160,71 @@ async fn chat_completions_handler(
         "handling chat completion request"
     );
 
-    // Capture request model before consuming openai_req (for echo in response).
     let request_model = openai_req.model.clone();
+    let weft_req = weft_providers::openai::translate::parse_inbound_request(openai_req)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
-    let weft_req = openai_to_weft(openai_req);
+    weft_service
+        .handle_weft_request(weft_req)
+        .await
+        .map(|weft_resp| {
+            Json(weft_providers::openai::translate::build_inbound_response(
+                weft_resp,
+                request_model,
+            ))
+        })
+        .map_err(|e| ApiError::from(CompatError::from_weft_error(e)))
+}
 
-    // Call handle_weft_request — the same method the gRPC handler calls.
-    // One code path to the engine regardless of entry point.
-    match weft_service.handle_weft_request(weft_req).await {
-        Ok(weft_resp) => Ok(Json(weft_to_openai(weft_resp, request_model))),
-        Err(e) => Err(ApiError::from_weft_error(e)),
+/// `POST /v1/messages`
+///
+/// Accepts an Anthropic-compatible Messages API request and returns an
+/// Anthropic-format response. Same convergence at `handle_weft_request()`
+/// as all other entry points.
+///
+/// Extracts W3C TraceContext from the `traceparent` request header for
+/// distributed tracing support.
+async fn anthropic_messages_handler(
+    State(weft_service): State<Arc<WeftService>>,
+    headers: HeaderMap,
+    Json(anthropic_req): Json<weft_providers::anthropic::wire::AnthropicRequest>,
+) -> Result<Json<weft_providers::anthropic::wire::AnthropicResponse>, AnthropicApiError> {
+    // Extract W3C TraceContext from incoming headers.
+    {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        let parent_ctx = crate::telemetry::propagation::extract_from_headers(&headers);
+        tracing::Span::current().set_parent(parent_ctx);
     }
+
+    crate::compat::validate_compat_request(
+        anthropic_req.messages.is_empty(),
+        anthropic_req.messages.iter().any(|m| m.role == "user"),
+        anthropic_req.stream,
+    )
+    .map_err(AnthropicApiError::bad_request)?;
+
+    info!(
+        model = %anthropic_req.model,
+        message_count = anthropic_req.messages.len(),
+        "handling Anthropic messages request"
+    );
+
+    let request_model = anthropic_req.model.clone();
+    let weft_req = weft_providers::anthropic::translate::parse_inbound_request(anthropic_req)
+        .map_err(|e| AnthropicApiError::bad_request(e.to_string()))?;
+
+    weft_service
+        .handle_weft_request(weft_req)
+        .await
+        .map(|weft_resp| {
+            Json(
+                weft_providers::anthropic::translate::build_inbound_response(
+                    weft_resp,
+                    request_model,
+                ),
+            )
+        })
+        .map_err(|e| AnthropicApiError::from(CompatError::from_weft_error(e)))
 }
 
 /// `GET /metrics`
@@ -406,77 +296,22 @@ struct ErrorDetail {
     code: Option<String>,
 }
 
-/// API error that converts to an HTTP response with the right status code.
-pub struct ApiError {
-    status: StatusCode,
-    message: String,
-    /// For rate-limit errors: the retry-after value in milliseconds.
-    retry_after_ms: Option<u64>,
-}
+/// OpenAI-format API error.
+///
+/// Thin wrapper around `CompatError` that produces OpenAI-shaped error bodies
+/// (`{ "error": { "message": "...", "type": "...", "code": null } }`).
+/// Status code mapping lives in `CompatError::from_weft_error`.
+pub struct ApiError(CompatError);
 
 impl ApiError {
     fn bad_request(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: message.into(),
-            retry_after_ms: None,
-        }
+        Self(CompatError::bad_request(message))
     }
+}
 
-    fn internal(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: message.into(),
-            retry_after_ms: None,
-        }
-    }
-
-    fn from_weft_error(e: WeftError) -> Self {
-        match e {
-            WeftError::InvalidRequest(_) => Self::bad_request(e.to_string()),
-            WeftError::ProtoConversion(_) => Self::internal(e.to_string()),
-            WeftError::StreamingNotSupported => Self::bad_request(e.to_string()),
-            WeftError::Config(_) => Self::internal(e.to_string()),
-            WeftError::RateLimited { retry_after_ms } => Self {
-                status: StatusCode::TOO_MANY_REQUESTS,
-                message: e.to_string(),
-                retry_after_ms: Some(retry_after_ms),
-            },
-            WeftError::RequestTimeout { .. } => Self {
-                status: StatusCode::GATEWAY_TIMEOUT,
-                message: e.to_string(),
-                retry_after_ms: None,
-            },
-            WeftError::ToolRegistry(_) => Self {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                message: e.to_string(),
-                retry_after_ms: None,
-            },
-            WeftError::CommandLoopExceeded { .. } => Self::internal(e.to_string()),
-            WeftError::Llm(_) => Self::internal(e.to_string()),
-            WeftError::Routing(_) => Self::internal(e.to_string()),
-            WeftError::ModelNotFound { .. } => Self::internal(e.to_string()),
-            WeftError::Command(_) => Self::internal(e.to_string()),
-            WeftError::MemoryStore(_) => Self {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                message: e.to_string(),
-                retry_after_ms: None,
-            },
-            // Configuration error: no models support the required capability.
-            WeftError::NoEligibleModels { .. } => Self::bad_request(e.to_string()),
-            // Hard block: hook terminated the request before LLM involvement.
-            WeftError::HookBlocked { .. } => Self {
-                status: StatusCode::FORBIDDEN,
-                message: e.to_string(),
-                retry_after_ms: None,
-            },
-            // Feedback block exhausted retries (PreResponse only).
-            WeftError::HookBlockedAfterRetries { .. } => Self {
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                message: e.to_string(),
-                retry_after_ms: None,
-            },
-        }
+impl From<CompatError> for ApiError {
+    fn from(e: CompatError) -> Self {
+        Self(e)
     }
 }
 
@@ -484,7 +319,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = ErrorBody {
             error: ErrorDetail {
-                message: self.message,
+                message: self.0.message,
                 error_type: "invalid_request_error".to_string(),
                 code: None,
             },
@@ -496,7 +331,7 @@ impl IntoResponse for ApiError {
         });
 
         let mut response = Response::builder()
-            .status(self.status)
+            .status(self.0.status)
             .header(header::CONTENT_TYPE, "application/json")
             .body(axum::body::Body::from(json_body))
             .unwrap_or_else(|_| {
@@ -504,8 +339,78 @@ impl IntoResponse for ApiError {
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
             });
 
-        // Add Retry-After header for rate-limit responses.
-        if let Some(retry_after_ms) = self.retry_after_ms {
+        if let Some(retry_after_ms) = self.0.retry_after_ms {
+            let retry_after_secs = retry_after_ms.div_ceil(1000);
+            if let Ok(value) = header::HeaderValue::from_str(&retry_after_secs.to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+        }
+
+        response
+    }
+}
+
+// ── Anthropic error types ──────────────────────────────────────────────────
+
+/// Anthropic-compatible error response body.
+#[derive(Debug, Serialize)]
+struct AnthropicErrorBody {
+    #[serde(rename = "type")]
+    kind: String, // "error"
+    error: AnthropicErrorDetail,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicErrorDetail {
+    #[serde(rename = "type")]
+    error_type: String, // "invalid_request_error", "rate_limit_error", etc.
+    message: String,
+}
+
+/// Anthropic-format API error that converts to an HTTP response.
+///
+/// Thin wrapper around `CompatError` that produces Anthropic-shaped error bodies
+/// (`{ "type": "error", "error": { "type": "...", "message": "..." } }`).
+/// Status code mapping lives in `CompatError::from_weft_error`.
+pub struct AnthropicApiError(CompatError);
+
+impl AnthropicApiError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self(CompatError::bad_request(message))
+    }
+}
+
+impl From<CompatError> for AnthropicApiError {
+    fn from(e: CompatError) -> Self {
+        Self(e)
+    }
+}
+
+impl IntoResponse for AnthropicApiError {
+    fn into_response(self) -> Response {
+        let body = AnthropicErrorBody {
+            kind: "error".to_string(),
+            error: AnthropicErrorDetail {
+                error_type: self.0.anthropic_error_type,
+                message: self.0.message,
+            },
+        };
+
+        let json_body = serde_json::to_string(&body).unwrap_or_else(|_| {
+            r#"{"type":"error","error":{"type":"api_error","message":"internal serialization error"}}"#
+                .to_string()
+        });
+
+        let mut response = Response::builder()
+            .status(self.0.status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(json_body))
+            .unwrap_or_else(|_| {
+                warn!("failed to build Anthropic error response");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            });
+
+        if let Some(retry_after_ms) = self.0.retry_after_ms {
             let retry_after_secs = retry_after_ms.div_ceil(1000);
             if let Ok(value) = header::HeaderValue::from_str(&retry_after_secs.to_string()) {
                 response.headers_mut().insert(header::RETRY_AFTER, value);
@@ -534,9 +439,9 @@ mod tests {
     };
     use weft_core::{
         ClassifierConfig, DomainsConfig, GatewayConfig, HookEvent, ModelEntry, ProviderConfig,
-        RouterConfig, ServerConfig, WeftConfig, WireFormat,
+        RouterConfig, ServerConfig, WeftConfig, WeftError, WireFormat,
     };
-    use weft_llm::{Capability, Provider, ProviderRegistry};
+    use weft_providers::{Capability, Provider, ProviderRegistry};
     use weft_reactor::{
         ActivityRegistry, Reactor, ReactorConfig,
         config::{ActivityRef, BudgetConfig, LoopHooks, PipelineConfig, RetryPolicy},
@@ -599,7 +504,7 @@ mod tests {
         let mut providers = HashMap::new();
         providers.insert(
             "test-model".to_string(),
-            Arc::new(llm) as Arc<dyn weft_llm::Provider>,
+            Arc::new(llm) as Arc<dyn weft_providers::Provider>,
         );
         let mut model_ids = HashMap::new();
         model_ids.insert("test-model".to_string(), "claude-test".to_string());
@@ -628,7 +533,7 @@ mod tests {
         let services = Arc::new(Services {
             config_store,
             resolved_config,
-            providers: provider_registry as Arc<dyn weft_llm::ProviderService + Send + Sync>,
+            providers: provider_registry as Arc<dyn weft_providers::ProviderService + Send + Sync>,
             router: Arc::new(StubRouter) as Arc<dyn weft_router::SemanticRouter + Send + Sync>,
             commands: Arc::new(weft_commands::test_support::StubCommandRegistry::new())
                 as Arc<dyn weft_commands::CommandRegistry + Send + Sync>,
@@ -753,9 +658,13 @@ mod tests {
     }
 
     async fn post_json(router: Router, body: Value) -> (StatusCode, Value) {
+        post_json_to(router, "/v1/chat/completions", body).await
+    }
+
+    async fn post_json_to(router: Router, uri: &str, body: Value) -> (StatusCode, Value) {
         let req = Request::builder()
             .method("POST")
-            .uri("/v1/chat/completions")
+            .uri(uri)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
@@ -773,7 +682,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_json_returns_4xx() {
-        let router = make_unit_test_router(weft_llm::test_support::StubProvider::new("irrelevant"));
+        let router = make_unit_test_router(weft_providers::test_support::StubProvider::new(
+            "irrelevant",
+        ));
         let req = Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
@@ -792,7 +703,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_messages_returns_400() {
-        let router = make_unit_test_router(weft_llm::test_support::StubProvider::new("irrelevant"));
+        let router = make_unit_test_router(weft_providers::test_support::StubProvider::new(
+            "irrelevant",
+        ));
         let body = json!({
             "model": "gpt-4",
             "messages": []
@@ -804,7 +717,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_user_message_returns_400() {
-        let router = make_unit_test_router(weft_llm::test_support::StubProvider::new("irrelevant"));
+        let router = make_unit_test_router(weft_providers::test_support::StubProvider::new(
+            "irrelevant",
+        ));
         let body = json!({
             "model": "gpt-4",
             "messages": [{"role": "system", "content": "system only"}]
@@ -816,7 +731,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_true_returns_400() {
-        let router = make_unit_test_router(weft_llm::test_support::StubProvider::new("irrelevant"));
+        let router = make_unit_test_router(weft_providers::test_support::StubProvider::new(
+            "irrelevant",
+        ));
         let body = json!({
             "model": "gpt-4",
             "messages": [{"role": "user", "content": "stream please"}],
@@ -827,7 +744,78 @@ mod tests {
         assert!(resp["error"]["message"].is_string());
     }
 
+    // ── Anthropic handler validation tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn test_anthropic_empty_messages_returns_400() {
+        let router = make_unit_test_router(weft_providers::test_support::StubProvider::new(
+            "irrelevant",
+        ));
+        let body = json!({
+            "model": "claude-3-opus-20240229",
+            "messages": [],
+            "max_tokens": 1024
+        });
+        let (status, resp) = post_json_to(router, "/v1/messages", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Anthropic error shape: { type: "error", error: { type: "...", message: "..." } }
+        assert_eq!(resp["type"], "error");
+        assert!(resp["error"]["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_no_user_message_returns_400() {
+        let router = make_unit_test_router(weft_providers::test_support::StubProvider::new(
+            "irrelevant",
+        ));
+        let body = json!({
+            "model": "claude-3-opus-20240229",
+            "messages": [{"role": "assistant", "content": "hi"}],
+            "max_tokens": 1024
+        });
+        let (status, resp) = post_json_to(router, "/v1/messages", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(resp["type"], "error");
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_stream_true_returns_400() {
+        let router = make_unit_test_router(weft_providers::test_support::StubProvider::new(
+            "irrelevant",
+        ));
+        let body = json!({
+            "model": "claude-3-opus-20240229",
+            "messages": [{"role": "user", "content": "stream please"}],
+            "max_tokens": 1024,
+            "stream": true
+        });
+        let (status, resp) = post_json_to(router, "/v1/messages", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(resp["type"], "error");
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_valid_request_returns_200() {
+        let router = make_unit_test_router(weft_providers::test_support::StubProvider::new(
+            "Hello from Anthropic compat!",
+        ));
+        let body = json!({
+            "model": "general",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+        let (status, resp) = post_json_to(router, "/v1/messages", body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(resp["type"], "message");
+        assert_eq!(resp["role"], "assistant");
+        assert_eq!(resp["content"][0]["type"], "text");
+        assert_eq!(resp["stop_reason"], "end_turn");
+    }
+
     // ── ApiError status code mapping tests ─────────────────────────────────
+    //
+    // These tests exercise the WeftError → HTTP status mapping via CompatError.
+    // ApiError is a thin wrapper; the mapping lives in CompatError::from_weft_error.
 
     #[test]
     fn test_hook_blocked_maps_to_403() {
@@ -836,8 +824,8 @@ mod tests {
             reason: "policy violation".to_string(),
             hook_name: "auth-hook".to_string(),
         };
-        let api_error = ApiError::from_weft_error(err);
-        assert_eq!(api_error.status, StatusCode::FORBIDDEN);
+        let api_error = ApiError::from(CompatError::from_weft_error(err));
+        assert_eq!(api_error.0.status, StatusCode::FORBIDDEN);
     }
 
     #[test]
@@ -848,133 +836,54 @@ mod tests {
             hook_name: "content-filter".to_string(),
             retries: 2,
         };
-        let api_error = ApiError::from_weft_error(err);
-        assert_eq!(api_error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let api_error = ApiError::from(CompatError::from_weft_error(err));
+        assert_eq!(api_error.0.status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[test]
     fn test_invalid_request_maps_to_400() {
         let err = WeftError::InvalidRequest("bad input".to_string());
-        let api_error = ApiError::from_weft_error(err);
-        assert_eq!(api_error.status, StatusCode::BAD_REQUEST);
+        let api_error = ApiError::from(CompatError::from_weft_error(err));
+        assert_eq!(api_error.0.status, StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn test_proto_conversion_maps_to_500() {
         let err = WeftError::ProtoConversion("missing role".to_string());
-        let api_error = ApiError::from_weft_error(err);
-        assert_eq!(api_error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        let api_error = ApiError::from(CompatError::from_weft_error(err));
+        assert_eq!(api_error.0.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // ── Translation unit tests ──────────────────────────────────────────────
+    // ── AnthropicApiError status code mapping tests ─────────────────────────
 
     #[test]
-    fn test_openai_to_weft_assigns_sources() {
-        use weft_core::Source;
-        let req = OpenAiChatRequest {
-            model: "gpt-4".to_string(),
-            messages: vec![
-                OpenAiMessage {
-                    role: Role::System,
-                    content: "sys prompt".to_string(),
-                },
-                OpenAiMessage {
-                    role: Role::User,
-                    content: "hello".to_string(),
-                },
-                OpenAiMessage {
-                    role: Role::Assistant,
-                    content: "hi there".to_string(),
-                },
-            ],
-            stream: None,
-            temperature: None,
-            max_tokens: None,
-        };
-        let weft_req = openai_to_weft(req);
-        assert_eq!(weft_req.messages[0].source, Source::Gateway);
-        assert_eq!(weft_req.messages[1].source, Source::Client);
-        assert_eq!(weft_req.messages[2].source, Source::Provider);
+    fn test_anthropic_invalid_request_maps_to_400() {
+        let err = WeftError::InvalidRequest("bad input".to_string());
+        let api_error = AnthropicApiError::from(CompatError::from_weft_error(err));
+        assert_eq!(api_error.0.status, StatusCode::BAD_REQUEST);
+        assert_eq!(api_error.0.anthropic_error_type, "invalid_request_error");
     }
 
     #[test]
-    fn test_openai_to_weft_routing_parsed() {
-        use weft_core::RoutingMode;
-        let req = OpenAiChatRequest {
-            model: "auto".to_string(),
-            messages: vec![OpenAiMessage {
-                role: Role::User,
-                content: "hi".to_string(),
-            }],
-            stream: None,
-            temperature: None,
-            max_tokens: None,
+    fn test_anthropic_rate_limited_maps_to_429() {
+        let err = WeftError::RateLimited {
+            retry_after_ms: 3000,
         };
-        let weft_req = openai_to_weft(req);
-        assert_eq!(weft_req.routing.mode, RoutingMode::Auto);
+        let api_error = AnthropicApiError::from(CompatError::from_weft_error(err));
+        assert_eq!(api_error.0.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(api_error.0.anthropic_error_type, "rate_limit_error");
+        assert_eq!(api_error.0.retry_after_ms, Some(3000));
     }
 
     #[test]
-    fn test_openai_to_weft_sampling_options() {
-        let req = OpenAiChatRequest {
-            model: "gpt-4".to_string(),
-            messages: vec![OpenAiMessage {
-                role: Role::User,
-                content: "hi".to_string(),
-            }],
-            stream: None,
-            temperature: Some(0.5),
-            max_tokens: Some(256),
+    fn test_anthropic_hook_blocked_maps_to_403_with_permission_error() {
+        let err = WeftError::HookBlocked {
+            event: "request_start".to_string(),
+            reason: "policy violation".to_string(),
+            hook_name: "auth-hook".to_string(),
         };
-        let weft_req = openai_to_weft(req);
-        assert_eq!(weft_req.options.temperature, Some(0.5));
-        assert_eq!(weft_req.options.max_tokens, Some(256));
-    }
-
-    #[test]
-    fn test_weft_to_openai_extracts_assistant_text() {
-        use weft_core::{ContentPart, Source, WeftResponse, WeftTiming, WeftUsage};
-        let resp = WeftResponse {
-            id: "chatcmpl-test".to_string(),
-            model: "gpt-4".to_string(),
-            messages: vec![weft_core::WeftMessage {
-                role: Role::Assistant,
-                source: Source::Provider,
-                model: Some("gpt-4".to_string()),
-                content: vec![ContentPart::Text("Hello!".to_string())],
-                delta: false,
-                message_index: 0,
-            }],
-            usage: WeftUsage {
-                prompt_tokens: 10,
-                completion_tokens: 5,
-                total_tokens: 15,
-                llm_calls: 1,
-            },
-            timing: WeftTiming::default(),
-            degradations: vec![],
-        };
-        let openai_resp = weft_to_openai(resp, "gpt-4".to_string());
-        assert_eq!(openai_resp.choices[0].message.content, "Hello!");
-        assert_eq!(openai_resp.usage.prompt_tokens, 10);
-        assert_eq!(openai_resp.usage.completion_tokens, 5);
-        assert_eq!(openai_resp.usage.total_tokens, 15);
-        assert_eq!(openai_resp.object, "chat.completion");
-    }
-
-    #[test]
-    fn test_weft_to_openai_empty_messages_returns_empty_content() {
-        use weft_core::{WeftResponse, WeftTiming, WeftUsage};
-        let resp = WeftResponse {
-            id: "chatcmpl-test".to_string(),
-            model: "auto".to_string(),
-            messages: vec![],
-            usage: WeftUsage::default(),
-            timing: WeftTiming::default(),
-            degradations: vec![],
-        };
-        let openai_resp = weft_to_openai(resp, "auto".to_string());
-        // No assistant message → empty content, not a panic
-        assert_eq!(openai_resp.choices[0].message.content, "");
+        let api_error = AnthropicApiError::from(CompatError::from_weft_error(err));
+        assert_eq!(api_error.0.status, StatusCode::FORBIDDEN);
+        assert_eq!(api_error.0.anthropic_error_type, "permission_error");
     }
 }

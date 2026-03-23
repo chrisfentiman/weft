@@ -75,8 +75,8 @@ pub struct Services {
     /// request entry). This field is only for `ServiceLocator::resolved_config()` fallback.
     pub resolved_config: Arc<ResolvedConfig>,
 
-    /// LLM provider service: routes model names to provider implementations.
-    pub providers: Arc<dyn weft_llm_trait::ProviderService + Send + Sync>,
+    /// Provider service: routes model names to provider implementations.
+    pub providers: Arc<dyn weft_provider_trait::ProviderService + Send + Sync>,
 
     /// Semantic router: makes all routing decisions for a request.
     pub router: Arc<dyn weft_router_trait::SemanticRouter + Send + Sync>,
@@ -111,7 +111,7 @@ pub struct Services {
 }
 
 impl ServiceLocator for Services {
-    fn providers(&self) -> &dyn weft_llm_trait::ProviderService {
+    fn providers(&self) -> &dyn weft_provider_trait::ProviderService {
         self.providers.as_ref()
     }
 
@@ -333,11 +333,11 @@ mod tests {
 
         struct PanicProvider;
         #[async_trait::async_trait]
-        impl weft_llm_trait::Provider for PanicProvider {
+        impl weft_provider_trait::Provider for PanicProvider {
             async fn execute(
                 &self,
-                _request: weft_llm_trait::ProviderRequest,
-            ) -> Result<weft_llm_trait::ProviderResponse, weft_llm_trait::ProviderError>
+                _request: weft_provider_trait::ProviderRequest,
+            ) -> Result<weft_provider_trait::ProviderResponse, weft_provider_trait::ProviderError>
             {
                 panic!("not called in test")
             }
@@ -427,14 +427,15 @@ api_key = "sk-test"
         )
         .expect("minimal test TOML must parse");
 
-        let mut providers: HashMap<String, Arc<dyn weft_llm_trait::Provider>> = HashMap::new();
+        let mut providers: HashMap<String, Arc<dyn weft_provider_trait::Provider>> = HashMap::new();
         providers.insert("stub".to_string(), Arc::new(PanicProvider));
         let mut model_ids = HashMap::new();
         model_ids.insert("stub".to_string(), "stub-model".to_string());
         let mut max_tokens = HashMap::new();
         max_tokens.insert("stub".to_string(), 4096u32);
-        let capabilities: HashMap<String, HashSet<weft_llm_trait::Capability>> = HashMap::new();
-        let registry = weft_llm::ProviderRegistry::new(
+        let capabilities: HashMap<String, HashSet<weft_provider_trait::Capability>> =
+            HashMap::new();
+        let registry = weft_providers::ProviderRegistry::new(
             providers,
             model_ids,
             max_tokens,

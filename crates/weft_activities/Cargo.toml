@@ -12,7 +12,7 @@ weft_reactor_trait = { path = "../weft_reactor_trait" }
 weft_core = { path = "../weft_core" }
 
 # Domain trait crates only (no concrete impl crates)
-weft_llm_trait = { path = "../weft_llm_trait" }
+weft_provider_trait = { path = "../weft_provider_trait" }
 weft_router_trait = { path = "../weft_router_trait" }
 weft_commands_trait = { path = "../weft_commands_trait" }
 weft_hooks_trait = { path = "../weft_hooks_trait" }
@@ -40,7 +40,7 @@ test-support = []
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 # Concrete crates needed only in tests (for stub/mock types re-exported by test_support).
-weft_llm = { path = "../weft_llm", features = ["test-support"] }
+weft_providers = { path = "../weft_providers", features = ["test-support"] }
 weft_router = { path = "../weft_router", features = ["test-support"] }
 weft_commands = { path = "../weft_commands", features = ["test-support"] }
 weft_hooks = { path = "../weft_hooks" }
