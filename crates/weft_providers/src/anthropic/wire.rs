@@ -30,11 +30,37 @@ pub struct AnthropicRequest {
     pub stream: Option<bool>,
 }
 
+/// Content of an Anthropic message.
+///
+/// The Anthropic API accepts content as either a plain string or an array of
+/// typed content blocks. Both forms carry the same semantic meaning; the array
+/// form is used by newer clients and the string form by older/simpler ones.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AnthropicContent {
+    /// Plain-text string content (legacy/simple form).
+    Text(String),
+    /// Array of typed content blocks (structured form).
+    Blocks(Vec<InboundContentBlock>),
+}
+
+/// A content block inside an inbound Anthropic message.
+///
+/// Only `type: "text"` blocks are supported for inbound requests.
+/// Other block types (image, tool_use, tool_result) are ignored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InboundContentBlock {
+    #[serde(rename = "type")]
+    pub content_type: String,
+    #[serde(default)]
+    pub text: String,
+}
+
 /// An Anthropic-format message.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AnthropicMessage {
     pub role: String,
-    pub content: String,
+    pub content: AnthropicContent,
 }
 
 /// Anthropic Messages API response body.

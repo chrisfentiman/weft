@@ -7,7 +7,8 @@
 use weft_core::{ContentPart, ModelRoutingInstruction, Role, SamplingOptions, Source, WeftMessage};
 
 use super::wire::{
-    AnthropicMessage, AnthropicRequest, AnthropicResponse, AnthropicUsage, ContentBlock,
+    AnthropicContent, AnthropicMessage, AnthropicRequest, AnthropicResponse, AnthropicUsage,
+    ContentBlock,
 };
 use crate::{TokenUsage, provider::extract_text_messages, translate::TranslationError};
 
@@ -57,11 +58,11 @@ pub fn build_outbound_request(
             Role::System => system_parts.push(text),
             Role::User => wire_messages.push(AnthropicMessage {
                 role: "user".to_string(),
-                content: text,
+                content: AnthropicContent::Text(text),
             }),
             Role::Assistant => wire_messages.push(AnthropicMessage {
                 role: "assistant".to_string(),
-                content: text,
+                content: AnthropicContent::Text(text),
             }),
         }
     }
@@ -121,6 +122,24 @@ pub fn parse_outbound_response(
 
 // ── Inbound (Anthropic -> Weft) ───────────────────────────────────────────────
 
+/// Flatten an `AnthropicContent` value into a plain text string.
+///
+/// - `Text(s)` → returns `s` directly.
+/// - `Blocks(blocks)` → concatenates the `text` field of all `type: "text"` blocks,
+///   joined by newline. Non-text block types are silently ignored because this
+///   compat endpoint handles text completions only.
+fn flatten_inbound_content(content: AnthropicContent) -> String {
+    match content {
+        AnthropicContent::Text(s) => s,
+        AnthropicContent::Blocks(blocks) => blocks
+            .into_iter()
+            .filter(|b| b.content_type == "text")
+            .map(|b| b.text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
 /// Translate an Anthropic-format inbound request into a domain `WeftRequest`.
 ///
 /// Maps message roles: "user" → `Source::Client`, "assistant" → `Source::Provider`.
@@ -157,11 +176,17 @@ pub fn parse_inbound_request(
             unknown => return Err(TranslationError::UnrecognizedRole(unknown.to_string())),
         };
 
+        // Flatten both content forms into a single text string.
+        // Block arrays concatenate all `type: "text"` blocks; other block types
+        // (image, tool_use, tool_result) are intentionally ignored since this
+        // compat endpoint only handles text completions.
+        let text = flatten_inbound_content(msg.content);
+
         messages.push(WeftMessage {
             role,
             source,
             model: None,
-            content: vec![ContentPart::Text(msg.content)],
+            content: vec![ContentPart::Text(text)],
             delta: false,
             message_index: 0,
         });
@@ -267,7 +292,10 @@ mod tests {
         assert_eq!(req.system, Some("You are helpful.".to_string()));
         assert_eq!(req.messages.len(), 1);
         assert_eq!(req.messages[0].role, "user");
-        assert_eq!(req.messages[0].content, "Hello");
+        assert_eq!(
+            req.messages[0].content,
+            super::super::wire::AnthropicContent::Text("Hello".to_string())
+        );
     }
 
     #[test]
@@ -467,7 +495,7 @@ mod tests {
     // ── parse_inbound_request ────────────────────────────────────────────────
 
     fn make_inbound_request(system: Option<&str>, messages: Vec<(&str, &str)>) -> AnthropicRequest {
-        use super::super::wire::AnthropicMessage;
+        use super::super::wire::{AnthropicContent, AnthropicMessage};
         AnthropicRequest {
             model: "claude-3-opus-20240229".to_string(),
             system: system.map(|s| s.to_string()),
@@ -475,7 +503,7 @@ mod tests {
                 .into_iter()
                 .map(|(role, content)| AnthropicMessage {
                     role: role.to_string(),
-                    content: content.to_string(),
+                    content: AnthropicContent::Text(content.to_string()),
                 })
                 .collect(),
             max_tokens: 1024,
@@ -539,11 +567,11 @@ mod tests {
 
     #[test]
     fn test_parse_inbound_unrecognized_role_returns_error() {
-        use super::super::wire::AnthropicMessage;
+        use super::super::wire::{AnthropicContent, AnthropicMessage};
         let mut req = make_inbound_request(None, vec![]);
         req.messages.push(AnthropicMessage {
             role: "system".to_string(),
-            content: "should not be here".to_string(),
+            content: AnthropicContent::Text("should not be here".to_string()),
         });
         let result = parse_inbound_request(req);
         assert!(matches!(
@@ -554,11 +582,11 @@ mod tests {
 
     #[test]
     fn test_parse_inbound_tool_role_returns_error() {
-        use super::super::wire::AnthropicMessage;
+        use super::super::wire::{AnthropicContent, AnthropicMessage};
         let mut req = make_inbound_request(None, vec![]);
         req.messages.push(AnthropicMessage {
             role: "tool".to_string(),
-            content: "tool result".to_string(),
+            content: AnthropicContent::Text("tool result".to_string()),
         });
         let result = parse_inbound_request(req);
         assert!(matches!(
@@ -569,13 +597,13 @@ mod tests {
 
     #[test]
     fn test_parse_inbound_sampling_options_mapped() {
-        use super::super::wire::AnthropicMessage;
+        use super::super::wire::{AnthropicContent, AnthropicMessage};
         let req = AnthropicRequest {
             model: "claude-3-opus-20240229".to_string(),
             system: None,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
-                content: "hi".to_string(),
+                content: AnthropicContent::Text("hi".to_string()),
             }],
             max_tokens: 512,
             temperature: Some(0.7),
@@ -683,5 +711,166 @@ mod tests {
         let anthropic_resp = build_inbound_response(resp, "claude-3".to_string());
         // Empty messages → empty content text
         assert_eq!(anthropic_resp.content[0].text, Some(String::new()));
+    }
+
+    // ── AnthropicContent serialization / deserialization ────────────────────
+
+    /// String-form content round-trips through serde without change.
+    #[test]
+    fn test_content_string_form_round_trips() {
+        use super::super::wire::AnthropicContent;
+        let content = AnthropicContent::Text("hello world".to_string());
+        let json = serde_json::to_string(&content).expect("serialize");
+        assert_eq!(json, r#""hello world""#);
+        let back: AnthropicContent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, AnthropicContent::Text("hello world".to_string()));
+    }
+
+    /// Array-form content deserializes to `Blocks`.
+    #[test]
+    fn test_content_array_form_deserializes() {
+        use super::super::wire::AnthropicContent;
+        let json = r#"[{"type":"text","text":"block one"},{"type":"text","text":"block two"}]"#;
+        let content: AnthropicContent = serde_json::from_str(json).expect("deserialize");
+        assert!(matches!(content, AnthropicContent::Blocks(_)));
+        if let AnthropicContent::Blocks(blocks) = content {
+            assert_eq!(blocks.len(), 2);
+            assert_eq!(blocks[0].text, "block one");
+            assert_eq!(blocks[1].text, "block two");
+        }
+    }
+
+    // ── flatten_inbound_content ──────────────────────────────────────────────
+
+    /// String content flattens to the string value unchanged.
+    #[test]
+    fn test_flatten_string_content() {
+        use super::super::wire::AnthropicContent;
+        let result = flatten_inbound_content(AnthropicContent::Text("hello".to_string()));
+        assert_eq!(result, "hello");
+    }
+
+    /// Block array with a single text block flattens to that block's text.
+    #[test]
+    fn test_flatten_single_text_block() {
+        use super::super::wire::{AnthropicContent, InboundContentBlock};
+        let content = AnthropicContent::Blocks(vec![InboundContentBlock {
+            content_type: "text".to_string(),
+            text: "hello from block".to_string(),
+        }]);
+        let result = flatten_inbound_content(content);
+        assert_eq!(result, "hello from block");
+    }
+
+    /// Block array with multiple text blocks joins them with newline.
+    #[test]
+    fn test_flatten_multiple_text_blocks_joined_with_newline() {
+        use super::super::wire::{AnthropicContent, InboundContentBlock};
+        let content = AnthropicContent::Blocks(vec![
+            InboundContentBlock {
+                content_type: "text".to_string(),
+                text: "first".to_string(),
+            },
+            InboundContentBlock {
+                content_type: "text".to_string(),
+                text: "second".to_string(),
+            },
+        ]);
+        let result = flatten_inbound_content(content);
+        assert_eq!(result, "first\nsecond");
+    }
+
+    /// Non-text blocks (image, tool_use) are ignored during flattening.
+    #[test]
+    fn test_flatten_non_text_blocks_ignored() {
+        use super::super::wire::{AnthropicContent, InboundContentBlock};
+        let content = AnthropicContent::Blocks(vec![
+            InboundContentBlock {
+                content_type: "image".to_string(),
+                text: String::new(),
+            },
+            InboundContentBlock {
+                content_type: "text".to_string(),
+                text: "actual text".to_string(),
+            },
+            InboundContentBlock {
+                content_type: "tool_use".to_string(),
+                text: "ignored".to_string(),
+            },
+        ]);
+        let result = flatten_inbound_content(content);
+        assert_eq!(result, "actual text");
+    }
+
+    /// An empty block array flattens to an empty string.
+    #[test]
+    fn test_flatten_empty_blocks_yields_empty_string() {
+        use super::super::wire::AnthropicContent;
+        let result = flatten_inbound_content(AnthropicContent::Blocks(vec![]));
+        assert_eq!(result, "");
+    }
+
+    // ── parse_inbound_request with array content ─────────────────────────────
+
+    /// An inbound request with array-format message content is parsed correctly.
+    #[test]
+    fn test_parse_inbound_array_content_flattened_to_text() {
+        use super::super::wire::{AnthropicContent, AnthropicMessage, InboundContentBlock};
+        let req = AnthropicRequest {
+            model: "claude-3-opus-20240229".to_string(),
+            system: None,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicContent::Blocks(vec![
+                    InboundContentBlock {
+                        content_type: "text".to_string(),
+                        text: "Hello, ".to_string(),
+                    },
+                    InboundContentBlock {
+                        content_type: "text".to_string(),
+                        text: "world!".to_string(),
+                    },
+                ]),
+            }],
+            max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stream: None,
+        };
+        let weft_req = parse_inbound_request(req).expect("should succeed");
+        assert_eq!(weft_req.messages.len(), 1);
+        assert_eq!(weft_req.messages[0].role, Role::User);
+        let text = match &weft_req.messages[0].content[0] {
+            ContentPart::Text(t) => t.as_str(),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(text, "Hello, \nworld!");
+    }
+
+    /// JSON string form deserializes into `AnthropicMessage` with `Text` variant.
+    #[test]
+    fn test_inbound_message_deserializes_string_content() {
+        use super::super::wire::AnthropicMessage;
+        let json = r#"{"role":"user","content":"hello"}"#;
+        let msg: AnthropicMessage = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(msg.role, "user");
+        assert_eq!(
+            msg.content,
+            super::super::wire::AnthropicContent::Text("hello".to_string())
+        );
+    }
+
+    /// JSON array form deserializes into `AnthropicMessage` with `Blocks` variant.
+    #[test]
+    fn test_inbound_message_deserializes_array_content() {
+        use super::super::wire::AnthropicMessage;
+        let json = r#"{"role":"user","content":[{"type":"text","text":"hi"}]}"#;
+        let msg: AnthropicMessage = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(msg.role, "user");
+        assert!(matches!(
+            msg.content,
+            super::super::wire::AnthropicContent::Blocks(_)
+        ));
     }
 }

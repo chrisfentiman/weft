@@ -42,15 +42,17 @@ pub fn inject_trace_context(headers: &mut reqwest::header::HeaderMap) {
 /// for error statuses, or the response body as a `String` on success.
 ///
 /// - 429 → `ProviderError::RateLimited` (extracts Retry-After header)
-/// - Other non-200 → `ProviderError::ProviderHttpError`
-/// - 200 → returns the response body as a string
+/// - Other non-2xx → `ProviderError::ProviderHttpError`
+/// - 2xx → returns the response body as a string
 pub async fn check_response(
     response: reqwest::Response,
     provider_name: &str,
 ) -> Result<String, ProviderError> {
-    let status = response.status().as_u16();
+    let status = response.status();
+    let status_u16 = status.as_u16();
 
-    if status == 429 {
+    // Check 429 first so we can read the Retry-After header before consuming the body.
+    if status_u16 == 429 {
         let retry_after_ms = response
             .headers()
             .get("retry-after")
@@ -61,17 +63,21 @@ pub async fn check_response(
         return Err(ProviderError::RateLimited { retry_after_ms });
     }
 
-    if status != 200 {
+    // Accept any 2xx status code (200 OK, 201 Created, etc.), not just exactly 200.
+    if !status.is_success() {
         let body = response
             .text()
             .await
             .unwrap_or_else(|_| "<failed to read body>".to_string());
         warn!(
-            status,
+            status = status_u16,
             provider = provider_name,
-            "provider returned non-200"
+            "provider returned non-2xx"
         );
-        return Err(ProviderError::ProviderHttpError { status, body });
+        return Err(ProviderError::ProviderHttpError {
+            status: status_u16,
+            body,
+        });
     }
 
     response

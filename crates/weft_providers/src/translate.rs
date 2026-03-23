@@ -9,6 +9,4 @@
 pub enum TranslationError {
     #[error("unrecognized role: {0}")]
     UnrecognizedRole(String),
-    #[error("missing required field: {0}")]
-    MissingField(String),
 }
