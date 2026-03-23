@@ -1,39 +1,10 @@
-use tracing::{Instrument, debug, info_span, warn};
-use weft_core::{ContentPart, Role, SamplingOptions, Source, WeftMessage};
+use tracing::{Instrument, debug, info_span};
+use weft_core::{SamplingOptions, WeftMessage};
 
-use super::wire::{AnthropicMessage, AnthropicRequest, AnthropicResponse};
+use super::translate;
 use crate::{
-    Provider, ProviderError, ProviderRequest, ProviderResponse, TokenUsage,
-    provider::extract_text_messages,
+    Provider, ProviderError, ProviderRequest, ProviderResponse, TokenUsage, http::check_response,
 };
-
-/// Inject W3C TraceContext into outgoing HTTP request headers.
-///
-/// See `openai/client.rs` for the full rationale. Compiled only when the
-/// `telemetry` feature is enabled.
-#[cfg(feature = "telemetry")]
-fn inject_trace_context(headers: &mut reqwest::header::HeaderMap) {
-    use opentelemetry::propagation::{Injector, TextMapPropagator};
-    use opentelemetry_sdk::propagation::TraceContextPropagator;
-
-    struct HeaderInjector<'a>(&'a mut reqwest::header::HeaderMap);
-
-    impl Injector for HeaderInjector<'_> {
-        fn set(&mut self, key: &str, value: String) {
-            if let Ok(name) = reqwest::header::HeaderName::from_bytes(key.as_bytes())
-                && let Ok(val) = reqwest::header::HeaderValue::from_str(&value)
-            {
-                self.0.insert(name, val);
-            }
-        }
-    }
-
-    let propagator = TraceContextPropagator::new();
-    propagator.inject_context(
-        &opentelemetry::Context::current(),
-        &mut HeaderInjector(headers),
-    );
-}
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -67,64 +38,10 @@ impl AnthropicProvider {
         messages: Vec<WeftMessage>,
         model: String,
         options: SamplingOptions,
-    ) -> Result<(WeftMessage, Option<TokenUsage>), ProviderError> {
-        let mut system_parts: Vec<String> = Vec::new();
-        let mut wire_messages = Vec::new();
+    ) -> Result<(weft_core::WeftMessage, Option<TokenUsage>), ProviderError> {
+        let request = translate::build_outbound_request(&messages, &model, &options);
 
-        // Extract system prompt from messages[0] if present.
-        // Anthropic requires the system prompt in a dedicated top-level `system` field,
-        // NOT in the messages array.
-        let conversation_start = if messages.first().map(|m| m.role) == Some(Role::System) {
-            let system_text: String = messages[0]
-                .content
-                .iter()
-                .filter_map(|p| match p {
-                    ContentPart::Text(t) => Some(t.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !system_text.is_empty() {
-                system_parts.push(system_text);
-            }
-            1 // skip messages[0] in the remaining extraction
-        } else {
-            0 // no system prompt
-        };
-
-        // Process remaining messages. System-role messages that survive the gateway
-        // activity filter are concatenated into the system field (Anthropic does not
-        // allow system role in the messages array).
-        for (role, text) in extract_text_messages(&messages[conversation_start..]) {
-            match role {
-                Role::System => system_parts.push(text),
-                Role::User => wire_messages.push(AnthropicMessage {
-                    role: "user".to_string(),
-                    content: text,
-                }),
-                Role::Assistant => wire_messages.push(AnthropicMessage {
-                    role: "assistant".to_string(),
-                    content: text,
-                }),
-            }
-        }
-
-        let system = system_parts.join("\n\n");
-
-        // Anthropic requires max_tokens; default to 4096 if not specified.
-        let max_tokens = options.max_tokens.unwrap_or(4096);
-
-        let request = AnthropicRequest {
-            model: model.clone(),
-            system,
-            messages: wire_messages,
-            max_tokens,
-            temperature: options.temperature,
-            top_p: options.top_p,
-            top_k: options.top_k,
-        };
-
-        debug!(model = %model, max_tokens, "sending Anthropic request");
+        debug!(model = %model, max_tokens = request.max_tokens, "sending Anthropic request");
 
         // Wrap the HTTP round-trip in a `provider_call` span so downstream
         // telemetry can observe provider latency independently of generation logic.
@@ -153,7 +70,7 @@ impl AnthropicProvider {
             #[cfg(feature = "telemetry")]
             {
                 let mut extra_headers = reqwest::header::HeaderMap::new();
-                inject_trace_context(&mut extra_headers);
+                crate::http::inject_trace_context(&mut extra_headers);
                 for (k, v) in extra_headers {
                     if let Some(name) = k {
                         req_builder = req_builder.header(name, v);
@@ -172,58 +89,12 @@ impl AnthropicProvider {
         let status = response.status().as_u16();
         provider_call_span.record("http.response.status_code", status as i64);
 
-        if status == 429 {
-            // Extract Retry-After header if present
-            let retry_after_ms = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(|secs| secs * 1000)
-                .unwrap_or(60_000);
-            return Err(ProviderError::RateLimited { retry_after_ms });
-        }
+        let body_text = check_response(response, "anthropic").await?;
 
-        if status != 200 {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<failed to read body>".to_string());
-            warn!(status, "Anthropic API returned non-200");
-            return Err(ProviderError::ProviderHttpError { status, body });
-        }
-
-        let body_text = response
-            .text()
-            .await
-            .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
-
-        let anthropic_response: AnthropicResponse = serde_json::from_str(&body_text)
+        let wire_response: super::wire::AnthropicResponse = serde_json::from_str(&body_text)
             .map_err(|e| ProviderError::DeserializationError(e.to_string()))?;
 
-        // Extract text from the first text content block
-        let text = anthropic_response
-            .content
-            .iter()
-            .find(|b| b.kind == "text")
-            .and_then(|b| b.text.clone())
-            .unwrap_or_default();
-
-        let usage = anthropic_response.usage.map(|u| TokenUsage {
-            prompt_tokens: u.input_tokens,
-            completion_tokens: u.output_tokens,
-        });
-
-        let response_message = WeftMessage {
-            role: Role::Assistant,
-            source: Source::Provider,
-            model: Some(model),
-            content: vec![ContentPart::Text(text)],
-            delta: false,
-            message_index: 0,
-        };
-
-        Ok((response_message, usage))
+        Ok(translate::parse_outbound_response(&wire_response, model))
     }
 }
 
@@ -315,7 +186,6 @@ mod tests {
         let ProviderResponse::ChatCompletion { message, usage } = result else {
             panic!("expected ChatCompletion response");
         };
-        // Extract text from WeftMessage content parts
         let text = message
             .content
             .iter()
@@ -380,8 +250,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_system_prompt_from_messages_0_extracted_to_system_field() {
-        // System prompt at messages[0] (Role::System, Source::Gateway) is extracted
-        // to Anthropic's top-level `system` field.
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("POST", "/")
@@ -422,8 +290,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_no_system_prompt_produces_empty_system_field() {
-        // When messages[0] is Role::User (not System), system field is empty string.
+    async fn test_no_system_prompt_system_field_absent() {
+        // When messages[0] is Role::User (not System), system field is omitted
+        // (None → skip_serializing_if omits it from JSON).
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("POST", "/")
@@ -436,9 +305,12 @@ mod tests {
                 })
                 .to_string(),
             )
-            .match_body(mockito::Matcher::PartialJsonString(
+            // The JSON body must NOT contain a "system" key when there's no system prompt.
+            .match_body(mockito::Matcher::JsonString(
                 json!({
-                    "system": ""
+                    "model": "claude-test",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 4096
                 })
                 .to_string(),
             ))
@@ -458,8 +330,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_additional_client_system_messages_concatenated() {
-        // After extracting messages[0] as system prompt, additional Role::System
-        // messages (e.g. Source::Client) are concatenated into the system field.
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("POST", "/")
@@ -481,11 +351,8 @@ mod tests {
             .create_async()
             .await;
 
-        // System messages with source Client are included and concatenated.
         let messages = vec![
-            // System prompt at messages[0]
             make_weft_message(Role::System, Source::Gateway, "base system"),
-            // Additional system message from client (not gateway activity -- passes filter)
             make_weft_message(Role::System, Source::Client, "You are a helpful assistant."),
             make_weft_message(Role::User, Source::Client, "Hello"),
         ];
@@ -503,9 +370,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_activity_messages_not_in_system_field() {
-        // Gateway activity messages (Role::System, Source::Gateway) with non-text content
-        // only are filtered out by extract_text_messages and do NOT pollute system field.
-        // Activity telemetry (routing events, hook results) carries no text parts.
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("POST", "/")
@@ -527,19 +391,17 @@ mod tests {
             .create_async()
             .await;
 
-        // Activity telemetry message: System+Gateway with NO text content parts.
         let activity_msg = WeftMessage {
             role: Role::System,
             source: Source::Gateway,
             model: None,
-            content: vec![], // no text -- pure telemetry, must be filtered
+            content: vec![],
             delta: false,
             message_index: 0,
         };
 
         let messages = vec![
             make_weft_message(Role::System, Source::Gateway, "sys prompt"),
-            // This gateway activity message (no text) must NOT appear in system field
             activity_msg,
             make_weft_message(Role::User, Source::Client, "Hello"),
         ];
@@ -571,9 +433,7 @@ mod tests {
             )
             .match_body(mockito::Matcher::AllOf(vec![
                 mockito::Matcher::PartialJsonString(json!({"max_tokens": 512}).to_string()),
-                // top_k is an integer, safe for PartialJsonString
                 mockito::Matcher::PartialJsonString(json!({"top_k": 50_u32}).to_string()),
-                // temperature and top_p are floats -- use regex to avoid precision issues
                 mockito::Matcher::Regex(r#""temperature"\s*:"#.to_string()),
                 mockito::Matcher::Regex(r#""top_p"\s*:"#.to_string()),
             ]))
@@ -604,8 +464,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_max_tokens_defaults_to_4096_when_none() {
-        // Anthropic requires max_tokens; when SamplingOptions.max_tokens is None,
-        // the provider defaults to 4096.
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("POST", "/")
@@ -629,7 +487,7 @@ mod tests {
             messages: vec![make_weft_message(Role::User, Source::Client, "Hello")],
             model: "claude-test".to_string(),
             options: SamplingOptions {
-                max_tokens: None, // None => default 4096
+                max_tokens: None,
                 ..SamplingOptions::default()
             },
         };
@@ -697,7 +555,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_unsupported_variant_returns_unsupported() {
-        // ChatCompletion should succeed — not unsupported.
         let mut server = mockito::Server::new_async().await;
         let _mock = server
             .mock("POST", "/")

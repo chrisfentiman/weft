@@ -1,43 +1,10 @@
-use tracing::{Instrument, debug, info_span, warn};
-use weft_core::{ContentPart, Role, SamplingOptions, Source, WeftMessage};
+use tracing::{Instrument, debug, info_span};
+use weft_core::{SamplingOptions, WeftMessage};
 
-use super::wire::{OpenAIMessage, OpenAIRequest, OpenAIResponse};
+use super::translate;
 use crate::{
-    Provider, ProviderError, ProviderRequest, ProviderResponse, TokenUsage,
-    provider::extract_text_messages,
+    Provider, ProviderError, ProviderRequest, ProviderResponse, TokenUsage, http::check_response,
 };
-
-/// Inject W3C TraceContext into outgoing HTTP request headers.
-///
-/// Uses the current OTel context (propagated from the active tracing span by the
-/// tracing-opentelemetry layer) to set the `traceparent` header. When OTel is not
-/// configured, `opentelemetry::Context::current()` returns an empty context and
-/// the propagator injects nothing — this is always safe to call.
-///
-/// This function is only compiled when the `telemetry` feature is enabled.
-#[cfg(feature = "telemetry")]
-fn inject_trace_context(headers: &mut reqwest::header::HeaderMap) {
-    use opentelemetry::propagation::{Injector, TextMapPropagator};
-    use opentelemetry_sdk::propagation::TraceContextPropagator;
-
-    struct HeaderInjector<'a>(&'a mut reqwest::header::HeaderMap);
-
-    impl Injector for HeaderInjector<'_> {
-        fn set(&mut self, key: &str, value: String) {
-            if let Ok(name) = reqwest::header::HeaderName::from_bytes(key.as_bytes())
-                && let Ok(val) = reqwest::header::HeaderValue::from_str(&value)
-            {
-                self.0.insert(name, val);
-            }
-        }
-    }
-
-    let propagator = TraceContextPropagator::new();
-    propagator.inject_context(
-        &opentelemetry::Context::current(),
-        &mut HeaderInjector(headers),
-    );
-}
 
 const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
 
@@ -70,62 +37,8 @@ impl OpenAIProvider {
         messages: Vec<WeftMessage>,
         model: String,
         options: SamplingOptions,
-    ) -> Result<(WeftMessage, Option<TokenUsage>), ProviderError> {
-        let mut wire_messages = Vec::new();
-
-        // Extract system prompt from messages[0] if present.
-        // For OpenAI, system messages are in the messages array with role "system".
-        // The system prompt (Role::System, Source::Gateway) is filtered out by
-        // extract_text_messages, so we handle it explicitly first.
-        let conversation_start = if messages.first().map(|m| m.role) == Some(Role::System) {
-            let system_text: String = messages[0]
-                .content
-                .iter()
-                .filter_map(|p| match p {
-                    ContentPart::Text(t) => Some(t.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !system_text.is_empty() {
-                wire_messages.push(OpenAIMessage {
-                    role: "system".to_string(),
-                    content: system_text,
-                });
-            }
-            1 // skip messages[0] in the remaining extraction
-        } else {
-            0 // no system prompt
-        };
-
-        // Extract text from remaining WeftMessages, skipping gateway activity messages.
-        for (role, text) in extract_text_messages(&messages[conversation_start..]) {
-            let role_str = match role {
-                Role::System => "system",
-                Role::User => "user",
-                Role::Assistant => "assistant",
-            };
-            wire_messages.push(OpenAIMessage {
-                role: role_str.to_string(),
-                content: text,
-            });
-        }
-
-        let request = OpenAIRequest {
-            model: model.clone(),
-            messages: wire_messages,
-            max_tokens: options.max_tokens,
-            temperature: options.temperature,
-            top_p: options.top_p,
-            frequency_penalty: options.frequency_penalty,
-            presence_penalty: options.presence_penalty,
-            seed: options.seed,
-            stop: if options.stop.is_empty() {
-                None
-            } else {
-                Some(options.stop.clone())
-            },
-        };
+    ) -> Result<(weft_core::WeftMessage, Option<TokenUsage>), ProviderError> {
+        let request = translate::build_outbound_request(&messages, &model, &options);
 
         debug!(model = %model, "sending OpenAI request");
 
@@ -156,7 +69,7 @@ impl OpenAIProvider {
             #[cfg(feature = "telemetry")]
             {
                 let mut extra_headers = reqwest::header::HeaderMap::new();
-                inject_trace_context(&mut extra_headers);
+                crate::http::inject_trace_context(&mut extra_headers);
                 for (k, v) in extra_headers {
                     if let Some(name) = k {
                         req_builder = req_builder.header(name, v);
@@ -175,55 +88,12 @@ impl OpenAIProvider {
         let status = response.status().as_u16();
         provider_call_span.record("http.response.status_code", status as i64);
 
-        if status == 429 {
-            let retry_after_ms = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(|secs| secs * 1000)
-                .unwrap_or(60_000);
-            return Err(ProviderError::RateLimited { retry_after_ms });
-        }
+        let body_text = check_response(response, "openai").await?;
 
-        if status != 200 {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<failed to read body>".to_string());
-            warn!(status, "OpenAI API returned non-200");
-            return Err(ProviderError::ProviderHttpError { status, body });
-        }
-
-        let body_text = response
-            .text()
-            .await
-            .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
-
-        let openai_response: OpenAIResponse = serde_json::from_str(&body_text)
+        let wire_response: super::wire::OpenAIResponse = serde_json::from_str(&body_text)
             .map_err(|e| ProviderError::DeserializationError(e.to_string()))?;
 
-        let text = openai_response
-            .choices
-            .first()
-            .map(|c| c.message.content.clone())
-            .unwrap_or_default();
-
-        let usage = openai_response.usage.map(|u| TokenUsage {
-            prompt_tokens: u.prompt_tokens,
-            completion_tokens: u.completion_tokens,
-        });
-
-        let response_message = WeftMessage {
-            role: Role::Assistant,
-            source: Source::Provider,
-            model: Some(model),
-            content: vec![ContentPart::Text(text)],
-            delta: false,
-            message_index: 0,
-        };
-
-        Ok((response_message, usage))
+        Ok(translate::parse_outbound_response(&wire_response, model))
     }
 }
 
@@ -317,7 +187,6 @@ mod tests {
         let ProviderResponse::ChatCompletion { message, usage } = result else {
             panic!("expected ChatCompletion response");
         };
-        // Extract text from WeftMessage content parts
         let text = message
             .content
             .iter()
@@ -382,8 +251,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_system_prompt_from_messages_0_as_system_message() {
-        // System prompt at messages[0] (Role::System, Source::Gateway) is extracted
-        // and sent as the first OpenAI system message.
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("POST", "/")
@@ -429,7 +296,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_system_prompt_when_messages_0_is_user() {
-        // When messages[0] is Role::User (not System), no system message is prepended.
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("POST", "/")
@@ -467,9 +333,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_activity_messages_not_sent() {
-        // Gateway activity messages (Role::System, Source::Gateway) with non-text content
-        // only are filtered out and not sent to OpenAI.
-        // Activity telemetry (routing events, hook results) carries no text parts.
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("POST", "/")
@@ -494,12 +357,11 @@ mod tests {
             .create_async()
             .await;
 
-        // Activity telemetry message: System+Gateway with NO text content parts.
         let activity_msg = WeftMessage {
             role: Role::System,
             source: Source::Gateway,
             model: None,
-            content: vec![], // no text -- pure telemetry, must be filtered
+            content: vec![],
             delta: false,
             message_index: 0,
         };
@@ -533,11 +395,9 @@ mod tests {
                 })
                 .to_string(),
             )
-            // Verify max_tokens and seed are serialized (exact integer match is safe)
             .match_body(mockito::Matcher::AllOf(vec![
                 mockito::Matcher::PartialJsonString(json!({"max_tokens": 256}).to_string()),
                 mockito::Matcher::PartialJsonString(json!({"seed": 42_i64}).to_string()),
-                // Verify the sampling fields are present (regex, no float precision issues)
                 mockito::Matcher::Regex(r#""temperature"\s*:"#.to_string()),
                 mockito::Matcher::Regex(r#""top_p"\s*:"#.to_string()),
                 mockito::Matcher::Regex(r#""frequency_penalty"\s*:"#.to_string()),
@@ -672,7 +532,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_unsupported_variant_returns_unsupported() {
-        // Verify the ChatCompletion arm works and future variants would return Unsupported.
         let mut server = mockito::Server::new_async().await;
         let _mock = server
             .mock("POST", "/")

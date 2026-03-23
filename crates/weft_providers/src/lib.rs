@@ -12,11 +12,13 @@
 //! - `ProviderRegistry`: Registry of named providers keyed by model routing name
 
 pub mod anthropic;
+pub mod http;
 pub mod openai;
 pub mod provider;
 pub mod provider_service;
 pub mod registry;
 pub mod rhai_provider;
+pub mod translate;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -30,5 +32,6 @@ pub use provider::{
 pub use provider_service::ProviderService;
 pub use registry::ProviderRegistry;
 pub use rhai_provider::RhaiProvider;
+pub use translate::TranslationError;
 // Re-export Provider trait from weft_provider_trait so existing import paths work.
 pub use weft_provider_trait::Provider;
