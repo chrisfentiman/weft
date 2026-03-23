@@ -936,6 +936,24 @@ mod tests {
         assert_eq!(resp["type"], "error");
     }
 
+    #[tokio::test]
+    async fn test_anthropic_valid_request_returns_200() {
+        let router = make_unit_test_router(weft_providers::test_support::StubProvider::new(
+            "Hello from Anthropic compat!",
+        ));
+        let body = json!({
+            "model": "general",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+        let (status, resp) = post_json_to(router, "/v1/messages", body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(resp["type"], "message");
+        assert_eq!(resp["role"], "assistant");
+        assert_eq!(resp["content"][0]["type"], "text");
+        assert_eq!(resp["stop_reason"], "end_turn");
+    }
+
     // ── ApiError status code mapping tests ─────────────────────────────────
 
     #[test]
