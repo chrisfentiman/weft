@@ -55,7 +55,7 @@ use weft_core::{
     CommandStub, ContentPart, DomainsConfig, GatewayConfig, HookEvent, ModelEntry, ProviderConfig,
     Role, RouterConfig, ServerConfig, Source, WeftConfig, WeftMessage, WireFormat,
 };
-use weft_llm::{
+use weft_providers::{
     Capability, Provider, ProviderError, ProviderRegistry, ProviderRequest, ProviderResponse,
     TokenUsage,
 };
@@ -161,7 +161,7 @@ pub fn make_provider_registry(llm: impl Provider + 'static) -> Arc<ProviderRegis
     let mut providers = HashMap::new();
     providers.insert(
         "test-model".to_string(),
-        Arc::new(llm) as Arc<dyn weft_llm::Provider>,
+        Arc::new(llm) as Arc<dyn weft_providers::Provider>,
     );
     let mut model_ids = HashMap::new();
     model_ids.insert("test-model".to_string(), "claude-test".to_string());
@@ -290,7 +290,7 @@ pub fn make_weft_service(llm: impl Provider + 'static) -> Arc<WeftService> {
     let services = Arc::new(Services {
         config_store,
         resolved_config,
-        providers: provider_registry as Arc<dyn weft_llm::ProviderService + Send + Sync>,
+        providers: provider_registry as Arc<dyn weft_providers::ProviderService + Send + Sync>,
         router: Arc::new(StubRouter) as Arc<dyn weft_router::SemanticRouter + Send + Sync>,
         commands: Arc::new(weft_commands::test_support::StubCommandRegistry::new())
             as Arc<dyn CommandRegistry + Send + Sync>,
@@ -512,7 +512,7 @@ impl Provider for SequencedProvider {
 }
 
 // ProviderRequest must be Clone for last_request storage.
-// It already derives Clone per its definition in weft_llm::provider.
+// It already derives Clone per its definition in weft_providers::provider.
 
 // ── SharedSequencedProvider ────────────────────────────────────────────────────
 //
@@ -786,7 +786,7 @@ pub fn make_weft_service_with_config(
     let services = Arc::new(Services {
         config_store,
         resolved_config,
-        providers: provider_registry as Arc<dyn weft_llm::ProviderService + Send + Sync>,
+        providers: provider_registry as Arc<dyn weft_providers::ProviderService + Send + Sync>,
         router: Arc::new(StubRouter) as Arc<dyn weft_router::SemanticRouter + Send + Sync>,
         commands: Arc::new(commands) as Arc<dyn CommandRegistry + Send + Sync>,
         memory: None,

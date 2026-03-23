@@ -20,7 +20,7 @@
 //!
 //! # Dependencies
 //!
-//! This crate depends only on trait crates (`weft_llm_trait`, `weft_router_trait`,
+//! This crate depends only on trait crates (`weft_provider_trait`, `weft_router_trait`,
 //! `weft_commands_trait`, `weft_hooks_trait`, `weft_memory_trait`). Concrete
 //! implementation crates are dev-dependencies only, used in test stubs.
 

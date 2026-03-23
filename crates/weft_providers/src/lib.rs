@@ -1,7 +1,7 @@
-//! `weft_llm` — Universal AI provider trait and implementations.
+//! `weft_providers` -- Provider implementations and wire format translation.
 //!
 //! Contains:
-//! - `Provider` trait for executing requests against an AI provider backend
+//! - `Provider` trait for executing requests against a provider backend
 //! - `ProviderError` error type
 //! - `ProviderRequest` / `ProviderResponse` enums covering all capability types
 //! - `TokenUsage` for provider-reported token counts
@@ -30,5 +30,5 @@ pub use provider::{
 pub use provider_service::ProviderService;
 pub use registry::ProviderRegistry;
 pub use rhai_provider::RhaiProvider;
-// Re-export Provider trait from weft_llm_trait so existing import paths work.
-pub use weft_llm_trait::Provider;
+// Re-export Provider trait from weft_provider_trait so existing import paths work.
+pub use weft_provider_trait::Provider;

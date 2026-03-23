@@ -536,7 +536,7 @@ mod tests {
         ClassifierConfig, DomainsConfig, GatewayConfig, HookEvent, ModelEntry, ProviderConfig,
         RouterConfig, ServerConfig, WeftConfig, WireFormat,
     };
-    use weft_llm::{Capability, Provider, ProviderRegistry};
+    use weft_providers::{Capability, Provider, ProviderRegistry};
     use weft_reactor::{
         ActivityRegistry, Reactor, ReactorConfig,
         config::{ActivityRef, BudgetConfig, LoopHooks, PipelineConfig, RetryPolicy},
@@ -599,7 +599,7 @@ mod tests {
         let mut providers = HashMap::new();
         providers.insert(
             "test-model".to_string(),
-            Arc::new(llm) as Arc<dyn weft_llm::Provider>,
+            Arc::new(llm) as Arc<dyn weft_providers::Provider>,
         );
         let mut model_ids = HashMap::new();
         model_ids.insert("test-model".to_string(), "claude-test".to_string());
@@ -628,7 +628,7 @@ mod tests {
         let services = Arc::new(Services {
             config_store,
             resolved_config,
-            providers: provider_registry as Arc<dyn weft_llm::ProviderService + Send + Sync>,
+            providers: provider_registry as Arc<dyn weft_providers::ProviderService + Send + Sync>,
             router: Arc::new(StubRouter) as Arc<dyn weft_router::SemanticRouter + Send + Sync>,
             commands: Arc::new(weft_commands::test_support::StubCommandRegistry::new())
                 as Arc<dyn weft_commands::CommandRegistry + Send + Sync>,
@@ -773,7 +773,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_json_returns_4xx() {
-        let router = make_unit_test_router(weft_llm::test_support::StubProvider::new("irrelevant"));
+        let router = make_unit_test_router(weft_providers::test_support::StubProvider::new(
+            "irrelevant",
+        ));
         let req = Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
@@ -792,7 +794,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_messages_returns_400() {
-        let router = make_unit_test_router(weft_llm::test_support::StubProvider::new("irrelevant"));
+        let router = make_unit_test_router(weft_providers::test_support::StubProvider::new(
+            "irrelevant",
+        ));
         let body = json!({
             "model": "gpt-4",
             "messages": []
@@ -804,7 +808,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_user_message_returns_400() {
-        let router = make_unit_test_router(weft_llm::test_support::StubProvider::new("irrelevant"));
+        let router = make_unit_test_router(weft_providers::test_support::StubProvider::new(
+            "irrelevant",
+        ));
         let body = json!({
             "model": "gpt-4",
             "messages": [{"role": "system", "content": "system only"}]
@@ -816,7 +822,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_true_returns_400() {
-        let router = make_unit_test_router(weft_llm::test_support::StubProvider::new("irrelevant"));
+        let router = make_unit_test_router(weft_providers::test_support::StubProvider::new(
+            "irrelevant",
+        ));
         let body = json!({
             "model": "gpt-4",
             "messages": [{"role": "user", "content": "stream please"}],

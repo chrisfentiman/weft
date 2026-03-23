@@ -1,7 +1,7 @@
-//! Test doubles for the LLM provider traits.
+//! Test doubles for the provider traits.
 //!
 //! Gated behind `feature = "test-support"`. Available to downstream crates
-//! via `weft_llm = { ..., features = ["test-support"] }` in `[dev-dependencies]`.
+//! via `weft_providers = { ..., features = ["test-support"] }` in `[dev-dependencies]`.
 //!
 //! **Available stubs:**
 //! - [`StubProvider`] — returns a fixed text response on every call

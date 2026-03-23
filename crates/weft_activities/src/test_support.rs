@@ -20,7 +20,7 @@ use weft_reactor_trait::{
 
 // Imports only needed by test-only builder functions (depend on dev-dep concrete crates).
 #[cfg(test)]
-use weft_llm_trait::{Provider, ProviderError};
+use weft_provider_trait::{Provider, ProviderError};
 
 // Re-export stub types from concrete crates (available as dev-dependencies only).
 // These are gated behind #[cfg(test)] because dev-dependencies are only linked
@@ -30,7 +30,7 @@ use weft_llm_trait::{Provider, ProviderError};
 #[cfg(test)]
 pub use weft_commands::test_support::{StubCommandRegistry, reconstruct_command_error};
 #[cfg(test)]
-pub use weft_llm::test_support::{
+pub use weft_providers::test_support::{
     ChunkStreamProvider, MidStreamErrorProvider, SingleUseErrorProvider, SlowProvider,
     StubProvider, StubProviderService,
 };
@@ -156,7 +156,7 @@ impl HookRunner for BlockingHookRunner {
 /// without depending on `weft_reactor::services::Services`.
 pub struct MockServiceLocator {
     pub resolved_config: Arc<ResolvedConfig>,
-    pub providers: Arc<dyn weft_llm_trait::ProviderService + Send + Sync>,
+    pub providers: Arc<dyn weft_provider_trait::ProviderService + Send + Sync>,
     pub router: Arc<dyn weft_router_trait::SemanticRouter + Send + Sync>,
     pub commands: Arc<dyn weft_commands_trait::CommandRegistry + Send + Sync>,
     pub hooks: Arc<dyn weft_hooks_trait::HookRunner + Send + Sync>,
@@ -166,7 +166,7 @@ pub struct MockServiceLocator {
 }
 
 impl ServiceLocator for MockServiceLocator {
-    fn providers(&self) -> &dyn weft_llm_trait::ProviderService {
+    fn providers(&self) -> &dyn weft_provider_trait::ProviderService {
         self.providers.as_ref()
     }
 
@@ -271,7 +271,7 @@ fn build_mock(
     fail_list_commands: bool,
 ) -> MockServiceLocator {
     let resolved_config = Arc::new(ResolvedConfig::from_operator(&make_test_config()));
-    let providers: Arc<dyn weft_llm_trait::ProviderService + Send + Sync> =
+    let providers: Arc<dyn weft_provider_trait::ProviderService + Send + Sync> =
         Arc::new(StubProviderService::new(provider));
     let router: Arc<dyn weft_router_trait::SemanticRouter + Send + Sync> = Arc::new(StubRouter);
     let commands: Arc<dyn weft_commands_trait::CommandRegistry + Send + Sync> =
@@ -393,7 +393,7 @@ pub fn make_test_services_with_failing_router() -> MockServiceLocator {
     let hooks: Arc<dyn HookRunner + Send + Sync> = Arc::new(NullHookRunner);
 
     let resolved_config = Arc::new(ResolvedConfig::from_operator(&make_test_config()));
-    let providers: Arc<dyn weft_llm_trait::ProviderService + Send + Sync> =
+    let providers: Arc<dyn weft_provider_trait::ProviderService + Send + Sync> =
         Arc::new(StubProviderService::new(provider));
     let router: Arc<dyn weft_router_trait::SemanticRouter + Send + Sync> =
         Arc::new(ErrorRouter::new("test router failure"));
@@ -442,7 +442,7 @@ pub fn make_test_services_with_memory() -> MockServiceLocator {
     let resolved_config = Arc::new(ResolvedConfig::from_operator(
         &make_test_config_with_memory(),
     ));
-    let providers: Arc<dyn weft_llm_trait::ProviderService + Send + Sync> =
+    let providers: Arc<dyn weft_provider_trait::ProviderService + Send + Sync> =
         Arc::new(StubProviderService::new(provider));
     let router: Arc<dyn weft_router_trait::SemanticRouter + Send + Sync> = Arc::new(StubRouter);
     let commands: Arc<dyn weft_commands_trait::CommandRegistry + Send + Sync> =

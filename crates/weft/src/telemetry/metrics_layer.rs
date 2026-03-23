@@ -12,8 +12,8 @@
 //! | `weft_requests_total` | counter | `request` span close |
 //! | `weft_request_duration_seconds` | histogram | `request` span close |
 //! | `weft_active_requests` | gauge | `request` span new/close |
-//! | `weft_llm_call_duration_seconds` | histogram | `generate` span close |
-//! | `weft_llm_tokens_total` | counter | `generate` span close |
+//! | `weft_provider_call_duration_seconds` | histogram | `generate` span close |
+//! | `weft_provider_tokens_total` | counter | `generate` span close |
 //! | `weft_activity_duration_seconds` | histogram | `activity` span close |
 //! | `weft_command_duration_seconds` | histogram | `execute_command` span close |
 //! | `weft_dispatch_iterations_total` | counter | `iteration` span close |
@@ -73,15 +73,15 @@ pub(crate) enum SpanAttributes {
         /// Populated via `on_record`. Empty when not degraded.
         error_code: String,
     },
-    /// `generate` span — LLM generation call inside an activity.
+    /// `generate` span — provider generation call inside an activity.
     Generate {
         model: String,
         provider: String,
         /// "ok" | "error" — set via `on_record`.
         status: String,
-        /// Input tokens consumed — populated via `on_record` when `llm.input_tokens` is recorded.
+        /// Input tokens consumed — populated via `on_record` when `provider.input_tokens` is recorded.
         input_tokens: u64,
-        /// Output tokens generated — populated via `on_record` when `llm.output_tokens` is recorded.
+        /// Output tokens generated — populated via `on_record` when `provider.output_tokens` is recorded.
         output_tokens: u64,
     },
     /// `execute_command` span — per-command invocation in the dispatch loop.
@@ -192,8 +192,14 @@ where
             "generate" => {
                 let mut visitor = StringVisitor::default();
                 attrs.record(&mut visitor);
-                let model = visitor.get("llm.model").unwrap_or("unknown").to_string();
-                let provider = visitor.get("llm.provider").unwrap_or("unknown").to_string();
+                let model = visitor
+                    .get("provider.model")
+                    .unwrap_or("unknown")
+                    .to_string();
+                let provider = visitor
+                    .get("provider.name")
+                    .unwrap_or("unknown")
+                    .to_string();
                 SpanAttributes::Generate {
                     model,
                     provider,
@@ -278,18 +284,18 @@ where
                         "ok".to_string()
                     };
                 }
-                // llm.provider and llm.model may be recorded late (after span creation)
+                // provider.name and provider.model may be recorded late (after span creation)
                 // via span.record() when the provider is not known at span creation time.
-                if let Some(p) = visitor.get("llm.provider") {
+                if let Some(p) = visitor.get("provider.name") {
                     *provider = p.to_string();
                 }
-                if let Some(m) = visitor.get("llm.model") {
+                if let Some(m) = visitor.get("provider.model") {
                     *model = m.to_string();
                 }
-                if let Some(tok) = visitor.get_u64("llm.input_tokens") {
+                if let Some(tok) = visitor.get_u64("provider.input_tokens") {
                     *input_tokens = tok;
                 }
-                if let Some(tok) = visitor.get_u64("llm.output_tokens") {
+                if let Some(tok) = visitor.get_u64("provider.output_tokens") {
                     *output_tokens = tok;
                 }
             }
@@ -339,7 +345,7 @@ where
                 output_tokens,
             } => {
                 histogram!(
-                    "weft_llm_call_duration_seconds",
+                    "weft_provider_call_duration_seconds",
                     "model" => model.clone(),
                     "provider" => provider.clone(),
                     "status" => status.clone()
@@ -347,7 +353,7 @@ where
                 .record(duration);
                 if *input_tokens > 0 {
                     counter!(
-                        "weft_llm_tokens_total",
+                        "weft_provider_tokens_total",
                         "model" => model.clone(),
                         "direction" => "input"
                     )
@@ -355,7 +361,7 @@ where
                 }
                 if *output_tokens > 0 {
                     counter!(
-                        "weft_llm_tokens_total",
+                        "weft_provider_tokens_total",
                         "model" => model.clone(),
                         "direction" => "output"
                     )
@@ -708,36 +714,36 @@ mod tests {
         );
     }
 
-    // ── weft_llm_call_duration_seconds ────────────────────────────────────
+    // ── weft_provider_call_duration_seconds ───────────────────────────────
 
     #[test]
-    fn generate_span_emits_llm_call_duration() {
+    fn generate_span_emits_provider_call_duration() {
         with_metrics_layer(
             || {
                 let _span = tracing::info_span!(
                     "generate",
-                    "llm.model" = "claude-sonnet",
-                    "llm.provider" = "anthropic",
-                    "llm.attempt" = 0u32,
-                    "llm.input_tokens" = tracing::field::Empty,
-                    "llm.output_tokens" = tracing::field::Empty,
-                    "llm.stop_reason" = tracing::field::Empty,
+                    "provider.model" = "claude-sonnet",
+                    "provider.name" = "anthropic",
+                    "provider.attempt" = 0u32,
+                    "provider.input_tokens" = tracing::field::Empty,
+                    "provider.output_tokens" = tracing::field::Empty,
+                    "provider.stop_reason" = tracing::field::Empty,
                 );
             },
             |items| {
                 assert!(
                     snapshot_has(
                         items,
-                        "weft_llm_call_duration_seconds",
+                        "weft_provider_call_duration_seconds",
                         &[("model", "claude-sonnet"), ("provider", "anthropic")]
                     ),
-                    "weft_llm_call_duration_seconds not found"
+                    "weft_provider_call_duration_seconds not found"
                 );
             },
         );
     }
 
-    // ── weft_llm_tokens_total counter ─────────────────────────────────────
+    // ── weft_provider_tokens_total counter ────────────────────────────────
 
     #[test]
     fn generate_span_emits_token_counters() {
@@ -745,38 +751,46 @@ mod tests {
             || {
                 let span = tracing::info_span!(
                     "generate",
-                    "llm.model" = "claude-sonnet",
-                    "llm.provider" = "anthropic",
-                    "llm.attempt" = 0u32,
-                    "llm.input_tokens" = tracing::field::Empty,
-                    "llm.output_tokens" = tracing::field::Empty,
-                    "llm.stop_reason" = tracing::field::Empty,
+                    "provider.model" = "claude-sonnet",
+                    "provider.name" = "anthropic",
+                    "provider.attempt" = 0u32,
+                    "provider.input_tokens" = tracing::field::Empty,
+                    "provider.output_tokens" = tracing::field::Empty,
+                    "provider.stop_reason" = tracing::field::Empty,
                 );
-                span.record("llm.input_tokens", 100u64);
-                span.record("llm.output_tokens", 50u64);
+                span.record("provider.input_tokens", 100u64);
+                span.record("provider.output_tokens", 50u64);
                 drop(span);
             },
             |items| {
                 assert!(
                     snapshot_has(
                         items,
-                        "weft_llm_tokens_total",
+                        "weft_provider_tokens_total",
                         &[("direction", "input"), ("model", "claude-sonnet")]
                     ),
-                    "weft_llm_tokens_total input not found"
+                    "weft_provider_tokens_total input not found"
                 );
-                let v = counter_value(items, "weft_llm_tokens_total", &[("direction", "input")]);
+                let v = counter_value(
+                    items,
+                    "weft_provider_tokens_total",
+                    &[("direction", "input")],
+                );
                 assert_eq!(v, Some(100), "input token counter should be 100");
 
                 assert!(
                     snapshot_has(
                         items,
-                        "weft_llm_tokens_total",
+                        "weft_provider_tokens_total",
                         &[("direction", "output"), ("model", "claude-sonnet")]
                     ),
-                    "weft_llm_tokens_total output not found"
+                    "weft_provider_tokens_total output not found"
                 );
-                let v = counter_value(items, "weft_llm_tokens_total", &[("direction", "output")]);
+                let v = counter_value(
+                    items,
+                    "weft_provider_tokens_total",
+                    &[("direction", "output")],
+                );
                 assert_eq!(v, Some(50), "output token counter should be 50");
             },
         );
@@ -789,18 +803,18 @@ mod tests {
             || {
                 let _span = tracing::info_span!(
                     "generate",
-                    "llm.model" = "claude-sonnet",
-                    "llm.provider" = "anthropic",
-                    "llm.attempt" = 0u32,
-                    "llm.input_tokens" = tracing::field::Empty,
-                    "llm.output_tokens" = tracing::field::Empty,
-                    "llm.stop_reason" = tracing::field::Empty,
+                    "provider.model" = "claude-sonnet",
+                    "provider.name" = "anthropic",
+                    "provider.attempt" = 0u32,
+                    "provider.input_tokens" = tracing::field::Empty,
+                    "provider.output_tokens" = tracing::field::Empty,
+                    "provider.stop_reason" = tracing::field::Empty,
                 );
             },
             |items| {
                 assert!(
-                    !snapshot_has(items, "weft_llm_tokens_total", &[]),
-                    "weft_llm_tokens_total should not be emitted when tokens are zero"
+                    !snapshot_has(items, "weft_provider_tokens_total", &[]),
+                    "weft_provider_tokens_total should not be emitted when tokens are zero"
                 );
             },
         );
@@ -941,54 +955,62 @@ mod tests {
             || {
                 let span = tracing::info_span!(
                     "generate",
-                    "llm.model" = "gpt-4",
-                    "llm.provider" = "openai",
-                    "llm.attempt" = 0u32,
-                    "llm.input_tokens" = tracing::field::Empty,
-                    "llm.output_tokens" = tracing::field::Empty,
-                    "llm.stop_reason" = tracing::field::Empty,
+                    "provider.model" = "gpt-4",
+                    "provider.name" = "openai",
+                    "provider.attempt" = 0u32,
+                    "provider.input_tokens" = tracing::field::Empty,
+                    "provider.output_tokens" = tracing::field::Empty,
+                    "provider.stop_reason" = tracing::field::Empty,
                 );
-                span.record("llm.input_tokens", 200u64);
-                span.record("llm.output_tokens", 75u64);
+                span.record("provider.input_tokens", 200u64);
+                span.record("provider.output_tokens", 75u64);
                 drop(span);
             },
             |items| {
-                let v = counter_value(items, "weft_llm_tokens_total", &[("direction", "input")]);
+                let v = counter_value(
+                    items,
+                    "weft_provider_tokens_total",
+                    &[("direction", "input")],
+                );
                 assert_eq!(v, Some(200), "input tokens not found after late record");
 
-                let v = counter_value(items, "weft_llm_tokens_total", &[("direction", "output")]);
+                let v = counter_value(
+                    items,
+                    "weft_provider_tokens_total",
+                    &[("direction", "output")],
+                );
                 assert_eq!(v, Some(75), "output tokens not found after late record");
             },
         );
     }
 
-    // ── Late-recorded llm.provider / llm.model labels ─────────────────────
+    // ── Late-recorded provider.name / provider.model labels ───────────────
 
     #[test]
     fn generate_span_late_recorded_provider_appears_in_metric_label() {
         // Production code in generate.rs creates the span with
-        // llm.provider = tracing::field::Empty and calls span.record() once
+        // provider.name = tracing::field::Empty and calls span.record() once
         // the provider is resolved. The metric label must reflect the recorded
         // value, not the "unknown" default stored at span creation.
         with_metrics_layer(
             || {
                 let span = tracing::info_span!(
                     "generate",
-                    "llm.model" = "llama3",
-                    "llm.provider" = tracing::field::Empty,
-                    "llm.attempt" = 0u32,
-                    "llm.input_tokens" = tracing::field::Empty,
-                    "llm.output_tokens" = tracing::field::Empty,
-                    "llm.stop_reason" = tracing::field::Empty,
+                    "provider.model" = "llama3",
+                    "provider.name" = tracing::field::Empty,
+                    "provider.attempt" = 0u32,
+                    "provider.input_tokens" = tracing::field::Empty,
+                    "provider.output_tokens" = tracing::field::Empty,
+                    "provider.stop_reason" = tracing::field::Empty,
                 );
-                span.record("llm.provider", "ollama");
+                span.record("provider.name", "ollama");
                 drop(span);
             },
             |items| {
                 assert!(
                     snapshot_has(
                         items,
-                        "weft_llm_call_duration_seconds",
+                        "weft_provider_call_duration_seconds",
                         &[("provider", "ollama")]
                     ),
                     "metric label should be 'ollama' after late span.record(), not 'unknown'"
@@ -996,7 +1018,7 @@ mod tests {
                 assert!(
                     !snapshot_has(
                         items,
-                        "weft_llm_call_duration_seconds",
+                        "weft_provider_call_duration_seconds",
                         &[("provider", "unknown")]
                     ),
                     "metric label must not be 'unknown' when provider was recorded late"
@@ -1007,27 +1029,27 @@ mod tests {
 
     #[test]
     fn generate_span_late_recorded_model_appears_in_metric_label() {
-        // Defensive coverage for llm.model using the same late-recording pattern
-        // as llm.provider (in case model resolution is also deferred).
+        // Defensive coverage for provider.model using the same late-recording pattern
+        // as provider.name (in case model resolution is also deferred).
         with_metrics_layer(
             || {
                 let span = tracing::info_span!(
                     "generate",
-                    "llm.model" = tracing::field::Empty,
-                    "llm.provider" = "anthropic",
-                    "llm.attempt" = 0u32,
-                    "llm.input_tokens" = tracing::field::Empty,
-                    "llm.output_tokens" = tracing::field::Empty,
-                    "llm.stop_reason" = tracing::field::Empty,
+                    "provider.model" = tracing::field::Empty,
+                    "provider.name" = "anthropic",
+                    "provider.attempt" = 0u32,
+                    "provider.input_tokens" = tracing::field::Empty,
+                    "provider.output_tokens" = tracing::field::Empty,
+                    "provider.stop_reason" = tracing::field::Empty,
                 );
-                span.record("llm.model", "claude-opus-4");
+                span.record("provider.model", "claude-opus-4");
                 drop(span);
             },
             |items| {
                 assert!(
                     snapshot_has(
                         items,
-                        "weft_llm_call_duration_seconds",
+                        "weft_provider_call_duration_seconds",
                         &[("model", "claude-opus-4")]
                     ),
                     "metric label should be 'claude-opus-4' after late span.record(), not 'unknown'"
@@ -1035,7 +1057,7 @@ mod tests {
                 assert!(
                     !snapshot_has(
                         items,
-                        "weft_llm_call_duration_seconds",
+                        "weft_provider_call_duration_seconds",
                         &[("model", "unknown")]
                     ),
                     "metric label must not be 'unknown' when model was recorded late"

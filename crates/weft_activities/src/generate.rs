@@ -17,7 +17,7 @@ use tracing::{debug, info_span, warn};
 #[cfg(test)]
 use weft_core::Role;
 use weft_core::{ContentPart, WeftMessage};
-use weft_llm_trait::{ProviderChunk, ProviderError, ProviderRequest, ProviderResponse};
+use weft_provider_trait::{ProviderChunk, ProviderError, ProviderRequest, ProviderResponse};
 
 use weft_reactor_trait::{
     Activity, ActivityEvent, ActivityInput, EventLog, ExecutionId, FailureDetail, GeneratedEvent,
@@ -254,7 +254,7 @@ impl Activity for GenerateActivity {
         // full stream consumption. Attributes known at span creation are set immediately;
         // token counts and stop reason are recorded via Span::current().record() at close.
         //
-        // `llm.attempt` is the retry attempt counter. GenerateActivity does not track
+        // `provider.attempt` is the retry attempt counter. GenerateActivity does not track
         // retries internally (the reactor handles retry orchestration), so we read it
         // from metadata if available, defaulting to 0.
         let llm_attempt: u32 = input
@@ -265,12 +265,12 @@ impl Activity for GenerateActivity {
 
         let generate_span = info_span!(
             "generate",
-            llm.model = %model,
-            llm.provider = tracing::field::Empty,
-            llm.attempt = llm_attempt,
-            llm.input_tokens = tracing::field::Empty,
-            llm.output_tokens = tracing::field::Empty,
-            llm.stop_reason = tracing::field::Empty,
+            provider.model = %model,
+            provider.name = tracing::field::Empty,
+            provider.attempt = llm_attempt,
+            provider.input_tokens = tracing::field::Empty,
+            provider.output_tokens = tracing::field::Empty,
+            provider.stop_reason = tracing::field::Empty,
         );
 
         // Spawn heartbeat task if configured.
@@ -328,7 +328,7 @@ impl Activity for GenerateActivity {
         let provider_name = provider.name().to_string();
         // Record provider name now that it is known; must happen before the stream
         // is opened so the attribute is present for the full span lifetime.
-        generate_span.record("llm.provider", &provider_name);
+        generate_span.record("provider.name", &provider_name);
 
         // Use tokio::select! to support cancellation while opening the stream.
         let stream_result = tokio::select! {
@@ -366,7 +366,10 @@ impl Activity for GenerateActivity {
         let mut stream: std::pin::Pin<
             Box<
                 dyn futures::Stream<
-                        Item = Result<weft_llm_trait::ProviderChunk, weft_llm_trait::ProviderError>,
+                        Item = Result<
+                            weft_provider_trait::ProviderChunk,
+                            weft_provider_trait::ProviderError,
+                        >,
                     > + Send,
             >,
         > = match stream_result {
@@ -624,9 +627,9 @@ impl Activity for GenerateActivity {
         } else {
             "end_turn"
         };
-        generate_span.record("llm.input_tokens", input_tokens.unwrap_or(0));
-        generate_span.record("llm.output_tokens", output_tokens.unwrap_or(0));
-        generate_span.record("llm.stop_reason", stop_reason);
+        generate_span.record("provider.input_tokens", input_tokens.unwrap_or(0));
+        generate_span.record("provider.output_tokens", output_tokens.unwrap_or(0));
+        generate_span.record("provider.stop_reason", stop_reason);
 
         let _ = event_tx
             .send(PipelineEvent::Generation(GenerationEvent::Completed {

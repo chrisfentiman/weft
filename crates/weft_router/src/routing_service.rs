@@ -46,7 +46,7 @@ pub struct RoutingResult {
 /// Pure data — no hook references, no provider references.
 ///
 /// The engine constructs model candidates (filtered by capability) BEFORE
-/// building this struct, keeping `weft_router` independent of `weft_llm`.
+/// building this struct, keeping `weft_router` independent of `weft_providers`.
 #[derive(Debug)]
 pub struct RoutingInput<'a> {
     /// The user message text (possibly modified by PreRoute hooks).

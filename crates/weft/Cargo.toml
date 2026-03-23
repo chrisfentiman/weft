@@ -16,7 +16,7 @@ path = "src/main.rs"
 weft_activities = { path = "../weft_activities" }
 weft_core = { path = "../weft_core" }
 weft_hooks = { path = "../weft_hooks" }
-weft_llm = { path = "../weft_llm", features = ["telemetry"] }
+weft_providers = { path = "../weft_providers", features = ["telemetry"] }
 weft_memory = { path = "../weft_memory" }
 weft_rhai = { path = "../weft_rhai" }
 weft_router = { path = "../weft_router" }
@@ -59,7 +59,7 @@ weft_eventlog_postgres = ["dep:weft_eventlog_postgres", "dep:sqlx"]
 [dev-dependencies]
 weft_activities = { path = "../weft_activities", features = ["test-support"] }
 weft_hooks = { path = "../weft_hooks", features = ["test-support"] }
-weft_llm = { path = "../weft_llm", features = ["test-support"] }
+weft_providers = { path = "../weft_providers", features = ["test-support"] }
 weft_router = { path = "../weft_router", features = ["test-support"] }
 weft_commands = { path = "../weft_commands", features = ["test-support"] }
 weft_eventlog_memory = { workspace = true }

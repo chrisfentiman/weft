@@ -14,8 +14,8 @@ use axum::{body::Body, http::Request, http::StatusCode};
 use serde_json::json;
 use tower::ServiceExt;
 use weft::server::build_router;
-use weft_llm::ProviderError;
-use weft_llm::test_support::SingleUseErrorProvider;
+use weft_providers::ProviderError;
+use weft_providers::test_support::SingleUseErrorProvider;
 
 use harness::{TestProvider, make_router, make_weft_service, post_json};
 
