@@ -138,7 +138,7 @@ async fn test_pre_loop_activities_produce_events_in_order() {
 /// and injects it into the conversation as a `MessageInjected` event.
 ///
 /// **Context on layering via HTTP:**
-/// The OpenAI-compat HTTP translation (`openai_to_weft`) assigns `Source::Gateway` to
+/// The OpenAI-compat HTTP translation (`weft_providers::openai::translate::parse_inbound_request`) assigns `Source::Gateway` to
 /// incoming system messages. `SystemPromptAssemblyActivity` treats messages with
 /// `Source::Client` as a second "caller layer". Since HTTP system messages arrive as
 /// `Source::Gateway`, they are not counted as a second layer — only the gateway's own
@@ -163,7 +163,7 @@ async fn test_system_prompt_layers_gateway_and_caller() {
     let router = build_router(svc, None);
 
     // Request with caller-supplied system message.
-    // Via HTTP, this gets Source::Gateway (see openai_to_weft), so it is NOT treated as
+    // Via HTTP, this gets Source::Gateway (see parse_inbound_request), so it is NOT treated as
     // a second caller layer by SystemPromptAssemblyActivity. Only the gateway config prompt
     // is assembled; message_count reflects the post-injection state.
     let body = json!({
