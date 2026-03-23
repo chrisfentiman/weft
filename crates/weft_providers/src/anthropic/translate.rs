@@ -2,12 +2,14 @@
 //!
 //! Direction-tagged functions for converting between Weft domain types
 //! and Anthropic wire format types. Outbound functions are used by the
-//! provider client. Inbound functions will be added in Phase 3.
+//! provider client. Inbound functions are used by the compat endpoint.
 
-use weft_core::{ContentPart, Role, SamplingOptions, Source, WeftMessage};
+use weft_core::{ContentPart, ModelRoutingInstruction, Role, SamplingOptions, Source, WeftMessage};
 
-use super::wire::{AnthropicMessage, AnthropicRequest, AnthropicResponse};
-use crate::{TokenUsage, provider::extract_text_messages};
+use super::wire::{
+    AnthropicMessage, AnthropicRequest, AnthropicResponse, AnthropicUsage, ContentBlock,
+};
+use crate::{TokenUsage, provider::extract_text_messages, translate::TranslationError};
 
 // ── Outbound (Weft -> Anthropic) ─────────────────────────────────────────────
 
@@ -115,6 +117,126 @@ pub fn parse_outbound_response(
     };
 
     (message, usage)
+}
+
+// ── Inbound (Anthropic -> Weft) ───────────────────────────────────────────────
+
+/// Translate an Anthropic-format inbound request into a domain `WeftRequest`.
+///
+/// Maps message roles: "user" → `Source::Client`, "assistant" → `Source::Provider`.
+/// Extracts the top-level `system` field as `messages[0]` with `Role::System` and
+/// `Source::Gateway` when the field is `Some(non-empty string)`.
+/// Maps `temperature`, `max_tokens`, `top_p`, `top_k` to `SamplingOptions`.
+/// Parses `ModelRoutingInstruction` from the model string.
+///
+/// Returns `Err` if any message has an unrecognized role string.
+pub fn parse_inbound_request(
+    request: AnthropicRequest,
+) -> Result<weft_core::WeftRequest, TranslationError> {
+    let mut messages = Vec::new();
+
+    // Prepend system field as messages[0] when non-empty.
+    // Absent or empty system fields produce no system message.
+    if let Some(system_text) = request.system
+        && !system_text.is_empty()
+    {
+        messages.push(WeftMessage {
+            role: Role::System,
+            source: Source::Gateway,
+            model: None,
+            content: vec![ContentPart::Text(system_text)],
+            delta: false,
+            message_index: 0,
+        });
+    }
+
+    for msg in request.messages {
+        let (role, source) = match msg.role.as_str() {
+            "user" => (Role::User, Source::Client),
+            "assistant" => (Role::Assistant, Source::Provider),
+            unknown => return Err(TranslationError::UnrecognizedRole(unknown.to_string())),
+        };
+
+        messages.push(WeftMessage {
+            role,
+            source,
+            model: None,
+            content: vec![ContentPart::Text(msg.content)],
+            delta: false,
+            message_index: 0,
+        });
+    }
+
+    let routing = ModelRoutingInstruction::parse(&request.model);
+
+    // Anthropic format always provides max_tokens (required field).
+    let options = SamplingOptions {
+        temperature: request.temperature,
+        max_tokens: Some(request.max_tokens),
+        top_p: request.top_p,
+        top_k: request.top_k,
+        // Anthropic does not support these — leave at defaults.
+        frequency_penalty: None,
+        presence_penalty: None,
+        seed: None,
+        stop: vec![],
+        ..Default::default()
+    };
+
+    Ok(weft_core::WeftRequest {
+        messages,
+        routing,
+        options,
+    })
+}
+
+/// Translate a domain `WeftResponse` into an Anthropic-format response.
+///
+/// Extracts the last assistant/provider text message. Constructs the Anthropic
+/// response envelope with content blocks, usage, stop_reason.
+/// Sets `id` from `response.id` with `msg_` prefix if not already present.
+/// Sets `kind: "message"`, `role: "assistant"`, `model: request_model`,
+/// `stop_reason: "end_turn"`.
+pub fn build_inbound_response(
+    response: weft_core::WeftResponse,
+    request_model: String,
+) -> AnthropicResponse {
+    // Extract the last assistant/provider text message.
+    let assistant_text = response
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Assistant && m.source == Source::Provider)
+        .and_then(|m| {
+            m.content.iter().find_map(|part| match part {
+                ContentPart::Text(text) => Some(text.clone()),
+                _ => None,
+            })
+        })
+        .unwrap_or_default();
+
+    // Prefix id with "msg_" to match Anthropic wire format.
+    let id = if response.id.starts_with("msg_") {
+        response.id
+    } else {
+        format!("msg_{}", response.id)
+    };
+
+    AnthropicResponse {
+        id: Some(id),
+        kind: Some("message".to_string()),
+        role: Some("assistant".to_string()),
+        model: Some(request_model),
+        content: vec![ContentBlock {
+            kind: "text".to_string(),
+            text: Some(assistant_text),
+        }],
+        usage: Some(AnthropicUsage {
+            input_tokens: response.usage.prompt_tokens,
+            output_tokens: response.usage.completion_tokens,
+        }),
+        stop_reason: Some("end_turn".to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -340,5 +462,226 @@ mod tests {
         };
         assert_eq!(text, "");
         assert!(usage.is_none());
+    }
+
+    // ── parse_inbound_request ────────────────────────────────────────────────
+
+    fn make_inbound_request(system: Option<&str>, messages: Vec<(&str, &str)>) -> AnthropicRequest {
+        use super::super::wire::AnthropicMessage;
+        AnthropicRequest {
+            model: "claude-3-opus-20240229".to_string(),
+            system: system.map(|s| s.to_string()),
+            messages: messages
+                .into_iter()
+                .map(|(role, content)| AnthropicMessage {
+                    role: role.to_string(),
+                    content: content.to_string(),
+                })
+                .collect(),
+            max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stream: None,
+        }
+    }
+
+    #[test]
+    fn test_parse_inbound_system_field_prepended() {
+        let req = make_inbound_request(Some("You are helpful."), vec![("user", "Hello")]);
+        let weft_req = parse_inbound_request(req).expect("should succeed");
+        assert_eq!(weft_req.messages.len(), 2);
+        assert_eq!(weft_req.messages[0].role, Role::System);
+        assert_eq!(weft_req.messages[0].source, Source::Gateway);
+        let text = match &weft_req.messages[0].content[0] {
+            ContentPart::Text(t) => t.as_str(),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(text, "You are helpful.");
+    }
+
+    #[test]
+    fn test_parse_inbound_no_system_field() {
+        let req = make_inbound_request(None, vec![("user", "Hello")]);
+        let weft_req = parse_inbound_request(req).expect("should succeed");
+        // No system message prepended
+        assert_eq!(weft_req.messages.len(), 1);
+        assert_eq!(weft_req.messages[0].role, Role::User);
+    }
+
+    #[test]
+    fn test_parse_inbound_empty_system_field_skipped() {
+        // Some("") → no system message prepended
+        let req = make_inbound_request(Some(""), vec![("user", "Hello")]);
+        let weft_req = parse_inbound_request(req).expect("should succeed");
+        assert_eq!(weft_req.messages.len(), 1);
+        assert_eq!(weft_req.messages[0].role, Role::User);
+    }
+
+    #[test]
+    fn test_parse_inbound_user_assistant_roles() {
+        let req = make_inbound_request(
+            None,
+            vec![
+                ("user", "Hello"),
+                ("assistant", "Hi there"),
+                ("user", "How are you?"),
+            ],
+        );
+        let weft_req = parse_inbound_request(req).expect("should succeed");
+        assert_eq!(weft_req.messages[0].role, Role::User);
+        assert_eq!(weft_req.messages[0].source, Source::Client);
+        assert_eq!(weft_req.messages[1].role, Role::Assistant);
+        assert_eq!(weft_req.messages[1].source, Source::Provider);
+        assert_eq!(weft_req.messages[2].role, Role::User);
+        assert_eq!(weft_req.messages[2].source, Source::Client);
+    }
+
+    #[test]
+    fn test_parse_inbound_unrecognized_role_returns_error() {
+        use super::super::wire::AnthropicMessage;
+        let mut req = make_inbound_request(None, vec![]);
+        req.messages.push(AnthropicMessage {
+            role: "system".to_string(),
+            content: "should not be here".to_string(),
+        });
+        let result = parse_inbound_request(req);
+        assert!(matches!(
+            result,
+            Err(TranslationError::UnrecognizedRole(r)) if r == "system"
+        ));
+    }
+
+    #[test]
+    fn test_parse_inbound_tool_role_returns_error() {
+        use super::super::wire::AnthropicMessage;
+        let mut req = make_inbound_request(None, vec![]);
+        req.messages.push(AnthropicMessage {
+            role: "tool".to_string(),
+            content: "tool result".to_string(),
+        });
+        let result = parse_inbound_request(req);
+        assert!(matches!(
+            result,
+            Err(TranslationError::UnrecognizedRole(r)) if r == "tool"
+        ));
+    }
+
+    #[test]
+    fn test_parse_inbound_sampling_options_mapped() {
+        use super::super::wire::AnthropicMessage;
+        let req = AnthropicRequest {
+            model: "claude-3-opus-20240229".to_string(),
+            system: None,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            }],
+            max_tokens: 512,
+            temperature: Some(0.7),
+            top_p: Some(0.95),
+            top_k: Some(40),
+            stream: None,
+        };
+        let weft_req = parse_inbound_request(req).expect("should succeed");
+        assert_eq!(weft_req.options.max_tokens, Some(512));
+        assert_eq!(weft_req.options.temperature, Some(0.7));
+        assert_eq!(weft_req.options.top_p, Some(0.95));
+        assert_eq!(weft_req.options.top_k, Some(40));
+        // Fields not supported by Anthropic are None/default
+        assert!(weft_req.options.frequency_penalty.is_none());
+        assert!(weft_req.options.presence_penalty.is_none());
+        assert!(weft_req.options.seed.is_none());
+        assert!(weft_req.options.stop.is_empty());
+    }
+
+    // ── build_inbound_response ───────────────────────────────────────────────
+
+    fn make_weft_response(id: &str, text: &str) -> weft_core::WeftResponse {
+        use weft_core::{WeftTiming, WeftUsage};
+        weft_core::WeftResponse {
+            id: id.to_string(),
+            model: "test-model".to_string(),
+            messages: vec![WeftMessage {
+                role: Role::Assistant,
+                source: Source::Provider,
+                model: None,
+                content: vec![ContentPart::Text(text.to_string())],
+                delta: false,
+                message_index: 0,
+            }],
+            usage: WeftUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                llm_calls: 1,
+            },
+            timing: WeftTiming::default(),
+            degradations: vec![],
+        }
+    }
+
+    #[test]
+    fn test_build_inbound_response_content_block() {
+        let resp = make_weft_response("test-id", "Hello from Anthropic!");
+        let anthropic_resp = build_inbound_response(resp, "claude-3-opus-20240229".to_string());
+        assert_eq!(anthropic_resp.content.len(), 1);
+        assert_eq!(anthropic_resp.content[0].kind, "text");
+        assert_eq!(
+            anthropic_resp.content[0].text,
+            Some("Hello from Anthropic!".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_inbound_response_usage_mapping() {
+        let resp = make_weft_response("id", "Hi");
+        let anthropic_resp = build_inbound_response(resp, "claude-3".to_string());
+        let usage = anthropic_resp.usage.expect("usage must be present");
+        // prompt_tokens → input_tokens, completion_tokens → output_tokens
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn test_build_inbound_response_id_prefix() {
+        // id without prefix gets "msg_" prepended
+        let resp = make_weft_response("abc-123", "Hi");
+        let anthropic_resp = build_inbound_response(resp, "claude-3".to_string());
+        assert_eq!(anthropic_resp.id, Some("msg_abc-123".to_string()));
+    }
+
+    #[test]
+    fn test_build_inbound_response_id_already_prefixed() {
+        // id with "msg_" prefix is not double-prefixed
+        let resp = make_weft_response("msg_already", "Hi");
+        let anthropic_resp = build_inbound_response(resp, "claude-3".to_string());
+        assert_eq!(anthropic_resp.id, Some("msg_already".to_string()));
+    }
+
+    #[test]
+    fn test_build_inbound_response_envelope_fields() {
+        let resp = make_weft_response("id", "Response text");
+        let anthropic_resp = build_inbound_response(resp, "claude-3-haiku".to_string());
+        assert_eq!(anthropic_resp.kind, Some("message".to_string()));
+        assert_eq!(anthropic_resp.role, Some("assistant".to_string()));
+        assert_eq!(anthropic_resp.model, Some("claude-3-haiku".to_string()));
+        assert_eq!(anthropic_resp.stop_reason, Some("end_turn".to_string()));
+    }
+
+    #[test]
+    fn test_build_inbound_response_empty_messages() {
+        use weft_core::{WeftTiming, WeftUsage};
+        let resp = weft_core::WeftResponse {
+            id: "test".to_string(),
+            model: "auto".to_string(),
+            messages: vec![],
+            usage: WeftUsage::default(),
+            timing: WeftTiming::default(),
+            degradations: vec![],
+        };
+        let anthropic_resp = build_inbound_response(resp, "claude-3".to_string());
+        // Empty messages → empty content text
+        assert_eq!(anthropic_resp.content[0].text, Some(String::new()));
     }
 }

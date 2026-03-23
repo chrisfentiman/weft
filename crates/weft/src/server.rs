@@ -2,6 +2,7 @@
 //!
 //! Endpoints:
 //! - `POST /v1/chat/completions` — OpenAI-compatible chat completions
+//! - `POST /v1/messages`         — Anthropic-compatible Messages API
 //! - `GET /health`               — Health check for load balancers
 //! - `GET /metrics`              — Prometheus metrics (when enabled)
 //!
@@ -53,9 +54,10 @@ pub fn build_router(
     ))
     .into_axum_router();
 
-    // Build the HTTP axum router for OpenAI compat + health.
+    // Build the HTTP axum router for OpenAI compat, Anthropic compat, and health.
     let mut http_router = Router::new()
         .route("/v1/chat/completions", post(chat_completions_handler))
+        .route("/v1/messages", post(anthropic_messages_handler))
         .route("/health", get(health_handler))
         .with_state(Arc::clone(&weft_service));
 
@@ -183,6 +185,67 @@ async fn chat_completions_handler(
             weft_providers::openai::translate::build_inbound_response(weft_resp, request_model),
         )),
         Err(e) => Err(ApiError::from_weft_error(e)),
+    }
+}
+
+/// `POST /v1/messages`
+///
+/// Accepts an Anthropic-compatible Messages API request and returns an
+/// Anthropic-format response. Same convergence at `handle_weft_request()`
+/// as all other entry points.
+///
+/// Extracts W3C TraceContext from the `traceparent` request header for
+/// distributed tracing support.
+async fn anthropic_messages_handler(
+    State(weft_service): State<Arc<WeftService>>,
+    headers: HeaderMap,
+    Json(anthropic_req): Json<weft_providers::anthropic::wire::AnthropicRequest>,
+) -> Result<Json<weft_providers::anthropic::wire::AnthropicResponse>, AnthropicApiError> {
+    // Extract W3C TraceContext from incoming headers.
+    {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        let parent_ctx = crate::telemetry::propagation::extract_from_headers(&headers);
+        tracing::Span::current().set_parent(parent_ctx);
+    }
+
+    // Validate: must have at least one message.
+    if anthropic_req.messages.is_empty() {
+        return Err(AnthropicApiError::bad_request(
+            "messages array must not be empty",
+        ));
+    }
+
+    // Validate: must have at least one user message.
+    if !anthropic_req.messages.iter().any(|m| m.role == "user") {
+        return Err(AnthropicApiError::bad_request(
+            "messages must contain at least one user message",
+        ));
+    }
+
+    // Reject streaming explicitly.
+    if anthropic_req.stream == Some(true) {
+        return Err(AnthropicApiError::bad_request(
+            "streaming is not supported in v1",
+        ));
+    }
+
+    info!(
+        model = %anthropic_req.model,
+        message_count = anthropic_req.messages.len(),
+        "handling Anthropic messages request"
+    );
+
+    // Capture request model before consuming anthropic_req (for echo in response).
+    let request_model = anthropic_req.model.clone();
+
+    let weft_req = weft_providers::anthropic::translate::parse_inbound_request(anthropic_req)
+        .map_err(|e| AnthropicApiError::bad_request(e.to_string()))?;
+
+    match weft_service.handle_weft_request(weft_req).await {
+        Ok(weft_resp) => Ok(Json(
+            weft_providers::anthropic::translate::build_inbound_response(weft_resp, request_model),
+        )),
+        Err(e) => Err(AnthropicApiError::from_weft_error(e)),
     }
 }
 
@@ -350,6 +413,141 @@ impl IntoResponse for ApiError {
             .body(axum::body::Body::from(json_body))
             .unwrap_or_else(|_| {
                 warn!("failed to build error response");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            });
+
+        // Add Retry-After header for rate-limit responses.
+        if let Some(retry_after_ms) = self.retry_after_ms {
+            let retry_after_secs = retry_after_ms.div_ceil(1000);
+            if let Ok(value) = header::HeaderValue::from_str(&retry_after_secs.to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+        }
+
+        response
+    }
+}
+
+// ── Anthropic error types ──────────────────────────────────────────────────
+
+/// Anthropic-compatible error response body.
+#[derive(Debug, Serialize)]
+struct AnthropicErrorBody {
+    #[serde(rename = "type")]
+    kind: String, // "error"
+    error: AnthropicErrorDetail,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicErrorDetail {
+    #[serde(rename = "type")]
+    error_type: String, // "invalid_request_error", "rate_limit_error", etc.
+    message: String,
+}
+
+/// Anthropic-format API error that converts to an HTTP response.
+///
+/// Produces Anthropic-shaped error bodies (`{ type: "error", error: { type: "...", message: "..." } }`).
+/// Status code mapping is identical to `ApiError`; only the response body shape differs.
+pub struct AnthropicApiError {
+    status: StatusCode,
+    error_type: String,
+    message: String,
+    retry_after_ms: Option<u64>,
+}
+
+impl AnthropicApiError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            error_type: "invalid_request_error".to_string(),
+            message: message.into(),
+            retry_after_ms: None,
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            error_type: "api_error".to_string(),
+            message: message.into(),
+            retry_after_ms: None,
+        }
+    }
+
+    fn from_weft_error(e: WeftError) -> Self {
+        match e {
+            WeftError::InvalidRequest(_) => Self::bad_request(e.to_string()),
+            WeftError::ProtoConversion(_) => Self::internal(e.to_string()),
+            WeftError::StreamingNotSupported => Self::bad_request(e.to_string()),
+            WeftError::Config(_) => Self::internal(e.to_string()),
+            WeftError::RateLimited { retry_after_ms } => Self {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                error_type: "rate_limit_error".to_string(),
+                message: e.to_string(),
+                retry_after_ms: Some(retry_after_ms),
+            },
+            WeftError::RequestTimeout { .. } => Self {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                error_type: "api_error".to_string(),
+                message: e.to_string(),
+                retry_after_ms: None,
+            },
+            WeftError::ToolRegistry(_) => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                error_type: "api_error".to_string(),
+                message: e.to_string(),
+                retry_after_ms: None,
+            },
+            WeftError::CommandLoopExceeded { .. } => Self::internal(e.to_string()),
+            WeftError::Llm(_) => Self::internal(e.to_string()),
+            WeftError::Routing(_) => Self::internal(e.to_string()),
+            WeftError::ModelNotFound { .. } => Self::internal(e.to_string()),
+            WeftError::Command(_) => Self::internal(e.to_string()),
+            WeftError::MemoryStore(_) => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                error_type: "api_error".to_string(),
+                message: e.to_string(),
+                retry_after_ms: None,
+            },
+            WeftError::NoEligibleModels { .. } => Self::bad_request(e.to_string()),
+            WeftError::HookBlocked { .. } => Self {
+                status: StatusCode::FORBIDDEN,
+                error_type: "permission_error".to_string(),
+                message: e.to_string(),
+                retry_after_ms: None,
+            },
+            WeftError::HookBlockedAfterRetries { .. } => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                error_type: "invalid_request_error".to_string(),
+                message: e.to_string(),
+                retry_after_ms: None,
+            },
+        }
+    }
+}
+
+impl IntoResponse for AnthropicApiError {
+    fn into_response(self) -> Response {
+        let body = AnthropicErrorBody {
+            kind: "error".to_string(),
+            error: AnthropicErrorDetail {
+                error_type: self.error_type,
+                message: self.message,
+            },
+        };
+
+        let json_body = serde_json::to_string(&body).unwrap_or_else(|_| {
+            r#"{"type":"error","error":{"type":"api_error","message":"internal serialization error"}}"#
+                .to_string()
+        });
+
+        let mut response = Response::builder()
+            .status(self.status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(json_body))
+            .unwrap_or_else(|_| {
+                warn!("failed to build Anthropic error response");
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
             });
 
@@ -602,9 +800,13 @@ mod tests {
     }
 
     async fn post_json(router: Router, body: Value) -> (StatusCode, Value) {
+        post_json_to(router, "/v1/chat/completions", body).await
+    }
+
+    async fn post_json_to(router: Router, uri: &str, body: Value) -> (StatusCode, Value) {
         let req = Request::builder()
             .method("POST")
-            .uri("/v1/chat/completions")
+            .uri(uri)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
@@ -684,6 +886,56 @@ mod tests {
         assert!(resp["error"]["message"].is_string());
     }
 
+    // ── Anthropic handler validation tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn test_anthropic_empty_messages_returns_400() {
+        let router = make_unit_test_router(weft_providers::test_support::StubProvider::new(
+            "irrelevant",
+        ));
+        let body = json!({
+            "model": "claude-3-opus-20240229",
+            "messages": [],
+            "max_tokens": 1024
+        });
+        let (status, resp) = post_json_to(router, "/v1/messages", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Anthropic error shape: { type: "error", error: { type: "...", message: "..." } }
+        assert_eq!(resp["type"], "error");
+        assert!(resp["error"]["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_no_user_message_returns_400() {
+        let router = make_unit_test_router(weft_providers::test_support::StubProvider::new(
+            "irrelevant",
+        ));
+        let body = json!({
+            "model": "claude-3-opus-20240229",
+            "messages": [{"role": "assistant", "content": "hi"}],
+            "max_tokens": 1024
+        });
+        let (status, resp) = post_json_to(router, "/v1/messages", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(resp["type"], "error");
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_stream_true_returns_400() {
+        let router = make_unit_test_router(weft_providers::test_support::StubProvider::new(
+            "irrelevant",
+        ));
+        let body = json!({
+            "model": "claude-3-opus-20240229",
+            "messages": [{"role": "user", "content": "stream please"}],
+            "max_tokens": 1024,
+            "stream": true
+        });
+        let (status, resp) = post_json_to(router, "/v1/messages", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(resp["type"], "error");
+    }
+
     // ── ApiError status code mapping tests ─────────────────────────────────
 
     #[test]
@@ -721,5 +973,38 @@ mod tests {
         let err = WeftError::ProtoConversion("missing role".to_string());
         let api_error = ApiError::from_weft_error(err);
         assert_eq!(api_error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ── AnthropicApiError status code mapping tests ─────────────────────────
+
+    #[test]
+    fn test_anthropic_invalid_request_maps_to_400() {
+        let err = WeftError::InvalidRequest("bad input".to_string());
+        let api_error = AnthropicApiError::from_weft_error(err);
+        assert_eq!(api_error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(api_error.error_type, "invalid_request_error");
+    }
+
+    #[test]
+    fn test_anthropic_rate_limited_maps_to_429() {
+        let err = WeftError::RateLimited {
+            retry_after_ms: 3000,
+        };
+        let api_error = AnthropicApiError::from_weft_error(err);
+        assert_eq!(api_error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(api_error.error_type, "rate_limit_error");
+        assert_eq!(api_error.retry_after_ms, Some(3000));
+    }
+
+    #[test]
+    fn test_anthropic_hook_blocked_maps_to_403_with_permission_error() {
+        let err = WeftError::HookBlocked {
+            event: "request_start".to_string(),
+            reason: "policy violation".to_string(),
+            hook_name: "auth-hook".to_string(),
+        };
+        let api_error = AnthropicApiError::from_weft_error(err);
+        assert_eq!(api_error.status, StatusCode::FORBIDDEN);
+        assert_eq!(api_error.error_type, "permission_error");
     }
 }
